@@ -26,7 +26,7 @@ jobs:
       # The pinned standalone CPython hermes-python-host embeds (and the packages ship), for every
       # build and test in this job.
       - if: runner.os != 'Windows'
-        run: echo "PYO3_PYTHON=$(scripts/python-runtime.sh)" >> "$GITHUB_ENV"
+        run: scripts/python-runtime.sh >> "$GITHUB_ENV"
       - if: runner.os == 'Windows'
         run: |
           $python = ./scripts/python-runtime.ps1

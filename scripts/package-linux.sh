@@ -9,8 +9,9 @@ destination=$(cd "$destination" && pwd)
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 # hermes-python-host embeds this exact CPython; it ships in lib/hermes/python.
-PYO3_PYTHON=${PYO3_PYTHON:-$(scripts/python-runtime.sh)}
-export PYO3_PYTHON
+if [ -z "${PYO3_CONFIG_FILE:-}" ]; then
+    for setting in $(scripts/python-runtime.sh); do export "$setting"; done
+fi
 cargo build --locked --release -p hermes-desktop -p hermes-gateway -p hermes-python-host
 target=${CARGO_TARGET_DIR:-"$PWD/target"}
 stage="$build/Hermes"
