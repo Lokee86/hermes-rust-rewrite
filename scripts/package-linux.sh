@@ -8,11 +8,16 @@ mkdir -p "$destination"
 destination=$(cd "$destination" && pwd)
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
-cargo build --locked --release -p hermes-desktop -p hermes-gateway
+# hermes-python-host embeds this exact CPython; it ships in lib/hermes/python.
+PYO3_PYTHON=${PYO3_PYTHON:-$(scripts/python-runtime.sh)}
+export PYO3_PYTHON
+cargo build --locked --release -p hermes-desktop -p hermes-gateway -p hermes-python-host
 target=${CARGO_TARGET_DIR:-"$PWD/target"}
 stage="$build/Hermes"
 install -d "$stage/bin" "$stage/share/applications" "$stage/share/icons/hicolor/512x512/apps" "$stage/share/licenses/hermes"
-install -m755 "$target/release/hermes-desktop" "$target/release/hermes-gateway" "$stage/bin/"
+install -m755 "$target/release/hermes-desktop" "$target/release/hermes-gateway" "$target/release/hermes-python-host" "$stage/bin/"
+scripts/bundle-python.sh "$PYO3_PYTHON" "$stage/lib/hermes/python"
+"$stage/bin/hermes-python-host" --version | grep -q " $stage/lib/hermes/python\$" || { echo "hermes-python-host does not run the bundled Python" >&2; exit 1; }
 install -m644 assets/icon.png "$stage/share/icons/hicolor/512x512/apps/com.nousresearch.hermes.rust-development.png"
 install -m644 packaging/linux/com.nousresearch.hermes.rust-development.desktop "$stage/share/applications/"
 install -m644 LICENSE-HERMES-AGENT "$stage/share/licenses/hermes/LICENSE"

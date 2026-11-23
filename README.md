@@ -1,6 +1,6 @@
 # Hermes Desktop — Rust rewrite
 
-A native rewrite of the [Hermes Agent](https://github.com/NousResearch/hermes-agent) desktop app in Rust. The UI is [Iced](https://iced.rs) and the agent engine (turns, streaming, tools, approvals, MCP, subagents) is Rust too, so the app is one native program: no Electron, Tauri, Node or bundled Chromium, and no separate Python backend to install.
+A native rewrite of the [Hermes Agent](https://github.com/NousResearch/hermes-agent) desktop app in Rust. The UI is [Iced](https://iced.rs) and the agent engine (turns, streaming, tools, approvals, MCP, subagents) is Rust too, so the app is one native program: no Electron, Tauri, Node or bundled Chromium, and no separate Python backend to install. The only Python is the CPython interpreter embedded to run Python plugins (see [Python plugins](#python-plugins)).
 
 This is an independent community project, not an official Nous Research release. The upstream pull request is [NousResearch/hermes-agent#159125](https://github.com/NousResearch/hermes-agent/pull/159125).
 
@@ -66,7 +66,7 @@ python3 benchmarks/summarize.py
 - **Capabilities:**
   - skills and MCP servers (HTTP, stdio, OAuth 2.1);
   - the plugin catalog, with Agent Plugins v1 packages running natively;
-  - Python plugins, run through an installed Hermes agent.
+  - Python plugins, run in the built-in Python interpreter.
 - **Routines (cron):** templates, a sidebar section with countdowns, and one chat per routine that streams its run live.
 - **Pages:** artifacts (with HTML preview in the OS webview), messaging, webhooks, profiles, agents, command center, star map.
 - **Floating windows:**
@@ -78,9 +78,27 @@ python3 benchmarks/summarize.py
 
 [`FEATURE_PARITY.md`](FEATURE_PARITY.md) lists every screen against the Electron app and says what is verified live, covered by tests, or only built.
 
+## Python plugins
+
+Hermes plugins written in Python (`plugin.yaml` + `__init__.py` with `register(ctx)`) run without installing Python or the Python Hermes agent:
+
+- `hermes-python-host`, a small Rust program, embeds CPython through [PyO3](https://pyo3.rs). Each enabled Python plugin runs in its own host process, so a crashing plugin can't take the app down.
+- Each package ships a pinned, checksummed CPython 3.13 runtime from [python-build-standalone](https://github.com/astral-sh/python-build-standalone), with tests, IDLE, Tk and headers removed:
+
+  | Platform | Interpreter library | Where it ships |
+  | --- | --- | --- |
+  | Windows | `python313.dll` | `python\` next to `Hermes.exe` |
+  | macOS | `libpython3.13.dylib` | `Hermes.app/Contents/Resources/python` |
+  | Linux | `libpython3.13.so.1.0` | `lib/hermes/python` |
+
+- The plugin `ctx` is implemented in Rust: `register_tool` (with `check_fn`, `requires_env` and async handlers), `register_hook` and `get_config`. Other `register_*` calls are skipped with a note on stderr.
+- These hooks run around every tool call: `pre_tool_call` (it can block the call), `transform_tool_result` and `post_tool_call`.
+- A plugin's `python_dependencies` are installed as wheels into the plugin's own data folder when you install it. Nothing runs at install time.
+- A plugin that imports Hermes internals (`hermes_cli`, `tools`, ...) falls back to an installed Hermes Python agent, if there is one.
+
 ## Build from source
 
-You need a recent stable Rust (`rustup update stable`). On Linux you also need the development packages listed in the [CI workflow](.github/workflows/build.yml).
+You need a recent stable Rust (`rustup update stable`) and a Python 3 with its shared library for PyO3 to link against (python.org's macOS installer, or a distribution's `python3-dev`). To use the same pinned runtime as the release builds, set `PYO3_PYTHON` first: `export PYO3_PYTHON=$(scripts/python-runtime.sh)` (on Windows, `$env:PYO3_PYTHON = ./scripts/python-runtime.ps1`). On Linux you also need the development packages listed in the [CI workflow](.github/workflows/build.yml).
 
 ```bash
 cargo run --locked -p hermes-desktop
@@ -100,6 +118,7 @@ The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh`
 | `crates/library` | Local storage: sessions, projects, bots and groups, webhooks, profiles |
 | `crates/gateway` | JSON-RPC gateway server and client, webhook receiver |
 | `crates/desktop` | The Iced app |
+| `crates/python-host` | Embedded CPython that runs Python plugins |
 | `benchmarks/` | Benchmark harness and results |
 
 ## Not done yet

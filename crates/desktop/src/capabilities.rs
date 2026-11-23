@@ -599,7 +599,7 @@ fn plugins(app: &Hermes) -> Element<'_, Message> {
         && terms.iter().all(|t| plugin.name.to_lowercase().contains(t) || plugin.description.to_lowercase().contains(t))).collect();
     let mut col = column![
         search_bar("Search plugins…", &state.search, p, pick_list(options, selected, |f| pressed(Action::PluginCategory(f))).text_size(12).padding([4, 8]).into()),
-        row![text(format!("{} plugins · {} installed · Agent Plugins packages run here; Python plugins run through your installed Hermes agent.", fmt_count(rows.len()), state.plugins_installed.len())).size(12).color(p.muted).width(Fill),
+        row![text(format!("{} plugins · {} installed · Agent Plugins packages run here; Python plugins run in the built-in Python.", fmt_count(rows.len()), state.plugins_installed.len())).size(12).color(p.muted).width(Fill),
             toggler(state.plugins_installed_only).label("Installed only").text_size(12).size(16).on_toggle(|v| pressed(Action::PluginsInstalledOnly(v)))].align_y(Alignment::Center),
     ].spacing(14);
     if let Some(error) = &state.error { col = col.push(text(error.clone()).size(12).color(Color::from_rgb8(0xd1, 0x43, 0x43))); }

@@ -2,6 +2,7 @@ mod attachment;
 pub use attachment::Attachment;
 mod history;
 mod mcp;
+mod plugin_hooks;
 pub mod connector;
 pub mod skill_catalog;
 pub mod plugins;
@@ -178,11 +179,14 @@ impl Session {
             self.publish(events)?;
             ensure!(round < self.settings.max_turns, "Stopped after {} rounds of tool calls",self.settings.max_turns);
             for call in calls {
-                let (approved, result) = if call.name == "delegate_task" && !self.child {
+                let (approved, result) = if let Some(message) = plugin_hooks::pre_tool_call(&mut mcp, &call).await {
+                    (false, json!({"error": message}).to_string())
+                } else if call.name == "delegate_task" && !self.child {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
                     let value = subagents::delegate(&args, provider.config().clone(), provider.options().clone(), &self.profile_root, self.tools.workspace_root(), events, cancel.clone()).await;
                     (true, value.to_string())
                 } else { handle_tool(&call, events, &self.tools, &mut self.memory, &mut mcp, &self.settings,&self.profile_root).await? };
+                let result = if approved { plugin_hooks::after_tool_call(&mut mcp, &call, result).await } else { result };
                 let result=if call.name=="read_file" {result}else{self.settings.bound_tool_result(result)};
                 self.history.turns[index].entries.push(Entry::Tool { id:call.id, name:call.name, approved, result });
                 self.publish(events)?;
