@@ -11,6 +11,7 @@ mkdir -p "$destination"
 rsync -a \
     --exclude "/bin/" --exclude "/include/" --exclude "/share/" --exclude "/lib/pkgconfig/" \
     --exclude "/lib/tcl*" --exclude "/lib/tk*" --exclude "/lib/itcl*" --exclude "/lib/thread*" \
+    --exclude "/lib/libtcl*" --exclude "/lib/libtk*" \
     --exclude "/lib/python$version/test/" --exclude "/lib/python$version/idlelib/" \
     --exclude "/lib/python$version/tkinter/" --exclude "/lib/python$version/turtledemo/" \
     --exclude "/lib/python$version/config-$version-*/" --exclude "/lib/python$version/lib-dynload/_tkinter*" \

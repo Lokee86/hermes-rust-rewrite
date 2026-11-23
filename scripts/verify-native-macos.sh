@@ -18,7 +18,7 @@ python=$(cd "$app/Contents/Resources/python" && pwd -P)
 test -x "$host"
 # Python plugins run in the embedded CPython; it is the only interpreter, and only the host links it.
 "$host" --version | grep -q " $python\$" || { echo "hermes-python-host does not run the bundled Python" >&2; exit 1; }
-foreign=$(find "$app/Contents" -path "$python" -prune -o \( -name '*.asar' -o -iname '*electron*' -o -iname '*chromium*' -o -iname '*tauri*' -o -iname '*webkit*' -o -iname '*python*' -o -iname node -o -iname node_modules -o -name '*.node' -o -name '*.py' -o -name '*.pyc' -o -name '*.html' -o -name '*.js' -o -name '*.wasm' \) -print)
+foreign=$(find "$app/Contents" -path "$app/Contents/Resources/python" -prune -o ! -path "$host" \( -name '*.asar' -o -iname '*electron*' -o -iname '*chromium*' -o -iname '*tauri*' -o -iname '*webkit*' -o -iname '*python*' -o -iname node -o -iname node_modules -o -name '*.node' -o -name '*.py' -o -name '*.pyc' -o -name '*.html' -o -name '*.js' -o -name '*.wasm' \) -print)
 if [ -n "$foreign" ]; then
     echo "Unexpected interpreter, web runtime, or script in application bundle" >&2
     echo "$foreign" >&2
