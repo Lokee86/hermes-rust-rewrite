@@ -2,11 +2,26 @@
 set -eu
 cd "$(dirname "$0")/.."
 destination=${1:-"$PWD/dist/Hermes.app"}
-cargo build --locked --release -p hermes-desktop -p hermes-gateway
+# hermes-python-host embeds this exact CPython; it ships in Contents/Resources/python.
+PYO3_PYTHON=${PYO3_PYTHON:-$(scripts/python-runtime.sh)}
+export PYO3_PYTHON
+cargo build --locked --release -p hermes-desktop -p hermes-gateway -p hermes-python-host
 target_dir=$(cargo metadata --no-deps --format-version 1 | plutil -extract target_directory raw -o - -)
 mkdir -p "$destination/Contents/MacOS" "$destination/Contents/Resources"
 install -m 755 "$target_dir/release/hermes-desktop" "$destination/Contents/MacOS/hermes-desktop"
 install -m 755 "$target_dir/release/hermes-gateway" "$destination/Contents/MacOS/hermes-gateway"
+install -m 755 "$target_dir/release/hermes-python-host" "$destination/Contents/MacOS/hermes-python-host"
+scripts/bundle-python.sh "$PYO3_PYTHON" "$destination/Contents/Resources/python"
+host="$destination/Contents/MacOS/hermes-python-host"
+library=$(otool -L "$host" | awk '/libpython3|Python\.framework/ { print $1; exit }')
+pyver=$("$PYO3_PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+case "$library" in
+    @rpath/*) ;;
+    *) install_name_tool -change "$library" "@rpath/libpython$pyver.dylib" "$host" ;;
+esac
+install_name_tool -id "@rpath/libpython$pyver.dylib" "$destination/Contents/Resources/python/lib/libpython$pyver.dylib"
+find "$destination/Contents/Resources/python" -type f \( -name '*.dylib' -o -name '*.so' \) -exec codesign --force --sign - {} +
+codesign --force --sign - "$host"
 cp packaging/macos/Info.plist "$destination/Contents/Info.plist"
 cp assets/icon.icns "$destination/Contents/Resources/Hermes.icns"
 mkdir -p "$destination/Contents/Resources/Notices"

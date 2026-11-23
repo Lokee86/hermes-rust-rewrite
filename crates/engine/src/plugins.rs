@@ -4,9 +4,12 @@
 //! (README rule 2) and copies the entry's subdir to <root>/plugins/<name>;
 //! its skills join the skill store and its MCP servers (streamable-http or
 //! stdio) are connected for every turn while the plugin is enabled. Python
-//! (`plugin.yaml` + `__init__.py`) plugins run in the installed Hermes Python
-//! agent: assets/python_plugin_bridge.py loads the plugin with Hermes's own
-//! PluginManager and serves the tools it registered over MCP stdio.
+//! (`plugin.yaml` + `__init__.py`) plugins run in hermes-python-host, which
+//! embeds the CPython runtime shipped with the app and implements `ctx` itself;
+//! their `python_dependencies` are installed (wheels only) into the plugin's
+//! data folder. A plugin that imports Hermes internals falls back to an
+//! installed Hermes Python agent: assets/python_plugin_bridge.py loads it with
+//! Hermes's own PluginManager.
 use crate::mcp::{Mcp, Stdio};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -71,13 +74,20 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
     git(&["checkout", "-q", "FETCH_HEAD"])?;
     let source = if entry.subdir.trim().is_empty() { staging.path().to_path_buf() } else { inside(staging.path(), entry.subdir.trim()).context("The catalog subdir is not valid")? };
     let package = read_package(&source)?;
-    if package.servers.contains_key("python") && python_hermes().is_none() {
-        bail!("This is a Python Hermes plugin. It runs through the Hermes Python agent, which is not installed on this computer (install it from hermes-agent.nousresearch.com, then try again).");
+    if package.servers.contains_key("python") && python_host().is_none() && python_hermes().is_none() {
+        bail!("This is a Python Hermes plugin, and this build of Hermes has no Python runtime (hermes-python-host is missing next to the app).");
+    }
+    let data = root.join("plugin-data").join(&entry.name);
+    fs::create_dir_all(&data)?;
+    if !package.python_dependencies.is_empty() {
+        let host = python_host().context("This plugin needs Python packages, and this build of Hermes has no Python runtime")?;
+        let out = Command::new(host).arg("install").arg(data.join(PACKAGES)).args(&package.python_dependencies).output().context("Could not start hermes-python-host")?;
+        ensure!(out.status.success(), "Could not install the plugin's Python packages ({}): {}", package.python_dependencies.join(", "),
+            String::from_utf8_lossy(&out.stderr).lines().chain(String::from_utf8_lossy(&out.stdout).lines()).filter(|l| l.contains("ERROR") || l.contains("rror:")).collect::<Vec<_>>().join(" ").trim());
     }
     let target = dir(root).join(&entry.name);
     if target.exists() { fs::remove_dir_all(&target)?; }
     copy_tree(&source, &target)?;
-    fs::create_dir_all(root.join("plugin-data").join(&entry.name))?;
     let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
     crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
     let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
@@ -179,6 +189,18 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 enum Server { Http { url: String, headers: Vec<(String, String)> }, Stdio { command: String, args: Vec<String>, env: Vec<(String, String)>, cwd: Option<String> }, Python }
 
 const BRIDGE: &str = include_str!("../assets/python_plugin_bridge.py");
+/// Where a Python plugin's `python_dependencies` are installed, inside its data folder.
+const PACKAGES: &str = "python-packages";
+
+/// hermes-python-host, next to the running executable (Hermes.app/Contents/MacOS, the Linux
+/// bin directory, the Windows install folder); for tests, the profile directory above the
+/// test binary (target/debug/deps/, or target/debug/build/<crate>/<hash>/out/).
+pub fn python_host() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = format!("hermes-python-host{}", std::env::consts::EXE_SUFFIX);
+    let depth = if cfg!(test) { 5 } else { 1 };
+    exe.ancestors().skip(1).take(depth).map(|dir| dir.join(&name)).find(|p| p.is_file())
+}
 
 /// The installed Hermes Python agent: (interpreter, hermes-agent checkout). The `hermes`
 /// launcher on PATH names both (`exec <python> -I -c '... sys.path.insert(0, <root>)'`),
@@ -210,7 +232,33 @@ pub fn python_hermes() -> Option<(PathBuf, PathBuf)> {
 fn yaml_field(text: &str, key: &str) -> String {
     text.lines().find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(':'))).map(|v| v.trim().trim_matches(['"', '\'']).to_owned()).unwrap_or_default()
 }
-struct Package { name: String, version: String, description: String, skills: Vec<(String, String)>, servers: std::collections::BTreeMap<String, Server> }
+struct Package { name: String, version: String, description: String, skills: Vec<(String, String)>, servers: std::collections::BTreeMap<String, Server>, python_dependencies: Vec<String> }
+
+/// A plugin.yaml list (`key: [a, b]` or `key:` then `- a` lines) of requirement strings.
+fn yaml_list(text: &str, key: &str) -> Vec<String> {
+    let clean = |v: &str| v.trim().trim_matches(['"', '\'']).to_owned();
+    let mut lines = text.lines();
+    let Some(rest) = lines.find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(':'))) else { return vec![] };
+    let rest = rest.trim();
+    let items: Vec<String> = if let Some(inline) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        // Split on commas outside quotes: "pkg>=1,<2" is one requirement.
+        let (mut items, mut current, mut quote) = (vec![], String::new(), None);
+        for c in inline.chars() {
+            match (c, quote) {
+                ('"' | '\'', None) => quote = Some(c),
+                (q, Some(open)) if q == open => quote = None,
+                (',', None) => items.push(std::mem::take(&mut current).trim().to_owned()),
+                _ => current.push(c),
+            }
+        }
+        items.push(current.trim().to_owned());
+        items
+    } else {
+        lines.take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t', '-'])).filter_map(|l| l.trim().strip_prefix('-').map(clean)).collect()
+    };
+    // A leading '-' would be a pip option (--index-url, -e), not a requirement.
+    items.into_iter().filter(|r| !r.is_empty() && !r.starts_with('-') && !r.contains('\0')).collect()
+}
 
 fn package_skills(root: &Path) -> Vec<(String, String)> {
     let mut skills = vec![];
@@ -238,7 +286,9 @@ fn read_package(root: &Path) -> Result<Package> {
         ensure!(valid_name(&name.replace('_', "-")), "plugin.yaml has no valid name");
         let mut servers = std::collections::BTreeMap::new();
         servers.insert("python".to_owned(), Server::Python);
-        return Ok(Package { name, version: yaml_field(&text, "version"), description: yaml_field(&text, "description"), skills: package_skills(root), servers });
+        let mut python_dependencies = yaml_list(&text, "python_dependencies");
+        python_dependencies.extend(yaml_list(&text, "pip_dependencies"));
+        return Ok(Package { name, version: yaml_field(&text, "version"), description: yaml_field(&text, "description"), skills: package_skills(root), servers, python_dependencies });
     }
     let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?).context("plugin.json is not valid JSON")?;
     if let Some(schema) = manifest["$schema"].as_str() { ensure!(schema == PLUGIN_SCHEMA, "plugin.json declares an unsupported schema"); }
@@ -265,7 +315,7 @@ fn read_package(root: &Path) -> Result<Package> {
             servers.insert(server.clone(), parsed);
         }
     }
-    Ok(Package { name, version: manifest["version"].as_str().unwrap_or_default().to_owned(), description: manifest["description"].as_str().unwrap_or_default().to_owned(), skills, servers })
+    Ok(Package { name, version: manifest["version"].as_str().unwrap_or_default().to_owned(), description: manifest["description"].as_str().unwrap_or_default().to_owned(), skills, servers, python_dependencies: vec![] })
 }
 
 fn prefix(server: &str) -> String {
@@ -298,13 +348,7 @@ pub(crate) async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
                     if let Err(e) = &result && format!("{e:#}").contains("401") { errors.push(format!("{} › {name}: needs sign-in (Capabilities › Plugins › Sign in)", plugin.title)); continue }
                     result
                 }
-                Server::Python => {
-                    let Some((python, agent)) = python_hermes() else { errors.push(format!("{}: needs the Hermes Python agent installed", plugin.title)); continue };
-                    let bridge = data.join("python_plugin_bridge.py");
-                    if fs::read_to_string(&bridge).ok().as_deref() != Some(BRIDGE) && let Err(e) = fs::create_dir_all(&data).and_then(|_| fs::write(&bridge, BRIDGE)) { errors.push(format!("{}: {e}", plugin.title)); continue }
-                    let args = vec!["-I".to_owned(), bridge.to_string_lossy().into_owned(), agent.to_string_lossy().into_owned(), plugin_root.to_string_lossy().into_owned()];
-                    Mcp::connect_stdio(Stdio { command: python.to_string_lossy().into_owned(), args, env: config_env.clone(), cwd: plugin_root.clone() }, &prefix(&plugin.name)).await
-                }
+                Server::Python => connect_python(&plugin_root, &data, &config_env, &prefix(&plugin.name)).await,
                 Server::Stdio { command, args, mut env, cwd } => {
                     let command = match command.strip_prefix("./") { Some(rel) => match inside(&plugin_root, rel) { Some(p) => p.to_string_lossy().into_owned(), None => { errors.push(format!("{name}: bad command path")); continue } }, None => command };
                     let cwd = match cwd { Some(c) => PathBuf::from(expand(&c)), None => plugin_root.clone() };
@@ -321,6 +365,30 @@ pub(crate) async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
         }
     }
     (live, errors)
+}
+
+/// A Python plugin: in hermes-python-host first; if it is missing or the plugin does not load
+/// there (it imports Hermes internals), through an installed Hermes Python agent.
+async fn connect_python(plugin_root: &Path, data: &Path, config_env: &[(String, String)], prefix: &str) -> Result<Mcp> {
+    let mut env = config_env.to_vec();
+    env.push(("PLUGIN_ROOT".into(), plugin_root.to_string_lossy().into_owned()));
+    env.push(("PLUGIN_DATA".into(), data.to_string_lossy().into_owned()));
+    let embedded = match python_host() {
+        Some(host) => {
+            let args = vec!["serve".to_owned(), plugin_root.to_string_lossy().into_owned(), data.join(PACKAGES).to_string_lossy().into_owned()];
+            match Mcp::connect_stdio(Stdio { command: host.to_string_lossy().into_owned(), args, env: env.clone(), cwd: plugin_root.to_path_buf() }, prefix).await {
+                Ok(mcp) => return Ok(mcp),
+                Err(e) => e,
+            }
+        }
+        None => anyhow::anyhow!("this build has no Python runtime"),
+    };
+    let Some((python, agent)) = python_hermes() else { bail!("{embedded:#}") };
+    let bridge = data.join("python_plugin_bridge.py");
+    if fs::read_to_string(&bridge).ok().as_deref() != Some(BRIDGE) { fs::create_dir_all(data)?; fs::write(&bridge, BRIDGE)?; }
+    let args = vec!["-I".to_owned(), bridge.to_string_lossy().into_owned(), agent.to_string_lossy().into_owned(), plugin_root.to_string_lossy().into_owned()];
+    Mcp::connect_stdio(Stdio { command: python.to_string_lossy().into_owned(), args, env, cwd: plugin_root.to_path_buf() }, prefix).await
+        .with_context(|| format!("built-in Python: {embedded:#}; installed Hermes agent"))
 }
 
 #[cfg(test)]
@@ -382,9 +450,74 @@ for line in sys.stdin:
         save(root.path(), &[record]).unwrap();
         assert!(connect_all(root.path()).await.0.is_empty());
     }
-    /// Needs the Hermes Python agent on this machine: `cargo test -- --ignored python_plugin`
+    #[test]
+    fn reads_python_dependencies_from_plugin_yaml() {
+        let yaml = "name: x\npython_dependencies:\n  - httpx>=0.27,<1\n  - \"rich\"\n  - --index-url=https://evil\nversion: 1\npip_dependencies: ['a; python_version > \"3.10\"', b]\n";
+        assert_eq!(yaml_list(yaml, "python_dependencies"), ["httpx>=0.27,<1", "rich"], "pip options are not requirements");
+        assert_eq!(yaml_list(yaml, "pip_dependencies"), ["a; python_version > \"3.10\"", "b"]);
+        assert!(yaml_list(yaml, "requires_env").is_empty());
+    }
+
+    const SHOUT: &str = r#"
+import json
+
+def _shout(args, **_):
+    return json.dumps({"text": str(args.get("text", "")).upper() + "!"})
+
+def _no_secrets(tool_name, args, **_):
+    if "secret" in json.dumps(args):
+        return {"action": "block", "message": "no secrets"}
+
+def _tag(tool_name, result, **_):
+    return result + " [seen]"
+
+def register(ctx):
+    ctx.register_tool("shout_text", "shout", {"name": "shout_text", "description": "Shout text",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}, _shout)
+    ctx.register_hook("pre_tool_call", _no_secrets)
+    ctx.register_hook("transform_tool_result", _tag)
+"#;
+
+    fn shout_plugin(root: &Path, requirements: &str) {
+        let pkg = root.join("plugins/shout");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("plugin.yaml"), format!("name: shout\nversion: 1.0.0\ndescription: Shouts\n{requirements}")).unwrap();
+        fs::write(pkg.join("__init__.py"), SHOUT).unwrap();
+        save(root, &[Installed { name: "shout".into(), title: "Shout".into(), enabled: true, servers: vec!["python".into()], ..Default::default() }]).unwrap();
+    }
+
+    /// Runs in the app's own embedded Python (hermes-python-host, built by `cargo test --workspace`).
+    #[tokio::test]
+    async fn a_python_plugin_runs_in_the_built_in_python_with_its_hooks() {
+        assert!(python_host().is_some(), "build hermes-python-host first (cargo test --workspace builds it)");
+        let root = tempfile::tempdir().unwrap();
+        shout_plugin(root.path(), "");
+        let (mut live, errors) = connect_all(root.path()).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(live[0].contains("mcp_shout__shout_text"), "{:?}", live[0].specs());
+        let reply = live[0].call("mcp_shout__shout_text", &serde_json::json!({"text": "hi"})).await.unwrap();
+        assert_eq!(reply["content"][0]["text"], r#"{"text": "HI!"}"#);
+        let call = |args: &str| crate::history::ToolCall { id: "c1".into(), name: "terminal".into(), arguments: args.into() };
+        assert_eq!(crate::plugin_hooks::pre_tool_call(&mut live, &call(r#"{"command":"cat secret.txt"}"#)).await.as_deref(), Some("no secrets"));
+        assert_eq!(crate::plugin_hooks::pre_tool_call(&mut live, &call(r#"{"command":"ls"}"#)).await, None);
+        assert_eq!(crate::plugin_hooks::after_tool_call(&mut live, &call("{}"), "ok".into()).await, "ok [seen]");
+        live[0].close().await;
+    }
+
+    /// Network (PyPI): `cargo test -- --ignored python_dependencies_install`
+    #[test] #[ignore]
+    fn python_dependencies_install_into_the_plugin_data_folder() {
+        let host = python_host().expect("build hermes-python-host first");
+        let data = tempfile::tempdir().unwrap();
+        let out = Command::new(host).arg("install").arg(data.path().join(PACKAGES)).arg("six==1.17.0").output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(data.path().join(PACKAGES).join("six.py").is_file());
+    }
+
+    /// A plugin that imports Hermes internals falls back to the installed Hermes Python agent.
+    /// Needs that agent on this machine: `cargo test -- --ignored python_plugin`
     #[tokio::test] #[ignore]
-    async fn a_python_plugin_runs_through_the_installed_hermes() {
+    async fn a_python_plugin_that_imports_hermes_runs_through_the_installed_hermes() {
         assert!(python_hermes().is_some(), "no Hermes Python agent found");
         let root = tempfile::tempdir().unwrap();
         let pkg = root.path().join("plugins/shout");
@@ -392,6 +525,7 @@ for line in sys.stdin:
         fs::write(pkg.join("plugin.yaml"), "name: shout\nversion: 1.0.0\ndescription: Shouts\n").unwrap();
         fs::write(pkg.join("__init__.py"), r#"
 import json
+from hermes_constants import get_hermes_home  # Hermes internals: not in the built-in Python
 
 def _shout(args, **_):
     return json.dumps({"text": str(args.get("text", "")).upper() + "!"})

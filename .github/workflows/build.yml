@@ -23,6 +23,15 @@ jobs:
           sudo apt-get update && sudo apt-get install -y
           libxkbcommon-dev libwayland-dev libdbus-1-dev libasound2-dev libfontconfig1-dev
           libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
+      # The pinned standalone CPython hermes-python-host embeds (and the packages ship), for every
+      # build and test in this job.
+      - if: runner.os != 'Windows'
+        run: echo "PYO3_PYTHON=$(scripts/python-runtime.sh)" >> "$GITHUB_ENV"
+      - if: runner.os == 'Windows'
+        run: |
+          $python = ./scripts/python-runtime.ps1
+          "PYO3_PYTHON=$python" >> $env:GITHUB_ENV
+          Split-Path $python >> $env:GITHUB_PATH
       - run: cargo test --locked --workspace
         shell: bash
       - if: runner.os == 'Linux'
