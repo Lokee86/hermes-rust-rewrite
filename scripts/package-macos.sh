@@ -3,8 +3,9 @@ set -eu
 cd "$(dirname "$0")/.."
 destination=${1:-"$PWD/dist/Hermes.app"}
 # hermes-python-host embeds this exact CPython; it ships in Contents/Resources/python.
-PYO3_PYTHON=${PYO3_PYTHON:-$(scripts/python-runtime.sh)}
-export PYO3_PYTHON
+if [ -z "${PYO3_CONFIG_FILE:-}" ]; then
+    for setting in $(scripts/python-runtime.sh); do export "$setting"; done
+fi
 cargo build --locked --release -p hermes-desktop -p hermes-gateway -p hermes-python-host
 target_dir=$(cargo metadata --no-deps --format-version 1 | plutil -extract target_directory raw -o - -)
 mkdir -p "$destination/Contents/MacOS" "$destination/Contents/Resources"

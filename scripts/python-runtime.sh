@@ -1,8 +1,10 @@
 #!/bin/sh
 # Fetch the pinned standalone CPython that hermes-python-host embeds and the packages ship
-# (python-build-standalone, install_only_stripped), verify it, and print its interpreter
-# path. Build with PYO3_PYTHON set to that path so the host links this exact runtime:
-#   export PYO3_PYTHON=$(scripts/python-runtime.sh)
+# (python-build-standalone, install_only_stripped), verify it, and print the environment a
+# build needs, as KEY=VALUE lines: PYO3_PYTHON (the interpreter) and PYO3_CONFIG_FILE. The
+# explicit PyO3 config is needed because these builds report a placeholder library folder
+# (/install/lib) in sysconfig. CI appends the lines to $GITHUB_ENV; the packaging scripts
+# export them.
 set -eu
 cd "$(dirname "$0")/.."
 release=20261026
@@ -21,4 +23,26 @@ if [ ! -x "$root/python/bin/python3" ]; then
   [ "$actual" = "$sha" ] || { echo "Checksum mismatch for $archive" >&2; exit 1; }
   tar -xzf "$root/$archive" -C "$root"
 fi
-printf '%s\n' "$root/python/bin/python3"
+python="$root/python/bin/python3"
+pyver=$("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+if [ "$(uname -s)" = Darwin ]; then
+  # Link and load it by @rpath, so the host finds it next to itself once packaged.
+  library="$root/python/lib/libpython$pyver.dylib"
+  if ! otool -D "$library" | grep -q '^@rpath/'; then
+    install_name_tool -id "@rpath/libpython$pyver.dylib" "$library"
+    codesign --force --sign - "$library"
+  fi
+fi
+cat > "$root/pyo3-config.txt" <<CONFIG
+implementation=CPython
+version=$pyver
+shared=true
+abi3=false
+lib_name=python$pyver
+lib_dir=$root/python/lib
+executable=$python
+pointer_width=64
+build_flags=
+suppress_build_script_link_lines=false
+CONFIG
+printf 'PYO3_PYTHON=%s\nPYO3_CONFIG_FILE=%s\n' "$python" "$root/pyo3-config.txt"
