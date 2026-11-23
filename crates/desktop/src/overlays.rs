@@ -35,7 +35,7 @@ fn frames() -> Vec<image::Handle> {
 
 /// What the pet is doing, from the agent's live state.
 pub(super) fn mood(app: &Hermes) -> (&'static str, Option<&'static str>) {
-    if app.approval.is_some() { return ("waiting", Some("I need your OK")); }
+    if !app.approvals.is_empty() { return ("waiting", Some("I need your OK")); }
     if app.running { return ("run", Some("Working on it…")); }
     if app.overlays.celebrate_until.is_some_and(|t| t > std::time::Instant::now()) { return ("jump", Some("Done!")); }
     if app.history.turns.last().is_some_and(|t| matches!(t.status, hermes_engine::Status::Failed(_))) { return ("failed", Some("That didn't work")); }
@@ -44,7 +44,7 @@ pub(super) fn mood(app: &Hermes) -> (&'static str, Option<&'static str>) {
 
 pub(super) fn subscription(app: &Hermes) -> Subscription<Message> {
     if app.overlays.pet.is_none() { return Subscription::none(); }
-    let ms = if app.running || app.approval.is_some() || app.overlays.celebrate_until.is_some() { 200 } else { 900 };
+    let ms = if app.running || !app.approvals.is_empty() || app.overlays.celebrate_until.is_some() { 200 } else { 900 };
     iced::time::every(std::time::Duration::from_millis(ms)).map(|_| Message::Overlay(Action::PetTick))
 }
 

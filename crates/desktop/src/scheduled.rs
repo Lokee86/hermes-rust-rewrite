@@ -46,6 +46,9 @@ pub enum Action {
     Pause(String),
     Resume(String),
     Trigger(String),
+    Triggered(String, String, Result<String, String>),
+    OpenedRoutine(Result<String, String>),
+    OpenRunChat(String),
     Delete(String),
     DeleteCancel,
     DeleteConfirm,
@@ -224,13 +227,42 @@ impl Scheduled {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    Store::open(&profile).map_err(|error| format!("{error:#}"))
+                    Store::open_view(&profile).map_err(|error| format!("{error:#}"))
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             move |result| Action::Opened(scope, result),
         )
+    }
+    /// Keep an unresolved manual request stable across retries and app restarts.
+    pub fn trigger_identity(&self, job: &str) -> Result<String, String> {
+        self.pending_trigger(job, None)
+    }
+    pub fn clear_trigger_identity(&self, job: &str, request: &str) -> Result<(), String> {
+        self.pending_trigger(job, Some(request)).map(|_| ())
+    }
+    fn pending_trigger(&self, job: &str, clear: Option<&str>) -> Result<String, String> {
+        use fs2::FileExt;
+        let root = self.profile.as_ref().ok_or("No active profile")?.join("cron");
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(root.join(".manual-requests.lock")).map_err(|e| e.to_string())?;
+        lock.lock_exclusive().map_err(|e| e.to_string())?;
+        let path = root.join("manual-requests.json");
+        let mut requests: BTreeMap<String, String> = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let id = if let Some(request) = clear {
+            if requests.get(job).is_some_and(|id| id == request) { requests.remove(job); }
+            request.to_owned()
+        } else { requests.entry(job.to_owned()).or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone() };
+        let mut temp = tempfile::NamedTempFile::new_in(&root).map_err(|e| e.to_string())?;
+        serde_json::to_writer_pretty(&mut temp, &requests).map_err(|e| e.to_string())?;
+        temp.as_file().sync_all().map_err(|e| e.to_string())?;
+        temp.persist(&path).map_err(|e| e.to_string())?;
+        Ok(id)
     }
     pub fn subscription(&self) -> Subscription<Action> {
         if self.store.is_some() {
@@ -290,44 +322,6 @@ impl Scheduled {
             },
             move |result| Action::Changed(scope, result),
         )
-    }
-    fn start(&mut self, claim: Claim, manual: bool, config: Config, scope: u64) -> Task<Action> {
-        let Some(store) = self.store.clone() else {
-            return Task::none();
-        };
-        let id = claim.run.id.clone();
-        let cancel = CancellationToken::new();
-        self.active.insert(
-            id.clone(),
-            Active {
-                session_dir: claim.run.session_dir.clone(),
-                job: claim.job.id.clone(),
-                title: claim.job.title().to_owned(),
-                started: std::time::Instant::now(),
-                cancel: cancel.clone(),
-                manual,
-                approval: None,
-                text: String::new(),
-            },
-        );
-        let (send, receive) = async_channel::unbounded();
-        let messages = iced::futures::stream::unfold(receive, |receive| async {
-            receive.recv().await.ok().map(|event| (event, receive))
-        });
-        let event_id = id.clone();
-        Task::batch([
-            Task::run(messages, move |event| {
-                Action::Engine(scope, event_id.clone(), event)
-            }),
-            Task::perform(
-                async move {
-                    cron::execute(store, claim, config, send, cancel)
-                        .await
-                        .map_err(|error| format!("{error:#}"))
-                },
-                move |result| Action::Finished(scope, id.clone(), result),
-            ),
-        ])
     }
     pub fn update(&mut self, action: Action, config: Config) -> Task<Action> {
         match action {
@@ -529,75 +523,8 @@ impl Scheduled {
                     Err(error) => self.error = Some(error),
                 }
             }
-            Action::Tick if !self.ticking => {
-                if config.validate().is_err()
-                    || (config.base_url.trim_end_matches('/')
-                        == hermes_engine::portal::INFERENCE.trim_end_matches('/')
-                        && !hermes_engine::portal::is_available())
-                {
-                    return self.reload();
-                }
-                let Some(store) = self.store.clone() else {
-                    return Task::none();
-                };
-                self.ticking = true;
-                let scope = self.scope;
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            store
-                                .claim_due(Utc::now())
-                                .map_err(|error| format!("{error:#}"))
-                        })
-                        .await
-                        .unwrap_or_else(|error| Err(error.to_string()))
-                    },
-                    move |result| Action::Claimed(scope, false, result),
-                );
-            }
-            Action::Trigger(id) if !self.busy => {
-                let Some(store) = self.store.clone() else {
-                    return Task::none();
-                };
-                if let Err(error) = config.validate() {
-                    self.error = Some(error.to_string());
-                    return Task::none();
-                }
-                self.busy = true;
-                self.error = None;
-                let scope = self.scope;
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            store
-                                .claim_now(&id, Utc::now())
-                                .map(|claim| vec![claim])
-                                .map_err(|error| format!("{error:#}"))
-                        })
-                        .await
-                        .unwrap_or_else(|error| Err(error.to_string()))
-                    },
-                    move |result| Action::Claimed(scope, true, result),
-                );
-            }
-            Action::Claimed(scope, manual, result) if scope == self.scope => {
-                if manual {
-                    self.busy = false;
-                } else {
-                    self.ticking = false;
-                }
-                match result {
-                    Ok(claims) => {
-                        let mut tasks = Vec::new();
-                        for claim in claims {
-                            tasks.push(self.start(claim, manual, config.clone(), scope));
-                        }
-                        tasks.push(self.reload());
-                        return Task::batch(tasks);
-                    }
-                    Err(error) => self.error = Some(error),
-                }
-            }
+            Action::Tick => return self.reload(),
+            Action::Trigger(_) | Action::Triggered(..) | Action::OpenedRoutine(_) | Action::OpenRunChat(_) | Action::Claimed(..) => return Task::none(),
             Action::Engine(scope, id, event) => {
                 let Some(active) = self.active.get_mut(&id) else {
                     if let Event::Approval { answer, .. } = event {
@@ -873,7 +800,7 @@ impl Scheduled {
                 .into()
         };
         panel = panel.push(body).push(
-            text("Runs while Hermes is open · This desktop · Unattended tool requests are denied")
+            text("Runs while the profile gateway is active · Unattended approval requests are denied")
                 .size(10)
                 .style(muted),
         );
@@ -976,6 +903,9 @@ impl Scheduled {
             detail = detail.push(text("No runs yet").size(12).style(muted));
         }
         for run in &self.runs {
+            if let Some(id) = &run.gateway_session {
+                detail = detail.push(button(text("Open run chat").size(11)).on_press(Action::OpenRunChat(id.clone())).style(quiet));
+            }
             detail = detail.push(
                 button(
                     row![

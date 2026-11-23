@@ -1,18 +1,21 @@
-//! Native counterpart of src/app/right-sidebar/terminal. Each local tab owns a
-//! genuine pseudoterminal; hiding the rail does not stop its shell.
+//! The Iced terminal is a viewer. The authenticated profile gateway owns terminal access.
+#[cfg(all(test, windows))]
+pub(crate) mod acceptance;
+mod wire;
+
 use crate::appearance::text;
 use iced::{
     Element, Fill, Size, Task,
     keyboard::{Key, key::Named},
     widget::{self, button, column, container, row, sensor, text_editor},
 };
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
+use wire::{Access, Command, Request};
 
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
@@ -21,6 +24,7 @@ const EDITOR_ID: &str = "hermes-terminal-surface";
 #[derive(Clone)]
 pub enum Action {
     New,
+    AttachExisting(String),
     AddToChat(String),
     Select(u64),
     Close(u64),
@@ -28,8 +32,10 @@ pub enum Action {
     Paste,
     Pasted(Option<String>),
     Display(text_editor::Action),
-    Output(u64, Arc<[u8]>),
-    End(u64, String),
+    Attached(u64, u64, String, String),
+    Output(u64, u64, Arc<[u8]>),
+    Disconnected(u64, u64, Option<String>),
+    Closed(u64, u64, Result<(), String>),
     Resize(Size),
 }
 impl std::fmt::Debug for Action {
@@ -38,75 +44,44 @@ impl std::fmt::Debug for Action {
     }
 }
 
-struct Pty {
-    master: Box<dyn MasterPty + Send>,
-    input: std::sync::mpsc::SyncSender<Vec<u8>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Scope {
+    route: String,
+    workspace: Option<PathBuf>,
 }
-impl Drop for Pty {
-    fn drop(&mut self) {
-        let _ = self.killer.kill();
+
+#[derive(Serialize, Deserialize)]
+struct Bookmark {
+    scope: Scope,
+    terminal_id: Option<String>,
+    name: String,
+}
+
+impl Bookmark {
+    fn save(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let dir = path.parent().ok_or("Missing terminal bookmark directory")?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut file, self).map_err(|e| e.to_string())?;
+        file.flush()
+            .and_then(|_| file.as_file().sync_all())
+            .map_err(|e| e.to_string())?;
+        file.persist(path).map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
-fn spawn_shell(
-    command: CommandBuilder,
-    rows: u16,
-    cols: u16,
-) -> Result<
-    (
-        Pty,
-        Box<dyn Read + Send>,
-        Box<dyn portable_pty::Child + Send + Sync>,
-    ),
-    String,
-> {
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())?;
-    let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|e| e.to_string())?;
-    let killer = child.clone_killer();
-    let (input, queue) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
-    // A shell that stops reading must never block the desktop event loop.
-    std::thread::spawn(move || {
-        while let Ok(bytes) = queue.recv() {
-            if writer
-                .write_all(&bytes)
-                .and_then(|_| writer.flush())
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    Ok((
-        Pty {
-            master: pair.master,
-            input,
-            killer,
-        },
-        reader,
-        child,
-    ))
-}
-
 struct Tab {
-    workspace: Option<PathBuf>,
     name: String,
-    pty: Option<Pty>,
+    bookmark: PathBuf,
+    terminal_id: Option<String>,
+    generation: u64,
+    commands: Option<async_channel::Sender<Command>>,
+    closing: bool,
     parser: vt100::Parser,
     editor: text_editor::Content,
-    ended: Option<String>,
+    notice: Option<String>,
 }
 impl Tab {
     fn refresh(&mut self) {
@@ -130,8 +105,15 @@ impl Tab {
     }
 }
 
+#[derive(Clone)]
+struct Target {
+    root: PathBuf,
+    scope: Scope,
+    access: Access,
+}
+
 pub struct TerminalPane {
-    workspace: Option<PathBuf>,
+    target: Option<Target>,
     current: Option<u64>,
     tabs: BTreeMap<u64, Tab>,
     next: u64,
@@ -139,10 +121,56 @@ pub struct TerminalPane {
     rows: u16,
     cols: u16,
 }
+
+impl crate::Hermes {
+    pub(super) fn sync_terminal_context(&mut self) {
+        use crate::connections::Mode;
+        let workspace = self.workspace();
+        let target = self.library.as_ref().and_then(|library| {
+            let root = library.root().to_owned();
+            let state = &self.connections;
+            let (route, access) = match state.config.mode {
+                Mode::Local => (
+                    "local".to_owned(),
+                    Access::Local {
+                        root: root.clone(),
+                        provider: self.config.clone(),
+                    },
+                ),
+                Mode::Remote | Mode::Ssh | Mode::Cloud => {
+                    let (url, token) = match crate::remote::Route::selected(&root, state).ok()? {
+                        crate::remote::Route::Local => return None,
+                        crate::remote::Route::Remote { origin, token } => (origin, token),
+                    };
+                    let route = if state.config.mode == Mode::Ssh {
+                        serde_json::to_string(&state.config.ssh).ok()?
+                    } else {
+                        url.clone()
+                    };
+                    (
+                        route,
+                        Access::Remote {
+                            root: root.clone(),
+                            url,
+                            token,
+                        },
+                    )
+                }
+            };
+            Some(Target {
+                root,
+                scope: Scope { route, workspace },
+                access,
+            })
+        });
+        self.terminal.bind(target);
+    }
+}
+
 impl TerminalPane {
     pub fn new() -> Self {
         Self {
-            workspace: None,
+            target: None,
             current: None,
             tabs: BTreeMap::new(),
             next: 0,
@@ -151,140 +179,307 @@ impl TerminalPane {
             cols: INITIAL_COLS,
         }
     }
-    pub fn set_workspace(&mut self, workspace: Option<PathBuf>) {
-        if self.workspace == workspace {
+    fn bind(&mut self, target: Option<Target>) {
+        let same = self
+            .target
+            .as_ref()
+            .zip(target.as_ref())
+            .is_some_and(|(a, b)| a.root == b.root && a.scope == b.scope);
+        self.target = target;
+        if same {
             return;
         }
-        self.workspace = workspace;
-        self.current = self
-            .tabs
-            .iter()
-            .rev()
-            .find(|(_, t)| t.workspace == self.workspace)
-            .map(|(id, _)| *id);
+        self.tabs.clear();
+        self.current = None;
         self.error = None;
-    }
-    pub fn ensure_shell(&mut self) -> Task<Action> {
-        if self.current.is_none() {
-            self.update(Action::New)
-        } else {
-            widget::operation::focus(EDITOR_ID)
+        let Some(target) = &self.target else { return };
+        let dir = target.root.join("terminal-tabs");
+        let entries = match std::fs::read_dir(dir) {
+            Ok(files) => files,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.error = Some(format!("Could not restore terminal tabs: {e}"));
+                return;
+            }
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Some(saved) = std::fs::read(&path)
+                .ok()
+                .and_then(|data| serde_json::from_slice::<Bookmark>(&data).ok())
+            else {
+                continue;
+            };
+            if saved.scope != target.scope
+                || saved.terminal_id.as_deref() == Some("")
+                || (saved.terminal_id.is_none() && !matches!(target.access, Access::Local { .. }))
+            {
+                continue;
+            }
+            self.next += 1;
+            self.tabs.insert(
+                self.next,
+                Tab {
+                    bookmark: path,
+                    name: saved.name,
+                    terminal_id: saved.terminal_id,
+                    generation: 0,
+                    commands: None,
+                    closing: false,
+                    parser: vt100::Parser::new(self.rows, self.cols, 1000),
+                    editor: text_editor::Content::new(),
+                    notice: Some("Select to reattach".into()),
+                },
+            );
+            self.current = Some(self.next);
         }
     }
     fn current_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(&self.current?)
     }
 
-    fn new_shell(&mut self) -> Result<Task<Action>, String> {
+    pub fn ensure_shell(&mut self) -> Task<Action> {
+        if let Some(id) = self.current {
+            self.update(Action::Select(id))
+        } else {
+            self.new_shell(None)
+        }
+    }
+    pub fn account_shell(&mut self, command: String) -> Task<Action> {
+        if !matches!(
+            self.target.as_ref().map(|t| &t.access),
+            Some(Access::Local { .. })
+        ) {
+            self.error =
+                Some("Select the local gateway to sign in to a local provider CLI.".into());
+            return Task::none();
+        }
+        self.new_shell(Some(format!("{command}\r").into_bytes()))
+    }
+    fn new_shell(&mut self, initial: Option<Vec<u8>>) -> Task<Action> {
+        let Some(target) = &self.target else {
+            self.error = Some("Connect to a profile gateway to open a terminal.".into());
+            return Task::none();
+        };
         if self.tabs.len() >= 16 {
-            return Err("Close a terminal before opening another.".into());
+            self.error = Some("Close a terminal before opening another.".into());
+            return Task::none();
         }
-        let program = std::env::var_os(if cfg!(windows) { "COMSPEC" } else { "SHELL" })
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "cmd.exe".into()
-                } else {
-                    "/bin/sh".into()
-                }
-            });
-        let name = Path::new(&program)
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("Terminal")
-            .to_owned();
-        let mut cmd = CommandBuilder::new(&program);
-        if let Some(folder) = &self.workspace {
-            cmd.cwd(folder);
-        } else if let Some(dir) = std::env::home_dir() {
-            cmd.cwd(dir);
-        }
-        cmd.env("TERM", "xterm-256color");
-        cmd.env_remove("HERMES_RUST_API_KEY");
-        cmd.env_remove("HERMES_RUST_MCP_TOKEN");
-        let (pty, mut output, mut child) = spawn_shell(cmd, self.rows, self.cols)?;
         self.next += 1;
         let id = self.next;
+        let bookmark = target
+            .root
+            .join("terminal-tabs")
+            .join(format!("{}.json", uuid::Uuid::new_v4()));
+        if matches!(target.access, Access::Local { .. }) {
+            let pending = Bookmark {
+                scope: target.scope.clone(),
+                terminal_id: None,
+                name: "Terminal".into(),
+            };
+            if let Err(e) = pending.save(&bookmark) {
+                self.error = Some(format!("Could not save terminal launch: {e}"));
+                return Task::none();
+            }
+        }
         self.tabs.insert(
             id,
             Tab {
-                workspace: self.workspace.clone(),
-                name,
-                pty: Some(pty),
+                name: "Terminal".into(),
+                bookmark,
+                terminal_id: None,
+                generation: 0,
+                commands: None,
+                closing: false,
                 parser: vt100::Parser::new(self.rows, self.cols, 1000),
                 editor: text_editor::Content::new(),
-                ended: None,
+                notice: None,
             },
         );
         self.current = Some(id);
-        let (sender, rx) = async_channel::bounded(24);
-        // Drain final PTY bytes before reporting exit so the final prompt or
-        // command result cannot be overtaken by a separate wait task.
-        std::thread::spawn(move || {
-            let mut buf = [0_u8; 8192];
-            loop {
-                match output.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if sender
-                            .send_blocking(Action::Output(id, Arc::from(&buf[..n])))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            let status = child
-                .wait()
-                .map(|s| s.exit_code().to_string())
-                .unwrap_or_else(|_| "unknown".into());
-            let _ = sender.send_blocking(Action::End(id, status));
-        });
-        Ok(Task::batch([
-            Task::run(rx, |event| event),
+        self.attach(id, initial)
+    }
+    fn attach_existing(&mut self, terminal_id: String) -> Task<Action> {
+        if !hermes_engine::herdr::valid_id(&terminal_id) {
+            self.error = Some("Invalid agent terminal ID.".into());
+            return Task::none();
+        }
+        let Some(target) = &self.target else {
+            self.error = Some("Connect to a profile gateway to open an agent terminal.".into());
+            return Task::none();
+        };
+        if let Some((&id, _)) = self.tabs.iter().find(|(_, tab)| tab.terminal_id.as_deref() == Some(&terminal_id)) {
+            self.current = Some(id);
+            return self.attach(id, None);
+        }
+        if self.tabs.len() >= 16 {
+            self.error = Some("Close a terminal before opening another.".into());
+            return Task::none();
+        }
+        self.next += 1;
+        let id = self.next;
+        let bookmark = target.root.join("terminal-tabs").join(format!("{}.json", uuid::Uuid::new_v4()));
+        let saved = Bookmark { scope: target.scope.clone(), terminal_id: Some(terminal_id.clone()), name: "Agent PTY".into() };
+        if let Err(error) = saved.save(&bookmark) {
+            self.error = Some(format!("Could not save agent terminal bookmark: {error}"));
+            return Task::none();
+        }
+        let tab = Tab {
+            name: "Agent PTY".into(),
+            bookmark,
+            terminal_id: Some(terminal_id),
+            generation: 0,
+            commands: None,
+            closing: false,
+            parser: vt100::Parser::new(self.rows, self.cols, 1000),
+            editor: text_editor::Content::new(),
+            notice: Some("Connecting…".into()),
+        };
+        self.tabs.insert(id, tab);
+        self.current = Some(id);
+        self.attach(id, None)
+    }
+    fn request(&self, id: u64) -> Option<Request> {
+        let target = self.target.as_ref()?;
+        let tab = self.tabs.get(&id)?;
+        Some(Request {
+            access: target.access.clone(),
+            scope: target.scope.clone(),
+            bookmark: tab.bookmark.clone(),
+            attach: tab.terminal_id.clone(),
+            cols: self.cols,
+            rows: self.rows,
+        })
+    }
+    fn attach(&mut self, id: u64, initial: Option<Vec<u8>>) -> Task<Action> {
+        let Some(request) = self.request(id) else {
+            return Task::none();
+        };
+        let tab = self.tabs.get_mut(&id).unwrap();
+        if tab.commands.is_some() || tab.closing {
+            return widget::operation::focus(EDITOR_ID);
+        }
+        if tab.generation != 0
+            && tab.terminal_id.is_none()
+            && !matches!(request.access, Access::Local { .. })
+        {
+            // Stock remote owners may not support idempotent launch after a lost reply.
+            return Task::none();
+        }
+        tab.generation += 1;
+        let generation = tab.generation;
+        let (commands, input) = async_channel::bounded(64);
+        if let Some(bytes) = initial {
+            let _ = commands.try_send(Command::Input(bytes));
+        }
+        tab.commands = Some(commands);
+        tab.parser = vt100::Parser::new(self.rows, self.cols, 1000);
+        tab.notice = Some("Connecting…".into());
+        Task::batch([
+            Task::run(
+                iced::stream::channel(24, move |ui| request.stream(id, generation, input, ui)),
+                |a| a,
+            ),
             widget::operation::focus(EDITOR_ID),
-        ]))
+        ])
+    }
+    fn forget(&mut self, id: u64) {
+        if let Some(tab) = self.tabs.remove(&id) {
+            if let Err(e) = std::fs::remove_file(&tab.bookmark)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                self.error = Some(format!("Could not remove the terminal bookmark: {e}"));
+            }
+        }
+        if self.current == Some(id) {
+            self.current = self.tabs.keys().next_back().copied();
+        }
+    }
+    fn close(&mut self, id: u64) -> Task<Action> {
+        let Some(request) = self.request(id) else {
+            return Task::none();
+        };
+        let tab = self.tabs.get_mut(&id).unwrap();
+        if tab.closing {
+            return Task::none();
+        }
+        if let Some(commands) = &tab.commands {
+            match commands.try_send(Command::End) {
+                Ok(()) => tab.closing = true,
+                Err(_) => self.error = Some("Terminal is busy. Try closing it again.".into()),
+            }
+        } else if tab.terminal_id.is_some() || matches!(request.access, Access::Local { .. }) {
+            tab.closing = true;
+            let generation = tab.generation;
+            return Task::perform(async move { request.end().await }, move |r| {
+                Action::Closed(id, generation, r)
+            });
+        } else {
+            self.forget(id);
+        }
+        Task::none()
     }
 
     pub fn update(&mut self, action: Action) -> Task<Action> {
         match action {
-            Action::New => match self.new_shell() {
-                Ok(task) => return task,
-                Err(e) => self.error = Some(e),
-            },
-            Action::Select(id)
-                if self
-                    .tabs
-                    .get(&id)
-                    .is_some_and(|t| t.workspace == self.workspace) =>
-            {
+            Action::New => return self.new_shell(None),
+            Action::AttachExisting(terminal_id) => return self.attach_existing(terminal_id),
+            Action::Select(id) if self.tabs.contains_key(&id) => {
                 self.current = Some(id);
-                return widget::operation::focus(EDITOR_ID);
+                return self.attach(id, None);
             }
             Action::Select(_) => {}
-            Action::Close(id) => {
-                self.tabs.remove(&id);
-                if self.current == Some(id) {
-                    self.current = self
-                        .tabs
-                        .iter()
-                        .rev()
-                        .find(|(_, t)| t.workspace == self.workspace)
-                        .map(|(id, _)| *id);
+            Action::Close(id) => return self.close(id),
+            Action::Attached(id, generation, terminal_id, shell) => {
+                if let Some(tab) = self
+                    .tabs
+                    .get_mut(&id)
+                    .filter(|t| t.generation == generation)
+                {
+                    if !shell.is_empty() {
+                        tab.name = shell;
+                    }
+                    tab.terminal_id = Some(terminal_id);
+                    tab.notice = None;
                 }
             }
-            Action::Output(id, bytes) => {
-                if let Some(tab) = self.tabs.get_mut(&id) {
+            Action::Output(id, generation, bytes) => {
+                if let Some(tab) = self
+                    .tabs
+                    .get_mut(&id)
+                    .filter(|t| t.generation == generation)
+                {
                     tab.parser.process(&bytes);
                     tab.refresh();
                 }
             }
-            Action::End(id, code) => {
-                if let Some(tab) = self.tabs.get_mut(&id) {
-                    tab.pty = None;
-                    tab.ended = Some(format!("Process exited with code {code}"));
+            Action::Disconnected(id, generation, reason) => {
+                if let Some(tab) = self
+                    .tabs
+                    .get_mut(&id)
+                    .filter(|t| t.generation == generation)
+                {
+                    tab.commands = None;
+                    tab.closing = false;
+                    tab.notice = reason;
+                }
+            }
+            Action::Closed(id, generation, result) => {
+                if let Some(tab) = self
+                    .tabs
+                    .get_mut(&id)
+                    .filter(|t| t.generation == generation)
+                {
+                    tab.closing = false;
+                    match result {
+                        Ok(()) => self.forget(id),
+                        Err(e) => self.error = Some(e),
+                    }
                 }
             }
             Action::AddToChat(_) => {}
@@ -314,10 +509,16 @@ impl TerminalPane {
                         tab.parser.screen_mut().set_scrollback(0);
                         tab.refresh();
                     }
-                    if let Some(pty) = &tab.pty
-                        && let Err(error) = pty.input.try_send(bytes)
-                    {
-                        self.error = Some(format!("Terminal input unavailable: {error}"));
+                    match &tab.commands {
+                        Some(commands) if !tab.closing => {
+                            if commands.try_send(Command::Input(bytes)).is_err() {
+                                self.error = Some("Terminal input busy or disconnected".into());
+                            }
+                        }
+                        _ => {
+                            self.error =
+                                Some("Select the terminal tab to reattach before typing.".into())
+                        }
                     }
                 }
             }
@@ -342,13 +543,10 @@ impl TerminalPane {
                 self.rows = rows;
                 if let Some(tab) = self.current_mut() {
                     if tab.parser.screen().size() != (rows, cols) {
-                        if let Some(pty) = &tab.pty {
-                            let _ = pty.master.resize(PtySize {
-                                rows,
-                                cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
+                        if let Some(commands) = &tab.commands {
+                            if commands.try_send(Command::Resize { rows, cols }).is_err() {
+                                tab.notice = Some("Terminal resize could not be delivered".into());
+                            }
                         }
                         tab.parser.screen_mut().set_size(rows, cols);
                         tab.refresh();
@@ -359,14 +557,14 @@ impl TerminalPane {
         Task::none()
     }
 
-    pub fn view(&self, shortcuts: &crate::shortcuts::Bindings, capturing: bool) -> Element<'_, Action> {
+    pub fn view(
+        &self,
+        shortcuts: &crate::shortcuts::Bindings,
+        capturing: bool,
+    ) -> Element<'_, Action> {
         let shortcuts = shortcuts.clone();
         let mut rail = row![].spacing(2);
-        for (&id, t) in self
-            .tabs
-            .iter()
-            .filter(|(_, tab)| tab.workspace == self.workspace)
-        {
+        for (&id, t) in self.tabs.iter() {
             rail = rail
                 .push(
                     button(text(&t.name).size(11))
@@ -402,8 +600,15 @@ impl TerminalPane {
                 .id(EDITOR_ID)
                 .on_action(Action::Display)
                 .key_binding(move |press| {
-                    if capturing || shortcuts.action_for_key(&press.key, press.physical_key, press.modifiers, true).is_some() { None }
-                    else { terminal_key(press) }
+                    if capturing
+                        || shortcuts
+                            .action_for_key(&press.key, press.physical_key, press.modifiers, true)
+                            .is_some()
+                    {
+                        None
+                    } else {
+                        terminal_key(press)
+                    }
                 })
                 .font(crate::appearance::terminal_font())
                 .size(13)
@@ -420,7 +625,7 @@ impl TerminalPane {
                     .on_resize(Action::Resize)
                     .on_show(Action::Resize),
             );
-            if let Some(end) = &tab.ended {
+            if let Some(end) = &tab.notice {
                 body = body.push(text(end).size(11));
             }
         } else {
@@ -466,39 +671,34 @@ fn terminal_key(key: text_editor::KeyPress) -> Option<text_editor::Binding<Actio
     Some(Binding::Custom(Action::Input(bytes)))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn real_pty_inputs_and_resizes_are_seen_by_the_child() {
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.args([
-            "-c",
-            "read first; stty size; printf 'answer=%s\\n' \"$first\"",
-        ]);
-        let (pty, mut out, mut child) = spawn_shell(cmd, 24, 80).unwrap();
-        pty.master
-            .resize(PtySize {
-                rows: 16,
-                cols: 92,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        pty.input.send(b"native-pty\n".to_vec()).unwrap();
-        let mut result = Vec::new();
-        let _ = out.read_to_end(&mut result);
-        assert!(child.wait().unwrap().success());
-        let text = String::from_utf8_lossy(&result);
-        assert!(
-            text.contains("16 92") && text.contains("answer=native-pty"),
-            "{text}"
-        );
-    }
     #[test]
     fn emulator_applies_terminal_control_sequences() {
         let mut p = vt100::Parser::new(4, 20, 0);
         p.process(b"old\r\x1b[2Knew");
         assert_eq!(p.screen().contents(), "new");
+    }
+
+    #[test]
+    fn agent_pty_action_attaches_existing_identity_without_launching_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let mut pane = TerminalPane::new();
+        pane.target = Some(Target {
+            root: path.clone(),
+            scope: Scope { route: "local".into(), workspace: Some(path.clone()) },
+            access: Access::Local { root: path, provider: hermes_engine::Config::from_env() },
+        });
+        let terminal_id = "A".repeat(43);
+        let _task = pane.update(Action::AttachExisting(terminal_id.clone()));
+        let tab = &pane.tabs[&pane.current.unwrap()];
+        assert_eq!(tab.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        assert_eq!(tab.generation, 1);
+        assert_eq!(tab.name, "Agent PTY");
+        assert_eq!(pane.tabs.len(), 1);
+        let saved: Bookmark = serde_json::from_slice(&std::fs::read(&tab.bookmark).unwrap()).unwrap();
+        assert_eq!(saved.terminal_id.as_deref(), Some(terminal_id.as_str()));
     }
 }

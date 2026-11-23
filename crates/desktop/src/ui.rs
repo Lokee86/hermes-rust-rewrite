@@ -25,6 +25,74 @@ pub(super) fn theme_for(dark: bool) -> Theme {
     })
 }
 
+fn agent_pty_session_id(turn: &hermes_engine::Turn, tool_id: &str, name: &str, result: &str) -> Option<String> {
+    if name != "terminal" {
+        return None;
+    }
+    let requested_pty = turn.entries.iter().any(|entry| {
+        let hermes_engine::Entry::Assistant { calls, .. } = entry else { return false };
+        calls.iter().any(|call| {
+            if call.id != tool_id || call.name != "terminal" {
+                return false;
+            }
+            serde_json::from_str::<serde_json::Value>(&call.arguments).is_ok_and(|args| {
+                args["background"] == true && args["pty"] == true
+            })
+        })
+    });
+    if !requested_pty {
+        return None;
+    }
+    let id = serde_json::from_str::<serde_json::Value>(result).ok()?
+        .get("session_id")?.as_str()?.to_owned();
+    hermes_engine::herdr::valid_id(&id).then_some(id)
+}
+
+#[cfg(test)]
+mod agent_pty_tests {
+    use super::*;
+
+    fn turn(arguments: &str) -> hermes_engine::Turn {
+        hermes_engine::Turn {
+            attachments: vec![],
+            prompt: String::new(),
+            context: String::new(),
+            model: String::new(),
+            entries: vec![hermes_engine::Entry::Assistant {
+                text: String::new(),
+                calls: vec![hermes_engine::ToolCall {
+                    id: "call-1".into(),
+                    name: "terminal".into(),
+                    arguments: arguments.into(),
+                }],
+            }],
+            status: Status::Complete,
+        }
+    }
+
+    #[test]
+    fn open_terminal_is_only_offered_for_returned_agent_pty() {
+        let id = "A".repeat(43);
+        let result = serde_json::json!({"session_id":id}).to_string();
+        assert_eq!(
+            agent_pty_session_id(&turn(r#"{"background":true,"pty":true}"#), "call-1", "terminal", &result),
+            Some("A".repeat(43))
+        );
+        assert_eq!(
+            agent_pty_session_id(&turn(r#"{"background":true,"pty":false}"#), "call-1", "terminal", &result),
+            None
+        );
+        assert_eq!(
+            agent_pty_session_id(&turn(r#"{"background":true,"pty":true}"#), "call-1", "process_manage", &result),
+            None
+        );
+        assert_eq!(
+            agent_pty_session_id(&turn(r#"{"background":true,"pty":true}"#), "call-1", "terminal", r#"{"session_id":"proc_abc"}"#),
+            None
+        );
+    }
+}
+
 impl Hermes {
     pub(super) fn view_window(&self, window: iced::window::Id) -> Element<'_, Message> {
         if self.overlays.pet == Some(window) { return super::overlays::pet_view(self); }
@@ -329,7 +397,7 @@ impl Hermes {
         let p = palette(self.dark);
         if !self.statusbar.preferences.visible { return Space::new().height(0).width(Fill).into(); }
         let sb = &self.statusbar;
-        let backend_ready = self.library.is_some() && self.session.is_some();
+        let backend_ready = self.library.is_some() && self.chat.ready;
         // Left: command center, backend health, workspace, agents, scheduled jobs.
         let command = tooltip(button(container(text("⌘").size(12).font(Font::DEFAULT).color(p.muted)).center_x(Fill).center_y(Fill))
                 .on_press(Message::Navigate(Screen::CommandCenter)).padding(0).width(28).height(20)
@@ -396,7 +464,7 @@ impl Hermes {
         match menu {
             statusbar::Menu::Backend => {
                 content = content.push(heading("Backend")).push(rule::horizontal(1)).push(container(row![text("Local Rust backend").size(12), Space::new().width(Fill),
-                        text(if self.session.is_some() { "Ready" } else { "Unavailable" }).size(12).color(p.muted)].spacing(10)).padding(8))
+                        text(if self.chat.ready { "Ready" } else { "Unavailable" }).size(12).color(p.muted)].spacing(10)).padding(8))
                     .push(menu_action("settings-gear", "Provider settings", Message::SettingsView(settings::View::Models), p))
                     .push(menu_action("folder", "Change workspace", Message::Navigate(Screen::Workspaces), p));
             }
@@ -478,7 +546,7 @@ impl Hermes {
         if !self.draft_files.files.is_empty() || self.draft_files.pending > 0 {
             band = band.push(container(self.draft_files.view().map(Message::Attachment)).padding([2, 10]));
         }
-        if let Some(approval) = &self.approval { band = band.push(container(self.approval_view(approval)).padding([0, 10])); }
+        for approval in &self.approvals { band = band.push(container(self.approval_view(approval)).padding([0, 10])); }
         if !self.history.turns.is_empty() || self.running { band = band.push(container(self.transcript()).height(Fill)); }
         // Over the native frost the band is a uniform tint, not a slab (Electron's glass rule).
         let tint = if super::hud_native::FADES { Color { a: 0.78, ..p.background } } else { p.background };
@@ -539,12 +607,18 @@ impl Hermes {
                         }
                         messages = messages.push(container(assistant).padding([0, 12]));
                     }
-                    Entry::Tool { name, approved, result, .. } => {
+                    Entry::Tool { id, name, approved, result } => {
                         let failed = serde_json::from_str::<serde_json::Value>(result).ok().is_some_and(|value| value.get("error").is_some());
                         let state = if failed && *approved { "Failed" } else if *approved { "" } else if imported { "Historical record" } else { "Denied / not run" };
-                        messages = messages.push(container(column![row![icon("chevron-right", 11, p.muted), icon(if *approved { "check" } else { "close" }, 11, p.muted),
+                        let mut header = row![icon("chevron-right", 11, p.muted), icon(if *approved { "check" } else { "close" }, 11, p.muted),
                             text(tool_label(name)).size(11).color(p.muted), text(state).size(10).color(p.muted), Space::new().width(Fill),
-                            button(icon("copy", 11, p.muted)).on_press(Message::Copy(result.clone())).padding(2).style(quiet_button)].spacing(5).align_y(Alignment::Center),
+                            button(icon("copy", 11, p.muted)).on_press(Message::Copy(result.clone())).padding(2).style(quiet_button)].spacing(5).align_y(Alignment::Center);
+                        if *approved && !failed {
+                            if let Some(session_id) = agent_pty_session_id(turn, id, name, result) {
+                                header = header.push(button(text("Open terminal").size(10)).on_press(Message::OpenAgentTerminal(session_id)).padding([3, 7]).style(quiet_button));
+                            }
+                        }
+                        messages = messages.push(container(column![header,
                             text(short(result, 1600)).size(11).font(Font::MONOSPACE).color(p.muted)].spacing(5)).padding([4, 12]));
                     }
                 }
@@ -563,7 +637,7 @@ impl Hermes {
                 else { text(live.to_owned()).size(appearance::chat_size(13.0)).line_height(1.4).into() };
             messages = messages.push(container(column![row![icon("watch", 12, p.accent), text(status).size(11).font(medium()).color(p.accent)].spacing(6).align_y(Alignment::Center), body].spacing(8)).padding([0, 12]));
         }
-        if let Some(approval) = &self.approval { messages = messages.push(self.approval_view(approval)); }
+        for approval in &self.approvals { messages = messages.push(self.approval_view(approval)); }
         scrollable(container(messages).width(Fill)).id(SCROLL_ID).height(Fill)
             .on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset_reversed().y < 48.0)).into()
     }
@@ -574,8 +648,8 @@ impl Hermes {
         container(column![row![icon("shield", 15, p.accent), text("Approval required").size(13).font(medium())].spacing(8).align_y(Alignment::Center),
             text(tool_label(&approval.call.name)).size(12),
             scrollable(text(args).size(11).font(Font::MONOSPACE)).height(130),
-            row![Space::new().width(Fill), button(text("Deny").size(12)).on_press(Message::Approve(false)).padding([6, 12]).style(outline_button),
-                button(text("Allow once").size(12)).on_press(Message::Approve(true)).padding([6, 12]).style(primary_button)].spacing(8),
+            row![Space::new().width(Fill), button(text("Deny").size(12)).on_press(Message::Approve(approval.call.id.clone(), approval.generation, false)).padding([6, 12]).style(outline_button),
+                button(text("Allow once").size(12)).on_press(Message::Approve(approval.call.id.clone(), approval.generation, true)).padding([6, 12]).style(primary_button)].spacing(8),
         ].spacing(10)).padding(14).width(Fill).style(move |_| panel(p.background, 8.0, Some(p.border))).into()
     }
 
@@ -633,7 +707,7 @@ impl Hermes {
                 .style(move |theme, status| { let mut s = send_button(theme, status); if on { s.background = Some(shell_art::accent().fill().into()); } s });
             controls = controls.push(tooltip(voice, text(if on { "End voice conversation" } else { "Start voice conversation" }).size(11), tooltip::Position::Top));
         } else {
-            controls = controls.push(tooltip(action, text(if show_stop { "Stop" } else if self.running { "Redirect the current run" } else { "Send" }).size(11), tooltip::Position::Top));
+            controls = controls.push(tooltip(action, text(if show_stop { "Stop" } else if self.running && self.group_round.is_some() { "Redirect the current run" } else if self.running { "Queue message" } else { "Send" }).size(11), tooltip::Position::Top));
         }
         let surface = container(row![
             icon_button("add", "Attach", Message::ToggleAttach, p), editor, controls,
@@ -651,6 +725,21 @@ impl Hermes {
         }
         if let Some(error)=&self.voice.error {dock=dock.push(text(error).size(11).color(p.muted));}
         if !self.queue.entries.is_empty() { dock = dock.push(self.queue_view()); }
+        if let Some(current) = &self.current {
+            for entry in &self.chat.pending_queue {
+                let mut item = row![text(format!("{} · {}", entry.status, short(&entry.text, 100))).size(12).color(p.muted), Space::new().width(Fill)].spacing(6);
+                if entry.status == "parked" {
+                    item = item.push(button(text("Resume").size(11)).on_press(Message::GatewayQueue(current.id.clone(), entry.id.clone(), super::chat_view::QueueAction::Resume)).style(quiet_button));
+                }
+                if matches!(entry.status.as_str(), "queued" | "parked") {
+                    item = item.push(icon_button("close", "Cancel queued message", Message::GatewayQueue(current.id.clone(), entry.id.clone(), super::chat_view::QueueAction::Cancel), p));
+                }
+                if entry.status == "unknown" {
+                    item = item.push(button(text("Mark interrupted and resume queue").size(11)).on_press(Message::GatewayQueue(current.id.clone(), entry.id.clone(), super::chat_view::QueueAction::MarkInterrupted(entry.generation))).style(quiet_button));
+                }
+                dock = dock.push(item);
+            }
+        }
         if self.chat_project().is_some() {
             let branch = self.git.branch_label().unwrap_or(self.chat_project().map(|p| p.name.as_str()).unwrap_or("No workspace"));
             dock = dock.push(button(row![icon("git-branch", 12, hex(0x1f8a65)), text(branch).size(11).color(p.muted)].spacing(5).align_y(Alignment::Center))

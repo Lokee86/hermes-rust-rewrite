@@ -28,17 +28,30 @@ pub struct SessionQuery {
 impl Library {
     /// Archive by last activity, excluding the foreground conversation and pins.
     pub fn archive_inactive(&self,days:u32,current:Option<&str>)->Result<()>{
+        self.archive_inactive_ids(days, current).map(|_| ())
+    }
+
+    pub fn archive_inactive_ids(&self,days:u32,current:Option<&str>)->Result<Vec<String>>{
         ensure!(days>0 && days<=36500,"Invalid inactive session age");
         let cutoff=Utc::now()-chrono::Duration::days(i64::from(days));
         self.with_catalog(true,|catalog|{
+            let mut archived = Vec::new();
             for record in &mut catalog.sessions {
                 if record.archived || record.pinned || current==Some(&record.id) || catalog.active_session.as_ref()==Some(&record.id){continue}
                 if chrono::DateTime::parse_from_rfc3339(&record.updated_at).is_ok_and(|stamp|stamp<cutoff){
                     let lock=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.checked_directory(&record.id)?.join("session.lock"))?;
-                    if lock.try_lock_exclusive().is_ok(){record.archived=true;}
+                    if lock.try_lock_exclusive().is_ok(){record.archived=true; archived.push(record.id.clone());}
                 }
-            }Ok(())
+            }Ok(archived)
         })
+    }
+
+    pub fn delete_archived_if_present(&self, id: &str) -> Result<()> {
+        ensure!(safe_id(id), "Invalid session identity");
+        if !self.with_catalog(false, |catalog| Ok(catalog.sessions.iter().any(|s| s.id == id)))? {
+            return self.finish_deletions();
+        }
+        self.delete_archived(id)
     }
 
     /// Journal removal before unlinking conversation files. User-created files
@@ -110,31 +123,29 @@ impl Library {
     /// Soft-hide/restore. No engine session is opened and no transcript is
     /// rewritten, including when another window currently owns the engine lock.
     pub fn set_archived(&self, id: &str, archived: bool) -> Result<SessionSummary> {
-        self.with_catalog(true, |catalog| {
-            let record = find_session_mut(catalog, id)?;
-            record.archived = archived;
-            let summary = self.summary(record);
-            if archived && catalog.active_session.as_deref() == Some(id) {
-                catalog.active_session = None;
-            }
-            Ok(summary)
-        })
+        self.set_session_flags(id, Some(archived), None)
     }
 
     /// Pin order is append order, as in the original desktop's pinSession().
     /// Unpinning/re-pinning moves a session to the end without changing its
     /// conversation activity timestamp or the transcript.
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<SessionSummary> {
+        self.set_session_flags(id, None, Some(pinned))
+    }
+
+    pub fn set_session_flags(&self, id: &str, archived: Option<bool>, pinned: Option<bool>) -> Result<SessionSummary> {
         self.with_catalog(true, |catalog| {
             let record = find_session_mut(catalog, id)?;
-            record.pinned = pinned;
+            if let Some(archived) = archived { record.archived = archived; }
+            if let Some(pinned) = pinned { record.pinned = pinned; }
             let summary = self.summary(record);
-            if pinned {
-                if !catalog.pinned_order.iter().any(|value| value == id) {
-                    catalog.pinned_order.push(id.to_owned());
-                }
-            } else {
-                catalog.pinned_order.retain(|value| value != id);
+            if archived == Some(true) && catalog.active_session.as_deref() == Some(id) {
+                catalog.active_session = None;
+            }
+            match pinned {
+                Some(true) if !catalog.pinned_order.iter().any(|p| p == id) => catalog.pinned_order.push(id.to_owned()),
+                Some(false) => catalog.pinned_order.retain(|p| p != id),
+                _ => {}
             }
             Ok(summary)
         })

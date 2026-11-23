@@ -4,22 +4,32 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+reliquary-memory = { git = "https://github.com/Lokee86/Reliquary.git", rev = "d94af8c1da7453137fa0afb8d71914a3699e81aa" }
 anyhow.workspace = true
 hermes-engine = { path = "../engine" }
 hermes-library = { path = "../library" }
+hermes-telegram = { path = "../telegram" }
 async-channel.workspace = true
 tokio = { workspace = true, features = ["net", "signal", "io-util"] }
-tokio-util.workspace = true
-axum = { version = "0.8", features = ["ws"] }
+tokio-util = { workspace = true, features = ["rt"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = "0.3"
+base64 = "0.22"
+ring = "0.17"
+scrypt = { version = "0.11", default-features = false }
+serde_yaml = "0.9"
+subtle = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 
-[dev-dependencies]
-ring = "0.17"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Pipes"] }

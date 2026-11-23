@@ -1,29 +1,17 @@
-//! Settings → Gateways, local in-process Rust listener only.
-//! Stock reference: 0284ce17 settings/gateway-settings and connections-registry.
-//! No listener is started until the user presses Start. No remote/SSH runtime
-//! or dashboard hosting is claimed by this local control.
+//! Settings controls for the selected profile’s independent gateway owner.
 use super::{Hermes, Message, ui};
 use crate::appearance::text;
 use hermes_engine::Config;
 use hermes_gateway::{
-    Gateway, GatewayConfig, RunningGateway,
     client::{ClientOptions, GatewayClient},
+    owner::{OwnerConnection, ensure_local},
 };
 use iced::{
     Alignment, Element, Fill, Font, Task,
     widget::{Space, button, column, container, row},
 };
 use serde_json::{Value, json};
-use std::{
-    fmt,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
-use tokio::sync::Mutex;
+use std::{fmt, path::PathBuf, time::Duration};
 
 #[derive(Clone)]
 pub enum Action {
@@ -59,11 +47,10 @@ pub struct Info {
     pub http_url: String,
     pub websocket_url: String,
     pub profile_root: PathBuf,
-    pub model: String,
+    owner: OwnerConnection,
 }
 pub struct State {
-    handle: Arc<Mutex<Option<RunningGateway>>>,
-    generation: Arc<AtomicU64>,
+    generation: u64,
     info: Option<Info>,
     details: Option<Value>,
     error: Option<String>,
@@ -72,13 +59,14 @@ pub struct State {
 }
 impl State {
     /// The running gateway's HTTP base URL, if it is up.
-    pub fn http_url(&self) -> Option<&str> { self.info.as_ref().map(|i| i.http_url.as_str()) }
+    pub fn http_url(&self) -> Option<&str> {
+        self.info.as_ref().map(|i| i.http_url.as_str())
+    }
 }
 impl Default for State {
     fn default() -> Self {
         Self {
-            handle: Arc::new(Mutex::new(None)),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: 0,
             info: None,
             details: None,
             error: None,
@@ -103,29 +91,25 @@ impl State {
                     self.error = Some("Open a local profile before starting its gateway.".into());
                     return Task::none();
                 };
-                let request = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let generation = self.generation.clone();
-                let handle = self.handle.clone();
+                self.generation += 1;
+                let request = self.generation;
                 self.busy = true;
                 self.stopping = false;
                 self.error = None;
-                let model = provider.model.clone();
                 return Task::perform(
                     async move {
-                        let service = Gateway::start(GatewayConfig::new(&profile_root, provider))
+                        let owner = ensure_local(&profile_root, &provider)
                             .await
                             .map_err(|error| format!("{error:#}"))?;
-                        if generation.load(Ordering::SeqCst) != request {
-                            let _ = service.shutdown().await;
-                            return Err("Gateway start was cancelled.".into());
-                        }
                         let info = Info {
-                            http_url: service.http_url(),
-                            websocket_url: service.websocket_url(),
+                            websocket_url: format!(
+                                "ws://{}/api/ws",
+                                owner.origin.trim_start_matches("http://")
+                            ),
+                            http_url: owner.origin.clone(),
                             profile_root,
-                            model,
+                            owner,
                         };
-                        *handle.lock().await = Some(service);
                         Ok(info)
                     },
                     move |result| Action::Started(request, result),
@@ -133,19 +117,16 @@ impl State {
             }
             Action::Stop | Action::Restart => {
                 let restart = matches!(action, Action::Restart);
-                let request = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let handle = self.handle.clone();
+                self.generation += 1;
+                let request = self.generation;
+                let owner = self.info.as_ref().map(|i| i.owner.clone());
                 self.busy = true;
                 self.stopping = true;
                 self.error = None;
                 return Task::perform(
                     async move {
-                        let service = handle.lock().await.take();
-                        if let Some(service) = service {
-                            service
-                                .shutdown()
-                                .await
-                                .map_err(|error| format!("{error:#}"))
+                        if let Some(owner) = owner {
+                            owner.stop().await.map_err(|error| format!("{error:#}"))
                         } else {
                             Ok(())
                         }
@@ -153,9 +134,7 @@ impl State {
                     move |result| Action::Stopped(request, restart, result),
                 );
             }
-            Action::Started(request, result)
-                if request == self.generation.load(Ordering::SeqCst) =>
-            {
+            Action::Started(request, result) if request == self.generation => {
                 self.busy = false;
                 self.stopping = false;
                 match result {
@@ -166,13 +145,13 @@ impl State {
                     Err(error) => self.error = Some(error),
                 }
             }
-            Action::Stopped(request, restart, result)
-                if request == self.generation.load(Ordering::SeqCst) =>
-            {
+            Action::Stopped(request, restart, result) if request == self.generation => {
                 self.busy = false;
                 self.stopping = false;
-                self.info = None;
-                self.details = None;
+                if result.is_ok() {
+                    self.info = None;
+                    self.details = None;
+                }
                 match result {
                     Ok(()) if restart => return Task::done(Action::Start),
                     Ok(()) => {}
@@ -180,27 +159,22 @@ impl State {
                 }
             }
             Action::Discover if !self.busy && self.info.is_some() => {
-                let request = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                let handle = self.handle.clone();
+                self.generation += 1;
+                let request = self.generation;
+                let owner = self.info.as_ref().map(|i| i.owner.clone());
                 self.busy = true;
                 self.error = None;
                 return Task::perform(
                     async move {
-                        let (origin, token) = {
-                            let locked = handle.lock().await;
-                            let service = locked
-                                .as_ref()
-                                .ok_or_else(|| "The local gateway is stopped.".to_owned())?;
-                            (service.http_url(), service.token().to_owned())
-                        };
+                        let owner = owner.ok_or_else(|| "No gateway connection.".to_owned())?;
                         let client = GatewayClient::new(ClientOptions {
                             connect_timeout: Duration::from_secs(5),
                             request_timeout: Duration::from_secs(10),
                             ..ClientOptions::default()
                         });
                         let result = async {
-                            client
-                                .connect_native(&origin, &token)
+                            owner
+                                .connect(&client)
                                 .await
                                 .map_err(|error| error.to_string())?;
                             let methods = client
@@ -220,9 +194,7 @@ impl State {
                     move |result| Action::Discovered(request, result),
                 );
             }
-            Action::Discovered(request, result)
-                if request == self.generation.load(Ordering::SeqCst) =>
-            {
+            Action::Discovered(request, result) if request == self.generation => {
                 self.busy = false;
                 match result {
                     Ok(details) => self.details = Some(details),
@@ -235,15 +207,11 @@ impl State {
                 }
             }
             Action::CopyToken if self.info.is_some() => {
-                let handle = self.handle.clone();
+                let owner = self.info.as_ref().map(|i| i.owner.clone());
                 return Task::perform(
                     async move {
-                        handle
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(|service| service.token().to_owned())
-                            .ok_or_else(|| "The local gateway is stopped.".into())
+                        let owner = owner.ok_or_else(|| "No gateway connection.".to_owned())?;
+                        owner.local_token().await.map_err(|e| format!("{e:#}"))
                     },
                     Action::Token,
                 );
@@ -256,6 +224,35 @@ impl State {
         }
         Task::none()
     }
+}
+
+pub(super) async fn catalog_request(
+    profile_root: PathBuf,
+    provider: Config,
+    method: &'static str,
+    params: Value,
+) -> Result<Value, String> {
+    let owner = ensure_local(&profile_root, &provider)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    let client = GatewayClient::new(ClientOptions {
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(30),
+        ..ClientOptions::default()
+    });
+    let result = async {
+        owner
+            .connect(&client)
+            .await
+            .map_err(|error| error.to_string())?;
+        client
+            .request(method, params)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    client.close();
+    result
 }
 
 pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
@@ -272,7 +269,7 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
     } else if gateway.info.is_some() {
         "Running"
     } else {
-        "Stopped"
+        "Disconnected"
     };
     let mut content = column![
         row![
@@ -295,16 +292,21 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
     .spacing(10)
     .max_width(720);
     let mut controls = row![].spacing(7);
+    let managed = gateway.info.as_ref().is_some_and(|i| i.owner.is_native());
     if gateway.info.is_some() {
         controls = controls.push(
             button(text("Stop").size(12))
-                .on_press_maybe((!gateway.busy).then_some(Message::LocalGateway(Action::Stop)))
+                .on_press_maybe(
+                    (managed && !gateway.busy).then_some(Message::LocalGateway(Action::Stop)),
+                )
                 .padding([6, 12])
                 .style(button::secondary),
         );
         controls = controls.push(
             button(text("Restart gateway").size(12))
-                .on_press_maybe((!gateway.busy).then_some(Message::LocalGateway(Action::Restart)))
+                .on_press_maybe(
+                    (managed && !gateway.busy).then_some(Message::LocalGateway(Action::Restart)),
+                )
                 .padding([6, 12])
                 .style(button::secondary),
         );
@@ -316,9 +318,16 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
         );
     } else {
         controls = controls.push(
-            button(text(if gateway.busy { "Starting..." } else { "Start" }).size(12))
-                .on_press_maybe((!gateway.busy).then_some(Message::LocalGateway(Action::Start)))
-                .padding([6, 12]),
+            button(
+                text(if gateway.busy {
+                    "Connecting..."
+                } else {
+                    "Connect or start"
+                })
+                .size(12),
+            )
+            .on_press_maybe((!gateway.busy).then_some(Message::LocalGateway(Action::Start)))
+            .padding([6, 12]),
         );
     }
     content = content.push(controls);
@@ -330,12 +339,28 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
         );
     }
     if let Some(info) = &gateway.info {
-        content=content.push(Space::new().height(12)).push(text("Connection details").size(13))
-            .push(detail("Address",&info.http_url,app.dark)).push(detail("WebSocket",&info.websocket_url,app.dark))
-            .push(detail("Profile",&info.profile_root.to_string_lossy(),app.dark)).push(detail("Model",&info.model,app.dark))
-            .push(detail("Access","Only this computer",app.dark))
-            .push(row![button(text("Copy WebSocket address").size(12)).on_press(Message::LocalGateway(Action::CopyAddress)).style(button::text),button(text("Copy authentication token").size(12)).on_press(Message::LocalGateway(Action::CopyToken)).style(button::text)].spacing(12))
-            .push(text("The authentication token is generated for this running gateway. Restarting creates a new token.").size(11).color(p.muted));
+        content = content
+            .push(Space::new().height(12))
+            .push(text("Connection details").size(13))
+            .push(detail("Address", &info.http_url, app.dark))
+            .push(detail("WebSocket", &info.websocket_url, app.dark))
+            .push(detail(
+                "Profile",
+                &info.profile_root.to_string_lossy(),
+                app.dark,
+            ))
+            .push(detail("Access", "Only this computer", app.dark))
+            .push(
+                row![
+                    button(text("Copy WebSocket address").size(12))
+                        .on_press(Message::LocalGateway(Action::CopyAddress))
+                        .style(button::text),
+                    button(text("Copy authentication token").size(12))
+                        .on_press_maybe(managed.then_some(Message::LocalGateway(Action::CopyToken)))
+                        .style(button::text)
+                ]
+                .spacing(12),
+            );
     } else if let Some(library) = &app.library {
         content = content.push(detail(
             "Profile",

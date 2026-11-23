@@ -3,7 +3,7 @@
 use crate::appearance::text;
 use super::{Hermes, Message, settings::View, ui};
 use hermes_engine::settings::{PERSONALITIES,ProfileSettings};
-use hermes_library::{ArchiveFilter,Library,SessionQuery,SessionSummary};
+use hermes_library::{ArchiveFilter,Library,SessionQuery,SessionSource,SessionSummary};
 use iced::{Alignment, Element, Fill, Task, widget::{button,column,container,pick_list,row,text_input,Space}};
 use std::{collections::BTreeMap,path::{Path,PathBuf},process::{Child,Command}};
 
@@ -42,7 +42,7 @@ const FIELDS:&[Field]=&[
 #[derive(Clone,Debug)]
 pub(super) enum Action {
     Set(&'static str,String,View), Edit(&'static str,String),Apply(View),Browse,DirectoryChosen(Result<Option<PathBuf>,String>),
-    Restore(String),Delete(String),CancelDelete,ConfirmDelete,Maintain,
+    Restore(String),RestoreDone(String,Result<serde_json::Value,String>),Delete(String),DeleteDone(String,Result<serde_json::Value,String>),CancelDelete,ConfirmDelete,Maintain,MaintainDone(Result<serde_json::Value,String>),
 }
 #[derive(Default)]
 pub(super) struct State {
@@ -118,19 +118,66 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
         Action::DirectoryChosen(Ok(None))=>{}
         Action::Maintain=>{
             if state.saved.auto_archive {
-                if let Err(e)=lib.archive_inactive(state.saved.auto_archive_days,app.current.as_ref().map(|s|s.id.as_str())){state.feedback=Some(Err(e.to_string()));}
+                let profile_root=lib.root().to_path_buf();
+                let provider=app.config.clone();
+                let days=state.saved.auto_archive_days;
+                let current_session_id=app.current.as_ref().map(|s|s.id.clone());
+                return Task::perform(async move {
+                    super::local_gateway::catalog_request(
+                        profile_root,provider,"catalog.archive_inactive",
+                        serde_json::json!({"days":days,"current_session_id":current_session_id}),
+                    ).await
+                },|result|Message::ProfileSetting(Action::MaintainDone(result)));
             }
             if app.settings_view==View::Sessions{state.archived(&lib);}
             app.refresh_sessions();
         }
+        Action::MaintainDone(result)=>{
+            if let Err(error)=result{state.feedback=Some(Err(error));}
+            if app.settings_view==View::Sessions{state.archived(&lib);}
+            app.refresh_sessions();
+        }
         Action::Restore(id)=>{
+            if lib.session(&id).is_ok_and(|summary|summary.source==SessionSource::Native) {
+                let profile_root=lib.root().to_path_buf();
+                let provider=app.config.clone();
+                let message_id=id.clone();
+                return Task::perform(async move {
+                    super::local_gateway::catalog_request(
+                        profile_root,provider,"catalog.session.set",
+                        serde_json::json!({"session_id":id,"archived":false}),
+                    ).await
+                },move|result|Message::ProfileSetting(Action::RestoreDone(message_id,result)));
+            }
             state.feedback=Some(lib.set_archived(&id,false).map(|_|"Session restored".into()).map_err(|e|e.to_string()));
+            state.archived(&lib);app.refresh_sessions();
+        }
+        Action::RestoreDone(id,result)=>{
+            let succeeded=result.is_ok();
+            state.feedback=Some(result.map(|_|"Session restored".into()));
+            if succeeded && let Ok(summary)=lib.session(&id)
+                && app.current.as_ref().is_some_and(|current|current.id==id) { app.current=Some(summary); }
             state.archived(&lib);app.refresh_sessions();
         }
         Action::Delete(id)=>state.delete=Some(id),
         Action::CancelDelete=>state.delete=None,
         Action::ConfirmDelete=>if let Some(id)=state.delete.take(){
+            if lib.session(&id).is_ok_and(|summary|summary.source==SessionSource::Native) {
+                let profile_root=lib.root().to_path_buf();
+                let provider=app.config.clone();
+                let message_id=id.clone();
+                return Task::perform(async move {
+                    super::local_gateway::catalog_request(
+                        profile_root,provider,"catalog.session.delete",
+                        serde_json::json!({"session_id":id}),
+                    ).await
+                },move|result|Message::ProfileSetting(Action::DeleteDone(message_id,result)));
+            }
             state.feedback=Some(lib.delete_archived(&id).map(|_|"Session deleted".into()).map_err(|e|e.to_string()));
+            state.archived(&lib);app.refresh_sessions();
+        },
+        Action::DeleteDone(_id,result)=>{
+            state.feedback=Some(result.map(|_|"Session deleted".into()));
             state.archived(&lib);app.refresh_sessions();
         }
     }

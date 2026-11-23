@@ -9,11 +9,30 @@ use iced::{
     Alignment, Border, Color, Element, Fill, Font, Length, Padding, Task,
     widget::{Space, button, column, container, row, rule, scrollable, svg, text_input},
 };
-use std::{collections::BTreeMap, fmt, fs::File, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use hermes_gateway::client::{ClientOptions, GatewayClient};
+use serde_json::{Value, json};
 use store::{Inbox, Settings, Store};
 pub(super) use telegram::Incoming;
-use telegram::{Client, Error, ErrorKind, Identity, Token};
+use telegram::{Error, ErrorKind, Identity, Token};
 use tokio_util::sync::CancellationToken;
+
+type GatewayProfile = (std::path::PathBuf, hermes_engine::Config);
+
+async fn gateway_call(endpoint: GatewayProfile, method: &str, params: Value) -> Result<Value, String> {
+    let client = GatewayClient::new(ClientOptions {
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(50),
+        ..ClientOptions::default()
+    });
+    let result = async {
+        let owner = hermes_gateway::owner::ensure_local(&endpoint.0, &endpoint.1).await.map_err(|e| e.to_string())?;
+        owner.connect(&client).await.map_err(|e| e.to_string())?;
+        client.request(method, params).await.map_err(|error| error.to_string())
+    }.await;
+    client.close();
+    result
+}
 
 #[derive(Clone)]
 pub(super) struct Loaded {
@@ -22,10 +41,8 @@ pub(super) struct Loaded {
 }
 #[derive(Clone)]
 pub(super) struct Ready {
-    client: Client,
     identity: Identity,
     inbox: Arc<Inbox>,
-    lease: Arc<File>,
 }
 #[derive(Clone)]
 pub(super) struct Received {
@@ -50,6 +67,7 @@ pub(super) enum Message {
     Connect,
     Disconnect,
     Connected(u64, Result<Arc<Ready>, String>),
+    Disconnected(u64, Result<(), String>),
     Polled(u64, Result<Arc<Received>, Error>),
     SelectUser(i64),
     Reply(String),
@@ -73,6 +91,7 @@ impl fmt::Debug for Message {
             Self::Connect => "ConnectTelegram",
             Self::Disconnect => "DisconnectTelegram",
             Self::Connected(..) => "TelegramConnected",
+            Self::Disconnected(..) => "TelegramDisconnected",
             Self::Polled(..) => "TelegramUpdates",
             Self::SelectUser(_) => "SelectTelegramConversation",
             Self::Reply(_) => "TelegramReply",
@@ -120,9 +139,7 @@ pub(super) struct Messaging {
     dirty: bool,
     saving: bool,
     status: Status,
-    client: Option<Client>,
     bot: Option<Identity>,
-    lease: Option<Arc<File>>,
     cancel: Option<CancellationToken>,
     generation: u64,
     selected_user: Option<i64>,
@@ -146,9 +163,7 @@ impl Default for Messaging {
             dirty: false,
             saving: false,
             status: Status::NeedsSetup,
-            client: None,
             bot: None,
-            lease: None,
             cancel: None,
             generation: 0,
             selected_user: None,
@@ -204,16 +219,10 @@ impl Messaging {
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
-        self.client = None;
-        self.lease = None;
         self.generation = self.generation.wrapping_add(1);
         self.sending = false;
-        self.status = if self
-            .saved
-            .as_ref()
-            .is_some_and(|settings| settings.token.is_some())
-        {
-            Status::Disabled
+        self.status = if self.saved.as_ref().is_some_and(|settings| settings.token.is_some()) {
+            if self.saved.as_ref().is_some_and(|settings| settings.enabled) { Status::Connected } else { Status::Disabled }
         } else {
             Status::NeedsSetup
         };
@@ -245,12 +254,8 @@ impl Messaging {
         self.dirty = false;
         self.saving = false;
         self.error = None;
-        self.status = if self
-            .saved
-            .as_ref()
-            .is_some_and(|settings| settings.token.is_some())
-        {
-            Status::Disabled
+        self.status = if self.saved.as_ref().is_some_and(|settings| settings.token.is_some()) {
+            if self.saved.as_ref().is_some_and(|settings| settings.enabled) { Status::Connected } else { Status::Disabled }
         } else {
             Status::NeedsSetup
         };
@@ -276,48 +281,47 @@ impl Messaging {
             });
         }
     }
-    fn poll(&self, delay: Duration) -> Task<Message> {
-        let (Some(client), Some(bot), Some(store), Some(cancel)) = (
-            self.client.clone(),
-            self.bot.clone(),
-            self.store.clone(),
-            self.cancel.clone(),
-        ) else {
+    fn poll(&self, delay: Duration, gateway: Option<GatewayProfile>) -> Task<Message> {
+        let (Some(bot), Some(store), Some(cancel)) = (self.bot.clone(), self.store.clone(), self.cancel.clone()) else {
             return Task::none();
         };
         let generation = self.generation;
-        let cursor = self.inbox.as_ref().map_or(0, |inbox| inbox.cursor);
-        Task::perform(
-            async move {
-                if !delay.is_zero() {
-                    tokio::select! {_=cancel.cancelled()=>return Err(Error{kind:ErrorKind::Cancelled,message:"Telegram connection stopped".into(),retry_after:None}),_=tokio::time::sleep(delay)=>{}}
+        Task::perform(async move {
+            if !delay.is_zero() {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(Error::invalid("Telegram inbox refresh stopped")),
+                    _ = tokio::time::sleep(delay) => {}
                 }
-                let batch = client.poll(bot.id, cursor, &cancel).await?;
-                let ignored = batch.ignored;
-                let (inbox, messages) = tokio::task::spawn_blocking(move || {
-                    store.commit_poll(
-                        &bot,
-                        client.credential(),
-                        &batch.messages,
-                        batch.next_offset,
-                    )
-                })
-                .await
-                .map_err(|_| Error::invalid("Could not save Telegram updates"))?
-                .map_err(Error::invalid)?;
-                Ok(Arc::new(Received {
-                    inbox,
-                    messages,
-                    ignored,
-                }))
-            },
-            move |result| Message::Polled(generation, result),
-        )
+            }
+            let Some(endpoint) = gateway else {
+                return Err(Error { kind: ErrorKind::Retryable, message: "Start the local profile gateway to refresh Telegram.".into(), retry_after: Some(3) });
+            };
+            let status = gateway_call(endpoint, "telegram.status", json!({})).await
+                .map_err(|message| Error { kind: ErrorKind::Retryable, message, retry_after: Some(3) })?;
+            if status["enabled"].as_bool() != Some(true) {
+                return Err(Error { kind: ErrorKind::Cancelled, message: "Telegram is disabled".into(), retry_after: None });
+            }
+            if status["connected"].as_bool() != Some(true) {
+                return Err(Error { kind: ErrorKind::Retryable, message: "Telegram gateway is reconnecting.".into(), retry_after: Some(3) });
+            }
+            let inbox = tokio::task::spawn_blocking(move || {
+                let settings = store.load_settings()?.ok_or_else(|| "Telegram setup was removed".to_owned())?;
+                if !settings.enabled || settings.bot.as_ref().map(|saved| saved.id) != Some(bot.id) {
+                    return Err("Telegram is disabled".to_owned());
+                }
+                store.load_inbox(&bot)
+            })
+            .await
+            .map_err(|_| Error::invalid("Could not refresh the native Telegram inbox"))?
+            .map_err(Error::invalid)?;
+            Ok(Arc::new(Received { inbox, messages: vec![], ignored: 0 }))
+        }, move |result| Message::Polled(generation, result))
     }
     pub(super) fn update(
         &mut self,
         message: Message,
         library: Option<Library>,
+        gateway: Option<GatewayProfile>,
     ) -> (Task<Message>, Vec<Effect>) {
         if self.store.is_none() && !matches!(message, Message::Loaded(..)) {
             let task = self.load(library.clone());
@@ -385,6 +389,11 @@ impl Messaging {
                             self.apply_settings(settings.clone());
                         }
                         self.apply_inbox_if_present();
+                        if self.saved.as_ref().is_some_and(|settings| settings.enabled) {
+                            self.cancel = Some(CancellationToken::new());
+                            self.status = Status::Connected;
+                            return (self.poll(Duration::ZERO, gateway.clone()), vec![]);
+                        }
                     }
                     Err(error) => self.error = Some(error),
                 }
@@ -413,11 +422,8 @@ impl Messaging {
                     version: 1,
                     token: Some(token),
                     allowed,
-                    bot: if self.token.trim().is_empty() {
-                        self.bot.clone()
-                    } else {
-                        None
-                    },
+                    bot: if self.token.trim().is_empty() { self.bot.clone() } else { None },
+                    enabled: false,
                 };
                 self.shutdown();
                 self.saving = true;
@@ -476,11 +482,7 @@ impl Messaging {
                 }
             }
             Message::Connect
-                if !self.saving
-                    && !matches!(
-                        self.status,
-                        Status::Connecting | Status::Connected | Status::Retrying
-                    ) =>
+                if !self.saving && !matches!(self.status, Status::Connecting | Status::Connected | Status::Retrying) =>
             {
                 if self.dirty {
                     self.error = Some("Save changes before enabling Telegram.".into());
@@ -490,75 +492,75 @@ impl Messaging {
                     self.error = Some("Save the bot token and allowlist first.".into());
                     return (Task::none(), vec![]);
                 };
-                let Some(token) = settings.token else {
-                    self.error = Some("Paste and save a Telegram bot token first.".into());
+                if settings.token.is_none() || settings.allowed.is_empty() {
+                    self.error = Some("Save a bot token and non-empty allowlist before connecting.".into());
+                    return (Task::none(), vec![]);
+                }
+                let Some(endpoint) = gateway else {
+                    self.error = Some("Start the local profile gateway before enabling Telegram.".into());
                     return (Task::none(), vec![]);
                 };
-                let client = match Client::new(token, settings.allowed) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        self.error = Some(error.to_string());
-                        return (Task::none(), vec![]);
-                    }
-                };
-                let Some(store) = self.store.clone() else {
-                    return (Task::none(), vec![]);
-                };
+                let Some(store) = self.store.clone() else { return (Task::none(), vec![]); };
                 self.shutdown();
                 let generation = self.generation;
                 let cancel = CancellationToken::new();
-                self.cancel = Some(cancel.clone());
+                self.cancel = Some(cancel);
                 self.status = Status::Connecting;
                 self.error = None;
                 self.note = None;
                 return (
-                    Task::perform(
-                        async move {
-                            let identity = client
-                                .verify(&cancel)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            let bot = identity.clone();
-                            let credential = client.credential().clone();
-                            let (inbox, lease) = tokio::task::spawn_blocking(move || {
-                                let lease = store.claim(bot.id)?;
-                                let inbox = store.load_inbox(&bot)?;
-                                store.remember_bot(&bot, &credential)?;
-                                Ok::<_, String>((inbox, lease))
-                            })
-                            .await
-                            .map_err(|_| "Could not open native Telegram inbox".to_owned())??;
-                            Ok(Arc::new(Ready {
-                                client,
-                                identity,
-                                inbox,
-                                lease,
-                            }))
-                        },
-                        move |result| Message::Connected(generation, result),
-                    ),
+                    Task::perform(async move {
+                        let value = gateway_call(endpoint, "telegram.connect", json!({})).await?;
+                        let identity: Identity = serde_json::from_value(value["bot"].clone())
+                            .map_err(|_| "The gateway returned an invalid Telegram identity".to_owned())?;
+                        let bot = identity.clone();
+                        let inbox = tokio::task::spawn_blocking(move || store.load_inbox(&bot))
+                            .await.map_err(|_| "Could not load the native Telegram inbox".to_owned())??;
+                        Ok(Arc::new(Ready { identity, inbox }))
+                    }, move |result| Message::Connected(generation, result)),
                     vec![],
                 );
             }
             Message::Disconnect => {
                 self.shutdown();
-                self.note = Some("Telegram disabled".into());
+                self.status = if self.saved.as_ref().is_some_and(|s| s.token.is_some()) { Status::Disabled } else { Status::NeedsSetup };
+                self.sending = false;
+                let generation = self.generation;
+                let store = self.store.clone();
+                return (
+                    Task::perform(async move {
+                        let remote = match gateway {
+                            Some(endpoint) => gateway_call(endpoint, "telegram.disconnect", json!({})).await.map(|_| ()),
+                            None => Ok(()),
+                        };
+                        if let Some(store) = store {
+                            tokio::task::spawn_blocking(move || store.set_disabled())
+                                .await.map_err(|_| "Could not persist Telegram disconnect state".to_owned())??;
+                        }
+                        remote
+                    }, move |result| Message::Disconnected(generation, result)),
+                    vec![],
+                );
             }
             Message::Connected(generation, result) if generation == self.generation => match result
             {
                 Ok(ready) => {
-                    self.client = Some(ready.client.clone());
                     self.bot = Some(ready.identity.clone());
-                    self.lease = Some(ready.lease.clone());
                     self.apply_inbox(ready.inbox.clone());
                     self.status = Status::Connected;
-                    return (self.poll(Duration::ZERO), vec![]);
+                    return (self.poll(Duration::ZERO, gateway.clone()), vec![]);
                 }
                 Err(error) => {
                     self.shutdown();
                     self.error = Some(error);
                 }
             },
+            Message::Disconnected(generation, result) if generation == self.generation => {
+                match result {
+                    Ok(()) => self.note = Some("Telegram disabled".into()),
+                    Err(error) => { self.error = Some(error); self.note = Some("Telegram was disabled locally.".into()); }
+                }
+            }
             Message::Polled(generation, result) if generation == self.generation => match result {
                 Ok(received) => {
                     self.status = Status::Connected;
@@ -571,16 +573,19 @@ impl Messaging {
                         .cloned()
                         .map(Effect::Incoming)
                         .collect();
-                    return (self.poll(Duration::from_millis(200)), effects);
+                    return (self.poll(Duration::from_secs(2), gateway.clone()), effects);
                 }
-                Err(error) if error.kind == ErrorKind::Cancelled => {}
+                Err(error) if error.kind == ErrorKind::Cancelled => {
+                    self.status = if self.saved.as_ref().is_some_and(|s| s.token.is_some()) { Status::Disabled } else { Status::NeedsSetup };
+                    self.error = None;
+                }
                 Err(error) if error.kind == ErrorKind::Retryable => {
                     self.status = Status::Retrying;
                     self.error = Some(error.message);
                     return (
                         self.poll(Duration::from_secs(
                             error.retry_after.unwrap_or(3).clamp(1, 60),
-                        )),
+                        ), gateway.clone()),
                         vec![],
                     );
                 }
@@ -601,13 +606,11 @@ impl Messaging {
             }
             Message::Reply(reply) if !self.sending => self.reply = reply,
             Message::Send if !self.sending && !self.saving && self.status == Status::Connected => {
-                let (Some(client), Some(bot), Some(cancel), Some(store), Some(user)) = (
-                    self.client.clone(),
-                    self.bot.clone(),
-                    self.cancel.clone(),
-                    self.store.clone(),
-                    self.selected_user,
-                ) else {
+                let (Some(bot), Some(store), Some(user)) = (self.bot.clone(), self.store.clone(), self.selected_user) else {
+                    return (Task::none(), vec![]);
+                };
+                let Some(endpoint) = gateway else {
+                    self.error = Some("Start the local profile gateway before replying.".into());
                     return (Task::none(), vec![]);
                 };
                 let text = self.reply.trim().to_owned();
@@ -619,33 +622,11 @@ impl Messaging {
                 self.error = None;
                 let generation = self.generation;
                 return (
-                    Task::perform(
-                        async move {
-                            let policy_store = store.clone();
-                            let policy_bot = bot.clone();
-                            let credential = client.credential().clone();
-                            tokio::task::spawn_blocking(move || {
-                                policy_store.authorize_reply(&policy_bot, &credential, user)
-                            })
-                            .await
-                            .map_err(|_| {
-                                "Could not check the saved Telegram allowlist".to_owned()
-                            })??;
-                            let receipt = client
-                                .send(user, &text, &cancel)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            tokio::task::spawn_blocking(move || {
-                                store.record_sent(&bot, user, text, receipt)
-                            })
-                            .await
-                            .map_err(|_| {
-                                "Reply delivered, but the native inbox could not be saved"
-                                    .to_owned()
-                            })?
-                        },
-                        move |result| Message::Sent(generation, result),
-                    ),
+                    Task::perform(async move {
+                        gateway_call(endpoint, "telegram.send", json!({"user_id":user,"text":text})).await?;
+                        tokio::task::spawn_blocking(move || store.load_inbox(&bot))
+                            .await.map_err(|_| "Reply delivered, but the native inbox could not be refreshed".to_owned())?
+                    }, move |result| Message::Sent(generation, result)),
                     vec![],
                 );
             }

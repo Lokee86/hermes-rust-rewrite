@@ -4,9 +4,29 @@
 //! not an implementation of the entire upstream dashboard or session authority.
 
 pub mod client;
+pub mod owner;
 pub mod replay;
+mod reliquary;
+mod reliquary_capture;
+mod reliquary_hosted;
+mod reliquary_recall;
 
+mod auth;
+mod rest;
+mod shell_exec;
+mod upload;
 mod webhooks;
+mod terminal;
+mod authority;
+mod scheduler;
+mod catalog;
+use authority::{Authority, Receipt};
+mod telegram_host;
+use hermes_engine::{
+    Attachment, ConversationWriter,
+    memory_capture::{CaptureBinding, PendingMemoryCapture},
+    models::GenerationOptions,
+};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -44,13 +64,13 @@ use tokio::{
 use uuid::Uuid;
 
 const PROTOCOL: &str = "hermes-gateway-v1";
+const RUNTIME_CAPABILITIES: &[&str] = &["session-authority-v1", "rust-engine-subset-v1", "event-replay-v1"];
 const TICKET_PREFIX: &str = "hermes-gateway-ticket.";
 const TICKET_TTL: Duration = Duration::from_secs(30);
 const MAX_SESSIONS: usize = 64;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_REPLAY_EVENTS: usize = 512;
 const MAX_REPLAY_BYTES: usize = 524_288;
-const MAX_RECEIPTS: usize = 256;
 const MAX_PROMPT_BYTES: usize = 262_144;
 
 /// Methods implemented by this crate. Other methods return JSON-RPC -32601.
@@ -74,12 +94,28 @@ pub const METHODS: &[&str] = &[
     "session.close",
     "session.title",
     "session.mutate",
+    "cron.chat",
+    "cron.trigger",
     "prompt.submit",
     "prompt.receipt",
     "prompt.cancel",
+    "catalog.session.set",
+    "catalog.session.delete",
+    "catalog.archive_inactive",
+    "process.list",
+    "process.kill",
+    "process.stop",
+    "prompt.resolve_unknown",
+    "prompt.resume_parked",
+    "file.attach",
+    "shell.exec",
     "approval.pending",
     "approval.received",
     "approval.respond",
+    "telegram.status",
+    "telegram.connect",
+    "telegram.disconnect",
+    "telegram.send",
 ];
 
 /// Gateway settings. The provider key stays in memory and is never sent to clients.
@@ -109,6 +145,7 @@ pub struct RunningGateway {
     address: SocketAddr,
     shared: Arc<Shared>,
     task: Option<JoinHandle<Result<()>>>,
+    scheduler_task: Option<JoinHandle<()>>,
 }
 
 impl RunningGateway {
@@ -127,6 +164,7 @@ impl RunningGateway {
     pub async fn shutdown(mut self) -> Result<()> {
         self.shared.shutdown.cancel();
         self.shared.stop_turns().await;
+        if let Some(task) = self.scheduler_task.take() { let _ = task.await; }
         if let Some(task) = self.task.take() {
             task.await.context("Gateway task stopped unexpectedly")??;
         }
@@ -141,7 +179,12 @@ impl Drop for RunningGateway {
 }
 
 impl Gateway {
-    pub async fn start(mut config: GatewayConfig) -> Result<RunningGateway> {
+    pub async fn start(config: GatewayConfig) -> Result<RunningGateway> {
+        fs::create_dir_all(&config.library_root)?;
+        let lock = owner::try_profile_lock(&config.library_root)?.context("An owner is running for this profile")?;
+        Self::start_profile(config, "default".into(), "default".into(), lock).await
+    }
+    async fn start_profile(mut config: GatewayConfig, profile_id: String, profile_name: String, owner_lock: File) -> Result<RunningGateway> {
         ensure!(
             config.bind.ip().is_loopback(),
             "The Rust gateway only binds to a loopback address"
@@ -153,31 +196,86 @@ impl Gateway {
             config.token.len() >= 32
                 && config.token.len() <= 512
                 && config.token.bytes().all(|b| b.is_ascii_graphic()),
-            "Gateway token must be 32–512 printable ASCII characters without spaces"
+            "Gateway token must be 32-512 printable ASCII characters without spaces"
         );
         let library = Library::open(&config.library_root)?;
+        let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
+        let memory = match reliquary::EmbeddedMemory::open(library.root(), &profile_name) {
+            Ok(memory) => memory.map(Arc::new),
+            Err(error) => {
+                eprintln!("Reliquary startup failed for this profile: {error:#}");
+                None
+            }
+        };
         let listener = TcpListener::bind(config.bind)
             .await
             .context("Could not bind gateway")?;
         let address = listener.local_addr()?;
+        let auth = auth::Auth::load(library.root(), &config.token, address)?;
+        let shutdown = CancellationToken::new();
+        let telegram = telegram_host::Host::new(&config.library_root, shutdown.clone());
+        let authority_epoch = owner::advance_authority_epoch(library.root())?;
         let shared = Arc::new(Shared {
+            _owner_lock: owner_lock,
+            authority_epoch,
+            profile_id,
+            profile_name,
+            memory,
+            memory_wake: tokio::sync::Notify::new(),
+            memory_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            memory_task: Mutex::new(None),
             library,
             provider: config.provider,
             token: config.token,
             address,
             epoch: new_id(),
             instance_id: new_id(),
-            shutdown: CancellationToken::new(),
+            shutdown,
             sessions: Mutex::new(HashMap::new()),
-            tickets: StdMutex::new(HashMap::new()),
+            tickets: auth::Tickets::default(),
+            auth,
+            terminal: terminal::Host::new(),
+            telegram,
             creates: Mutex::new(HashMap::new()),
+            catalog_edits: Mutex::new(()),
             turns: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
+            gateway_tasks: tokio_util::task::TaskTracker::new(),
+            scheduler: scheduler_store.clone(),
+            scheduler_notify: tokio::sync::Notify::new(),
+            webhook_watches: Mutex::new(std::collections::HashSet::new()),
         });
+        shared.recover_queued().await?;
+        webhooks::recover(&shared).await?;
+        telegram_host::Host::restore(&shared.telegram);
+        let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
+        if shared.memory.is_some() {
+            let owner = shared.clone();
+            *shared.memory_task.lock().await = Some(tokio::spawn(owner.run_memory_capture()));
+        }
         let router = Router::new()
             .route("/health", get(health))
+            .route("/", get(auth::landing))
+            .route("/api/status", get(auth::status))
+            .route("/api/chat/file-upload", post(upload::receive).layer(axum::extract::DefaultBodyLimit::max(upload::MAX_BYTES + 65536)))
             .route("/api/auth/ws-ticket", post(mint_ticket))
+            .route("/api/auth/providers", get(auth::providers))
+            .route("/api/auth/me", get(auth::me))
+            .route("/login", get(auth::login))
+            .route("/auth/password-login", post(auth::password_login).layer(axum::extract::DefaultBodyLimit::max(16_384)))
+            .route("/auth/native/authorize", get(auth::native_authorize))
+            .route("/auth/native/token", post(auth::native_token).layer(axum::extract::DefaultBodyLimit::max(16_384)))
+            .route("/auth/native/refresh", post(auth::native_refresh).layer(axum::extract::DefaultBodyLimit::max(16_384)))
+            .route("/auth/logout", post(auth::logout))
+            .route("/api/profiles", get(rest::profiles))
+            .route("/api/profiles/active", get(rest::active))
+            .route("/api/profiles/sessions", get(rest::profile_sessions))
+            .route("/api/profiles/sessions/sidebar", get(rest::sidebar))
+            .route("/api/sessions", get(rest::sessions))
+            .route("/api/sessions/{session_id}/messages", get(rest::history))
             .route("/api/ws", get(upgrade))
+            .route("/api/webapp/socket-ticket", post(terminal::ticket))
+            .route("/api/host-terminal", get(terminal::upgrade))
             .route("/webhooks/{name}", post(webhooks::receive))
             .with_state(shared.clone());
         let stop = shared.shutdown.clone();
@@ -190,13 +288,17 @@ impl Gateway {
             .with_graceful_shutdown(stop.cancelled_owned())
             .await
             .context("Gateway listener failed");
+            on_stop.telegram.shutdown().await;
             on_stop.stop_turns().await;
+            on_stop.gateway_tasks.close();
+            on_stop.gateway_tasks.wait().await;
             result
         });
         Ok(RunningGateway {
             address,
             shared,
             task: Some(task),
+            scheduler_task: Some(scheduler_task),
         })
     }
 }
@@ -224,6 +326,13 @@ fn same_secret(left: &str, right: &str) -> bool {
 }
 
 struct Shared {
+    authority_epoch: u64,
+    profile_id: String,
+    profile_name: String,
+    memory: Option<Arc<reliquary::EmbeddedMemory>>,
+    memory_wake: tokio::sync::Notify,
+    memory_slots: Arc<tokio::sync::Semaphore>,
+    memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
     token: String,
@@ -232,10 +341,20 @@ struct Shared {
     instance_id: String,
     shutdown: CancellationToken,
     sessions: Mutex<HashMap<String, Arc<LiveSession>>>,
-    tickets: StdMutex<HashMap<String, Instant>>,
+    tickets: auth::Tickets,
+    auth: auth::Auth,
+    terminal: terminal::Host,
+    telegram: Arc<telegram_host::Host>,
     creates: Mutex<HashMap<String, (String, String)>>,
+    catalog_edits: Mutex<()>,
     turns: Mutex<Vec<JoinHandle<()>>>,
     connections: AtomicUsize,
+    gateway_tasks: tokio_util::task::TaskTracker,
+    scheduler: hermes_engine::cron::Store,
+    scheduler_notify: tokio::sync::Notify,
+    webhook_watches: Mutex<std::collections::HashSet<(String, String)>>,
+    // Drop the scheduler and other owned resources before the profile becomes available.
+    _owner_lock: File,
 }
 
 #[derive(Clone)]
@@ -244,6 +363,8 @@ struct Peer {
     tx: mpsc::Sender<Value>,
     stop: CancellationToken,
     canonical: bool,
+    // A private local control-socket grant establishes native caller provenance.
+    pub(crate) local_native: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -262,6 +383,12 @@ struct Settings {
     metadata_revision: u64,
     #[serde(default)]
     execution_generation: u64,
+    #[serde(default)]
+    generation_options: GenerationOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_binding: Option<CaptureBinding>,
+    #[serde(default)]
+    shell_policy: Option<shell_exec::Policy>,
 }
 
 impl Settings {
@@ -289,6 +416,10 @@ struct LiveSession {
     settings: StdMutex<Settings>,
     config: StdMutex<Config>,
     engine: Mutex<Session>,
+    processes: hermes_engine::ProcessControls,
+    member_engines: Mutex<HashMap<String, Session>>,
+    member_controls: StdMutex<HashMap<String, hermes_engine::ProcessControls>>,
+    writer: Arc<ConversationWriter>,
     view: StdMutex<View>,
     peers: StdMutex<HashMap<String, Peer>>,
 }
@@ -302,7 +433,7 @@ struct View {
     cancel: Option<CancellationToken>,
     current_admission: Option<String>,
     approvals: BTreeMap<String, Approval>,
-    receipts: VecDeque<Receipt>,
+    authority: Authority,
     sequence: u64,
     replay: VecDeque<Value>,
     replay_bytes: usize,
@@ -314,29 +445,6 @@ struct Approval {
     payload: Value,
     answer: async_channel::Sender<bool>,
     timeout: CancellationToken,
-}
-
-#[derive(Clone)]
-struct Receipt {
-    id: String,
-    input_id: Option<String>,
-    text: String,
-    generation: u64,
-    status: String,
-    outcome: Option<String>,
-    result: Option<Value>,
-}
-
-impl Receipt {
-    fn value(&self, sid: &str, include_result: bool) -> Value {
-        let mut result = json!({ "admission_id":self.id, "ref":{"profile_id":"default","session_id":sid},
-            "sequence":self.generation, "status":self.status, "outcome":self.outcome,
-            "authority_epoch":1, "execution_generation":self.generation });
-        if include_result {
-            result["result"] = self.result.clone().unwrap_or(Value::Null);
-        }
-        result
-    }
 }
 
 #[derive(Debug)]
@@ -389,6 +497,21 @@ impl Shared {
         for task in tasks {
             let _ = task.await;
         }
+        if let Some(task) = self.memory_task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+
+    fn has_session_capacity(sessions: &mut HashMap<String, Arc<LiveSession>>) -> bool {
+        if sessions.len() >= MAX_SESSIONS {
+            sessions.retain(|_, session| Arc::strong_count(session) > 1 || !Self::detached_idle(session));
+        }
+        sessions.len() < MAX_SESSIONS
+    }
+
+    fn detached_idle(session: &LiveSession) -> bool {
+        !lock(&session.view).running && lock(&session.peers).is_empty() && !session.processes.has_running_jobs()
+            && !lock(&session.member_controls).values().any(|controls| controls.has_running_jobs())
     }
 
     async fn session(&self, id: &str) -> std::result::Result<Arc<LiveSession>, RpcError> {
@@ -396,22 +519,15 @@ impl Shared {
         if let Some(session) = sessions.get(id) {
             return Ok(session.clone());
         }
-        if sessions.len() >= MAX_SESSIONS {
+        if !Self::has_session_capacity(&mut sessions) {
             return Err(RpcError::new(
                 4001,
                 "session_limit",
                 "Close an idle session before opening another (limit 64)",
             ));
         }
-        let summary = self
-            .library
-            .sessions(None)
-            .map_err(RpcError::internal)?
-            .into_iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| {
-                RpcError::new(4004, "not_found", "Session not found in the Rust library")
-            })?;
+        let summary = self.library.session(id).map_err(|error|
+            RpcError::new(4004, "not_found", format!("Cannot open session: {error:#}")))?;
         let dir = self.library.session_dir(id).map_err(RpcError::internal)?;
         let mut settings = Settings::read(&dir).map_err(RpcError::internal)?;
         let workspace = self
@@ -420,20 +536,31 @@ impl Shared {
             .map_err(RpcError::internal)?
             .or_else(|| settings.cwd.clone());
         let actual_workspace = workspace.clone().unwrap_or_else(|| dir.join("workspace"));
-        let engine = Session::open_for_profile(&dir, workspace.as_deref(), self.library.root())
-            .map_err(|e| {
+        let profile = match summary.bot.as_deref() {
+            Some(name) if !name.starts_with("group:") => self.library.bot_profile(name).map_err(RpcError::internal)?,
+            _ => self.library.root().to_owned(),
+        };
+        let engine = if settings.source == "scheduled" {
+            Session::open_scheduled(&dir, &actual_workspace, &profile)
+        } else {
+            Session::open_for_profile(&dir, workspace.as_deref(), &profile)
+        };
+        let mut engine = engine.map_err(|e| {
                 RpcError::new(
                     4001,
                     "session_busy",
                     format!("Could not open session: {e:#}"),
                 )
             })?;
+        let processes = engine.enable_local_processes(id).map_err(RpcError::internal)?;
         settings.cwd = Some(actual_workspace);
         if settings.source.is_empty() {
             settings.source = "rust".into();
         }
         let history = engine.history().clone();
-        let generation = (history.turns.len() as u64).max(settings.execution_generation);
+        let writer = engine.writer();
+        let authority = Authority::recover(&writer, &dir, &settings, history.turns.len()).map_err(RpcError::internal)?;
+        let generation = authority.generation.max(history.turns.len() as u64).max(settings.execution_generation);
         let mut config = self.provider.clone();
         if let Some(model) = &settings.model {
             config.model.clone_from(model);
@@ -443,7 +570,11 @@ impl Shared {
             dir,
             settings: StdMutex::new(settings.clone()),
             config: StdMutex::new(config),
+            writer,
             engine: Mutex::new(engine),
+            processes,
+            member_engines: Mutex::new(HashMap::new()),
+            member_controls: StdMutex::new(HashMap::new()),
             peers: StdMutex::new(HashMap::new()),
             view: StdMutex::new(View {
                 history,
@@ -454,7 +585,7 @@ impl Shared {
                 cancel: None,
                 current_admission: None,
                 approvals: BTreeMap::new(),
-                receipts: VecDeque::new(),
+                authority,
                 sequence: 0,
                 replay: VecDeque::new(),
                 replay_bytes: 0,
@@ -469,9 +600,13 @@ impl Shared {
     fn emit(&self, session: &LiveSession, kind: &str, payload: Value) {
         let id = lock(&session.summary).id.clone();
         let mut view = lock(&session.view);
+        self.emit_locked(session, &id, &mut view, kind, payload);
+    }
+
+    fn emit_locked(&self, session: &LiveSession, id: &str, view: &mut View, kind: &str, payload: Value) {
         view.sequence += 1;
         let mut params = json!({"type":kind,"session_id":id,"payload":payload,
-            "seq":view.sequence,"replay_epoch":self.epoch,"authority_epoch":1,"execution_generation":view.generation});
+            "seq":view.sequence,"replay_epoch":self.epoch,"authority_epoch":self.authority_epoch,"execution_generation":view.generation});
         if let Some(admission) = &view.current_admission {
             params["admission_id"] = json!(admission);
         }
@@ -506,10 +641,10 @@ impl Shared {
         let config = lock(&session.config);
         let view = lock(&session.view);
         json!({ "desktop_protocol":PROTOCOL,"version":concat!(env!("CARGO_PKG_VERSION"),"-rust"),
-            "model":config.model,"provider":provider_label(&config),"profile_id":"default","profile_name":"default",
+            "model":config.model,"provider":provider_label(&config),"profile_id":self.profile_id,"profile_name":self.profile_name,
             "title":summary.title,"source":settings.source,"stored_session_id":summary.id,
-            "cwd":settings.cwd.as_ref().map(|p|p.to_string_lossy().to_string()).unwrap_or_default(),
-            "running":view.running,"execution_generation":view.generation,"revision":view.revision,
+            "project_id":summary.project_id,"generation_options":settings.generation_options,"cwd":settings.cwd.as_ref().map(|p|p.to_string_lossy().to_string()).unwrap_or_default(),
+            "running":view.running,"pending":view.authority.pending(&self.profile_id, &summary.id, self.authority_epoch),"execution_generation":view.generation,"revision":view.revision,
             "turn_started_at":view.started,"started_at":epoch_time(&summary.created_at),
             "approval_mode":"manual","yolo":false,"tools":{"rust":tool_names()},"skills":{},"mcp_servers":[],
             "terminal_backend":"rust","replay_epoch":self.epoch,"last_sequence":view.sequence,
@@ -521,51 +656,83 @@ impl Shared {
         let info = self.info(session);
         let id = lock(&session.summary).id.clone();
         let view = lock(&session.view);
-        let messages = transcript(&view.history);
+        let messages = transcript(&id, &view.history, Some(&view.authority));
         let prompts: Vec<_> = view.approvals.values().map(|p| p.payload.clone()).collect();
         let mut result = json!({"session_id":id,"stored_session_id":id,"message_count":messages.len(),
             "messages":if omit {vec![]} else {messages},"info":info,"running":view.running,
             "messages_omitted":omit,"open_requests":[],"pending_approval":prompts.first(),
             "turn_started_at":view.started});
         if peer.canonical {
-            result["authority_epoch"] = json!(1);
+            result["authority_epoch"] = json!(self.authority_epoch);
             result["replay_epoch"] = json!(self.epoch);
             result["last_sequence"] = json!(view.sequence);
             result["subscription_id"] = json!(format!("{}:{id}", peer.id));
             result["revision"] = json!(view.revision);
             result["execution_generation"] = json!(view.generation);
-            result["pending"] = json!([]);
+            result["pending"] = view.authority.pending(&self.profile_id, &id, self.authority_epoch);
+            result["latest_receipt"] = json!(view.authority.receipts.iter().rev().find(|r| r.status == "terminal").map(|r| r.value(&self.profile_id, &id, self.authority_epoch, true)));
+            if !omit {
+                let mut history = view.history.clone();
+                for turn in &mut history.turns { turn.context.clear(); }
+                result["native_history"] = json!(history);
+            }
             result["prompts"] = json!(prompts);
         }
         result
     }
 
     async fn dispatch(self: &Arc<Self>, method: &str, params: &Value, peer: &Peer) -> RpcResult {
+        if method == "shell.exec" {
+            return shell_exec::exec(self, params, peer).await;
+        }
         params
             .as_object()
             .ok_or_else(|| RpcError::invalid("params must be an object"))?;
-        if let Some(profile) = optional_string(params, "profile")?
-            && profile != "default"
+        let label = optional_string(params, "profile")?;
+        let explicit = optional_string(params, "profile_id")?;
+        let nested = optional_string(&params["ref"], "profile_id")?;
+        if label.is_some_and(|p| p != self.profile_name && p != self.profile_id)
+            || [explicit, nested].into_iter().flatten().any(|p| p != self.profile_id)
         {
-            return Err(RpcError::new(
-                4001,
-                "unsupported_profile",
-                "This gateway serves only the Rust library's default profile",
-            ));
+            return Err(RpcError::new(4001, "unsupported_profile", "This gateway serves a different profile"));
         }
         match method {
             "ping" => Ok(json!({"pong":true})),
             "gateway.ping" => Ok(json!({"ok":true})),
             "runtime.describe" => Ok(
-                json!({"instance_id":self.instance_id,"profile_id":"default","authority_epoch":1,"capabilities":["rust-engine-subset-v1","event-replay-v1"],"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
+                json!({"instance_id":self.instance_id,"profile_id":self.profile_id,"authority_epoch":self.authority_epoch,"capabilities":RUNTIME_CAPABILITIES,"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
             ),
             "rpc.discover" => Ok(
-                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS,"limitations":["one active turn per session; busy submissions are refused","queue, steer, redirect, multimodal attachments, profile routing, dashboard REST and non-Rust tools are not implemented","receipts and replay are bounded and retained only until process restart"]}),
+                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS,"limitations":["one running turn per session","steer and redirect are not implemented","event replay is bounded to the current process"]}),
             ),
             "gateway.capabilities" => Ok(json!({"per_session_exclusive_submit":true})),
             "client.capabilities" => Ok(
                 json!({"server_requests":[],"declines_not_shown":false,"canonical_clarify_batch":false}),
             ),
+            "cron.chat" => {
+                if !peer.canonical { return Err(RpcError::unsupported("A native session is required")); }
+                let id = required_string(params, "job_id")?;
+                let job = self.scheduler.jobs().map_err(RpcError::internal)?.into_iter().find(|job| job.id == id)
+                    .ok_or_else(|| RpcError::new(4004, "not_found", "Scheduled job not found"))?;
+                let session = scheduler::routine_for(self, &job.id, job.title()).await.map_err(RpcError::internal)?;
+                let sid = lock(&session.summary).id.clone();
+                Ok(json!({"session_id":sid}))
+            }
+            "cron.trigger" => {
+                if !peer.canonical { return Err(RpcError::unsupported("A native session is required")); }
+                let id = required_string(params, "job_id")?;
+                let request_id = required_string(params, "request_id")?;
+                let claim = self.scheduler.claim_gateway_now(id, request_id, chrono::Utc::now()).map_err(RpcError::internal)?;
+                self.scheduler_notify.notify_one();
+                let run = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let run = self.scheduler.runs(id)?.into_iter().find(|run| run.id == claim.run.id).context("Run no longer exists")?;
+                        if run.gateway_session.is_some() || !run.status.live() { return Ok::<_, anyhow::Error>(run); }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }).await.map_err(|_| RpcError::internal("Scheduler has not bound this run yet; retry with the same request_id"))?.map_err(RpcError::internal)?;
+                Ok(json!({"run_id":run.id,"session_id":run.gateway_session,"status":run.status,"error":run.error}))
+            }
             "session.create" => self.create(params, peer).await,
             "session.list" | "session.active_list" => {
                 self.list(params, peer, method == "session.active_list")
@@ -582,7 +749,9 @@ impl Shared {
             }
             "session.history" => {
                 let session = self.resolve(params).await?;
-                let messages = transcript(&lock(&session.view).history);
+                let sid = lock(&session.summary).id.clone();
+                let view = lock(&session.view);
+                let messages = transcript(&sid, &view.history, Some(&view.authority));
                 Ok(json!({"count":messages.len(),"messages":messages}))
             }
             "session.info" => {
@@ -595,24 +764,69 @@ impl Shared {
                 Ok(json!({"output":if view.running {"Running"} else {"Idle"}}))
             }
             "session.events.since" => self.replay(params, peer).await,
+            "file.attach" => self.attach_file(params,peer).await,
             "prompt.submit" => self.submit(params, peer).await,
+            "prompt.resume_parked" => self.resume_parked(params, peer).await,
+            "prompt.resolve_unknown" => self.resolve_unknown(params, peer).await,
             "prompt.receipt" => {
                 let session = self.attached(params, peer).await?;
                 let id = required_string(params, "admission_id")?;
                 let sid = lock(&session.summary).id.clone();
                 let view = lock(&session.view);
-                let receipt = view.receipts.iter().find(|r| r.id == id).ok_or_else(|| {
+                let receipt = view.authority.receipts.iter().find(|r| r.id == id).ok_or_else(|| {
                     RpcError::new(
                         4004,
                         "not_found",
                         "Admission not retained; refetch session history",
                     )
                 })?;
-                Ok(receipt.value(&sid, params["include_result"].as_bool().unwrap_or(false)))
+                Ok(receipt.value(&self.profile_id, &sid, self.authority_epoch, params["include_result"].as_bool().unwrap_or(false)))
             }
             "session.interrupt" | "prompt.cancel" => {
                 self.interrupt(params, peer, method == "prompt.cancel")
                     .await
+            }
+            "catalog.session.set" | "catalog.session.delete" | "catalog.archive_inactive" => self.catalog_edit(method,params,peer).await,
+            "process.list" | "process.kill" | "process.stop" => {
+                let session = self.attached(params, peer).await?;
+                let mut controls = vec![session.processes.clone()];
+                controls.extend(lock(&session.member_controls).values().cloned());
+                match method {
+                    "process.list" => {
+                        let mut rows: Vec<Value> = Vec::new();
+                        for control in controls {
+                            for row in control.list().await.map_err(RpcError::internal)? {
+                                if !rows.iter().any(|existing| existing["session_id"] == row["session_id"]) { rows.push(row); }
+                            }
+                        }
+                        Ok(json!({"processes":rows}))
+                    }
+                    "process.stop" => {
+                        let mut ids = std::collections::BTreeSet::new();
+                        for control in &controls {
+                            for row in control.list().await.map_err(RpcError::internal)? {
+                                if row["status"] == "running" && let Some(id) = row["session_id"].as_str() { ids.insert(id.to_owned()); }
+                            }
+                        }
+                        let mut killed = 0;
+                        for id in ids {
+                            for control in &controls {
+                                if let Some(result) = control.kill(&id).await.map_err(RpcError::internal)? {
+                                    if result["status"] == "killed" { killed += 1; }
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(json!({"killed":killed,"delegations":0}))
+                    }
+                    _ => {
+                        let id = required_string(params, "process_id")?;
+                        for control in controls {
+                            if let Some(result) = control.kill(id).await.map_err(RpcError::internal)? { return Ok(result); }
+                        }
+                        Err(RpcError::new(4044, "not_found", "No such process in this conversation"))
+                    }
+                }
             }
             "approval.pending" => {
                 let session = self.attached(params, peer).await?;
@@ -629,22 +843,27 @@ impl Shared {
                 Ok(json!({"acknowledged":lock(&session.view).approvals.contains_key(id)}))
             }
             "approval.respond" => self.respond(params, peer).await,
+            "telegram.status" | "telegram.connect" | "telegram.disconnect" | "telegram.send" if !peer.local_native => {
+                Err(RpcError::new(4403, "permission_denied", "Telegram setup and manual replies require the private profile client"))
+            }
+            "telegram.status" => self.telegram.status().await.map_err(RpcError::internal),
+            "telegram.connect" => self.telegram.connect().await.map_err(RpcError::internal),
+            "telegram.disconnect" => self.telegram.disconnect().await.map_err(RpcError::internal),
+            "telegram.send" => {
+                let user_id = params["user_id"].as_i64().filter(|id| *id > 0)
+                    .ok_or_else(|| RpcError::invalid("user_id must be a positive Telegram user ID"))?;
+                let text = required_string(params, "text")?;
+                self.telegram.send(user_id, text.to_owned()).await.map_err(RpcError::internal)
+            },
             "session.title" | "session.mutate" => {
                 self.mutate(params, peer, method == "session.mutate").await
             }
             "session.close" => {
                 let id = required_string(params, "session_id")?;
                 let session = self.attached(params, peer).await?;
-                if lock(&session.view).running {
-                    return Err(RpcError::fenced(
-                        "session_busy",
-                        "Interrupt and wait for the turn to finish before closing",
-                        &lock(&session.view),
-                    ));
-                }
                 let mut sessions = self.sessions.lock().await;
                 lock(&session.peers).remove(&peer.id);
-                if lock(&session.peers).is_empty() {
+                if Arc::strong_count(&session) == 2 && Self::detached_idle(&session) {
                     sessions.remove(id);
                 }
                 Ok(json!({"closed":true}))
@@ -683,7 +902,6 @@ impl Shared {
             &[
                 "messages",
                 "parent_session_id",
-                "reasoning_effort",
                 "reasoning",
                 "toolsets",
                 "skills",
@@ -738,7 +956,7 @@ impl Shared {
         }
         let model = optional_string(params, "model")?.map(str::to_owned);
         if matches!(&model,Some(s) if s.trim().is_empty() || s.len()>256) {
-            return Err(RpcError::invalid("model must contain 1–256 bytes"));
+            return Err(RpcError::invalid("model must contain 1-256 bytes"));
         }
         let cwd = optional_string(params, "cwd")?
             .filter(|s| !s.is_empty())
@@ -764,11 +982,20 @@ impl Shared {
             .map(str::to_owned);
         if matches!(&key,Some(k) if k.is_empty() || k.len()>256) {
             return Err(RpcError::invalid(
-                "request identity must contain 1–256 bytes",
+                "request identity must contain 1-256 bytes",
             ));
         }
-        let fingerprint =
-            json!({"title":title,"model":model,"cwd":cwd,"source":source}).to_string();
+        let project = optional_string(params, "project_id")?;
+        let mut options: GenerationOptions = match params.get("generation_options") {
+            Some(value) => serde_json::from_value(value.clone()).map_err(|e| RpcError::invalid(e.to_string()))?,
+            None => GenerationOptions::default(),
+        };
+        if let Some(effort) = optional_string(params, "reasoning_effort")? { options.reasoning_effort = Some(effort.into()); }
+        options.validate().map_err(|e| RpcError::invalid(e.to_string()))?;
+        let mut creation = json!({"title":title,"model":model,"cwd":cwd,"source":source});
+        if let Some(project) = project { creation["project_id"] = json!(project); }
+        if params.get("generation_options").is_some() || params.get("reasoning_effort").is_some() { creation["generation_options"] = json!(options); }
+        let fingerprint = creation.to_string();
         // One admission lock covers durable lookup and creation, including reconnect retries.
         let mut creates = self.creates.lock().await;
         let mut existing = None;
@@ -803,28 +1030,39 @@ impl Shared {
         let id = if let Some(id) = existing {
             id
         } else {
-            if self.sessions.lock().await.len() >= MAX_SESSIONS {
+            if !Self::has_session_capacity(&mut *self.sessions.lock().await) {
                 return Err(RpcError::new(
                     4001,
                     "session_limit",
                     "Close an idle session before creating another",
                 ));
             }
-            let summary = self
-                .library
-                .create_session(None, Some(title))
-                .map_err(RpcError::internal)?;
-            Settings {
-                source: source.into(),
-                model,
-                cwd,
-                creation_key: key.clone(),
-                creation_fingerprint: Some(fingerprint.clone()),
-                metadata_revision: 0,
-                execution_generation: 0,
-            }
-            .save(&summary.directory)
-            .map_err(RpcError::internal)?;
+            let mut prepared = Settings {
+                source: source.into(), model, cwd, creation_key: key.clone(),
+                creation_fingerprint: Some(fingerprint.clone()), metadata_revision: 0,
+                execution_generation: 0, generation_options: options, memory_binding: None, shell_policy: None,
+            };
+            let local_backend = (peer.local_native && matches!(source, "cli" | "tui" | "gui"))
+                .then(|| shell_exec::backend(self.library.root()));
+            let summary = self.library.create_initialized_session_with_workspace(project, Some(title), key.as_deref(), |summary, project_workspace| {
+                if summary.directory.join("gateway.json").exists() {
+                    let existing = Settings::read(&summary.directory)?;
+                    ensure!(existing.creation_key == prepared.creation_key && existing.creation_fingerprint == prepared.creation_fingerprint,
+                        "Creation identity was previously used with different options");
+                } else {
+                    if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
+                        prepared.memory_binding = self.memory.as_ref().and_then(|memory| memory.binding_for_new_session(summary));
+                    }
+                    if let Some(backend) = local_backend {
+                        let cwd = project_workspace.map(Path::to_owned)
+                            .or_else(|| prepared.cwd.clone())
+                            .unwrap_or_else(|| summary.directory.join("workspace"));
+                        prepared.shell_policy = Some(shell_exec::Policy { cwd, backend });
+                    }
+                    prepared.save(&summary.directory)?;
+                }
+                Ok(())
+            }).map_err(RpcError::internal)?;
             summary.id
         };
         if let Some(key) = key {
@@ -896,7 +1134,7 @@ impl Shared {
                     false,
                 )
             };
-            let messages = transcript(&history);
+            let messages = transcript(&summary.id, &history, None);
             let model = settings
                 .model
                 .unwrap_or_else(|| self.provider.model.clone());
@@ -970,126 +1208,42 @@ impl Shared {
         )
     }
 
-    async fn submit(self: &Arc<Self>, params: &Value, peer: &Peer) -> RpcResult {
-        reject_options(
-            params,
-            &[
-                "attachments",
-                "api_text",
-                "model_override",
-                "turn_author",
-                "voice_context",
-                "voice_turn",
-                "truncate_before_row_id",
-                "truncate_before_user_ordinal",
-                "truncate_before_message_id",
-                "confirm_truncate",
-                "display_kind",
-            ],
-        )?;
-        if params["queued"].as_bool() == Some(true) {
-            return Err(RpcError::unsupported(
-                "This gateway does not queue turns; send after the current turn completes",
-            ));
-        }
-        let text = required_string(params, "text")?.trim().to_owned();
-        if text.is_empty() || text.len() > MAX_PROMPT_BYTES {
-            return Err(RpcError::invalid("text must contain 1–262144 bytes"));
-        }
-        let input = optional_string(params, "submission_id")?
-            .or(optional_string(params, "input_id")?)
-            .map(str::to_owned);
-        if matches!(&input,Some(s) if s.is_empty() || s.len()>256) {
-            return Err(RpcError::invalid(
-                "submission identity must contain 1–256 bytes",
-            ));
-        }
-        let session = self.attached(params, peer).await?;
-        let config = lock(&session.config).clone();
-        config
-            .validate()
-            .map_err(|e| RpcError::new(4001, "provider_configuration", format!("{e:#}")))?;
-        let id = lock(&session.summary).id.clone();
-        let cancel = self.shutdown.child_token();
-        let receipt = {
-            let mut settings = lock(&session.settings);
-            let mut view = lock(&session.view);
-            if let Some(input) = &input
-                && let Some(receipt) = view
-                    .receipts
-                    .iter()
-                    .find(|r| r.input_id.as_ref() == Some(input))
-            {
-                if receipt.text != text {
-                    return Err(RpcError::new(
-                        4001,
-                        "admission_conflict",
-                        "Submission identity was reused with different text",
-                    ));
-                }
-                return Ok(receipt.value(&id, false));
-            }
-            if view.running {
-                return Err(RpcError::fenced(
-                    "session_busy",
-                    "A turn is already running; interrupt it or wait for completion",
-                    &view,
-                ));
-            }
-            let mut saved = settings.clone();
-            saved.execution_generation = view.generation + 1;
-            saved.save(&session.dir).map_err(RpcError::internal)?;
-            *settings = saved;
-            view.generation += 1;
-            view.revision += 1;
-            view.running = true;
-            view.started = Some(now());
-            view.cancel = Some(cancel.clone());
-            let receipt = Receipt {
-                id: new_id(),
-                input_id: input,
-                text: text.clone(),
-                generation: view.generation,
-                status: "started".into(),
-                outcome: None,
-                result: None,
-            };
-            view.current_admission = Some(receipt.id.clone());
-            view.receipts.push_back(receipt.clone());
-            while view.receipts.len() > MAX_RECEIPTS {
-                view.receipts.pop_front();
-            }
-            receipt
-        };
-        // Legacy connections subscribe when submitting even when created by another client.
-        lock(&session.peers).insert(peer.id.clone(), peer.clone());
-        let shared = self.clone();
-        let task = tokio::spawn(async move {
-            shared.run_turn(session, config, text, cancel).await;
-        });
-        let mut turns = self.turns.lock().await;
-        turns.retain(|task| !task.is_finished());
-        turns.push(task);
-        if peer.canonical {
-            Ok(receipt.value(&id, false))
-        } else {
-            Ok(json!({"status":"streaming","admission_id":receipt.id}))
-        }
-    }
-
-    async fn interrupt(&self, params: &Value, peer: &Peer, admission: bool) -> RpcResult {
+    async fn interrupt(self: &Arc<Self>, params: &Value, peer: &Peer, admission: bool) -> RpcResult {
         let session = self.attached(params, peer).await?;
         let id = lock(&session.summary).id.clone();
-        let view = lock(&session.view);
+        let mut view = lock(&session.view);
         if admission {
             let admission_id = required_string(params, "admission_id")?;
-            let receipt = view
+            let receipt = view.authority
                 .receipts
                 .iter()
                 .find(|r| r.id == admission_id)
                 .ok_or_else(|| RpcError::new(4004, "not_found", "Admission is not retained"))?;
             if receipt.status == "terminal" {
-                return Ok(receipt.value(&id, false));
+                return Ok(receipt.value(&self.profile_id, &id, self.authority_epoch, false));
+            }
+            if matches!(receipt.status.as_str(), "queued" | "parked") {
+                let mut next = view.authority.clone();
+                let pending = next.receipts.iter_mut().find(|r| r.id == admission_id).expect("found admission");
+                pending.status = "terminal".into();
+                pending.outcome = Some("cancelled".into());
+                let result = pending.value(&self.profile_id, &id, self.authority_epoch, false);
+                let round = pending.group.as_ref().map(|group| group.round.clone());
+                if let Some(round) = round { next.cancel_group(&round); }
+                next.persist(&session.writer,None).map_err(RpcError::internal)?;
+                view.authority = next;
+                view.revision += 1;
+                drop(view);
+                self.emit(&session,"session.info",self.info(&session));
+                let owner = self.clone();
+                self.gateway_tasks.spawn(async move {
+                    match owner.claim_next(&session) {
+                        Ok(Some(first)) => owner.spawn_worker(session, first).await,
+                        Ok(None) => {},
+                        Err(error) => owner.emit(&session,"error",json!({"message":error.to_string()})),
+                    }
+                });
+                return Ok(result);
             }
             if view.current_admission.as_deref() != Some(admission_id) {
                 return Err(RpcError::new(
@@ -1111,20 +1265,27 @@ impl Shared {
             }
         }
         let interrupted = view.running;
+        if !admission && interrupted && view.authority.receipts.iter().any(|r| r.status=="queued") {
+            let mut next = view.authority.clone();
+            for r in &mut next.receipts { if r.status=="queued" { r.status="parked".into(); } }
+            next.persist(&session.writer,None).map_err(RpcError::internal)?;
+            view.authority = next;
+            view.revision += 1;
+        }
         if let Some(cancel) = &view.cancel {
             cancel.cancel();
         }
         if admission {
-            let receipt = view
+            let receipt = view.authority
                 .receipts
                 .iter()
                 .find(|r| Some(&r.id) == view.current_admission.as_ref())
                 .expect("active admission retained");
-            return Ok(receipt.value(&id, false));
+            return Ok(receipt.value(&self.profile_id, &id, self.authority_epoch, false));
         }
         if peer.canonical {
             Ok(
-                json!({"ref":{"profile_id":"default","session_id":id},"instance_id":self.instance_id,"authority_epoch":1,
+                json!({"ref":{"profile_id":self.profile_id,"session_id":id},"instance_id":self.instance_id,"authority_epoch":self.authority_epoch,
                 "revision":view.revision,"execution_generation":view.generation,"execution_state":if view.running {"running"} else {"idle"}}),
             )
         } else {
@@ -1224,7 +1385,7 @@ impl Shared {
             None
         };
         if request_id.is_some_and(|s| s.is_empty() || s.len() > 256) {
-            return Err(RpcError::invalid("request_id must contain 1–256 bytes"));
+            return Err(RpcError::invalid("request_id must contain 1-256 bytes"));
         }
         let fingerprint=json!({"operation":operation,"payload":payload,"expected_revision":params["expected_revision"],"expected_generation":params["expected_generation"]}).to_string();
         // The lock order is shared with info(): summary, settings, config, view.
@@ -1285,10 +1446,14 @@ impl Shared {
             reject_options(payload, &["reasoning", "confirm"])?;
             let model = required_string(payload, "model")?;
             if model.trim().is_empty() || model.len() > 256 {
-                return Err(RpcError::invalid("model must contain 1–256 bytes"));
+                return Err(RpcError::invalid("model must contain 1-256 bytes"));
             }
             let mut saved = settings.clone();
             saved.model = Some(model.into());
+            if let Some(value) = payload.get("generation_options") {
+                saved.generation_options = serde_json::from_value(value.clone()).map_err(|e| RpcError::invalid(e.to_string()))?;
+                saved.generation_options.validate().map_err(|e| RpcError::invalid(e.to_string()))?;
+            }
             saved.metadata_revision += 1;
             saved.save(&session.dir).map_err(RpcError::internal)?;
             *settings = saved;
@@ -1296,7 +1461,7 @@ impl Shared {
         } else {
             let title = required_string(payload, "title")?;
             if title.trim().is_empty() || title.chars().count() > 200 {
-                return Err(RpcError::invalid("title must contain 1–200 characters"));
+                return Err(RpcError::invalid("title must contain 1-200 characters"));
             }
             let mut saved = settings.clone();
             saved.metadata_revision += 1;
@@ -1328,13 +1493,15 @@ impl Shared {
     async fn run_turn(
         self: Arc<Self>,
         session: Arc<LiveSession>,
-        config: Config,
-        text: String,
+        mut config: Config,
+        admission: Receipt,
         cancel: CancellationToken,
-    ) {
+    ) -> bool {
+        config.model.clone_from(&admission.model);
         let id = lock(&session.summary).id.clone();
         let mut stream = TurnStream {
-            id: new_id(),
+            unattended: admission.unattended,
+            id: admission.id.clone(),
             segment: 0,
             offset: 0,
             sealed: std::collections::HashSet::new(),
@@ -1344,22 +1511,70 @@ impl Shared {
         self.emit(&session, "message.start", json!({"turn_id":stream.id}));
         self.emit(&session, "session.info", self.info(&session));
         let (tx, rx) = async_channel::bounded(1024);
+        let (recall, memory_confirmation) = match self.prepare_turn_recall(&session, &admission, &config, &cancel).await {
+            Some((recall, confirmation)) => (Some(recall), Some(confirmation)),
+            None => (None, None),
+        };
         let mut engine = session.engine.lock().await;
         let initial_count = engine.history().turns.len();
-        let result = {
-            let future = engine.turn(config, text, tx, cancel.clone());
-            tokio::pin!(future);
-            loop {
-                tokio::select! {
-                    result=&mut future => break result,
-                    event=rx.recv() => if let Ok(event)=event {self.handle_event(&session,event,&mut stream,&cancel);},
+        let mut members = session.member_engines.lock().await;
+        let preparation: Result<()> = (|| {
+            if let Some(member) = &admission.group {
+                ensure!(self.library.bots()?.iter().any(|bot| bot.name == member.name), "Group member no longer exists");
+                if !members.contains_key(&member.name) {
+                    let profile = self.library.bot_profile(&member.name)?;
+                    let variant = engine.profile_variant(&profile, &id)?;
+                    if let Some(controls) = variant.process_controls() { lock(&session.member_controls).insert(member.name.clone(), controls); }
+                    members.insert(member.name.clone(), variant);
                 }
             }
+            Ok(())
+        })();
+        let prior = engine.history().clone();
+        let (result, history) = if let Err(error) = preparation {
+            (Err(error), prior)
+        } else {
+            let target = if let Some(member) = &admission.group {
+                let target = members.get_mut(&member.name).expect("prepared member");
+                target.accept_committed_history(prior);
+                target
+            } else { &mut *engine };
+            let prompt = match &admission.group {
+                Some(member) if member.first => format!("{}\u{2063}{}\u{2063}\n\n(Group chat \"{}\": you are {}. Reply in your own voice; the other members answer after you.)", admission.text, member.display, member.title, member.display),
+                _ => admission.text.clone(),
+            };
+            let result = {
+                let future = async {
+                    match recall {
+                        Some(recall) => target.run_admitted_turn_with_recall(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone(), recall).await,
+                        None => target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone()).await,
+                    }
+                };
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        result=&mut future => break result,
+                        event=rx.recv() => if let Ok(event)=event {self.handle_event(&session,event,&mut stream,&cancel);},
+                    }
+                }
+            };
+            let abandoned = result.is_err() || target.history().turns.get(initial_count).is_some_and(|turn|
+                matches!(turn.status, Status::Interrupted | Status::Failed(_)));
+            if abandoned && !self.shutdown.is_cancelled() && let Err(error) = target.release_abandoned_turn(initial_count).await {
+                self.emit(&session, "error", json!({"message":format!("Could not release abandoned processes: {error:#}")}));
+            }
+            (result, target.history().clone())
         };
         while let Ok(event) = rx.try_recv() {
             self.handle_event(&session, event, &mut stream, &cancel);
         }
-        let history = engine.history().clone();
+        if let Some(confirmation) = memory_confirmation {
+            // Give Root a chance to record the current selection before staging
+            // this new turn can advance the owner cut.
+            let _ = tokio::time::timeout(Duration::from_secs(1), confirmation).await;
+        }
+        if admission.group.is_some() { engine.accept_committed_history(history.clone()); }
+        drop(members);
         drop(engine);
         let (status, error) = match result {
             Err(error) => ("error", Some(format!("{error:#}"))),
@@ -1386,12 +1601,14 @@ impl Shared {
             .unwrap_or_default();
         let payload =
             json!({"text":text,"status":status,"error":error,"partial":status!="complete"});
-        let cancelled = {
+        let capture = self.pending_memory_capture(&session, &admission, initial_count, &history);
+        let has_capture = capture.is_some();
+        {
             let mut view = lock(&session.view);
-            view.history = history;
+            let mut authority = view.authority.clone();
             view.revision += 1;
             let current = view.current_admission.clone();
-            if let Some(receipt) = view
+            if let Some(receipt) = authority
                 .receipts
                 .iter_mut()
                 .find(|r| Some(&r.id) == current.as_ref())
@@ -1399,31 +1616,45 @@ impl Shared {
                 receipt.status = "terminal".into();
                 receipt.outcome = Some(status.into());
                 receipt.result = Some(payload.clone());
+                receipt.capture = capture;
             }
+            if status != "complete" && let Some(group) = &admission.group { authority.cancel_group(&group.round); }
+            if let Err(error) = authority.persist(&session.writer, Some(&history)) {
+                // A failed commit leaves the on-disk claim uncertain. Fence this
+                // session until the owner reopens and reconciles it.
+                view.running = false;
+                view.cancel = None;
+                drop(view);
+                self.emit(&session, "error", json!({"message":format!("Could not commit turn: {error:#}")}));
+                return false;
+            }
+            view.history = history;
+            view.authority = authority;
             let approvals = std::mem::take(&mut view.approvals);
             for approval in approvals.values() {
                 approval.timeout.cancel();
                 let _ = approval.answer.try_send(false);
             }
-            approvals.into_keys().collect::<Vec<_>>()
-        };
-        if !cancelled.is_empty() {
-            self.emit(&session,"approval.cancelled",json!({"session_id":id,"stored_session_id":id,"reason":status,"cancelled_count":cancelled.len(),"request_ids":cancelled}));
-        }
-        // Complete is the terminal fence. History and the receipt already reflect it.
-        self.emit(&session, "message.complete", payload);
-        {
-            let mut view = lock(&session.view);
+            let cancelled: Vec<_> = approvals.into_keys().collect();
+            if !cancelled.is_empty() {
+                self.emit_locked(&session, &id, &mut view, "approval.cancelled",
+                    json!({"session_id":id,"stored_session_id":id,"reason":status,"cancelled_count":cancelled.len(),"request_ids":cancelled}));
+            }
             view.running = false;
             view.cancel = None;
             view.started = None;
+            // Publish under the same lock as the idle transition. A client reacting
+            // to completion must see the committed receipt and consistent snapshot.
+            self.emit_locked(&session, &id, &mut view, "message.complete", payload);
             view.current_admission = None;
         }
+        if has_capture { self.memory_wake.notify_one(); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,
             Err(error)=>self.emit(&session,"error",json!({"message":format!("Conversation saved, but catalog update failed: {error:#}")})),
         }
         self.emit(&session, "session.info", self.info(&session));
+        true
     }
 
     fn handle_event(
@@ -1471,6 +1702,7 @@ impl Shared {
                 lock(&session.view).history = history;
             }
             Event::Approval { call, answer } => {
+                if stream.unattended { let _ = answer.try_send(false); return; }
                 let id = new_id();
                 let timeout = CancellationToken::new();
                 let mut command = format!("{}({})", call.name, call.arguments);
@@ -1494,7 +1726,7 @@ impl Shared {
                 let shared = self.clone();
                 let session = session.clone();
                 let cancel = cancel.clone();
-                tokio::spawn(async move {
+                self.gateway_tasks.spawn(async move {
                     tokio::select! {
                         _=timeout.cancelled()=>return,
                         _=cancel.cancelled()=>return,
@@ -1516,6 +1748,7 @@ impl Shared {
 }
 
 struct TurnStream {
+    unattended: bool,
     id: String,
     segment: u64,
     offset: usize,
@@ -1583,17 +1816,34 @@ fn tool_names() -> Vec<String> {
 fn shorten(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
-fn read_history(dir: &Path) -> Result<History> {
+#[derive(Default, Deserialize)]
+struct StoredConversation {
+    #[serde(flatten)]
+    history: History,
+    authority: Option<Authority>,
+}
+
+fn read_record(dir: &Path) -> Result<StoredConversation> {
     match File::open(dir.join("conversation.json")) {
         Ok(file) => serde_json::from_reader(file).context("Could not read conversation history"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(History::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoredConversation::default()),
         Err(e) => Err(e.into()),
     }
 }
-fn transcript(history: &History) -> Vec<Value> {
+
+fn read_history(dir: &Path) -> Result<History> {
+    Ok(read_record(dir)?.history)
+}
+fn transcript(sid: &str, history: &History, authority: Option<&Authority>) -> Vec<Value> {
     let mut messages = Vec::new();
-    for turn in &history.turns {
-        messages.push(json!({"role":"user","text":turn.prompt,"content":turn.prompt,"row_id":messages.len()+1}));
+    let receipts: HashMap<usize, &Receipt> = authority.into_iter().flat_map(|a| a.receipts.iter())
+        .filter_map(|r| r.turn_index.map(|n| (n,r))).collect();
+    for (turn_index, turn) in history.turns.iter().enumerate() {
+        let receipt = receipts.get(&turn_index);
+        let turn_id = receipt.map(|r| r.id.clone()).unwrap_or_else(||format!("{sid}-turn-{turn_index}"));
+        let first = messages.len();
+        messages.push(json!({"role":"user","text":turn.prompt,"content":turn.prompt,"row_id":messages.len()+1,
+            "turn_index":turn_index,"attachments":turn.attachments,"model":turn.model,"status":turn.status}));
         for entry in &turn.entries {
             match entry {
                 Entry::Assistant{text,calls}=>{
@@ -1603,6 +1853,15 @@ fn transcript(history: &History) -> Vec<Value> {
                 }
                 Entry::Tool{id,name,result,approved}=>messages.push(json!({"role":"tool","text":result,"content":result,"tool_call_id":id,"name":name,"approved":approved,"row_id":messages.len()+1})),
             }
+        }
+        for (ordinal, message) in messages[first..].iter_mut().enumerate() {
+            message["turn_id"] = json!(turn_id);
+            message["message_id"] = json!(format!("{turn_id}-row-{ordinal}"));
+            message["model"] = json!(turn.model);
+            if let Some(receipt) = receipt.filter(|receipt| receipt.admitted_ns > 0) {
+                message["timestamp"] = json!(receipt.admitted_ns as f64 / 1_000_000_000.0);
+            }
+            message["turn_status"] = receipt.map(|r| json!(r.outcome.as_deref().unwrap_or(&r.status))).unwrap_or_else(||json!(turn.status));
         }
     }
     messages
@@ -1614,33 +1873,8 @@ fn boundary(
     headers: &HeaderMap,
     remote: SocketAddr,
 ) -> std::result::Result<(), StatusCode> {
-    if !remote.ip().is_loopback() {
+    if shared.auth.audience(shared, headers, remote)? != auth::Audience::Local {
         return Err(StatusCode::FORBIDDEN);
-    }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::FORBIDDEN)?;
-    let authority = host
-        .parse::<axum::http::uri::Authority>()
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    if !matches!(
-        authority.host(),
-        "localhost" | "127.0.0.1" | "[::1]" | "::1"
-    ) || authority.port_u16() != Some(shared.address.port())
-    {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin = origin.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-        let allowed = [
-            format!("http://127.0.0.1:{}", shared.address.port()),
-            format!("http://localhost:{}", shared.address.port()),
-            format!("http://[::1]:{}", shared.address.port()),
-        ];
-        if !allowed.iter().any(|s| s == origin) && !matches!(origin, "file://" | "app://hermes") {
-            return Err(StatusCode::FORBIDDEN);
-        }
     }
     Ok(())
 }
@@ -1669,31 +1903,26 @@ async fn health(
     Json(json!({"status":"ok","implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION")}))
         .into_response()
 }
+impl Shared {
+    fn issue_ticket(&self) -> Option<String> {
+        self.tickets.issue_native()
+    }
+}
+
+#[derive(Deserialize)]
+struct TicketQuery {
+    profile: Option<String>,
+}
+
 async fn mint_ticket(
+    access: auth::Access,
     State(shared): State<Arc<Shared>>,
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Query(query): Query<TicketQuery>,
 ) -> Response {
-    if let Err(status) = boundary(&shared, &headers, remote) {
-        return status.into_response();
+    if !rest::profile_matches(&shared, query.profile.as_deref(), false) {
+        return auth::error(StatusCode::FORBIDDEN, "This gateway serves a different profile");
     }
-    if !header_token(&headers).is_some_and(|t| same_secret(t, &shared.token)) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let ticket = new_id();
-    let mut tickets = lock(&shared.tickets);
-    tickets.retain(|_, created| created.elapsed() < TICKET_TTL);
-    if tickets.len() >= 256 {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-    tickets.insert(ticket.clone(), Instant::now());
-    let mut response =
-        Json(json!({"ticket":ticket,"ttl_seconds":TICKET_TTL.as_secs()})).into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-store"),
-    );
-    response
+    shared.tickets.mint(access)
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1709,14 +1938,17 @@ async fn upgrade(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(status) = boundary(&shared, &headers, remote) {
-        return status.into_response();
+    let audience = match shared.auth.audience(&shared, &headers, remote) {
+        Ok(audience) => audience,
+        Err(status) => return status.into_response(),
+    };
+    let offered = headers.get_all(header::SEC_WEBSOCKET_PROTOCOL);
+    if offered.iter().any(|value| value.to_str().is_err()) {
+        return StatusCode::BAD_REQUEST.into_response();
     }
-    let protocols: Vec<_> = headers
-        .get(header::SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .split(',')
+    let protocols: Vec<_> = offered.iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
@@ -1730,54 +1962,56 @@ async fn upgrade(
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let credentials = if audience == auth::Audience::Remote {
+        auth::credential_count(&headers)
+    } else {
+        headers.get_all(header::AUTHORIZATION).iter().count()
+            + headers.get_all("x-hermes-session-token").iter().count()
+    };
     let sources = usize::from(query.token.is_some())
         + usize::from(query.ticket.is_some())
-        + headers.get_all(header::AUTHORIZATION).iter().count()
-        + headers.get_all("x-hermes-session-token").iter().count()
+        + credentials
         + protocol_tickets.len();
     if sources != 1 {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let authenticated = if let Some(ticket) = query
-        .ticket
-        .as_deref()
-        .or_else(|| protocol_tickets.first().copied())
+    let (revoked, local_native) = if let Some(ticket) = query.ticket.as_deref().or_else(|| protocol_tickets.first().copied()) {
+        let Some(ticket) = shared.tickets.redeem(ticket, audience) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        (ticket.revocation(), canonical && ticket.local_native())
+    } else if audience == auth::Audience::Local && !canonical
+        && query.token.as_deref().or_else(|| header_token(&headers))
+            .is_some_and(|token| same_secret(token, &shared.token))
     {
-        lock(&shared.tickets)
-            .remove(ticket)
-            .is_some_and(|created| created.elapsed() < TICKET_TTL)
-    } else if canonical {
-        false
+        (CancellationToken::new(), false)
     } else {
-        query
-            .token
-            .as_deref()
-            .or_else(|| header_token(&headers))
-            .is_some_and(|t| same_secret(t, &shared.token))
-    };
-    if !authenticated {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     if shared.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
         shared.connections.fetch_sub(1, Ordering::AcqRel);
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let upgraded = ws.max_message_size(1_048_576).max_frame_size(1_048_576);
+    let upgraded = ws.max_message_size(6 * 1024 * 1024).max_frame_size(6 * 1024 * 1024);
     let upgraded = if protocols.contains(&PROTOCOL) {
         upgraded.protocols([PROTOCOL])
     } else {
         upgraded
     };
-    let failed = shared.clone();
+    let handler = shared.gateway_tasks.token();
+    let failed = Arc::downgrade(&shared);
     upgraded
         .on_failed_upgrade(move |_| {
-            failed.connections.fetch_sub(1, Ordering::AcqRel);
+            if let Some(shared) = failed.upgrade() { shared.connections.fetch_sub(1, Ordering::AcqRel); }
         })
-        .on_upgrade(move |socket| serve_socket(shared, socket, canonical))
+        .on_upgrade(move |socket| async move {
+            serve_socket(shared, socket, canonical, local_native, revoked).await;
+            drop(handler);
+        })
         .into_response()
 }
 
-async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool) {
+async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool, local_native: bool, revoked: CancellationToken) {
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Value>(256);
     let stop = shared.shutdown.child_token();
@@ -1786,9 +2020,11 @@ async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool) {
         tx,
         stop: stop.clone(),
         canonical,
+        local_native,
     };
     let ready = json!({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{
-        "skin":{},"change_events":false,"heartbeat":true,"replay_epoch":shared.epoch,"session_authority":canonical}}});
+        "skin":{},"change_events":false,"heartbeat":true,"replay_epoch":shared.epoch,"session_authority":canonical,
+        "instance_id":shared.instance_id,"profile_id":shared.profile_id,"authority_epoch":shared.authority_epoch}}});
     let _ = peer.tx.try_send(ready);
     let writer_stop = stop.clone();
     let writer = tokio::spawn(async move {
@@ -1804,56 +2040,66 @@ async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool) {
         let _ = sink.close().await;
         writer_stop.cancel();
     });
-    loop {
-        let incoming = tokio::select! {_=stop.cancelled()=>break,frame=source.next()=>frame};
-        match incoming {
-            Some(Ok(Message::Text(raw))) => {
-                let parsed = serde_json::from_str::<Value>(&raw);
-                let (id, result) = match parsed {
-                    Err(_) => (
-                        Value::Null,
-                        Err(RpcError::new(-32700, "parse_error", "Invalid JSON")),
-                    ),
-                    Ok(frame) => {
-                        let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                        if frame.get("id").is_none() && frame.get("method").is_none() {
-                            continue;
-                        }
-                        if frame["jsonrpc"] != "2.0"
-                            || !frame["method"].is_string()
-                            || !(id.is_null() || id.is_string() || id.is_number())
-                        {
-                            (
-                                id,
-                                Err(RpcError::new(
-                                    -32600,
-                                    "invalid_request",
-                                    "Expected a JSON-RPC 2.0 method request",
-                                )),
-                            )
-                        } else {
-                            let method = frame["method"].as_str().unwrap_or("");
-                            let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-                            let result = shared.dispatch(method, &params, &peer).await;
-                            if frame.get("id").is_none() {
-                                continue;
+    // Keep dispatch ordered while the reader continues polling WebSocket
+    // control frames. The bounded queue applies backpressure during bursts.
+    let (requests, mut queued) = mpsc::channel(8);
+    let read = async {
+        loop {
+            let incoming = tokio::select! {
+                biased;
+                _ = revoked.cancelled() => break,
+                _ = stop.cancelled() => break,
+                frame = source.next() => frame,
+            };
+            match incoming {
+                Some(Ok(Message::Text(raw))) => {
+                    let parsed = serde_json::from_str::<Value>(&raw);
+                    let enqueue = async {
+                        // This endpoint is stateless. Its client uses it for
+                        // liveness while ordinary requests are queued.
+                        if parsed.as_ref().is_ok_and(|frame| {
+                            frame["jsonrpc"] == "2.0" && frame["method"] == "gateway.ping"
+                        }) {
+                            match socket_reply(&shared, &peer, parsed).await {
+                                Some(reply) => peer.tx.send(reply).await.is_ok(),
+                                None => true,
                             }
-                            (id, result)
+                        } else {
+                            requests.send(parsed).await.is_ok()
                         }
+                    };
+                    let accepted = tokio::select! {
+                        biased;
+                        _ = revoked.cancelled() => false,
+                        _ = stop.cancelled() => false,
+                        accepted = enqueue => accepted,
+                    };
+                    if !accepted {
+                        break;
                     }
-                };
-                let response = match result {
-                    Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-                    Err(error) => json!({"jsonrpc":"2.0","id":id,"error":error.value()}),
-                };
-                if peer.tx.send(response).await.is_err() {
-                    break;
                 }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
             }
-            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-            Some(Ok(_)) => {}
         }
-    }
+        stop.cancel();
+    };
+    let dispatch = async {
+        loop {
+            let request = tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                request = queued.recv() => request,
+            };
+            let Some(request) = request else { break };
+            if let Some(reply) = socket_reply(&shared, &peer, request).await
+                && peer.tx.send(reply).await.is_err()
+            {
+                break;
+            }
+        }
+    };
+    tokio::join!(read, dispatch);
     stop.cancel();
     for session in shared.sessions.lock().await.values() {
         lock(&session.peers).remove(&peer.id);
@@ -1861,3 +2107,48 @@ async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool) {
     let _ = writer.await;
     shared.connections.fetch_sub(1, Ordering::AcqRel);
 }
+
+async fn socket_reply(
+    shared: &Arc<Shared>,
+    peer: &Peer,
+    parsed: serde_json::Result<Value>,
+) -> Option<Value> {
+    let (id, result) = match parsed {
+        Err(_) => (
+            Value::Null,
+            Err(RpcError::new(-32700, "parse_error", "Invalid JSON")),
+        ),
+        Ok(frame) => {
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            if frame.get("id").is_none() && frame.get("method").is_none() {
+                return None;
+            }
+            if frame["jsonrpc"] != "2.0"
+                || !frame["method"].is_string()
+                || !(id.is_null() || id.is_string() || id.is_number())
+            {
+                (
+                    id,
+                    Err(RpcError::new(
+                        -32600,
+                        "invalid_request",
+                        "Expected a JSON-RPC 2.0 method request",
+                    )),
+                )
+            } else {
+                let method = frame["method"].as_str().unwrap_or("");
+                let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+                let result = shared.dispatch(method, &params, peer).await;
+                frame.get("id")?;
+                (id, result)
+            }
+        }
+    };
+    Some(match result {
+        Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":error.value()}),
+    })
+}
+
+#[cfg(test)]
+mod socket_tests;

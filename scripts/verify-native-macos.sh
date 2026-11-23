@@ -4,9 +4,9 @@ set -eu
 app=${1:?Pass the path to the native Hermes.app}
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 desktop="$app/Contents/MacOS/hermes-desktop"
-gateway="$app/Contents/MacOS/hermes-gateway"
 test -x "$desktop"
-test -x "$gateway"
+test ! -e "$app/Contents/MacOS/hermes-gateway"
+"$desktop" gateway --help >/dev/null
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 test "$(plutil -extract CFBundleExecutable raw -o - "$app/Contents/Info.plist")" = hermes-desktop
 test "$(plutil -extract CFBundleDisplayName raw -o - "$app/Contents/Info.plist")" = Hermes

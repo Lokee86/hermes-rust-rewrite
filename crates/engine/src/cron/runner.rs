@@ -22,14 +22,8 @@ pub async fn execute(
     store.finish(&claim, outcome.clone(), Utc::now())?;
     Ok(outcome)
 }
-async fn execute_inner(
-    store: &Store,
-    claim: &Claim,
-    config: &mut Config,
-    events: &Sender<Event>,
-    cancel: &CancellationToken,
-) -> Result<Outcome> {
-    store.begin(claim, Utc::now())?;
+/// Validate a frozen job and derive the same provider and workspace used by the runner.
+pub fn prepare_job(store: &Store, claim: &Claim, config: &mut Config) -> Result<std::path::PathBuf> {
     let job = &claim.job;
     ensure!(
         job.deliver == "local",
@@ -91,6 +85,18 @@ async fn execute_inner(
         std::fs::create_dir_all(&default_workspace)?;
         default_workspace
     };
+    Ok(workspace)
+}
+async fn execute_inner(
+    store: &Store,
+    claim: &Claim,
+    config: &mut Config,
+    events: &Sender<Event>,
+    cancel: &CancellationToken,
+) -> Result<Outcome> {
+    store.begin(claim, Utc::now())?;
+    let job = &claim.job;
+    let workspace = prepare_job(store, claim, config)?;
     let mut session =
         Session::open_scheduled(&claim.run.session_dir, &workspace, store.profile_root())?;
     let (send, receive) = async_channel::unbounded();

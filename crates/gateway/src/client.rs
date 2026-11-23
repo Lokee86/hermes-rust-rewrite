@@ -27,6 +27,14 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) fn local_origin(origin: &str) -> Result<reqwest::Url, ClientError> {
+    let url = reqwest::Url::parse(origin).map_err(|_| ClientError::Transport("invalid gateway origin"))?;
+    if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost")) || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() || url.path() != "/" {
+        return Err(ClientError::Transport("expected an HTTP loopback origin"));
+    }
+    Ok(url)
+}
+
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const APPROVAL_RESPOND_TIMEOUT: Duration = Duration::from_secs(300);
@@ -280,7 +288,7 @@ impl GatewayClient {
         if lock(&self.inner.connection).is_some() {
             return Ok(());
         }
-        let mut base = reqwest::Url::parse(origin)
+        let base = reqwest::Url::parse(origin)
             .map_err(|_| ClientError::Transport("invalid gateway origin"))?;
         let loopback = matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
         let scheme_ok = if remote { base.scheme() == "https" || (base.scheme() == "http" && loopback) } else { base.scheme() == "http" && loopback };
@@ -323,6 +331,12 @@ impl GatewayClient {
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or(ClientError::Transport("native gateway returned no ticket"))?;
+        self.open_ticket(base, &prefix, ticket).await
+    }
+    pub(crate) async fn connect_local_grant(&self, origin: &str, ticket: &str) -> Result<(), ClientError> {
+        self.open_ticket(local_origin(origin)?, "", ticket).await
+    }
+    async fn open_ticket(&self, mut base: reqwest::Url, prefix: &str, ticket: &str) -> Result<(), ClientError> {
         base.set_scheme(if base.scheme() == "https" { "wss" } else { "ws" })
             .map_err(|_| ClientError::Transport("invalid native WebSocket origin"))?;
         base.set_path(&format!("{prefix}/api/ws"));

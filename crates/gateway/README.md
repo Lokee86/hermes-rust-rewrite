@@ -2,14 +2,14 @@
 
 This crate runs the Rust `hermes_engine::Session::turn` over real HTTP and WebSocket transports. It does not spawn the Python gateway. It shares the desktop's `hermes-library` catalog, native transcript files, configured providers, approved workspace tools and optional MCP adapter.
 
-It implements a **scoped subset**, checked against the supplied Hermes upstream checkout's `apps/shared/src/gateway-contract.openrpc.json`, `tui_gateway/ws.py`, `tui_gateway/contracts/canonical_sessions.py`, and Desktop `canonical-protocol.ts`. It is not a replacement for upstream's complete dashboard, control socket, account service or session authority. The native Desktop in this workspace uses the same engine directly; this listener is an optional integration surface.
+It implements a **scoped subset**, checked against the supplied Hermes upstream checkout's `apps/shared/src/gateway-contract.openrpc.json`, `tui_gateway/ws.py`, `tui_gateway/contracts/canonical_sessions.py`, and Desktop `canonical-protocol.ts`. The gateway owns chat execution and serves the native Desktop over its local owner connection. Its upstream compatibility covers the documented client surfaces.
 
 ## Run
 
 From the workspace root:
 
 ```sh
-cargo run -p hermes-gateway -- --port 8765
+cargo run -p hermes-gateway -- gateway run --port 8765
 ```
 
 `--data-dir PATH` selects the catalog; otherwise it uses `Session::default_dir()` (including `HERMES_RUST_DATA_DIR`). `--host` accepts only a loopback IP. Port `0` chooses a free port. The single startup JSON line contains the HTTP origin, WebSocket URL and token file path. Ctrl-C or SIGTERM interrupts active turns, saves their terminal state, closes clients and stops the listener.
@@ -35,7 +35,22 @@ For legacy JSON-RPC clients, open `/api/ws?ticket=<fresh ticket>` without `nativ
 
 The first frame has method `event`, type `gateway.ready`, a replay epoch, heartbeat support and `session_authority: true` on a native dial (`false` on legacy). `runtime.describe` returns the supported creation parameters and the explicit `rust-engine-subset-v1` capability. It does not advertise full upstream `sessions-v1` support. `rpc.discover` returns the exact method list and scope limitations. The first-party `gateway.ping` heartbeat is answered throughout a running turn, including approval waits.
 
-The listener checks the actual peer, Host and Origin. It accepts loopback Hosts with the listener's exact port; absent Origin, that same loopback HTTP origin, `file://`, or `app://hermes`. It does not trust forwarded/proxy headers, expose a public bind option, provide permissive CORS, or accept an Internet site's Origin. No TLS or remote deployment is implemented.
+Private local discovery advertises `session-authority-v1` after the profile's authority is ready. Identify, profile resolution, ticket minting and `runtime.describe` share the same profile, instance and persistent authority epoch. The epoch advances on owner restart. The private control socket accepts interactive tickets scoped to its profile. The stock client discovers individual method support through `rpc.discover`.
+
+The listener binds to loopback. Local routes require the listener's Host and accept an absent Origin, the matching loopback HTTP origin, `file://`, or `app://hermes`. Requests for the local authority carrying forwarding headers are refused.
+
+### Published gateway
+
+Set `webapp.public_url` in the selected profile's `config.yaml` (or set `HERMES_DASHBOARD_PUBLIC_URL`) to the HTTPS address clients use, including a mount prefix if needed. Terminate TLS at the reverse proxy, preserve the public Host, and strip the configured mount prefix when proxying the path to the Rust listener. A supplied Origin must match the configured HTTPS origin. Forwarding headers do not establish an authority.
+
+Configure at least one remote credential:
+
+- `HERMES_DASHBOARD_SESSION_TOKEN` provisions the stock deployment credential, either a literal token or `file:PATH`. Authenticate HTTP requests with a bearer or the `X-Hermes-Session-Token` header. The deployment credential is independent of the private local owner token. `dashboard.session_token_auth.enabled: false` disables it.
+- `dashboard.basic_auth.username` plus `password_hash` accepts the stock `scrypt$n$r$p$salt$hash` format. The corresponding `HERMES_DASHBOARD_BASIC_AUTH_*` environment variables and the stock plaintext `password` setting are also supported. Sign in through `/login` for a secure browser session or through the native PKCE flow for bearer credentials. Sessions issued by the password provider expire when the gateway restarts.
+
+After authenticating, read `/api/profiles` or `/api/profiles/active` to select the profile served by the gateway. Session lists are available at `/api/sessions`, `/api/profiles/sessions`, and `/api/profiles/sessions/sidebar`. `GET /api/sessions/{id}/messages` uses the canonical transcript projection. Its default is the latest 500 rows, ordered chronologically within the page. Use `order=latest` and `offset` to page backward, or use an explicit `limit` with the default oldest-first paging.
+
+Mint a one-use ticket with authenticated `POST /api/auth/ws-ticket`. Browser and Desktop clients can dial with `?ticket=...`. Android-style clients can offer both WebSocket subprotocols without an Origin. Terminal tickets use `POST /api/webapp/socket-ticket?socket=host-terminal` and are redeemed only on the terminal route. Remote upgrades require a remote ticket, including when the underlying peer is a local proxy.
 
 ## Supported operations
 
@@ -53,9 +68,18 @@ The listener checks the actual peer, Host and Origin. It accepts loopback Hosts 
 | `session.interrupt` | Cancel streaming/model/tool approval work and persist interruption. Native controls require the current execution generation, so an older control cannot stop a newer turn. |
 | `session.events.since` | Bounded ordered event replay with sequence and restart epoch. A gap or different epoch explicitly requests a fresh snapshot. |
 | `session.title`, `session.mutate` | Rename; canonical `session.mutate` also changes the model at an idle boundary. Canonical edits require revision fences and request IDs; model changes also require execution generation. Exact mutation retries are deduplicated within retained process state. Other mutation operations are refused. |
+| `shell.exec` | Capture local composer commands from a private native attachment to a locally created session with a frozen local backend. See the supported command forms below. |
 | `session.close` | Detach this socket from an idle session; release its engine lock when its last attachment closes it. It never deletes history. |
 
-Requests use JSON-RPC 2.0 IDs and object parameters. Unknown methods return `-32601`; malformed JSON returns `-32700`; invalid arguments return `-32602`; state/policy refusals include `error.data.reason` and, for stale fences, current revision/generation. Only `profile: "default"` is served. Batch JSON-RPC requests are not supported.
+Requests use JSON-RPC 2.0 IDs and object parameters. Unknown methods return `-32601`; malformed JSON returns `-32700`; invalid arguments return `-32602`; state/policy refusals include `error.data.reason` and, for stale fences, current revision/generation. Each listener serves its configured profile. Batch JSON-RPC requests are not supported.
+
+Stock Ink sends `!command` and `{!command}` through `shell.exec`. The gateway checks the private native attachment, session origin and frozen backend before starting a process. The session’s launch directory supplies the working directory. Commands receive no interactive input and have a 30-second execution deadline. Most use a fresh `/bin/sh` or Windows `cmd.exe`. Supported standalone Git reports use a directly resolved executable, and the Windows `more` reader uses System32’s `more.com`. Ordinary operator environment variables reach the child. Hermes-managed credentials and shell startup hooks are removed. The response carries the native exit code and the final 4,000 characters of stdout and 2,000 characters of stderr after newline normalization and redaction. Capture leaves the session transcript and admission queue untouched.
+
+For an authenticated local composer, the session directory is the starting directory for ordinary file reads and directory listings. Relative paths such as `..\notes.txt` on Windows and `../notes.txt` on POSIX can reach a sibling file. Absolute local paths also work. A plain `!` command displays the captured output. Interpolation with `{!…}` includes it in the submitted prompt. Missing files return the native command's exit status and diagnostic. Input redirection also accepts ordinary parent paths. Output redirection retains its narrower rules for local targets.
+
+Windows recursive and wildcard `findstr` searches support one local file operand and use a bounded list of checked files. Selected filenames must be ASCII for the native `/F` path list. Windows working-tree Git reports run with a one-process limit. Git operations that require external filters can return an error. The pip version query uses the trusted interpreter’s isolated mode, which excludes workspace and user-site module overrides.
+
+The native classifier checks the pinned stock rule tables and recognizes platform-specific command forms, including pipelines, file redirection, conditional chains, selected file utilities and literal Python script invocations. It returns `dangerous_command` for unclassified forms. The differential driver `scripts/verify_stock_composer_shell.py` exercises both owners using the stock private client. `scripts/verify_stock_ink_composer.mjs` exercises the pinned Ink renderer and composer hooks. `scripts/compare_composer_classifiers.py` compares the two classifiers without executing the input commands. Build the Rust driver with `cargo build --locked -p hermes-engine --example composer_classifier`. Its JSON report counts differences in both directions, and a disagreement causes a nonzero exit status.
 
 A minimal native conversation is:
 
@@ -77,6 +101,14 @@ Replay is at most 512 events and 512 KiB per loaded session; admissions and muta
 At most 64 sessions are loaded and 32 sockets connected. WebSocket frames/messages are capped at 1 MiB and prompts at 256 KiB; a slow client is disconnected when its bounded outgoing queue fills and can reconcile from history/replay. Closing a socket leaves its active turn running, so a short transport failure does not abandon an approval. The approval deadline and explicit interruption still apply. Stop the gateway gracefully to persist shutdown interruption.
 
 Unsupported: queued/steered/redirected inputs, multimodal attachments, edit/regenerate/rewind/branch/compression/reset/delete mutations, cross-profile routing, legacy server-to-client request RPCs, upstream tool/plugin catalogs, process/control-socket discovery, bot/room transports, billing, scheduler, voice, screen/browser control, dashboard settings REST and automatic handoff to a Python gateway. Any optional MCP server is external to Rust; it is connected through the engine, not a fallback to Python.
+
+## Embedded Reliquary
+
+The selected data directory supplies the profile's existing `reliquary/capture-enrollment-v1.json` and `reliquary/topology-v1.json`. The gateway uses the same service lease as the standalone host. A newly created ordinary native chat binds to the configured General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs do not enter automatic capture.
+
+Set the profile's `memory_embedding` in `agent-settings.json` to `{"endpoint_id":"<saved endpoint ID>","dimensions":1024}` using the intended embedding space's actual dimensions. The endpoint ID refers to a saved profile provider in the profile's `providers` store. Processing and recall use the chat's configured OpenAI-compatible structured-completion route and that embedding endpoint. An incompatible stored embedding identity or an unavailable route pauses memory work while chat remains available.
+
+The turn commit includes its pending capture. Archive admission and semantic processing record separate progress after that commit. Recall keeps one bounded selection across model rounds and records use after a successful model response. Archiving or deleting a source fences future capture and recall. If an open Reliquary import defers its archive tombstone, the gateway retains the fence and retries the tombstone.
 
 ## Verification
 
@@ -130,6 +162,12 @@ node --experimental-strip-types \
   ./crates/gateway/tests/replay-reference.mjs \
   ../shared/src/json-rpc-gateway.ts \
   ./crates/gateway/tests/fixtures/upstream-replay.json --verify
+```
+
+The live stock Node fixture uses the original Desktop and shared client sources from the pinned `caafe5389ae58` object. Run it from the workspace root with Node 24, Git, tar, and OpenSSL. It creates its own TLS proxy, synthetic credentials and deterministic model endpoint.
+
+```sh
+node scripts/verify_stock_node_gateway.mjs STOCK_CHECKOUT RUST_GATEWAY_EXECUTABLE
 ```
 
 The Rust transport test additionally connects this client to the real native Rust server, disconnects it while a clock tool awaits approval, completes the turn through another viewer, and verifies one replayed terminal event after reconnect, a valid history barrier, the saved transcript, and concurrent RPCs. These checks establish the ported replay behavior and essential native flow; they do not claim a full port of the original Desktop screens, JS callback registry, or all upstream canonical mutation adapters.

@@ -47,10 +47,20 @@ impl Default for History {
     fn default() -> Self { Self { version: 1, turns: Vec::new() } }
 }
 
+/// Serialized alongside the transcript. Gateway participants coordinate through one
+/// handle so a streaming checkpoint cannot replace a newly admitted prompt.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct NativeRecord {
+    #[serde(flatten)]
+    history: History,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority: Option<serde_json::Value>,
+}
+
 pub struct Store {
     dir: PathBuf,
-    // Hold an exclusive process lock for the lifetime of this conversation.
     _lock: File,
+    record: std::sync::Mutex<NativeRecord>,
 }
 
 impl Store {
@@ -67,30 +77,52 @@ impl Store {
             .open(dir.join("session.lock")).context("Could not open the conversation lock")?;
         lock.try_lock_exclusive().context("This conversation is already open in another window or cannot be locked")?;
         let path = dir.join("conversation.json");
-        let mut history: History = match File::open(&path) {
+        let mut record: NativeRecord = match File::open(&path) {
             Ok(file) => serde_json::from_reader(file).context("Could not read the saved conversation")?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => History::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => NativeRecord::default(),
             Err(err) => return Err(err).context("Could not open the saved conversation"),
         };
-        if history.version != 1 { bail!("Unsupported conversation format {}", history.version); }
-        let store = Self { dir: dir.to_path_buf(), _lock: lock };
+        if record.history.version != 1 { bail!("Unsupported conversation format {}", record.history.version); }
         let mut recovered = false;
-        for turn in &mut history.turns {
-            if turn.status == Status::Running {
-                turn.status = Status::Interrupted;
-                recovered = true;
+        // Only the gateway can resolve the disposition of a claimed admission.
+        if record.authority.is_none() {
+            for turn in &mut record.history.turns {
+                if turn.status == Status::Running {
+                    turn.status = Status::Interrupted;
+                    recovered = true;
+                }
             }
         }
+        let history = record.history.clone();
+        let store = Self { dir: dir.to_path_buf(), _lock: lock, record: record.into() };
         if recovered { store.save(&history)?; }
         Ok((store, history))
     }
 
+    pub fn authority(&self) -> Option<serde_json::Value> {
+        self.record.lock().expect("conversation writer poisoned").authority.clone()
+    }
+
+    pub fn commit(&self, history: Option<&History>, authority: &serde_json::Value) -> Result<()> {
+        self.replace(history, Some(authority))
+    }
+
     pub fn save(&self, history: &History) -> Result<()> {
+        self.replace(Some(history), None)
+    }
+
+    fn replace(&self, history: Option<&History>, authority: Option<&serde_json::Value>) -> Result<()> {
+        let mut current = self.record.lock().expect("conversation writer poisoned");
+        let next = NativeRecord {
+            history: history.unwrap_or(&current.history).clone(),
+            authority: authority.or(current.authority.as_ref()).cloned(),
+        };
         let mut file = NamedTempFile::new_in(&self.dir)?;
-        serde_json::to_writer_pretty(&mut file, history)?;
+        serde_json::to_writer_pretty(&mut file, &next)?;
         file.write_all(b"\n")?;
         file.as_file().sync_all()?;
         file.persist(self.dir.join("conversation.json")).context("Could not replace the saved conversation")?;
+        *current = next;
         #[cfg(unix)]
         File::open(&self.dir)?.sync_all()?;
         Ok(())

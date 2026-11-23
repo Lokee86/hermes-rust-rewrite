@@ -8,14 +8,15 @@ mkdir -p "$destination"
 destination=$(cd "$destination" && pwd)
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
-cargo build --locked --release -p hermes-desktop -p hermes-gateway
+cargo build --locked --release --features embedded-herdr -p hermes-desktop
 target=${CARGO_TARGET_DIR:-"$PWD/target"}
 stage="$build/Hermes"
 install -d "$stage/bin" "$stage/share/applications" "$stage/share/icons/hicolor/512x512/apps" "$stage/share/licenses/hermes"
-install -m755 "$target/release/hermes-desktop" "$target/release/hermes-gateway" "$stage/bin/"
+install -m755 "$target/release/hermes-desktop" "$stage/bin/hermes"
 install -m644 assets/icon.png "$stage/share/icons/hicolor/512x512/apps/com.nousresearch.hermes.rust-development.png"
 install -m644 packaging/linux/com.nousresearch.hermes.rust-development.desktop "$stage/share/applications/"
 install -m644 LICENSE-HERMES-AGENT "$stage/share/licenses/hermes/LICENSE"
+"$stage/bin/hermes" --licenses > "$stage/share/licenses/hermes/Herdr-THIRD-PARTY-NOTICES"
 for notice in crates/desktop/assets/fonts/*NOTICE.txt crates/desktop/assets/fonts/*LICENSE*.txt; do
   if [ -f "$notice" ]; then install -m644 "$notice" "$stage/share/licenses/hermes/"; fi
 done

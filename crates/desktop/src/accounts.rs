@@ -67,9 +67,10 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         Action::External(id) => {
             let Some(provider) = accounts::provider(id) else { return Task::none() };
             state.notice = Some(format!("Running `{}` in the terminal. Finish the sign-in there, then come back.", provider.cli_command));
-            let open = app.update(Message::Navigate(Screen::Terminal));
-            let line = format!("{}\r", provider.cli_command).into_bytes();
-            return Task::batch([open, Task::done(Message::Terminal(super::terminal::Action::Input(line)))]);
+            app.screen = Screen::Chat;
+            app.right_pane = Some(super::RightPane::Terminal);
+            app.sync_terminal_context();
+            return app.terminal.account_shell(provider.cli_command.to_owned()).map(Message::Terminal);
         }
         Action::ToggleAll => state.show_all = !state.show_all,
     }
