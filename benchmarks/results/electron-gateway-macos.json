@@ -1,0 +1,1 @@
+{"app": "electron", "process": "python3 -m hermes_cli.main gateway run (started detached by the Electron app; outside its process tree)", "footprint_mib": 283, "launcher_osascript_footprint_mib": 18, "idle_cpu_percent": 4.1}

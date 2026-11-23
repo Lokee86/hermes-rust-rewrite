@@ -1,0 +1,6 @@
+{"app":"electron","first_window_s":6.101,"footprint_mib":313.39999999999998,"idle_cpu_percent":5.7000000000000002,"processes":4,"run":1}
+{"app":"electron","first_window_s":0.79000000000000004,"footprint_mib":309.80000000000001,"idle_cpu_percent":0.5,"processes":4,"run":2}
+{"app":"electron","first_window_s":2.101,"footprint_mib":258.39999999999998,"idle_cpu_percent":0.40000000000000002,"processes":4,"run":3}
+{"app":"electron","first_window_s":2.7389999999999999,"footprint_mib":324.10000000000002,"idle_cpu_percent":3.3999999999999999,"processes":4,"run":4}
+{"app":"electron","first_window_s":2.3580000000000001,"footprint_mib":261.80000000000001,"idle_cpu_percent":0.20000000000000001,"processes":4,"run":5}
+{"app":"electron","first_window_s":2.4020000000000001,"footprint_mib":256.19999999999999,"idle_cpu_percent":0.29999999999999999,"processes":4,"run":6}
