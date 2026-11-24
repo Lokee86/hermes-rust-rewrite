@@ -87,7 +87,30 @@ const TERMINAL_ONLY: &[&str] = &["/busy", "/clear", "/copy", "/cron", "/exit", "
 pub(super) struct Item { pub name: String, pub description: String, pub group: &'static str }
 
 #[derive(Default)]
-pub(super) struct State { pub index: usize, pub dismissed_for: Option<String> }
+pub(super) struct State { pub index: usize, pub dismissed_for: Option<String>, catalog: Vec<Item>, catalog_profile: Option<String>, pending_exec: Option<(String,String)> }
+impl State { pub fn reset_picker(&mut self) { self.index=0; self.dismissed_for=None; } }
+
+pub(super) fn refresh(app: &mut Hermes) -> Task<Message> {
+    let Ok(conn) = app.chat_connection() else { return Task::none() };
+    let root=app.library.as_ref().map(|l|l.root().to_string_lossy().into_owned()).unwrap_or_default();
+    let profile=match &conn.route { super::remote::Route::Local=>format!("{root}:local"),super::remote::Route::Remote{origin,..}=>format!("{root}:{origin}") };
+    if app.slash.catalog_profile.as_deref()!=Some(profile.as_str()){app.slash.catalog.clear();app.slash.catalog_profile=Some(profile.clone());}
+    Task::perform(async move { conn.request("commands.catalog", serde_json::json!({})).await },
+        move |result| Message::Slash(Action::CatalogLoaded(profile,result)))
+}
+
+pub(super) fn session_ready(app: &mut Hermes) -> Task<Message> {
+    let Some((name,args)) = app.slash.pending_exec.take() else { return Task::none() };
+    plugin_exec(app, name, args)
+}
+
+fn plugin_exec(app: &mut Hermes, name: String, args: String) -> Task<Message> {
+    let (Ok(conn), Some(sid)) = (app.chat_connection(), app.chat.sid.clone()) else {
+        app.error("The profile gateway session is not ready for this plugin command."); return Task::none();
+    };
+    Task::perform(async move { conn.request("slash.exec", serde_json::json!({"session_id":sid,"command":format!("/{name} {args}").trim_end()})).await },
+        |result| Message::Slash(Action::PluginFinished(result)))
+}
 
 /// The completion list for the composer's text, or empty when no popup should show.
 pub(super) fn items(app: &Hermes) -> Vec<Item> {
@@ -98,6 +121,7 @@ pub(super) fn items(app: &Hermes) -> Vec<Item> {
     let query = line[1..].to_lowercase();
     let mut out: Vec<Item> = COMMANDS.iter().filter(|(name, _, _, _)| *name != "/model").filter(|(name, aliases, _, _)| name[1..].starts_with(&query) || aliases.iter().any(|a| a[1..].starts_with(&query)))
         .map(|(name, _, description, _)| Item { name: (*name).into(), description: (*description).into(), group: "Commands" }).collect();
+    out.extend(app.slash.catalog.iter().filter(|item| item.name[1..].to_lowercase().starts_with(&query)).cloned());
     if let Some(library) = &app.library && let Ok(status) = hermes_engine::skill_catalog::status(library.root()) {
         let mut skills: Vec<Item> = status.installed.iter().filter(|id| !status.disabled.contains(*id))
             .filter_map(|id| { let slug = id.rsplit('/').next()?; slug.to_lowercase().contains(&query).then(|| Item { name: format!("/{slug}"), description: "Skill".into(), group: "Skills" }) })
@@ -141,9 +165,29 @@ fn reference_items(app: &Hermes, line: &str) -> Option<Vec<Item>> {
 
 /// Keys the composer hands to the popup while it is open.
 #[derive(Clone, Debug)]
-pub(super) enum Action { Up, Down, Pick(usize), Accept, Dismiss }
+pub(super) enum Action { Up, Down, Pick(usize), Accept, Dismiss, CatalogLoaded(String,Result<serde_json::Value,String>), PluginFinished(Result<serde_json::Value,String>) }
 
 pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
+    let action = match action {
+    Action::CatalogLoaded(profile,result) => {
+        if app.slash.catalog_profile.as_deref()==Some(profile.as_str()) && let Ok(value) = result {
+            let commands = value["commands"].as_object();
+            let plugin_map = value["plugin_commands"].as_object();
+            app.slash.catalog = commands.into_iter().flat_map(|commands| commands.iter()).filter_map(|(name,meta)| {
+                let name = name.trim_start_matches('/');
+                let description = meta["description"].as_str().or_else(|| plugin_map.and_then(|map|map.get(name)).and_then(serde_json::Value::as_str));
+                (!name.is_empty() && description.is_some()).then(|| Item { name: format!("/{name}"), description: description.unwrap_or("Plugin command").to_owned(), group:"Plugins" })
+            }).collect();
+            app.slash.catalog.sort_by(|a,b|a.name.cmp(&b.name));
+        }
+        return Task::none();
+    },
+    Action::PluginFinished(result) => {
+        match result { Ok(value) => app.note(value["output"].as_str().unwrap_or_default().to_owned()), Err(error) => app.error(error) }
+        return Task::none();
+    },
+    action => action,
+    };
     let list = items(app);
     if list.is_empty() { return Task::none(); }
     match action {
@@ -184,7 +228,14 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
     let (word, arg) = line.split_once(char::is_whitespace).map_or((line, ""), |(w, a)| (w, a.trim()));
     let word = word.to_lowercase();
     let canonical = COMMANDS.iter().find(|(name, aliases, _, _)| *name == word || aliases.contains(&word.as_str())).map(|c| c.0);
-    let clear = |app: &mut Hermes| { app.composer = text_editor::Content::new(); let _ = app.save_draft(); app.slash = State::default(); };
+    let clear = |app: &mut Hermes| { app.composer = text_editor::Content::new(); let _ = app.save_draft(); app.slash.reset_picker(); };
+    if canonical.is_none() && app.slash.catalog.iter().any(|item| item.name == word) {
+        clear(app);
+        let _ = app.chat_connection();
+        if app.chat.sid.is_some() && app.chat.ready { return Some(plugin_exec(app, word[1..].to_owned(), arg.to_owned())); }
+        app.slash.pending_exec = Some((word[1..].to_owned(), arg.to_owned()));
+        return Some(app.update(Message::NewChat));
+    }
     let task = match canonical {
         Some("/archive" | "/archive-tree") => {
             if arg.is_empty() {
@@ -207,7 +258,7 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
         Some("/stop") => { clear(app); app.update(Message::Stop) }
         Some("/retry") => {
             let Some(last) = app.history.turns.last().map(|t| t.prompt.clone()) else { app.note("Nothing to retry yet."); return Some(Task::none()); };
-            app.composer = text_editor::Content::with_text(&last); app.slash = State::default();
+            app.composer = text_editor::Content::with_text(&last); app.slash.reset_picker();
             app.update(Message::Send)
         }
         Some("/title") => {
@@ -258,12 +309,12 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
         }
         Some("/queue") => {
             if arg.is_empty() { clear(app); app.note("Use /queue <prompt>."); return Some(Task::none()); }
-            app.composer = text_editor::Content::with_text(arg); app.slash = State::default();
+            app.composer = text_editor::Content::with_text(arg); app.slash.reset_picker();
             app.update(Message::QueueCurrent)
         }
         Some("/steer") => {
             if arg.is_empty() { clear(app); app.note("Use /steer <message>."); return Some(Task::none()); }
-            app.composer = text_editor::Content::with_text(arg); app.slash = State::default();
+            app.composer = text_editor::Content::with_text(arg); app.slash.reset_picker();
             app.update(Message::Send)
         }
         Some("/resume") => { clear(app); app.update(Message::OpenCommands) }
@@ -292,7 +343,7 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
             if matches!(canonical, Some("/plan") | Some("/btw") | Some("/learn") | Some("/goal") | Some("/subgoal")) && arg.is_empty() {
                 clear(app); app.note(format!("Use {} <text>.", canonical.unwrap())); return Some(Task::none());
             }
-            app.composer = text_editor::Content::with_text(&instruction); app.slash = State::default();
+            app.composer = text_editor::Content::with_text(&instruction); app.slash.reset_picker();
             app.update(Message::Send)
         }
         Some("/diff") => { clear(app); app.update(Message::Navigate(Screen::Git)) }
@@ -342,9 +393,9 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
             Task::none()
         }
         Some("/help") => {
-            app.composer = text_editor::Content::with_text("/"); app.slash = State::default();
+            app.composer = text_editor::Content::with_text("/"); app.slash.reset_picker();
             app.note("Slash commands: type / to browse them.");
-            iced::widget::operation::focus(super::COMPOSER_ID)
+            Task::batch([refresh(app), iced::widget::operation::focus(super::COMPOSER_ID)])
         }
         _ => {
             // "/<skill> …": send the request with that skill loaded.
@@ -356,7 +407,7 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
                 Some(id) => {
                     let request = if arg.is_empty() { "Follow this skill's instructions.".to_owned() } else { arg.to_owned() };
                     app.composer = text_editor::Content::with_text(&format!("Use the \"{slug}\" skill (call skill_view with name \"catalog:{id}\" first), then: {request}"));
-                    app.slash = State::default();
+                    app.slash.reset_picker();
                     app.update(Message::Send)
                 }
                 None => { app.error(format!("Unknown command {word}. Type / to see what's available.")); Task::none() }

@@ -459,6 +459,7 @@ impl Hermes {
     }
     pub fn gateway_update(&mut self, update: remote::Update) -> Task<Message> {
         use remote::Update;
+        let mut followup = Task::none();
         match update {
             Update::Created(result) => {
                 self.chat.creating = false;
@@ -567,6 +568,7 @@ impl Hermes {
                     }
                 }
                 self.accept_snapshot(history);
+                followup = Task::batch([super::slash::session_ready(self), super::slash::refresh(self)]);
                 self.approvals = snapshot["prompts"]
                     .as_array()
                     .map(|v| v.iter().collect::<Vec<_>>())
@@ -724,6 +726,6 @@ impl Hermes {
                 }
             }
         }
-        Task::none()
+        followup
     }
 }

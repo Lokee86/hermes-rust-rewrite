@@ -894,11 +894,14 @@ impl Hermes {
             }
             Message::Edit(_) if self.reasoning.anchor.is_some()=>return Task::none(),
             Message::Edit(action) => {
+                let was_slash = self.composer.text().trim_start().starts_with('/');
                 let changed = action.is_edit(); self.composer.perform(action);
                 if changed {
                     self.slash.index = 0;
+                    let entered_slash = !was_slash && self.composer.text().trim_start().starts_with('/');
                     self.draft_revision=self.draft_revision.wrapping_add(1);
-                    if !self.draft_save_pending { self.draft_save_pending=true; return self.draft_timer(); }
+                    if !self.draft_save_pending { self.draft_save_pending=true; return Task::batch([self.draft_timer(), if entered_slash { slash::refresh(self) } else { Task::none() }]); }
+                    if entered_slash { return slash::refresh(self); }
                 }
             }
             Message::IntroSize(size) => self.intro_width=size.width,
@@ -1572,6 +1575,7 @@ impl Hermes {
                 self.profile_settings.feedback=None; self.settings_view = view; self.screen = Screen::Provider;
                 if view==settings::View::Safety{return checkpoint_ui::update(self,checkpoint_ui::Action::Refresh);}
                 if view==settings::View::Billing{return billing::update(self,billing::Action::Refresh);}
+                if view==settings::View::Memory{return profile_settings::load_memory_providers(self);}
                 if view==settings::View::Models && self.models.catalog.is_empty() && !self.models.loading && self.ready() {return self.update(Message::Models(models::Action::Refresh));} }
             Message::SettingsSearch(query) => self.settings_query = query,
             Message::SettingsApply => {
