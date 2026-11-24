@@ -518,6 +518,48 @@ def register(ctx):
         live[0].close().await;
     }
 
+    #[tokio::test]
+    async fn a_shared_worker_follows_tool_checks_and_stops_when_its_plugin_is_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let flag = root.path().join("signed-in");
+        shout_plugin(root.path(), "");
+        fs::write(root.path().join("plugins/shout/__init__.py"), format!(r#"
+import os
+def _noisy(args, **_):
+    os.write(1, b"not a protocol frame\n")
+    return os.getcwd()
+def register(ctx):
+    schema = lambda name: {{"name": name, "description": name, "parameters": {{"type": "object"}}}}
+    ctx.register_tool("noisy", "shout", schema("noisy"), _noisy)
+    ctx.register_tool("later", "shout", schema("later"), _noisy, check_fn=lambda: os.path.exists({:?}))
+"#, flag.to_string_lossy())).unwrap();
+        let runtime = PluginRuntime::new(root.path().to_path_buf(), None);
+        let (mut live, errors) = runtime.tool_connections().await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!live[0].contains("mcp_shout__later"));
+        // Output from a child program does not end the plugin, and the worker stays out of the
+        // plugin folder so an update can replace it.
+        let reply = live[0].call("mcp_shout__noisy", &serde_json::json!({})).await.unwrap();
+        let cwd = PathBuf::from(reply["content"][0]["text"].as_str().unwrap()).canonicalize().unwrap();
+        assert_eq!(cwd, root.path().join("plugin-data/shout").canonicalize().unwrap());
+        fs::write(&flag, "").unwrap();
+        let (mut live, _) = runtime.tool_connections().await;
+        assert!(live[0].contains("mcp_shout__later"), "{:?}", live[0].specs());
+
+        // An unreadable index is not an uninstall.
+        let saved = fs::read(index(root.path())).unwrap();
+        fs::write(index(root.path()), "{").unwrap();
+        runtime.retire_stale().await;
+        assert!(live[0].call("mcp_shout__noisy", &serde_json::json!({})).await.is_ok());
+        fs::write(index(root.path()), saved).unwrap();
+
+        set_enabled(root.path(), "shout", false).unwrap();
+        runtime.retire_stale().await;
+        assert!(live[0].call("mcp_shout__noisy", &serde_json::json!({})).await.is_err());
+        uninstall(root.path(), "shout").unwrap();
+        assert!(!root.path().join("plugins/shout").exists());
+    }
+
     /// Network (PyPI): `cargo test -- --ignored python_dependencies_install`
     #[test] #[ignore]
     fn python_dependencies_install_into_the_plugin_data_folder() {

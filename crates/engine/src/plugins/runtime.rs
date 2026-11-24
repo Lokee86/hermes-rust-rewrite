@@ -41,7 +41,7 @@ pub struct PluginStatus {
     pub handle: Option<PythonPlugin>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 struct Registration {
     #[serde(default)]
     commands: Vec<PluginCommand>,
@@ -102,6 +102,22 @@ struct Activation {
 struct Running {
     worker: Worker,
     connection: Mcp,
+    described: Mutex<Option<Registration>>,
+}
+
+impl Running {
+    /// A worker that is busy in a callback keeps its last known registrations.
+    async fn describe(&self) -> Result<Registration> {
+        let request = self.worker.request("hermes/describe", json!({}));
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(reply) => {
+                let registration: Registration = serde_json::from_value(reply?).context("Invalid plugin registration")?;
+                *self.described.lock().await = Some(registration.clone());
+                Ok(registration)
+            }
+            Err(_) => self.described.lock().await.clone().context("The plugin is busy"),
+        }
+    }
 }
 
 struct Candidate {
@@ -125,16 +141,19 @@ impl PluginRuntime {
 
     async fn reconcile(&self) -> Vec<Candidate> {
         let mut active = self.active.lock().await;
-        let selected = ProfileSettings::load(&self.root).ok().and_then(|settings| {
-            match settings.memory_provider {
-                MemoryProvider::Plugin(id) => Some(id),
-                _ => None,
-            }
-        });
+        // A file that cannot be read right now says nothing about what is installed. Keep the
+        // running plugins instead of ending their sessions.
+        let (Ok(listed), Ok(settings)) = (installed(&self.root), ProfileSettings::load(&self.root)) else {
+            return Vec::new();
+        };
+        let selected = match settings.memory_provider {
+            MemoryProvider::Plugin(id) => Some(id),
+            _ => None,
+        };
         let mut present = BTreeSet::new();
         let mut retired = Vec::new();
         let mut candidates = Vec::new();
-        for installed in installed(&self.root).unwrap_or_default() {
+        for installed in listed {
             if !valid_name(&installed.name) || !installed.servers.iter().any(|kind| kind == "python") {
                 continue;
             }
@@ -187,6 +206,13 @@ impl PluginRuntime {
         candidates
     }
 
+    /// Stop the workers of plugins that were disabled, replaced or removed.
+    pub async fn retire_stale(&self) {
+        if !self.active.lock().await.is_empty() {
+            self.reconcile().await;
+        }
+    }
+
     pub async fn is_current(&self, plugin: &PythonPlugin) -> bool {
         self.reconcile().await.iter().any(|candidate| {
             candidate.activation.as_ref().is_some_and(|slot| Arc::ptr_eq(slot, &plugin.0))
@@ -211,8 +237,7 @@ impl PluginRuntime {
             if let Some(slot) = candidate.activation {
                 let result = async {
                     let running = slot.open(self).await?;
-                    let registration = running.worker.request("hermes/describe", json!({})).await?;
-                    serde_json::from_value::<Registration>(registration).context("Invalid plugin registration")
+                    running.describe().await
                 }.await;
                 match result {
                     Ok(registration) => {
@@ -235,7 +260,7 @@ impl PluginRuntime {
             let Some(slot) = candidate.activation else { continue };
             match slot.open(self).await {
                 Ok(running) => {
-                    if let Some(connection) = running.connection.plugin_view() {
+                    if let Some(connection) = running.connection.plugin_view().await {
                         live.push(connection);
                     }
                 }
@@ -284,6 +309,7 @@ impl Activation {
         let path = python_host().context("The bundled Python host is unavailable")?;
         let plugin = dir(&runtime.root).join(&self.id);
         let data = runtime.root.join("plugin-data").join(&self.id);
+        fs::create_dir_all(&data)?;
         let mut env = self.key.env.clone();
         env.extend([
             ("PLUGIN_ROOT".into(), plugin.to_string_lossy().into_owned()),
@@ -298,14 +324,16 @@ impl Activation {
             command: path.to_string_lossy().into_owned(),
             args: vec!["serve".into(), plugin.to_string_lossy().into_owned(), data.join(PACKAGES).to_string_lossy().into_owned()],
             env,
-            cwd: plugin,
+            // Windows cannot replace or remove a folder that a running process works in, and
+            // this worker outlives the turn: updating the plugin must be able to.
+            cwd: data,
         }, runtime.root.clone(), runtime.chat.clone())?;
         let connection = Mcp::connect_plugin(worker.clone(), &prefix(&self.id)).await?;
         if !self.active.load(Ordering::Acquire) {
             worker.stop();
             anyhow::bail!("Plugin activation has ended");
         }
-        Ok(Running { worker, connection })
+        Ok(Running { worker, connection, described: Mutex::new(None) })
     }
 
     fn revoke(&self) {

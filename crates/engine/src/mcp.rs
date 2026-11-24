@@ -60,16 +60,22 @@ impl Mcp {
         }.handshake().await
     }
 
-    pub(crate) fn plugin_view(&self) -> Option<Self> {
+    /// This turn's view of a shared plugin worker. Tools are listed again because a plugin's
+    /// `check_fn` can change between turns; a busy worker keeps its last known list.
+    pub(crate) async fn plugin_view(&self) -> Option<Self> {
         let Transport::Plugin(worker) = &self.transport else { return None };
-        Some(Self {
+        let mut view = Self {
             transport: Transport::Plugin(worker.clone()),
             version: self.version.clone(),
             next_id: 0,
-            tools: self.tools.clone(),
+            tools: BTreeMap::new(),
             prefix: self.prefix.clone(),
             hooks: self.hooks.clone(),
-        })
+        };
+        if !matches!(tokio::time::timeout(Duration::from_secs(5), view.list_tools()).await, Ok(Ok(()))) {
+            view.tools = self.tools.clone();
+        }
+        Some(view)
     }
 
     async fn handshake(mut self) -> Result<Self> {
@@ -80,6 +86,11 @@ impl Mcp {
         self.version = protocol.to_owned();
         self.hooks = hello.pointer("/capabilities/experimental/hermes/hooks").and_then(Value::as_array).map(|h| h.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         self.notify(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await?;
+        self.list_tools().await?;
+        Ok(self)
+    }
+
+    async fn list_tools(&mut self) -> Result<()> {
         let mut cursor = None;
         let mut seen_cursors = std::collections::HashSet::<String>::new();
         loop {
@@ -99,7 +110,7 @@ impl Mcp {
                 ensure!(seen_cursors.len() < 32 && seen_cursors.insert(c.clone()), "Invalid MCP pagination");
             } else { break; }
         }
-        Ok(self)
+        Ok(())
     }
 
     fn http(&self, body: Value) -> Option<reqwest::RequestBuilder> {

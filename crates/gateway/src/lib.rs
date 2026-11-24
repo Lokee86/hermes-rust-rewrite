@@ -1553,6 +1553,8 @@ impl Shared {
             biased;
             _ = cancel.cancelled() => None,
             memory = self.prepare_python_memory(&session, &admission) => memory,
+            // The provider may be busy in another chat. Run this turn without recall.
+            _ = tokio::time::sleep(Duration::from_secs(60)) => None,
         };
         let mut engine = session.engine.lock().await;
         let initial_count = engine.history().turns.len();
