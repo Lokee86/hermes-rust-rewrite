@@ -107,6 +107,9 @@ pub(super) struct PythonSlot {
     terminal: StdMutex<BTreeSet<String>>,
     fence_files: StdMutex<()>,
     provider_failure: StdMutex<Option<(PythonSelection, String)>>,
+    delivery_warning: StdMutex<Option<PythonSelection>>,
+    recovery: StdMutex<Option<Result<(), String>>>,
+    recovered: tokio::sync::Notify,
     task: Mutex<Option<JoinHandle<()>>>,
     wake: tokio::sync::Notify,
 }
@@ -119,6 +122,19 @@ impl PythonSlot {
             .entry(id.into())
             .or_default()
             .clone()
+    }
+
+    async fn wait_for_recovery(&self, shutdown: &CancellationToken) -> bool {
+        loop {
+            let ready = self.recovered.notified();
+            if let Some(recovery) = lock(&self.recovery).as_ref() {
+                return recovery.is_ok();
+            }
+            tokio::select! {
+                _ = ready => {},
+                _ = shutdown.cancelled() => return false,
+            }
+        }
     }
 }
 
@@ -196,6 +212,13 @@ impl Shared {
 
         let failure = lock(&self.python_memory.provider_failure).clone();
         let configured = PythonSelection::configured(&settings);
+        let warning = configured.as_ref().is_some_and(|selection| {
+            lock(&self.python_memory.delivery_warning).as_ref() == Some(selection)
+        });
+        let recovery_error = lock(&self.python_memory.recovery)
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned();
         let mut selected_ready = false;
         for plugin in self.plugins.inventory().await {
             let id = MemoryProvider::Plugin(plugin.id).as_id().into_owned();
@@ -206,17 +229,24 @@ impl Shared {
                 .as_ref()
                 .filter(|(pin, _)| id == selected && Some(pin) == configured.as_ref());
             let available = plugin.provider.is_some()
-                && plugin.handle.is_some()
                 && plugin.issue.is_none()
-                && failed.is_none();
+                && failed.is_none()
+                && recovery_error.is_none();
             let label = plugin.provider.unwrap_or(plugin.title);
-            selected_ready |= id == selected && available;
+            // An installed exclusive provider can be chosen before it runs.
+            selected_ready |= id == selected && available && plugin.handle.is_some();
             if available {
-                providers.push(json!({"id":id,"label":label,"status":"available"}));
+                let mut option = json!({"id":id,"label":label,"status":"available"});
+                if id == selected && warning {
+                    option["reason"] =
+                        json!("A committed memory handoff has an uncertain outcome.");
+                }
+                providers.push(option);
             } else {
                 let reason = failed
                     .map(|(_, reason)| reason.clone())
                     .or(plugin.issue)
+                    .or_else(|| recovery_error.clone())
                     .unwrap_or_else(|| "Plugin did not register a memory provider".into());
                 providers
                     .push(json!({"id":id,"label":label,"status":"unavailable","reason":reason}));
@@ -333,6 +363,9 @@ impl Shared {
         let selection = admission.python_selection.as_ref()?;
         let id = lock(&session.summary).id.clone();
         if self.configured_python().as_ref() != Some(selection) || self.python_source_ended(&id) {
+            return None;
+        }
+        if !self.python_memory.wait_for_recovery(&self.shutdown).await {
             return None;
         }
         let lane = self.python_memory.session(&id).await;
@@ -562,6 +595,9 @@ impl Shared {
                     PythonDelivery::Uncertain,
                 )
                 .await?;
+                if let Some(selection) = &receipt.python_selection {
+                    *lock(&self.python_memory.delivery_warning) = Some(selection.clone());
+                }
                 continue;
             }
             let selection = receipt
@@ -675,6 +711,7 @@ impl Shared {
             )
             .await?;
             if let Err(error) = result {
+                *lock(&self.python_memory.delivery_warning) = Some(selection.clone());
                 eprintln!(
                     "Python memory handoff {id}/{} has uncertain delivery: {error:#}",
                     receipt.id
@@ -695,14 +732,20 @@ impl Shared {
 
     pub(super) async fn start_python_memory(self: &Arc<Self>) {
         let owner = self.clone();
-        match tokio::task::spawn_blocking(move || owner.recover_python_work()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("Could not recover Python memory tasks: {error:#}"),
-            Err(error) => eprintln!("Python memory recovery worker stopped: {error}"),
-        }
-        let owner = self.clone();
         *self.python_memory.task.lock().await = Some(tokio::spawn(async move {
-            owner.run_python_memory().await;
+            let recovery = owner.clone();
+            let result = tokio::task::spawn_blocking(move || recovery.recover_python_work()).await;
+            let ready = matches!(result, Ok(Ok(())));
+            *lock(&owner.python_memory.recovery) = Some(if ready {
+                Ok(())
+            } else {
+                eprintln!("Could not recover Python memory tasks: {result:?}");
+                Err("Committed Python memory work could not be recovered.".into())
+            });
+            owner.python_memory.recovered.notify_waiters();
+            if ready {
+                owner.run_python_memory().await;
+            }
         }));
     }
 
@@ -760,6 +803,7 @@ impl Shared {
 
     fn recover_python_work(&self) -> Result<()> {
         let summaries = self.library.authority_sessions()?;
+        let configured = self.configured_python();
         let existing = summaries
             .iter()
             .map(|summary| summary.id.clone())
@@ -772,6 +816,16 @@ impl Shared {
             let Ok(record) = serde_json::from_reader::<_, CommittedRecord>(file) else {
                 continue;
             };
+            if let Some(selection) = &configured
+                && record.authority.as_ref().is_some_and(|authority| {
+                    authority.receipts.iter().any(|receipt| {
+                        receipt.python_selection.as_ref() == Some(selection)
+                            && receipt.python_delivery == Some(PythonDelivery::Uncertain)
+                    })
+                })
+            {
+                *lock(&self.python_memory.delivery_warning) = Some(selection.clone());
+            }
             if summary.archived
                 && record.authority.as_ref().is_some_and(|authority| {
                     authority

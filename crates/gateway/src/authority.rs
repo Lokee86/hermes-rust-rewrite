@@ -55,6 +55,9 @@ impl Receipt {
             "authority_epoch":epoch,"execution_generation":self.generation});
         if include_result {
             result["result"] = json!(self.result);
+            if let Some(delivery) = self.python_delivery {
+                result["memory_delivery"] = json!(delivery);
+            }
         }
         result
     }
