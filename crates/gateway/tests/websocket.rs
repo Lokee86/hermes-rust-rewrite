@@ -102,7 +102,11 @@ impl Client {
                 .await
                 .unwrap_or_else(|_| {
                     let observed: Vec<_> = self.events.iter().rev().take(8)
-                        .map(|event| (&event["type"], &event["payload"]["status"])).collect();
+                        .map(|event| (&event["type"], if event["type"] == "error" {
+                            &event["payload"]
+                        } else {
+                            &event["payload"]["status"]
+                        })).collect();
                     panic!("gateway timed out waiting for {waiting_for} after RPC {}. Recent events: {observed:?}", self.id)
                 })
                 .expect("gateway closed")
