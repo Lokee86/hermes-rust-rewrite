@@ -329,3 +329,103 @@ async fn provider_recalls_committed_context_and_switches_without_crossing_revisi
     gateway.shutdown().await.unwrap();
     model.abort();
 }
+
+#[tokio::test]
+async fn restart_delivers_a_committed_pending_handoff_once() {
+    let home = TempDir::new().unwrap();
+    install_provider(home.path());
+    ProfileSettings::update(
+        home.path(),
+        json!({"approval_mode":"off","mcp_tools":false,"memory_provider":"off"})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fixture = ModelFixture::default();
+    let config = Config {
+        base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+        model: "fixture-model".into(),
+        api_key: String::new(),
+    };
+    let router = Router::new()
+        .route("/v1/chat/completions", post(reply))
+        .with_state(fixture.clone());
+    let model = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let gateway = Gateway::start(GatewayConfig::new(home.path(), config.clone()))
+        .await
+        .unwrap();
+    let (owner, mut events) = peer();
+    let choice = format!("plugin:{FIXTURE_ID}");
+    call(
+        &gateway.shared,
+        &owner,
+        "memory.provider.set",
+        json!({"provider":choice}),
+    )
+    .await;
+    let id = create(&gateway.shared, &owner).await;
+    send_prompt(
+        &gateway.shared,
+        &owner,
+        &id,
+        "Pause until the provider changes.",
+    )
+    .await;
+    timeout(Duration::from_secs(10), fixture.waiting.notified())
+        .await
+        .unwrap();
+
+    // Provider preparation has finished. Hold only its dispatch lane while the
+    // turn commits so shutdown leaves a real Pending receipt for recovery.
+    let lane = gateway.shared.python_memory.session(&id).await;
+    let guard = lane.lock().await;
+    fixture.release.notify_one();
+    completed(&mut events).await;
+    let admission_id = {
+        let session = gateway.shared.session(&id).await.unwrap();
+        let view = lock(&session.view);
+        let receipt = view.authority.receipts.back().unwrap();
+        assert_eq!(receipt.python_delivery, Some(PythonDelivery::Pending));
+        receipt.id.clone()
+    };
+    gateway.shared.shutdown.cancel();
+    drop(guard);
+    gateway.shutdown().await.unwrap();
+    assert!(handoffs(home.path()).is_empty());
+
+    let gateway = Gateway::start(GatewayConfig::new(home.path(), config))
+        .await
+        .unwrap();
+    let (owner, _events) = peer();
+    call(
+        &gateway.shared,
+        &owner,
+        "session.resume",
+        json!({"session_id":id}),
+    )
+    .await;
+    let received = wait_for_handoffs(home.path(), 1).await;
+    assert_eq!(received[0]["session"], id);
+    let limit = Instant::now() + Duration::from_secs(15);
+    loop {
+        let receipt = call(
+            &gateway.shared,
+            &owner,
+            "prompt.receipt",
+            json!({"session_id":id,"admission_id":admission_id,"include_result":true}),
+        )
+        .await;
+        if receipt["memory_delivery"] == "acknowledged" {
+            break;
+        }
+        assert!(
+            Instant::now() < limit,
+            "handoff was never acknowledged: {receipt}"
+        );
+        sleep(Duration::from_millis(15)).await;
+    }
+    gateway.shutdown().await.unwrap();
+    assert_eq!(handoffs(home.path()).len(), 1);
+    model.abort();
+}
