@@ -90,6 +90,11 @@ jobs:
         run: ./scripts/package-windows.ps1
       - if: runner.os == 'macOS'
         run: scripts/package-macos.sh && ditto -c -k --sequesterRsrc --keepParent dist/Hermes.app dist/Hermes-macOS.zip
+      - name: Verify release license and source notices
+        shell: bash
+        run: |
+          shopt -s nullglob
+          python scripts/reliquary-notices.py verify dist/*.zip dist/*.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Hermes-${{ runner.os }}

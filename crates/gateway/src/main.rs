@@ -1,5 +1,5 @@
 fn main() -> anyhow::Result<()> {
-    if let Some(code) = hermes_engine::herdr::dispatch_role() { std::process::exit(code); }
+    if let Some(code) = hermes_gateway::owner::dispatch_role() { std::process::exit(code); }
     tokio::runtime::Runtime::new()?.block_on(run())
 }
 

@@ -104,7 +104,7 @@ fn group_prompt(prompt: &str) -> (&str, Option<&str>) {
 }
 
 fn main() -> iced::Result {
-    if let Some(code) = hermes_engine::herdr::dispatch_role() { std::process::exit(code); }
+    if let Some(code) = hermes_gateway::owner::dispatch_role() { std::process::exit(code); }
     // Owner processes must reach their entry point before Iced creates a window.
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "gateway") {
         let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from)

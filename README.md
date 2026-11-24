@@ -14,6 +14,8 @@ This is an independent community project, not an official Nous Research release.
 
 Every build comes from [the CI workflow](.github/workflows/build.yml), which runs the test suite on all three platforms first. No build is notarized or signed with a developer certificate. On macOS, the first time you open the app, right-click it and choose **Open**. On Linux, install WebKitGTK 4.1 and GTK 3 from your distribution.
 
+Packages built from this revision embed [Reliquary](https://github.com/Lokee86/Reliquary) for native profile memory. Reliquary is MPL-2.0 software. Each package includes its exact source revision, source-archive link and license links in `Reliquary-NOTICE` (under `Notices`, the macOS app's `Contents/Resources/Notices`, or Linux's `share/licenses/hermes`). The corresponding source for the pinned revision is also available directly from [GitHub](https://github.com/Lokee86/Reliquary/tree/a428108e69b4b119adabd3311f10ba47ca1e5830).
+
 ## Rust vs Electron benchmark
 
 The same machine, the same source baseline, and a returning user in both cases (each app's data folder was isolated and already set up).
@@ -132,4 +134,4 @@ The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh`
 
 ## License
 
-MIT; see [LICENSE](LICENSE). The app is derived from Hermes Agent by Nous Research, also MIT. Its notice is in [LICENSE-HERMES-AGENT](LICENSE-HERMES-AGENT). The Hermes name, wordmark and icon belong to Nous Research.
+MIT; see [LICENSE](LICENSE). The app is derived from Hermes Agent by Nous Research, also MIT. Its notice is in [LICENSE-HERMES-AGENT](LICENSE-HERMES-AGENT). Official binaries embed MPL-2.0 Reliquary; see [RELIQUARY-NOTICE](RELIQUARY-NOTICE) for the pinned source and license. The Hermes name, wordmark and icon belong to Nous Research.

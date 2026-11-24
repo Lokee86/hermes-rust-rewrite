@@ -32,7 +32,10 @@ try {
     $reported = & (Join-Path $root "hermes-python-host.exe") --version
     if ($LASTEXITCODE -ne 0 -or $reported -notmatch '\\Hermes\\python$') { throw "hermes-python-host does not run the bundled Python: $reported" }
     Copy-Item "assets/icon.ico" "$root/Hermes.ico"
-    Copy-Item "LICENSE-HERMES-AGENT" "$root/Notices/Hermes-LICENSE"
+    & $env:PYO3_PYTHON "scripts/reliquary-notices.py" stage "$root/Notices"
+    if ($LASTEXITCODE -ne 0) { throw "Could not stage locked upstream licenses ($LASTEXITCODE)" }
+    $licenses = (& "$root/Hermes.exe" --licenses 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $licenses -notmatch 'https://github\.com/Lokee86/Reliquary/archive/') { throw "Packaged Hermes.exe does not report embedded Reliquary" }
     Get-ChildItem "crates/desktop/assets/fonts" -File | Where-Object { $_.Name -match '(NOTICE|LICENSE).*\.txt$' } | Copy-Item -Destination "$root/Notices"
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = Join-Path $stage "Hermes.zip"

@@ -8,7 +8,7 @@ mod transport;
 mod transport;
 use crate::{Shared, client::GatewayClient};
 use anyhow::{Context, Result, bail, ensure};
-pub use cli::serve;
+pub use cli::{dispatch_role, serve};
 use hermes_engine::Config;
 use serde_json::{Value, json};
 use std::{
