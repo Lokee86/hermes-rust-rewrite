@@ -19,7 +19,6 @@ impl Shared {
         if !admission.ordinary_chat
             || admission.turn_index != Some(index)
             || profile_memory::source_ended(&session.dir)
-            || !self.native_memory_available()
         {
             return None;
         }
@@ -66,12 +65,12 @@ impl Shared {
             tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => break,
-                _ = self.memory_wake.notified() => {},
-                _ = interval.tick(), if lock(&self.memory).is_some() => {},
+                _ = self.memory.wake.notified() => {},
+                _ = interval.tick(), if self.memory.active() => {},
             }
             let owner = self.clone();
             let summaries = match tokio::task::spawn_blocking(move || -> Result<_> {
-                if !owner.native_memory_available() {
+                if owner.memory.with_selected(|_| ()).is_none() {
                     return Ok(Vec::new());
                 }
                 let mut summaries = owner.library.sessions(None)?;
@@ -79,7 +78,9 @@ impl Shared {
                 for summary in &mut summaries {
                     summary.archived |= profile_memory::source_ended(&summary.directory);
                 }
-                let _ = owner.with_selected_memory(|memory| memory.reconcile_tombstones(&summaries));
+                let _ = owner
+                    .memory
+                    .with_selected(|memory| memory.reconcile_tombstones(&summaries));
                 Ok(summaries)
             })
             .await
@@ -88,7 +89,7 @@ impl Shared {
                 _ => continue,
             };
             for summary in summaries {
-                if self.shutdown.is_cancelled() || lock(&self.memory).is_none() {
+                if self.shutdown.is_cancelled() || !self.memory.active() {
                     break;
                 }
                 let config = self
@@ -110,7 +111,8 @@ impl Shared {
                         return Ok(None);
                     };
                     Ok(owner
-                        .with_selected_memory(|memory| {
+                        .memory
+                        .with_selected(|memory| {
                             stage_next(memory, &summary, &record.history, authority, &config)
                         })
                         .transpose()?
@@ -154,10 +156,8 @@ impl Shared {
                 }
             }
         }
-        let memory = lock(&self.memory).take();
-        if let Some(memory) = memory {
-            let _ = tokio::task::spawn_blocking(move || memory.stop_processing()).await;
-        }
+        let slot = self.memory.clone();
+        let _ = tokio::task::spawn_blocking(move || slot.shutdown()).await;
     }
 }
 

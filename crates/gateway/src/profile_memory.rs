@@ -27,7 +27,8 @@ impl Shared {
             }
             #[cfg(feature = "reliquary")]
             shared
-                .with_selected_memory(|memory| memory.terminal_source(&session_id))
+                .memory
+                .with_selected(|memory| memory.terminal_source(&session_id))
                 .transpose()?;
             Ok(())
         })
@@ -35,32 +36,56 @@ impl Shared {
     }
 }
 
+/// Profile-owned native handles can mount files, stop and join processing jobs.
 #[cfg(feature = "reliquary")]
-impl Shared {
-    /// Serialize a native operation against deselection, including cancellation of
-    /// active processing jobs. Explicit alternative providers never open a REL.
-    pub(super) fn with_selected_memory<T>(
+pub(super) struct NativeSlot {
+    home: PathBuf,
+    profile_name: String,
+    mounted: StdMutex<Option<Arc<reliquary::EmbeddedMemory>>>,
+    active: std::sync::atomic::AtomicBool,
+    pub(super) wake: tokio::sync::Notify,
+}
+
+#[cfg(feature = "reliquary")]
+impl NativeSlot {
+    pub(super) fn new(home: &Path, profile: &str) -> Arc<Self> {
+        Arc::new(Self {
+            home: home.to_owned(),
+            profile_name: profile.to_owned(),
+            mounted: StdMutex::new(None),
+            active: false.into(),
+            wake: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Always run on the blocking pool. Joins can wait for hosted model calls.
+    pub(super) fn with_selected<T>(
         &self,
         operation: impl FnOnce(&Arc<reliquary::EmbeddedMemory>) -> T,
     ) -> Option<T> {
         use hermes_engine::settings::{MemoryProvider, ProfileSettings};
-        let mut mounted = lock(&self.memory);
-        let configured =
-            ProfileSettings::load(self.library.root()).map(|settings| settings.memory_provider);
+        let mut mounted = lock(&self.mounted);
+        let configured = ProfileSettings::load(&self.home).map(|settings| settings.memory_provider);
         if !matches!(
             configured,
             Ok(MemoryProvider::Auto | MemoryProvider::Reliquary)
         ) {
             if let Some(previous) = mounted.take() {
+                self.active.store(false, Ordering::Release);
                 previous.stop_processing();
             }
             return None;
         }
         if mounted.is_none() {
-            match reliquary::EmbeddedMemory::open(self.library.root(), &self.profile_name) {
+            match reliquary::EmbeddedMemory::open(&self.home, &self.profile_name) {
                 Ok(Some(memory)) => {
                     *mounted = Some(Arc::new(memory));
-                    self.memory_wake.notify_one();
+                    self.active.store(true, Ordering::Release);
+                    self.wake.notify_one();
                 }
                 Ok(None) => return None,
                 Err(error) => {
@@ -72,18 +97,50 @@ impl Shared {
         mounted.as_ref().map(operation)
     }
 
-    pub(super) fn native_memory_available(&self) -> bool {
-        self.with_selected_memory(|_| ()).is_some()
+    pub(super) fn shutdown(&self) {
+        self.active.store(false, Ordering::Release);
+        if let Some(memory) = lock(&self.mounted).take() {
+            memory.stop_processing();
+        }
     }
+}
 
-    pub(super) fn new_memory_binding(&self, summary: &SessionSummary) -> Option<CaptureBinding> {
-        self.with_selected_memory(|memory| memory.binding_for_new_session(summary))
-            .flatten()
+#[derive(Default)]
+pub(super) struct Selected {
+    #[cfg(feature = "reliquary")]
+    native: Option<Arc<reliquary::EmbeddedMemory>>,
+}
+
+impl Shared {
+    pub(super) async fn selected_memory(&self) -> Selected {
+        #[cfg(feature = "reliquary")]
+        {
+            let slot = self.memory.clone();
+            let native = tokio::task::spawn_blocking(move || slot.with_selected(Arc::clone))
+                .await
+                .ok()
+                .flatten();
+            Selected { native }
+        }
+        #[cfg(not(feature = "reliquary"))]
+        {
+            Selected::default()
+        }
     }
+}
 
-    pub(super) fn configure_turn_memory(
+#[cfg(feature = "reliquary")]
+impl Selected {
+    pub(super) fn native(&self) -> bool {
+        self.native.is_some()
+    }
+    pub(super) fn binding(&self, summary: &SessionSummary) -> Option<CaptureBinding> {
+        self.native.as_ref()?.binding_for_new_session(summary)
+    }
+    pub(super) fn configure_turn(
         &self,
         target: &mut Session,
+        library: &Library,
         session: &LiveSession,
         admission: &mut Receipt,
     ) {
@@ -92,8 +149,9 @@ impl Shared {
             target.set_native_memory(false, None);
             return;
         }
-        let binding = lock(&session.settings).memory_binding.clone();
-        let available = self.with_selected_memory(|memory| {
+        // Require consent both when the client submits and when its turn runs.
+        admission.ordinary_chat &= self.native();
+        let query = self.native.as_ref().and_then(|memory| {
             if !admission.ordinary_chat
                 || summary.archived
                 || source_ended(&session.dir)
@@ -102,33 +160,32 @@ impl Shared {
             {
                 return None;
             }
+            let binding = lock(&session.settings).memory_binding.clone()?;
             let query = reliquary_query::GatewayMemoryQuery::new(
                 memory.clone(),
-                self.library.clone(),
-                binding?,
-                summary.id.clone(),
+                library.clone(),
+                binding,
+                summary.id,
                 admission.id.clone(),
             );
             Some(Arc::new(query) as Arc<dyn hermes_engine::native_memory::MemoryQuery>)
         });
-        // A queued turn must be eligible at both admission and execution. This
-        // in-memory snapshot also fences a switch back before the active turn commits.
-        admission.ordinary_chat &= available.is_some();
-        target.set_native_memory(available.is_some(), available.flatten());
+        target.set_native_memory(self.native(), query);
     }
 }
 
 #[cfg(not(feature = "reliquary"))]
-impl Shared {
-    pub(super) fn native_memory_available(&self) -> bool {
+impl Selected {
+    pub(super) fn native(&self) -> bool {
         false
     }
-    pub(super) fn new_memory_binding(&self, _: &SessionSummary) -> Option<CaptureBinding> {
+    pub(super) fn binding(&self, _: &SessionSummary) -> Option<CaptureBinding> {
         None
     }
-    pub(super) fn configure_turn_memory(
+    pub(super) fn configure_turn(
         &self,
         target: &mut Session,
+        _: &Library,
         _: &LiveSession,
         _: &mut Receipt,
     ) {

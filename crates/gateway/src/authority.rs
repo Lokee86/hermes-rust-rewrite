@@ -388,6 +388,9 @@ impl Shared {
         let sid = summary.id.clone();
         let config = lock(&session.config).clone();
         let options = lock(&session.settings).generation_options.clone();
+        let bound = lock(&session.settings).memory_binding.is_some();
+        let ordinary_chat = matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none()
+            && bound && self.selected_memory().await.native();
         let mut candidate = Receipt {
             id: new_id(),
             input_id: input,
@@ -406,8 +409,7 @@ impl Shared {
             admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
             // Freeze consent at submission, including queued turns that run after a switch.
-            ordinary_chat: matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none()
-                && lock(&session.settings).memory_binding.is_some() && self.native_memory_available(),
+            ordinary_chat,
             capture: None,
             group: None,
         };

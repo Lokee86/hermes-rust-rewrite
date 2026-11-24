@@ -217,11 +217,9 @@ impl Gateway {
             _owner_lock: owner_lock,
             authority_epoch,
             profile_id,
+            #[cfg(feature = "reliquary")]
+            memory: profile_memory::NativeSlot::new(library.root(), &profile_name),
             profile_name,
-            #[cfg(feature = "reliquary")]
-            memory: StdMutex::new(None),
-            #[cfg(feature = "reliquary")]
-            memory_wake: tokio::sync::Notify::new(),
             #[cfg(feature = "reliquary")]
             memory_task: Mutex::new(None),
             library,
@@ -253,7 +251,7 @@ impl Gateway {
         {
             let owner = shared.clone();
             *shared.memory_task.lock().await = Some(tokio::spawn(owner.run_memory_capture()));
-            shared.native_memory_available();
+            shared.selected_memory().await;
         }
         let router = Router::new()
             .route("/health", get(health))
@@ -332,9 +330,7 @@ struct Shared {
     profile_id: String,
     profile_name: String,
     #[cfg(feature = "reliquary")]
-    memory: StdMutex<Option<Arc<reliquary::EmbeddedMemory>>>,
-    #[cfg(feature = "reliquary")]
-    memory_wake: tokio::sync::Notify,
+    memory: Arc<profile_memory::NativeSlot>,
     #[cfg(feature = "reliquary")]
     memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
@@ -548,7 +544,7 @@ impl Shared {
         let engine = if settings.source == "scheduled" {
             Session::open_scheduled(&dir, &actual_workspace, &profile)
         } else {
-            let enrolled = profile == self.library.root() && self.native_memory_available();
+            let enrolled = profile == self.library.root() && self.selected_memory().await.native();
             Session::open_for_profile_with_enrollment(&dir, workspace.as_deref(), &profile, enrolled)
         };
         let mut engine = engine.map_err(|e| {
@@ -1048,6 +1044,7 @@ impl Shared {
                 creation_fingerprint: Some(fingerprint.clone()), metadata_revision: 0,
                 execution_generation: 0, generation_options: options, memory_binding: None, shell_policy: None,
             };
+            let selected_memory = self.selected_memory().await;
             let local_backend = (peer.local_native && matches!(source, "cli" | "tui" | "gui"))
                 .then(|| shell_exec::backend(self.library.root()));
             let summary = self.library.create_initialized_session_with_workspace(project, Some(title), key.as_deref(), |summary, project_workspace| {
@@ -1057,7 +1054,7 @@ impl Shared {
                         "Creation identity was previously used with different options");
                 } else {
                     if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
-                        prepared.memory_binding = self.new_memory_binding(summary);
+                        prepared.memory_binding = selected_memory.binding(summary);
                     }
                     if let Some(backend) = local_backend {
                         let cwd = project_workspace.map(Path::to_owned)
@@ -1545,7 +1542,7 @@ impl Shared {
                 Some(member) if member.first => format!("{}\u{2063}{}\u{2063}\n\n(Group chat \"{}\": you are {}. Reply in your own voice; the other members answer after you.)", admission.text, member.display, member.title, member.display),
                 _ => admission.text.clone(),
             };
-            self.configure_turn_memory(target, &session, &mut admission);
+            self.selected_memory().await.configure_turn(target, &self.library, &session, &mut admission);
             let result = {
                 let future = target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone());
                 tokio::pin!(future);
@@ -1596,7 +1593,9 @@ impl Shared {
         let payload =
             json!({"text":text,"status":status,"error":error,"partial":status!="complete"});
         #[cfg(feature = "reliquary")]
-        let capture = self.pending_memory_capture(&session, &admission, initial_count, &history);
+        let capture = if admission.ordinary_chat && self.selected_memory().await.native() {
+            self.pending_memory_capture(&session, &admission, initial_count, &history)
+        } else { None };
         #[cfg(not(feature = "reliquary"))]
         let capture = None;
         #[cfg(feature = "reliquary")]
@@ -1647,7 +1646,7 @@ impl Shared {
             view.current_admission = None;
         }
         #[cfg(feature = "reliquary")]
-        if has_capture { self.memory_wake.notify_one(); }
+        if has_capture { self.memory.wake.notify_one(); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,
             Err(error)=>self.emit(&session,"error",json!({"message":format!("Conversation saved, but catalog update failed: {error:#}")})),
