@@ -108,7 +108,7 @@ Choose a provider in Desktop under **Settings → Memory & Context**, or set `me
 
 | Setting | Behavior |
 | --- | --- |
-| `auto` (default) | Enroll the profile and use the Reliquary stock plugin. Builds without Reliquary use the profile's Markdown notes. |
+| `auto` (default) | Use the Reliquary stock plugin when the profile is already enrolled. Otherwise, use the profile's existing Markdown notes. Automatic never enrolls a profile. |
 | `reliquary` | Enroll the profile and use its Reliquary owners for capture and agent-requested queries. Requires a build with the `reliquary` feature. |
 | `notes` | Use Hermes' existing `MEMORY.md`, `USER.md`, and `memory` tool. The agent and user note controls apply independently. |
 | `external` | Expose the designated external provider's MCP tools to the agent. Configure the HTTP MCP endpoint under **Capabilities → Connectors**, select **Use as external memory provider**, and enable memory and MCP tools. The provider defines its tools and storage behavior. |
@@ -118,11 +118,11 @@ Gateway and Desktop include the Reliquary stock plugin by default. Desktop lists
 
 ### Reliquary enrollment and capture
 
-**Automatic** and **Reliquary** enroll a private PHY named for the profile and `general.rel` in `reliquary/<profile>/` beside the installation. Each project has a named REL under that profile's `projects/` folder. The plugin uses the profile data area when the installation location is read-only. Project renames update the REL filename. Renaming a profile with its gateway stopped updates the folder and PHY filename. Both operations preserve owner IDs and existing chat bindings. Filenames use filesystem-safe display names and suffixes when names collide.
+Selecting **Reliquary** enrolls a private PHY named for the profile and `general.rel` in `plugin-data/reliquary_store/<profile>/` in the Hermes data directory, so replacing the app during an update keeps them. Each project has a named REL under that profile's `projects/` folder. Project renames update the REL filename. Renaming a profile with its gateway stopped updates the folder and PHY filename. Both operations preserve owner IDs and existing chat bindings. Filenames use filesystem-safe display names and suffixes when names collide.
 
 Existing manual enrollments still use their registered owner files and the original service lease. A profile rename updates any registered paths that moved with the profile and preserves the original owner identities and external paths. A newly created ordinary chat binds to its assigned General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs are excluded from automatic capture.
 
-The installation-adjacent owners are stored separately from Hermes profile exports. A profile imported into another data directory gets independent owners on enrollment.
+The owners are not part of Hermes profile exports, and deleting a profile leaves them in place. A profile imported into another data directory gets independent owners on enrollment.
 
 Open **Capabilities → Plugins → Reliquary → Configure** to edit the profile’s Reliquary Switchboard routes in **Settings → Memory & Context**. The Switchboard selects models for General, Insomnia, Insomnia Metadata, Entity Extraction, General Decision, Entity Resolution Decision, Memory Retrieval Decision, Entity Resolution, Dream, and Embedding. General and Entity Resolution initially follow the Hermes chat model. Insomnia and Dream fall back to General. Ownership metadata falls back to Insomnia, and decisions use a dedicated route, the shared General Decision route, or General in that order. Completed-turn processing also requires configured Entity Resolution and Embedding routes.
 

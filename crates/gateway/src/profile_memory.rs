@@ -34,7 +34,10 @@ impl NativeSlot {
         if !matches!(configured, MemoryProvider::Auto | MemoryProvider::Reliquary) {
             self.unmount(mounted);
         } else if mounted.is_none() {
-            *mounted = plugin.open(&self.library, &self.profile_name, true)?;
+            // Enrollment replaces the profile's Markdown notes and starts copying its chats, so
+            // only an explicit choice enrolls. Automatic uses an enrollment that already exists.
+            let enroll = configured == MemoryProvider::Reliquary;
+            *mounted = plugin.open(&self.library, &self.profile_name, enroll)?;
             self.active.store(mounted.is_some(), Ordering::Release);
             if mounted.is_some() {
                 self.wake.notify_one();

@@ -109,7 +109,7 @@ impl Topology {
     }
 }
 
-/// A locator in the Hermes profile ties the adjacent store to this profile, even when
+/// A locator in the Hermes profile ties the shared store to this profile, even when
 /// another data directory uses the same display name.
 #[derive(Deserialize, Serialize)]
 struct Location {
@@ -399,14 +399,14 @@ fn check_directory(path: &Path) -> Result<()> {
 }
 
 pub(super) fn open(library: &Library, name: &str, enroll: bool) -> Result<Option<EmbeddedMemory>> {
-    open_at(library, name, enroll, &adjacent_root()?)
+    open_at(library, name, enroll, &data_root(library.root()))
 }
 
 fn open_at(
     library: &Library,
     name: &str,
     enroll: bool,
-    adjacent: &Path,
+    root: &Path,
 ) -> Result<Option<EmbeddedMemory>> {
     let home = library.root();
     let managed_location = Location::load(home)?.filter(|location| location.belongs_to(home));
@@ -433,7 +433,7 @@ fn open_at(
             if !enroll {
                 return Ok(None);
             }
-            provision(home, name, adjacent)?
+            provision(home, name, root)?
         }
     };
     let projects = library.projects()?;
@@ -502,28 +502,16 @@ pub(super) fn legacy(home: &Path, name: &str) -> Result<Option<EmbeddedMemory>> 
     .map(Some)
 }
 
-fn adjacent_root() -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    if let Some(image) = std::env::var_os("APPIMAGE")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_file())
-        && let Some(parent) = image.parent()
-    {
-        return Ok(parent.join("reliquary"));
-    }
-    let executable = std::env::current_exe()?;
-    #[cfg(target_os = "macos")]
-    if let Some(bundle) = executable
-        .ancestors()
-        .find(|p| p.extension().is_some_and(|ext| ext == "app"))
-        && let Some(parent) = bundle.parent()
-    {
-        return Ok(parent.join("reliquary"));
-    }
-    Ok(executable
-        .parent()
-        .context("Hermes executable has no parent directory")?
-        .join("reliquary"))
+/// The store lives in the Hermes data area, shared by its profiles. Files beside the executable
+/// are lost when an update replaces the app folder. Plugin names cannot contain `_`, so no
+/// plugin's own data folder has this name.
+fn data_root(home: &Path) -> PathBuf {
+    home.parent()
+        .filter(|parent| parent.file_name().is_some_and(|part| part == "profiles"))
+        .and_then(Path::parent)
+        .unwrap_or(home)
+        .join("plugin-data")
+        .join("reliquary_store")
 }
 
 fn open_root(root: &Path) -> Result<(PathBuf, File)> {
@@ -533,31 +521,9 @@ fn open_root(root: &Path) -> Result<(PathBuf, File)> {
     Ok((directory, lock))
 }
 
-fn provision(home: &Path, name: &str, adjacent: &Path) -> Result<Location> {
+fn provision(home: &Path, name: &str, root: &Path) -> Result<Location> {
     ensure_directory(&home.join("plugin-data"))?;
-    match provision_at(home, name, adjacent) {
-        Err(error)
-            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
-                )
-            }) =>
-        {
-            let base = home
-                .parent()
-                .filter(|parent| parent.file_name().is_some_and(|part| part == "profiles"))
-                .and_then(Path::parent)
-                .unwrap_or(home);
-            let data = base.join("plugin-data");
-            ensure_directory(&data)?;
-            provision_at(home, name, &data.join("reliquary"))
-        }
-        result => result,
-    }
-}
-
-fn provision_at(home: &Path, name: &str, root: &Path) -> Result<Location> {
+    ensure_directory(root.parent().context("Reliquary storage has no parent directory")?)?;
     let (root, _root_lock) = open_root(root)?;
     let replace_locator = match Location::load(home)? {
         Some(location) if location.belongs_to(home) => return Ok(location),
