@@ -8,6 +8,7 @@ use tokio::{
     process::{ChildStdin, ChildStdout},
     sync::{mpsc, oneshot},
     task::JoinSet,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -87,19 +88,24 @@ async fn exchange(
 ) -> Result<()> {
     let mut output = BufReader::new(output);
     let mut bytes = Vec::new();
-    let mut pending = HashMap::new();
+    let mut pending = HashMap::<u64, (Instant, oneshot::Sender<Result<Value>>)>::new();
     let mut next_id = 0_u64;
     let mut services = JoinSet::new();
     loop {
+        // A vanished caller must not leave a blocked worker in the registry forever.
+        let deadline = pending.values().map(|(deadline, _)| *deadline).min();
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
+            _ = async { tokio::time::sleep_until(deadline.expect("guarded deadline")).await }, if deadline.is_some() => {
+                bail!("A Python plugin callback exceeded its deadline");
+            }
             request = inbox.recv(), if pending.len() < MAX_REQUESTS => {
                 let Some(request) = request else { return Ok(()) };
                 next_id += 1;
                 let frame = json!({
                     "jsonrpc":"2.0", "id":next_id, "method":request.method, "params":request.params
                 });
-                pending.insert(next_id, request.reply);
+                pending.insert(next_id, (Instant::now() + REQUEST_TIMEOUT, request.reply));
                 send(&mut input, frame, stop).await?;
             }
             message = receive(&mut output, &mut bytes) => {
@@ -116,7 +122,7 @@ async fn exchange(
                         let response = plugin_inference::serve(&profile, chat.as_ref(), &message["params"]).await;
                         service_response(&id, response)
                     });
-                } else if let Some(reply) = message["id"].as_u64().and_then(|id| pending.remove(&id)) {
+                } else if let Some((_, reply)) = message["id"].as_u64().and_then(|id| pending.remove(&id)) {
                     let result = if let Some(error) = message.get("error") {
                         Err(anyhow::anyhow!("{}", error["message"].as_str().unwrap_or("Plugin request failed")))
                     } else {

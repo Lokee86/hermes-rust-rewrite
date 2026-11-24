@@ -1549,7 +1549,11 @@ impl Shared {
         self.emit(&session, "message.start", json!({"turn_id":stream.id}));
         self.emit(&session, "session.info", self.info(&session));
         let (tx, rx) = async_channel::bounded(1024);
-        let python = self.prepare_python_memory(&session, &admission).await;
+        let python = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            memory = self.prepare_python_memory(&session, &admission) => memory,
+        };
         let mut engine = session.engine.lock().await;
         let initial_count = engine.history().turns.len();
         let mut members = session.member_engines.lock().await;
@@ -1640,9 +1644,11 @@ impl Shared {
             self.pending_memory_capture(&session, &admission, initial_count, &history, reasoning_summaries)
         } else { None };
         let has_capture = capture.is_some();
-        let committed_ns = (status == "complete").then(|| {
+        let committed_ns = if status == "complete" {
             chrono::Utc::now().timestamp_nanos_opt().map(|ns| ns.max(admission.admitted_ns))
-        }).flatten();
+        } else {
+            None
+        };
         let python_capture = self.pending_python_delivery(
             &session, &admission, initial_count, &history, committed_ns, python.as_ref(),
         );
