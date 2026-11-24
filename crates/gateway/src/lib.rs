@@ -9,6 +9,9 @@ pub mod replay;
 pub mod stock_plugins;
 mod memory_capture;
 mod profile_memory;
+mod python_history;
+mod python_memory;
+mod slash_commands;
 
 mod auth;
 mod rest;
@@ -103,6 +106,10 @@ pub const METHODS: &[&str] = &[
     "catalog.archive_inactive",
     "plugins.memory.sync",
     "plugins.memory.archive_search",
+    "commands.catalog",
+    "slash.exec",
+    "memory.providers",
+    "memory.provider.set",
     "process.list",
     "process.kill",
     "process.stop",
@@ -215,6 +222,11 @@ impl Gateway {
             authority_epoch,
             profile_id,
             memory: profile_memory::NativeSlot::new(library.clone(), &profile_name),
+            plugins: hermes_engine::plugins::PluginRuntime::for_profile(
+                library.root().to_owned(), profile_name.clone(), Some(config.provider.clone()),
+            ),
+            other_plugin_profiles: Mutex::new(HashMap::new()),
+            python_memory: python_memory::PythonSlot::default(),
             profile_name,
             memory_task: Mutex::new(None),
             library,
@@ -239,6 +251,7 @@ impl Gateway {
             webhook_watches: Mutex::new(std::collections::HashSet::new()),
         });
         shared.recover_queued().await?;
+        shared.start_python_memory().await;
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
@@ -324,6 +337,9 @@ struct Shared {
     profile_id: String,
     profile_name: String,
     memory: Arc<profile_memory::NativeSlot>,
+    plugins: Arc<hermes_engine::plugins::PluginRuntime>,
+    other_plugin_profiles: Mutex<HashMap<PathBuf, Arc<hermes_engine::plugins::PluginRuntime>>>,
+    python_memory: python_memory::PythonSlot,
     memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
@@ -492,6 +508,21 @@ impl Shared {
         if let Some(task) = self.memory_task.lock().await.take() {
             let _ = task.await;
         }
+        self.stop_python_memory().await;
+        self.plugins.unload().await;
+        let profiles = std::mem::take(&mut *self.other_plugin_profiles.lock().await);
+        for runtime in profiles.into_values() {
+            runtime.unload().await;
+        }
+    }
+
+    async fn plugin_runtime(&self, profile: &Path) -> Arc<hermes_engine::plugins::PluginRuntime> {
+        if profile == self.library.root() {
+            return self.plugins.clone();
+        }
+        self.other_plugin_profiles.lock().await.entry(profile.to_owned()).or_insert_with(|| {
+            hermes_engine::plugins::PluginRuntime::new(profile.to_owned(), Some(self.provider.clone()))
+        }).clone()
     }
 
     fn has_session_capacity(sessions: &mut HashMap<String, Arc<LiveSession>>) -> bool {
@@ -546,6 +577,7 @@ impl Shared {
                 )
             })?;
         let processes = engine.enable_local_processes(id).map_err(RpcError::internal)?;
+        engine.set_plugin_runtime(self.plugin_runtime(&profile).await);
         settings.cwd = Some(actual_workspace);
         if settings.source.is_empty() {
             settings.source = "rust".into();
@@ -782,6 +814,10 @@ impl Shared {
             "catalog.session.set" | "catalog.session.delete" | "catalog.archive_inactive" => self.catalog_edit(method,params,peer).await,
             "plugins.memory.sync" => self.sync_memory_plugin(peer).await,
             "plugins.memory.archive_search" => self.user_archive_search(params, peer).await,
+            "commands.catalog" => self.commands_catalog(params, peer).await,
+            "slash.exec" => self.slash_exec(params, peer).await,
+            "memory.providers" => self.python_memory_providers(peer).await,
+            "memory.provider.set" => self.set_python_memory_provider(params, peer).await,
             "process.list" | "process.kill" | "process.stop" => {
                 let session = self.attached(params, peer).await?;
                 let mut controls = vec![session.processes.clone()];
@@ -1513,6 +1549,7 @@ impl Shared {
         self.emit(&session, "message.start", json!({"turn_id":stream.id}));
         self.emit(&session, "session.info", self.info(&session));
         let (tx, rx) = async_channel::bounded(1024);
+        let python = self.prepare_python_memory(&session, &admission).await;
         let mut engine = session.engine.lock().await;
         let initial_count = engine.history().turns.len();
         let mut members = session.member_engines.lock().await;
@@ -1528,6 +1565,12 @@ impl Shared {
             }
             Ok(())
         })();
+        if let Some(member) = &admission.group
+            && let Some(target) = members.get_mut(&member.name)
+            && let Ok(profile) = self.library.bot_profile(&member.name)
+        {
+            target.set_plugin_runtime(self.plugin_runtime(&profile).await);
+        }
         let prior = engine.history().clone();
         let (result, history, reasoning_summaries) = if let Err(error) = preparation {
             (Err(error), prior, Vec::new())
@@ -1542,6 +1585,7 @@ impl Shared {
                 _ => admission.text.clone(),
             };
             self.selected_memory().await.configure_turn(target, &self.library, &session, &mut admission);
+            target.set_python_memory(python.clone());
             let result = {
                 let future = target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone());
                 tokio::pin!(future);
@@ -1553,6 +1597,7 @@ impl Shared {
                 }
             };
             target.clear_native_query();
+            target.set_python_memory(None);
             let abandoned = result.is_err() || target.history().turns.get(initial_count).is_some_and(|turn|
                 matches!(turn.status, Status::Interrupted | Status::Failed(_)));
             if abandoned && !self.shutdown.is_cancelled() && let Err(error) = target.release_abandoned_turn(initial_count).await {
@@ -1595,6 +1640,13 @@ impl Shared {
             self.pending_memory_capture(&session, &admission, initial_count, &history, reasoning_summaries)
         } else { None };
         let has_capture = capture.is_some();
+        let committed_ns = (status == "complete").then(|| {
+            chrono::Utc::now().timestamp_nanos_opt().map(|ns| ns.max(admission.admitted_ns))
+        }).flatten();
+        let python_capture = self.pending_python_delivery(
+            &session, &admission, initial_count, &history, committed_ns, python.as_ref(),
+        );
+        let has_python_capture = python_capture.is_some();
         {
             let mut view = lock(&session.view);
             let mut authority = view.authority.clone();
@@ -1609,6 +1661,8 @@ impl Shared {
                 receipt.outcome = Some(status.into());
                 receipt.result = Some(payload.clone());
                 receipt.capture = capture;
+                receipt.committed_ns = committed_ns;
+                receipt.python_delivery = python_capture;
             }
             if status != "complete" && let Some(group) = &admission.group { authority.cancel_group(&group.round); }
             if let Err(error) = authority.persist(&session.writer, Some(&history)) {
@@ -1641,6 +1695,7 @@ impl Shared {
             view.current_admission = None;
         }
         if has_capture { self.memory.wake.notify_one(); }
+        if has_python_capture { self.schedule_python_delivery(&id); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,
             Err(error)=>self.emit(&session,"error",json!({"message":format!("Conversation saved, but catalog update failed: {error:#}")})),
@@ -1658,6 +1713,7 @@ impl Shared {
     ) {
         match event {
             Event::Subagent(progress) => self.emit(session, "subagent.progress", serde_json::to_value(&progress).unwrap_or_default()),
+            Event::MemoryRecall(status) => self.emit(session, "memory.recall", serde_json::to_value(status).unwrap_or_default()),
             Event::Text(text) => {
                 self.emit(session,"message.delta",json!({"text":text,"turn_id":stream.id,"segment":stream.segment,"offset":stream.offset}));
                 stream.offset += text.encode_utf16().count();
