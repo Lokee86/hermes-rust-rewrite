@@ -1,6 +1,7 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes},
+    extract::State,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
@@ -9,7 +10,15 @@ use futures_util::{SinkExt, StreamExt, stream};
 use hermes_engine::Config;
 use hermes_gateway::{Gateway, GatewayConfig, RunningGateway};
 use serde_json::{Value, json};
-use std::{convert::Infallible, net::SocketAddr, time::Duration};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -140,6 +149,7 @@ impl Client {
 }
 struct Provider {
     address: SocketAddr,
+    memory_requests: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 impl Drop for Provider {
@@ -151,16 +161,20 @@ impl Provider {
     async fn start() -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
+        let memory_requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&memory_requests);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new()
-                    .route("/v1/chat/completions", post(model)),
+                    .route("/v1/chat/completions", post(model))
+                    .route("/v1/embeddings", post(embed_memory_fixture))
+                    .with_state(observed),
             )
             .await
             .unwrap();
         });
-        Self { address, task }
+        Self { address, memory_requests, task }
     }
     fn config(&self) -> Config {
         Config {
@@ -185,9 +199,22 @@ fn event(delta: Value, finish: Option<&str>) -> String {
         json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
     )
 }
-async fn model(Json(request): Json<Value>) -> Response {
+async fn model(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Response {
+    if let Some(schema) = request["response_format"].get("json_schema") {
+        memory_requests.fetch_add(1, Ordering::Relaxed);
+        return Json(structured_memory_fixture(&request, schema)).into_response();
+    }
     let messages = request["messages"].as_array().unwrap();
     let last = messages.last().unwrap();
+    if last["content"] == CONTEXT_PROBE {
+        // Observe at the chat request. Background capture of this turn starts after it commits.
+        let report = json!({
+            "memory_requests": memory_requests.load(Ordering::Relaxed),
+            "included_fact": messages.iter().any(|message| message.to_string().contains(PROJECT_FACT)),
+        });
+        return ([(header::CONTENT_TYPE, "text/event-stream")],
+                format!("{}data: [DONE]\n\n", event(json!({"content":report.to_string()}), Some("stop")))).into_response();
+    }
     if last["content"] == "provider-error" {
         return (
             [(header::CONTENT_TYPE, "text/event-stream")],
@@ -272,6 +299,178 @@ async fn model(Json(request): Json<Value>) -> Response {
         format!("{body}data: [DONE]\n\n"),
     )
         .into_response()
+}
+
+const PROJECT_FACT: &str = "The workspace project is Amethyst Lantern 741.";
+const CONTEXT_PROBE: &str = "How is the Amethyst Lantern project going?";
+
+async fn embed_memory_fixture(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Json<Value> {
+    memory_requests.fetch_add(1, Ordering::Relaxed);
+    let inputs = request["input"].as_array().unwrap();
+    let data = (0..inputs.len()).map(|index| {
+        json!({"index": index, "embedding": [1.0, 0.0]})
+    }).collect::<Vec<_>>();
+    Json(json!({"model": request["model"], "data": data}))
+}
+
+fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
+    let shape = &schema["schema"]["properties"];
+    let value = match schema["name"].as_str().unwrap() {
+        "insomnia_authority_disposition_ledger" => {
+            let mut turns = serde_json::Map::new();
+            for id in shape["turns"]["required"].as_array().unwrap() {
+                let id = id.as_str().unwrap();
+                let clauses = if id.ends_with("-user") {
+                    json!([{"disposition":"retain", "authority_kind":"direct", "category":"fact",
+                        "type":"project", "lifecycle":"current", "proposition":PROJECT_FACT,
+                        "authority_source_node_id":"", "grounding_source_node_id":"",
+                        "reason":"The user gave the project name."}])
+                } else {
+                    json!([])
+                };
+                turns.insert(id.into(), clauses);
+            }
+            json!({"turns": turns, "evidence_requests":[]})
+        }
+        "insomnia_memory_ownership" => {
+            let ownership: serde_json::Map<String, Value> = shape["ownership"]["required"]
+                .as_array().unwrap().iter()
+                .map(|id| (id.as_str().unwrap().into(), json!("project"))).collect();
+            json!({"ownership": ownership})
+        }
+        "insomnia_memory_wording" => {
+            let candidates = shape["candidates"]["items"]["properties"]["source_node_id"]["enum"]
+                .as_array().unwrap().iter().filter(|id| id.as_str().unwrap().ends_with("-user"))
+                .map(|id| json!({
+                    "authority_kind":"direct", "category":"fact", "memory_type":"project",
+                    "temporal_status":"current", "ownership":"project", "title":"Amethyst Lantern",
+                    "content":PROJECT_FACT, "source_node_id":id, "source_quote":PROJECT_FACT,
+                    "authority_source":null, "grounding_source":null, "routing_mentions":[]
+                })).collect::<Vec<_>>();
+            json!({"candidates":candidates})
+        }
+        "decision_response" => {
+            let payload: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let approved = payload["state"]["candidates"].as_array().into_iter().flatten()
+                .filter(|candidate| candidate["content"].as_str().is_some_and(|text| text.contains(PROJECT_FACT)))
+                .map(|candidate| candidate["memory"].clone()).collect::<Vec<_>>();
+            json!({"version":1,"approved":approved})
+        }
+        "dream_pair_classification" => json!({"relation":"none","direction":"none","evidence":[]}),
+        _ => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    json!({"choices":[{"message":{"content":value.to_string()}}]})
+}
+
+#[tokio::test]
+async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval() {
+    use hermes_engine::{credentials::EndpointStore, memory_capture::CaptureReceipt};
+    use hermes_library::Library;
+    use reliquary_memory::{
+        Gateway as MemoryGateway, HostCredentialBinding, NativeImportState, OwnerGrant,
+        Phylactery, Rel, TrustedHostAdmission,
+    };
+    use std::fs;
+
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+    let library = Library::open(root.path()).unwrap();
+    let project = library.add_project(project_dir.path()).unwrap();
+    let rel = Rel::create(root.path().join("project.rel")).unwrap();
+    let general = Rel::create(root.path().join("general.rel")).unwrap();
+    let phy = Phylactery::create(root.path().join("private.phy")).unwrap();
+    let state = root.path().join("reliquary");
+    fs::create_dir(&state).unwrap();
+    let topology = json!({
+        "version": 2, "profile_id": "default", "principal_id": "owner",
+        "main_rel": general.owner_id(), "active_phy": phy.owner_id(),
+        "projects": {(project.id.clone()): {"rel_id": rel.owner_id()}},
+        "owners": {
+            (general.owner_id().to_string()): {"kind":"rel", "path":general.path()},
+            (rel.owner_id().to_string()): {"kind":"rel", "path":rel.path()},
+            (phy.owner_id().to_string()): {"kind":"phylactery", "path":phy.path()}
+        }
+    });
+    let old = library.create_session(Some(&project.id), Some("Before enrollment")).unwrap();
+    fs::write(state.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
+    fs::write(state.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
+    let endpoint = EndpointStore::open(&root.path().join("providers")).unwrap()
+        .save(Some("fixture-embeddings"), "Embeddings", &Config {
+            model: "fixture-embeddings".into(), ..provider.config()
+        }).unwrap();
+    let settings = json!({"memory_embedding":{"endpoint_id":endpoint.id,"dimensions":2}});
+    hermes_engine::settings::ProfileSettings::update(root.path(), settings.as_object().unwrap()).unwrap();
+
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    client.ok("session.resume", json!({"session_id":old.id})).await;
+    client.ok("prompt.submit", json!({"session_id":old.id,"submission_id":"preexisting","text":"A historical chat"})).await;
+    assert_eq!(client.event("message.complete").await["payload"]["status"], "complete");
+    let old_record: Value = serde_json::from_slice(&fs::read(old.directory.join("conversation.json")).unwrap()).unwrap();
+    assert!(old_record["authority"]["receipts"][0]["capture"].is_null());
+
+    let source = client.ok("session.create", json!({"project_id":project.id,"title":"Memory source"})).await;
+    let source_id = source["session_id"].as_str().unwrap();
+    let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
+    let submit = json!({"session_id":source_id,"submission_id":"source-fact","text":PROJECT_FACT});
+    let admission = client.ok("prompt.submit", submit.clone()).await;
+    assert_eq!(client.event("message.complete").await["payload"]["status"], "complete");
+    let committed: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(committed["authority"]["receipts"][0]["status"], "terminal");
+    assert_eq!(committed["authority"]["receipts"][0]["capture"]["admission_id"], admission["admission_id"]);
+    assert_eq!(committed["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], rel.owner_id().to_string());
+
+    // Root may settle semantic processing independently of the conversation.
+    let accepted = timeout(Duration::from_secs(40), async {
+        loop {
+            let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            let capture = record["authority"]["receipts"][0]["capture"]["receipt"].clone();
+            if record["authority"]["receipts"][0]["capture"]["settled"] == true {
+                break serde_json::from_value::<CaptureReceipt>(capture).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.expect("project archive did not finish semantic processing");
+
+    drop(client);
+    gateway.shutdown().await.unwrap();
+    {
+        let reader = MemoryGateway::new();
+        let owner = reader.mount_rel(&rel, false).unwrap();
+        let token = "project-fixture-reader-with-a-local-token";
+        let instance = TrustedHostAdmission::new([HostCredentialBinding::new(
+            "reader", token, [OwnerGrant::ViewRel(owner)],
+        )]).install(&reader).unwrap().0.authenticate(token).unwrap();
+        let status = instance.native_import_status(owner, &accepted.import_id).unwrap().unwrap();
+        assert_eq!(status.state, NativeImportState::Completed);
+        assert!(instance.has_active_vectors(owner).unwrap());
+        assert_eq!(status.receipt_digest, Some(accepted.receipt_digest));
+    }
+    let restarted = provider.gateway(&root).await;
+    let mut next = Client::native(&restarted).await;
+    next.ok("session.resume", json!({"session_id":source_id})).await;
+    assert_eq!(next.ok("prompt.submit", submit).await["admission_id"], admission["admission_id"]);
+    let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["authority"]["receipts"].as_array().unwrap().len(), 1);
+    assert_eq!(record["authority"]["receipts"][0]["capture"]["receipt"]["import_id"], accepted.import_id);
+
+    let related = next.ok("session.create", json!({"project_id":project.id,"title":"Same project"})).await;
+    provider.memory_requests.store(0, Ordering::Relaxed);
+    next.ok("prompt.submit", json!({"session_id":related["session_id"],"submission_id":"ask","text":CONTEXT_PROBE})).await;
+    let completed = next.event("message.complete").await;
+    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(report, json!({"memory_requests":0,"included_fact":false}));
+
+    let general_chat = next.ok("session.create", json!({"title":"General chat"})).await;
+    let general_id = general_chat["session_id"].as_str().unwrap();
+    next.ok("prompt.submit", json!({"session_id":general_id,"submission_id":"hello","text":"Hello"})).await;
+    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    let general_record = library.session(general_id).unwrap().directory.join("conversation.json");
+    let record: Value = serde_json::from_slice(&fs::read(general_record).unwrap()).unwrap();
+    assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general.owner_id().to_string());
+    drop(next);
+    restarted.shutdown().await.unwrap();
 }
 
 #[tokio::test]

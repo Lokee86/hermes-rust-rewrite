@@ -8,6 +8,7 @@ pub mod skill_catalog;
 pub mod plugins;
 pub mod mcp_oauth;
 pub mod memory;
+pub mod memory_capture;
 pub mod settings;
 mod privacy;
 mod processes;

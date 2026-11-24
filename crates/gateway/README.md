@@ -102,6 +102,14 @@ At most 64 sessions are loaded and 32 sockets connected. WebSocket frames/messag
 
 Unsupported: queued/steered/redirected inputs, multimodal attachments, edit/regenerate/rewind/branch/compression/reset/delete mutations, cross-profile routing, legacy server-to-client request RPCs, upstream tool/plugin catalogs, process/control-socket discovery, bot/room transports, billing, scheduler, voice, screen/browser control, dashboard settings REST and automatic handoff to a Python gateway. Any optional MCP server is external to Rust; it is connected through the engine, not a fallback to Python.
 
+## Embedded Reliquary
+
+The selected data directory supplies the profile's existing `reliquary/capture-enrollment-v1.json` and `reliquary/topology-v1.json`. The gateway uses the same service lease as the standalone host. A newly created ordinary native chat binds to the configured General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs do not enter automatic capture.
+
+Set the profile's `memory_embedding` in `agent-settings.json` to `{"endpoint_id":"<saved endpoint ID>","dimensions":1024}` using the intended embedding space's actual dimensions. The endpoint ID refers to a saved profile provider in the profile's `providers` store. Background processing uses the chat's configured OpenAI-compatible structured-completion route and that embedding endpoint. An incompatible stored embedding identity or an unavailable route pauses memory work while chat remains available.
+
+The turn commit includes its pending capture. Archive admission and semantic processing record separate progress after that commit. The chat model receives its conversation and enabled profile notes. The background worker processes each pending capture after commit. Archiving or deleting a source fences future capture. If an open Reliquary import defers its archive tombstone, the gateway retains the fence and retries the tombstone.
+
 ## Verification
 
 ```sh

@@ -9,6 +9,8 @@ pub static PERSONALITIES: LazyLock<BTreeMap<String,String>> = LazyLock::new(||
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfileSettings {
+    /// Saved profile endpoint used for shared-space embeddings by embedded Reliquary.
+    pub memory_embedding: Option<MemoryEmbedding>,
     pub checkpoints_enabled: bool,
     pub checkpoint_max_snapshots: usize,
     pub redact_secrets: bool,
@@ -38,8 +40,13 @@ pub struct ProfileSettings {
     pub auto_archive_days: u32,
     pub keep_awake: bool,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryEmbedding {
+    pub endpoint_id: String,
+    pub dimensions: u32,
+}
 impl Default for ProfileSettings {
-    fn default()->Self {Self {checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
+    fn default()->Self {Self {memory_embedding: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
         memory_enabled:true,user_profile_enabled:true,memory_char_limit:crate::memory::DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:8,
         file_read_max_chars:100_000,tool_output_bytes:50000,tool_output_lines:2000,tool_output_line_length:2000,

@@ -35,6 +35,7 @@ impl Shared {
             .await
             .map_err(RpcError::internal)?
             .map_err(RpcError::internal)?;
+            for id in &archived { self.memory_source_terminal(id).await.map_err(RpcError::internal)?; }
             return Ok(json!({"archived":archived}));
         }
         let id = required_string(params, "session_id")?.to_owned();
@@ -61,6 +62,7 @@ impl Shared {
                 .await
                 .map_err(RpcError::internal)?
                 .map_err(RpcError::internal)?;
+                if archived == Some(true) { self.memory_source_terminal(&id).await.map_err(RpcError::internal)?; }
                 let live = self.sessions.lock().await.get(&id).cloned();
                 if let Some(live) = live {
                     *lock(&live.summary) = summary.clone();
@@ -86,6 +88,7 @@ impl Shared {
                     .await
                     .map_err(RpcError::internal)?
                     .map_err(RpcError::internal)?;
+                self.memory_source_terminal(&id).await.map_err(RpcError::internal)?;
                 Ok(json!({"deleted":true,"session_id":id}))
             }
             _ => unreachable!(),

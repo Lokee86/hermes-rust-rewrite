@@ -6,6 +6,9 @@
 pub mod client;
 pub mod owner;
 pub mod replay;
+mod reliquary;
+mod reliquary_capture;
+mod reliquary_hosted;
 
 mod auth;
 mod rest;
@@ -20,6 +23,7 @@ use authority::{Authority, Receipt};
 mod telegram_host;
 use hermes_engine::{
     Attachment, ConversationWriter,
+    memory_capture::{CaptureBinding, PendingMemoryCapture},
     models::GenerationOptions,
 };
 use anyhow::{Context, Result, ensure};
@@ -195,6 +199,13 @@ impl Gateway {
         );
         let library = Library::open(&config.library_root)?;
         let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
+        let memory = match reliquary::EmbeddedMemory::open(library.root(), &profile_name) {
+            Ok(memory) => memory.map(Arc::new),
+            Err(error) => {
+                eprintln!("Reliquary startup failed for this profile: {error:#}");
+                None
+            }
+        };
         let listener = TcpListener::bind(config.bind)
             .await
             .context("Could not bind gateway")?;
@@ -208,6 +219,9 @@ impl Gateway {
             authority_epoch,
             profile_id,
             profile_name,
+            memory,
+            memory_wake: tokio::sync::Notify::new(),
+            memory_task: Mutex::new(None),
             library,
             provider: config.provider,
             token: config.token,
@@ -233,6 +247,10 @@ impl Gateway {
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
+        if shared.memory.is_some() {
+            let owner = shared.clone();
+            *shared.memory_task.lock().await = Some(tokio::spawn(owner.run_memory_capture()));
+        }
         let router = Router::new()
             .route("/health", get(health))
             .route("/", get(auth::landing))
@@ -309,6 +327,9 @@ struct Shared {
     authority_epoch: u64,
     profile_id: String,
     profile_name: String,
+    memory: Option<Arc<reliquary::EmbeddedMemory>>,
+    memory_wake: tokio::sync::Notify,
+    memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
     token: String,
@@ -361,6 +382,8 @@ struct Settings {
     execution_generation: u64,
     #[serde(default)]
     generation_options: GenerationOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_binding: Option<CaptureBinding>,
     #[serde(default)]
     shell_policy: Option<shell_exec::Policy>,
 }
@@ -469,6 +492,9 @@ impl Shared {
         }
         let tasks = std::mem::take(&mut *self.turns.lock().await);
         for task in tasks {
+            let _ = task.await;
+        }
+        if let Some(task) = self.memory_task.lock().await.take() {
             let _ = task.await;
         }
     }
@@ -1011,7 +1037,7 @@ impl Shared {
             let mut prepared = Settings {
                 source: source.into(), model, cwd, creation_key: key.clone(),
                 creation_fingerprint: Some(fingerprint.clone()), metadata_revision: 0,
-                execution_generation: 0, generation_options: options, shell_policy: None,
+                execution_generation: 0, generation_options: options, memory_binding: None, shell_policy: None,
             };
             let local_backend = (peer.local_native && matches!(source, "cli" | "tui" | "gui"))
                 .then(|| shell_exec::backend(self.library.root()));
@@ -1021,6 +1047,9 @@ impl Shared {
                     ensure!(existing.creation_key == prepared.creation_key && existing.creation_fingerprint == prepared.creation_fingerprint,
                         "Creation identity was previously used with different options");
                 } else {
+                    if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
+                        prepared.memory_binding = self.memory.as_ref().and_then(|memory| memory.binding_for_new_session(summary));
+                    }
                     if let Some(backend) = local_backend {
                         let cwd = project_workspace.map(Path::to_owned)
                             .or_else(|| prepared.cwd.clone())
@@ -1555,6 +1584,8 @@ impl Shared {
             .unwrap_or_default();
         let payload =
             json!({"text":text,"status":status,"error":error,"partial":status!="complete"});
+        let capture = self.pending_memory_capture(&session, &admission, initial_count, &history);
+        let has_capture = capture.is_some();
         {
             let mut view = lock(&session.view);
             let mut authority = view.authority.clone();
@@ -1568,6 +1599,7 @@ impl Shared {
                 receipt.status = "terminal".into();
                 receipt.outcome = Some(status.into());
                 receipt.result = Some(payload.clone());
+                receipt.capture = capture;
             }
             if status != "complete" && let Some(group) = &admission.group { authority.cancel_group(&group.round); }
             if let Err(error) = authority.persist(&session.writer, Some(&history)) {
@@ -1599,6 +1631,7 @@ impl Shared {
             self.emit_locked(&session, &id, &mut view, "message.complete", payload);
             view.current_admission = None;
         }
+        if has_capture { self.memory_wake.notify_one(); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,
             Err(error)=>self.emit(&session,"error",json!({"message":format!("Conversation saved, but catalog update failed: {error:#}")})),
