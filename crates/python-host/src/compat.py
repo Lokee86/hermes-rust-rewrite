@@ -37,16 +37,40 @@ def get_hermes_home():
     return _HOME
 
 
+def _ordinary_path(path):
+    # Rust canonicalizes Windows homes to a verbatim form. SQLite file URLs need
+    # a drive path or a UNC path, since the verbatim '?' would parse as the host.
+    path = Path(path)
+    if os.name == "nt":
+        raw = str(path)
+        if raw[:8].upper() == "\\\\?\\UNC\\":
+            return Path("\\\\" + raw[8:])
+        if raw.startswith("\\\\?\\") and re.match(r"^[A-Za-z]:\\", raw[4:]):
+            return Path(raw[4:])
+    return path
+
+
+def _sqlite_uri(path):
+    path = _ordinary_path(path)
+    uri = path.as_uri()
+    if os.name == "nt" and path.drive.startswith("\\\\"):
+        # Use an empty URI authority. The path component retains the UNC prefix.
+        return "file:////" + uri.removeprefix("file://")
+    return uri
+
+
 def profile_name_for_home(home):
     if home is None or _HOME is None:
         return None
-    return _PROFILE if Path(home).resolve() == _HOME else None
+    return _PROFILE if _ordinary_path(Path(home).resolve()) == _ordinary_path(_HOME) else None
 
 
 def _profile_path(path):
     path = Path(path)
     home = get_hermes_home()
-    if not path.is_absolute() or not path.is_relative_to(home) or path.resolve() != path:
+    plain = _ordinary_path(path)
+    if (not path.is_absolute() or not plain.is_relative_to(_ordinary_path(home))
+            or _ordinary_path(path.resolve()) != plain):
         raise ValueError("Path is outside the bound Hermes profile")
     return path
 
@@ -277,24 +301,25 @@ def _configured_selection():
 
 def _canonical_db(path):
     expected = get_hermes_home() / "state.db"
-    if Path(path) != expected:
+    if _ordinary_path(path) != _ordinary_path(expected):
         raise sqlite3.OperationalError("Session store is outside the bound Hermes profile")
     info = expected.lstat()
-    if not S_ISREG(info.st_mode) or expected.resolve(strict=True) != expected:
+    if (not S_ISREG(info.st_mode)
+            or _ordinary_path(expected.resolve(strict=True)) != _ordinary_path(expected)):
         raise sqlite3.OperationalError("Session store is not a canonical regular file")
     return expected
 
 
 def _open_owned(path, *, read_only):
     mode = "ro" if read_only else "rw"
-    db = sqlite3.connect(_canonical_db(path).as_uri() + f"?mode={mode}", uri=True, timeout=5)
+    db = sqlite3.connect(_sqlite_uri(_canonical_db(path)) + f"?mode={mode}", uri=True, timeout=5)
     try:
         app_id = db.execute("PRAGMA application_id").fetchone()[0]
         version = db.execute("PRAGMA user_version").fetchone()[0]
         if app_id != _APPLICATION_ID or version != _SCHEMA_VERSION:
             raise sqlite3.OperationalError("Existing state.db is not an owned Hermes Rust projection")
         owner = db.execute("SELECT home FROM projection_owner").fetchone()
-        if owner != (str(get_hermes_home()),):
+        if owner is None or _ordinary_path(owner[0]) != _ordinary_path(get_hermes_home()):
             raise sqlite3.OperationalError("Session projection belongs to a different profile")
         return db
     except BaseException:
@@ -321,7 +346,7 @@ def _ensure_projection(path):
                 );
                 CREATE TABLE projection_terminal (id TEXT PRIMARY KEY);
             """)
-            db.execute("INSERT INTO projection_owner VALUES (?)", (str(get_hermes_home()),))
+            db.execute("INSERT INTO projection_owner VALUES (?)", (str(_ordinary_path(get_hermes_home())),))
         if os.name != "nt":
             staging.chmod(0o600)
         try:
@@ -470,7 +495,7 @@ def install(home):
         if not path.is_absolute() or not path.is_dir():
             raise ValueError("Hermes plugin host needs an existing absolute profile home")
         resolved = path.resolve(strict=True)
-        if _HOME is not None and _HOME != resolved:
+        if _HOME is not None and _ordinary_path(_HOME) != _ordinary_path(resolved):
             raise ValueError("Cannot rebind the plugin host to another Hermes profile")
         _HOME = resolved
         inferred = _HOME.name if _HOME.parent.name == "profiles" else "default"
