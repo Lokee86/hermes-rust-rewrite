@@ -5,7 +5,7 @@
 mod runner;
 mod schedule;
 mod store;
-pub use runner::execute;
+pub use runner::{execute, prepare_job};
 pub use schedule::{Schedule, instant, stamp};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -169,6 +169,13 @@ pub struct Run {
     pub error: Option<String>,
     #[serde(default)]
     pub cancel_requested: bool,
+    /// Frozen definition and chat identity for a gateway-owned claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_job: Option<Box<Job>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_request_id: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct Claim {

@@ -426,7 +426,9 @@ mod tests {
         let pkg = root.path().join("plugins/echo-kit");
         fs::create_dir_all(&pkg).unwrap();
         fs::write(pkg.join("plugin.json"), r#"{"name":"echo-kit","version":"0.1.0"}"#).unwrap();
-        fs::write(pkg.join("mcp.json"), r#"{"mcpServers":{"echo":{"type":"stdio","command":"python3","args":["${PLUGIN_ROOT}/server.py"]}}}"#).unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let manifest = serde_json::json!({"mcpServers":{"echo":{"type":"stdio","command":python,"args":["${PLUGIN_ROOT}/server.py"]}}});
+        fs::write(pkg.join("mcp.json"), manifest.to_string()).unwrap();
         fs::write(pkg.join("server.py"), r#"
 import json, sys, os
 for line in sys.stdin:

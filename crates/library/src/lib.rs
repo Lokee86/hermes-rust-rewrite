@@ -215,10 +215,37 @@ impl Library {
         })
     }
 
+    /// Sessions eligible for gateway recovery, including hidden bot and group chats.
+    pub fn authority_sessions(&self) -> Result<Vec<SessionSummary>> {
+        self.with_catalog(false, |catalog| Ok(catalog.sessions.iter().map(|record| self.summary(record)).collect()))
+    }
+
     pub fn create_session(
         &self,
         project_id: Option<&str>,
         title: Option<&str>,
+    ) -> Result<SessionSummary> {
+        self.create_initialized_session(project_id, title, None, |_| Ok(()))
+    }
+
+    pub fn create_initialized_session(
+        &self,
+        project_id: Option<&str>,
+        title: Option<&str>,
+        request_key: Option<&str>,
+        initialize: impl FnOnce(&SessionSummary) -> Result<()>,
+    ) -> Result<SessionSummary> {
+        self.create_initialized_session_with_workspace(project_id, title, request_key, |summary, _| initialize(summary))
+    }
+
+    /// Publish the catalog entry only after both transcript and owner metadata
+    /// are durable. Pass the selected project directory to the initializer.
+    pub fn create_initialized_session_with_workspace(
+        &self,
+        project_id: Option<&str>,
+        title: Option<&str>,
+        request_key: Option<&str>,
+        initialize: impl FnOnce(&SessionSummary, Option<&Path>) -> Result<()>,
     ) -> Result<SessionSummary> {
         let default_project = if project_id.is_none(){
             hermes_engine::settings::ProfileSettings::load(&self.root)?.default_directory
@@ -226,10 +253,8 @@ impl Library {
         }else{None};
         let project_id=project_id.or_else(||default_project.as_ref().map(|p|p.id.as_str()));
         self.with_catalog(true, |catalog| {
-            if let Some(id) = project_id {
-                ensure_project(catalog, id)?;
-            }
-            if title.is_none() && let Some(existing) = catalog.sessions.iter().find(|record| {
+            let workspace = project_id.map(|id| ensure_project(catalog, id).map(|project| project.path.clone())).transpose()?;
+            if request_key.is_none() && title.is_none() && let Some(existing) = catalog.sessions.iter().find(|record| {
                 record.last_active.is_none() && record.bot.is_none() && matches!(record.source, SessionSource::Native) && !record.archived && !record.pinned
                     && record.title == "New chat" && record.project_id.as_deref() == project_id
                     && self.root.join("sessions").join(&record.id).join("conversation.json").is_file()
@@ -239,17 +264,30 @@ impl Library {
                 catalog.selected_project = existing.project_id.clone();
                 return Ok(summary);
             }
-            let record = self.new_record(project_id, title, SessionSource::Native);
-            let directory = self.create_directory(&record.id)?;
-            if let Err(error) =
-                atomic_json(&directory.join("conversation.json"), &History::default())
-            {
-                let _ = fs::remove_dir(&directory);
-                return Err(error);
+            let mut record = self.new_record(project_id, title, SessionSource::Native);
+            if let Some(key) = request_key {
+                use std::fmt::Write;
+                let digest = ring::digest::digest(&ring::digest::SHA256,key.as_bytes());
+                let mut id = String::from("session-create-");
+                for byte in digest.as_ref() { write!(&mut id,"{byte:02x}")?; }
+                record.id = id;
+                if let Some(existing) = catalog.sessions.iter().find(|existing| existing.id==record.id) {
+                    let summary = self.summary(existing);
+                    initialize(&summary, workspace.as_deref())?;
+                    return Ok(summary);
+                }
             }
+            let directory = if request_key.is_some() && self.root.join("sessions").join(&record.id).exists() {
+                self.checked_directory(&record.id)?
+            } else {
+                self.create_directory(&record.id)?
+            };
+            let summary = self.summary(&record);
+            initialize(&summary, workspace.as_deref())?;
+            let transcript = directory.join("conversation.json");
+            if !transcript.exists() { atomic_json(&transcript,&History::default())?; }
             catalog.active_session = Some(record.id.clone());
             catalog.selected_project = record.project_id.clone();
-            let summary = self.summary(&record);
             catalog.sessions.push(record);
             Ok(summary)
         })

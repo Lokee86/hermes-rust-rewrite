@@ -152,7 +152,7 @@ pub(super) fn agents(app: &Hermes) -> Element<'_, Message> {
     let p = ui::palette(app.dark);
     let state = if app.stopping {
         "Stop requested"
-    } else if app.approval.is_some() {
+    } else if !app.approvals.is_empty() {
         "Awaiting approval"
     } else if app.running {
         "Running"
@@ -225,7 +225,7 @@ pub(super) fn agents(app: &Hermes) -> Element<'_, Message> {
     } else {
         content = content.push(text("No session selected.").size(12).color(p.muted));
     }
-    if let Some(approval) = &app.approval {
+    if let Some(approval) = app.approvals.first() {
         let arguments = serde_json::from_str::<serde_json::Value>(&approval.call.arguments)
             .and_then(|value| serde_json::to_string_pretty(&value))
             .unwrap_or_else(|_| approval.call.arguments.clone());
@@ -248,11 +248,11 @@ pub(super) fn agents(app: &Hermes) -> Element<'_, Message> {
             .push(
                 row![
                     button(text("Deny").size(12))
-                        .on_press(Message::Approve(false))
+                        .on_press(Message::Approve(approval.call.id.clone(), approval.generation, false))
                         .padding([6, 10])
                         .style(button::secondary),
                     button(text("Allow once").size(12))
-                        .on_press(Message::Approve(true))
+                        .on_press(Message::Approve(approval.call.id.clone(), approval.generation, true))
                         .padding([6, 10])
                         .style(button::primary)
                 ]
@@ -292,7 +292,7 @@ fn session_row<'a>(app: &'a Hermes, session: &'a SessionSummary) -> Element<'a, 
         .is_some_and(|active| active.id == session.id);
     let live = current && app.running;
     let state = if live {
-        if app.approval.is_some() {
+        if !app.approvals.is_empty() {
             "Awaiting approval"
         } else if app.stopping {
             "Stop requested"

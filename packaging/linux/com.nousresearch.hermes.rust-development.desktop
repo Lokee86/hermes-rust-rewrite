@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Hermes
-Exec=hermes-desktop
+Exec=hermes
 Icon=com.nousresearch.hermes.rust-development
 Terminal=false
 Categories=Office;Utility;

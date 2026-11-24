@@ -96,10 +96,8 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             let target = app.quick_entry.target.unwrap_or(if app.current.is_some() { Target::Current } else { Target::NewChat });
             let hide = close(app);
             if app.running { app.note("Hermes is busy with another reply — try again when it finishes."); return hide; }
-            if target == Target::NewChat || app.current.is_none() { app.create_chat(); }
             app.screen = super::Screen::Chat;
-            app.composer = iced::widget::text_editor::Content::with_text(&prompt);
-            Task::batch([hide, app.update(Message::Send)])
+            Task::batch([hide, app.quick_chat(prompt, target == Target::NewChat)])
         }
     }
 }

@@ -95,11 +95,25 @@ impl Attachment {
             data.len() as u64 <= MAX_IMAGE,
             "Attachment grew past 4 MiB while reading"
         );
-        let media_type = media_type(&data)?.to_owned();
-        let key = hash(&data);
+        Self::capture_bytes(session, name, &data)
+    }
+
+    pub fn capture_data_url(session: &Path, name: String, url: &str) -> Result<Self> {
+        let (header, encoded) = url.split_once(',').context("Invalid data URL")?;
+        ensure!(header.starts_with("data:") && header.ends_with(";base64"), "Expected a base64 data URL");
+        ensure!(encoded.len() <= 4 * (MAX_IMAGE as usize).div_ceil(3), "File exceeds the attachment limit");
+        let data = STANDARD.decode(encoded).context("Invalid attachment encoding")?;
+        Self::capture_bytes(session, name, &data)
+    }
+
+    fn capture_bytes(session: &Path, name: String, data: &[u8]) -> Result<Self> {
+        ensure!(data.len() <= MAX_IMAGE as usize, "Attachments must be 4 MiB or smaller");
+        ensure!(!name.is_empty() && name.len() <= 1024 && !name.chars().any(char::is_control), "Unsupported filename");
+        let media_type = media_type(data)?.to_owned();
+        let key = hash(data);
         let dir = blob_dir(session)?;
         let mut file = NamedTempFile::new_in(&dir)?;
-        file.write_all(&data)?;
+        file.write_all(data)?;
         file.as_file().sync_all()?;
         match file.persist_noclobber(dir.join(&key)) {
             Ok(_) => {}
@@ -114,7 +128,7 @@ impl Attachment {
         })
     }
 
-    fn data(&self, session: &Path) -> Result<Vec<u8>> {
+    pub fn data(&self, session: &Path) -> Result<Vec<u8>> {
         ensure!(
             self.digest.len() == 64 && self.digest.bytes().all(|b| b.is_ascii_hexdigit()),
             "Invalid attachment reference"
@@ -136,6 +150,15 @@ impl Attachment {
             "The saved attachment has changed"
         );
         Ok(data)
+    }
+    pub fn snapshot_path(&self, session: &Path) -> Result<PathBuf> {
+        self.validate_snapshot(session)?;
+        Ok(blob_dir(session)?.join(&self.digest))
+    }
+
+    pub fn validate_snapshot(&self, session: &Path) -> Result<()> {
+        ensure!(!self.name.is_empty() && self.name.len() <= 1024 && !self.name.chars().any(char::is_control), "Invalid attachment name");
+        self.data(session).map(|_| ())
     }
     pub fn validate_set(files: &[Self]) -> Result<()> {
         ensure!(

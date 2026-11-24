@@ -1,87 +1,380 @@
-//! Running a chat turn on a remote Hermes gateway (Settings › Gateways ›
-//! Remote). Uses the shared JSON-RPC transport (hermes-gateway's client): a
-//! one-use ticket, `session.create`, `prompt.submit`, then the session's
-//! `message.delta` / `tool.*` / `approval.request` / `message.complete` events.
-//! The streamed text and approvals reach the desktop as ordinary engine events,
-//! and the finished turn is saved into the local transcript.
-use hermes_engine::{Entry, Event, Status, ToolCall, Turn};
-use hermes_gateway::client::{ClientMessage, ClientOptions, GatewayClient};
+//! A window subscribes to the selected gateway even when another client owns the active turn.
+use super::{Message, connections};
+use hermes_engine::{CancellationToken, Config, Entry, History, Status, ToolCall, Turn};
+use hermes_gateway::client::{ClientMessage, ConnectionState, GatewayClient};
+use iced::{Task, futures::SinkExt};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-/// The saved remote gateway, if Settings › Gateways is on Remote with a URL and token.
-pub(super) fn configured(root: &Path, state: &super::connections::State) -> Option<(String, String)> {
-    let config = &state.config;
-    if config.mode == super::connections::Mode::Ssh { return state.tunnel.as_ref().map(|t| (t.url.clone(), t.token.clone())); }
-    if config.mode != super::connections::Mode::Remote || config.url.trim().is_empty() { return None; }
-    let url = config.url.trim().trim_end_matches('/').to_owned();
-    let token = std::fs::read_to_string(root.join("connection-token")).unwrap_or_default().trim().to_owned();
-    // An empty token means the gateway's native OAuth sign-in supplies the bearer at turn time.
-    if token.is_empty() && !super::gateway_oauth::signed_in(root, &url) { return None; }
-    Some((url, token))
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum Route {
+    Local,
+    Remote { origin: String, token: String },
 }
 
-/// The remote session this local chat continues, remembered beside its transcript.
-fn remote_session(dir: &Path, url: &str) -> Option<String> {
-    let saved: Value = serde_json::from_slice(&std::fs::read(dir.join("remote-session.json")).ok()?).ok()?;
-    (saved["url"].as_str() == Some(url)).then(|| saved["session_id"].as_str().map(str::to_owned)).flatten()
-}
-
-pub(super) async fn run_turn(root: std::path::PathBuf, url: String, token: String, dir: std::path::PathBuf, title: String, prompt: String,
-    events: async_channel::Sender<Event>, cancel: tokio_util::sync::CancellationToken) -> Result<Turn, String> {
-    let token = if token.is_empty() { super::gateway_oauth::access_token(&root, &url).await? } else { token };
-    let client = GatewayClient::new(ClientOptions::default());
-    client.connect_remote(&url, &token).await.map_err(|e| format!("Could not connect to the remote gateway: {e}"))?;
-    let mut stream = client.subscribe();
-    let session_id = match remote_session(&dir, &url) {
-        Some(id) => id,
-        None => {
-            let created = client.request("session.create", json!({"source":"gui","title":title})).await.map_err(|e| format!("The remote gateway refused a new session: {e}"))?;
-            let id = created["session_id"].as_str().ok_or("The remote gateway returned no session id")?.to_owned();
-            let _ = std::fs::write(dir.join("remote-session.json"), json!({"url":url,"session_id":id}).to_string());
-            id
+impl Route {
+    pub fn selected(root: &Path, state: &connections::State) -> Result<Self, String> {
+        match state.config.mode {
+            connections::Mode::Local => Ok(Self::Local),
+            connections::Mode::Ssh => state
+                .tunnel
+                .as_ref()
+                .map(|t| Self::Remote {
+                    origin: t.url.clone(),
+                    token: t.token.clone(),
+                })
+                .ok_or_else(|| "Connect the selected SSH tunnel before opening a chat.".into()),
+            connections::Mode::Remote | connections::Mode::Cloud => {
+                let origin = state.config.url.trim().trim_end_matches('/').to_owned();
+                if origin.is_empty() {
+                    return Err("Select a gateway URL before opening a chat.".into());
+                }
+                let token = std::fs::read_to_string(root.join("connection-token"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                Ok(Self::Remote { origin, token })
+            }
         }
-    };
-    let _ = client.request("session.resume", json!({"session_id":session_id})).await;
-    client.request("prompt.submit", json!({"session_id":session_id,"text":prompt})).await.map_err(|e| format!("The remote gateway refused the message: {e}"))?;
-    let mut text = String::new();
-    let mut entries: Vec<Entry> = Vec::new();
-    let status = loop {
-        let message = tokio::select! {
-            _ = cancel.cancelled() => { let _ = client.request("session.interrupt", json!({"session_id":session_id})).await; break Status::Interrupted; }
-            message = stream.recv() => message,
-        };
-        let Ok(ClientMessage::Event(frame)) = message else { if message.is_err() { break Status::Failed("The remote gateway connection closed".into()); } continue };
-        let event = if frame.get("params").is_some() { frame["params"].clone() } else { frame };
-        if event["session_id"].as_str().is_some_and(|id| id != session_id) { continue; }
-        let payload = &event["payload"];
-        match event["type"].as_str().unwrap_or_default() {
-            "message.delta" => if let Some(delta) = payload["text"].as_str() { text.push_str(delta); let _ = events.send(Event::Text(delta.to_owned())).await; },
-            "tool.start" => {
-                if !text.is_empty() { entries.push(Entry::Assistant { text: std::mem::take(&mut text), calls: vec![] }); }
+    }
+}
+
+pub(super) struct Connection {
+    pub route: Route,
+    root: PathBuf,
+    provider: Config,
+    client: GatewayClient,
+    connecting: tokio::sync::Mutex<()>,
+}
+
+impl Connection {
+    pub fn new(root: PathBuf, route: Route, provider: Config) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            route,
+            provider,
+            client: GatewayClient::new(Default::default()),
+            connecting: Default::default(),
+        })
+    }
+    pub fn matches(&self, root: &Path, route: &Route) -> bool {
+        self.root == root && self.route == *route
+    }
+    async fn connect(&self) -> Result<(), String> {
+        let _guard = self.connecting.lock().await;
+        if self.client.connection_state() == ConnectionState::Open {
+            return Ok(());
+        }
+        match &self.route {
+            Route::Local => {
+                let owner = hermes_gateway::owner::ensure_local(&self.root, &self.provider)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                owner
+                    .connect(&self.client)
+                    .await
+                    .map_err(|e| format!("Could not attach to the local gateway: {e}"))
             }
-            "tool.complete" => entries.push(Entry::Tool { id: payload["tool_id"].as_str().unwrap_or_default().to_owned(), name: payload["name"].as_str().unwrap_or_default().to_owned(),
-                approved: true, result: payload["result_text"].as_str().map(str::to_owned).unwrap_or_else(|| payload["result"].to_string()) }),
-            "approval.request" => {
-                let request = payload["request_id"].as_str().or(payload["prompt_id"].as_str()).unwrap_or_default().to_owned();
-                let call = ToolCall { id: request.clone(), name: payload["tool_name"].as_str().unwrap_or("remote tool").to_owned(),
-                    arguments: payload["command"].as_str().map(str::to_owned).unwrap_or_else(|| payload["description"].to_string()) };
-                let (answer, decision) = async_channel::bounded(1);
-                let _ = events.send(Event::Approval { call, answer }).await;
-                let approved = decision.recv().await.unwrap_or(false);
-                let _ = client.request("approval.respond", json!({"session_id":session_id,"request_id":request,"prompt_id":request,
-                    "execution_generation":event["execution_generation"],"choice": if approved { "once" } else { "deny" }})).await;
+            Route::Remote { origin, token } => {
+                let bearer = if token.is_empty() {
+                    super::gateway_oauth::access_token(&self.root, origin).await?
+                } else {
+                    token.clone()
+                };
+                self.client
+                    .connect_remote(origin, &bearer)
+                    .await
+                    .map_err(|e| e.to_string())
             }
-            "message.complete" => {
-                if let Some(final_text) = payload["text"].as_str() && text.is_empty() { text = final_text.to_owned(); }
-                break Status::Complete;
+        }
+    }
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.connect().await?;
+        self.client
+            .request(method, params)
+            .await
+            .map_err(|e| format!("{method}: {e}"))
+    }
+    async fn resume(&self, sid: &str) -> Result<Value, String> {
+        if let Some(barrier) = self.client.session_replay_barrier(sid)
+            && !barrier.wait().await
+        {
+            return Err("Gateway disconnected during replay".into());
+        }
+        self.client
+            .request("session.resume", json!({"session_id":sid}))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    pub fn watch(
+        self: Arc<Self>,
+        sid: String,
+        epoch: u64,
+        detach: CancellationToken,
+    ) -> Task<Message> {
+        let stream = iced::stream::channel::<Update>(64, async move |mut out| {
+            let mut delay = 250;
+            loop {
+                let mut events = self.client.subscribe();
+                let attach = async {
+                    self.connect().await?;
+                    self.resume(&sid).await
+                };
+                let result =
+                    tokio::select! { _ = detach.cancelled() => return, result = attach => result };
+                let error = match result {
+                    Err(error) => error,
+                    Ok(snap) => {
+                        delay = 250;
+                        let mut watermark = snap["last_sequence"].as_u64().unwrap_or(0);
+                        if out.send(Update::Snapshot(snap)).await.is_err() {
+                            return;
+                        }
+                        loop {
+                            let message = tokio::select! { _ = detach.cancelled() => return, event = events.recv() => event };
+                            let fetch = match message {
+                                Ok(ClientMessage::Event(frame)) => {
+                                    let event = frame.get("params").unwrap_or(&frame);
+                                    if event["session_id"].as_str() != Some(&sid) {
+                                        continue;
+                                    }
+                                    let seq = event["seq"].as_u64();
+                                    if seq.is_some_and(|s| s <= watermark) {
+                                        continue;
+                                    }
+                                    let gap =
+                                        seq.is_some_and(|s| watermark != 0 && s > watermark + 1);
+                                    if let Some(seq) = seq {
+                                        watermark = seq;
+                                    }
+                                    let kind = event["type"].as_str().unwrap_or_default();
+                                    if !gap
+                                        && matches!(
+                                            kind,
+                                            "message.delta"
+                                                | "message.complete"
+                                                | "error"
+                                                | "message.error"
+                                                | "subagent.progress"
+                                        )
+                                    {
+                                        if out.send(Update::Event(event.clone())).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    gap || matches!(
+                                        kind,
+                                        "message.start"
+                                            | "session.info"
+                                            | "session.updated"
+                                            | "message.complete"
+                                            | "tool.start"
+                                            | "tool.complete"
+                                            | "approval.request"
+                                            | "approval.settled"
+                                            | "approval.cancelled"
+                                            | "session.replay_gap"
+                                            | "session.snapshot_required"
+                                            | "replay.snapshot_required"
+                                    )
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                                Ok(ClientMessage::State(
+                                    ConnectionState::Closed | ConnectionState::Error,
+                                ))
+                                | Err(_) => break "Gateway disconnected".into(),
+                                _ => continue,
+                            };
+                            if fetch {
+                                let result = tokio::select! { _ = detach.cancelled() => return, result = self.resume(&sid) => result };
+                                match result {
+                                    Ok(snap) => {
+                                        watermark =
+                                            snap["last_sequence"].as_u64().unwrap_or(watermark);
+                                        if out.send(Update::Snapshot(snap)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => break error,
+                                }
+                            }
+                        }
+                    }
+                };
+                if out.send(Update::Offline(error)).await.is_err() {
+                    return;
+                }
+                tokio::select! { _ = detach.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(delay)) => () }
+                delay = (delay * 2).min(5000);
             }
-            "subagent.progress" => if let Ok(progress) = serde_json::from_value(payload.clone()) { let _ = events.send(Event::Subagent(progress)).await; },
-            "error" | "message.error" => break Status::Failed(payload["message"].as_str().unwrap_or("The remote turn failed").to_owned()),
+        });
+        Task::run(stream, move |update| Message::Gateway(epoch, update))
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum Update {
+    Snapshot(Value),
+    Event(Value),
+    Offline(String),
+    Created(Result<String, String>),
+    Submitted(String, Result<Value, String>),
+    Renamed(Result<String, String>),
+    Controlled(Result<Value, String>),
+    Listed(Result<Value, String>),
+}
+
+// Only UI state lives under this directory. Remote strings never become literal paths.
+pub fn cache(root: &Path, key: &str) -> PathBuf {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let mut path = root.to_owned();
+    let encoded = URL_SAFE_NO_PAD.encode(key);
+    for part in encoded.as_bytes().chunks(64) {
+        path.push(format!(
+            "k-{}",
+            std::str::from_utf8(part).expect("base64 is ASCII")
+        ));
+    }
+    path
+}
+
+pub fn remote_summary(
+    root: &Path,
+    origin: &str,
+    row: &Value,
+) -> Option<hermes_library::SessionSummary> {
+    let id = row["session_id"].as_str().or_else(|| row["id"].as_str())?;
+    if id.is_empty() || id.len() > 256 {
+        return None;
+    }
+    let profile = cache(&root.join("gateway-views"), origin);
+    let directory = cache(&profile.join("sessions"), id);
+    let title = row["title"].as_str().unwrap_or("New chat").to_owned();
+    let date = row["started_at"]
+        .as_i64()
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    Some(hermes_library::SessionSummary {
+        id: id.into(),
+        title,
+        project_id: row["project_id"].as_str().map(Into::into),
+        directory,
+        created_at: date.clone(),
+        updated_at: date,
+        last_active: None,
+        bot: None,
+        source: hermes_library::SessionSource::Native,
+        archived: false,
+        pinned: false,
+    })
+}
+
+pub(super) fn history(snapshot: &Value) -> Result<History, String> {
+    if let Some(native) = snapshot.get("native_history") {
+        return serde_json::from_value(native.clone())
+            .map_err(|e| format!("Invalid gateway history: {e}"));
+    }
+    let rows = snapshot["messages"]
+        .as_array()
+        .ok_or("The gateway returned no session history")?;
+    let mut history = History::default();
+    let model = snapshot["info"]["model"].as_str().unwrap_or_default();
+    for row in rows {
+        let text = row["text"]
+            .as_str()
+            .or_else(|| row["content"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        match row["role"].as_str() {
+            Some("user") => history.turns.push(Turn {
+                context: String::new(),
+                attachments: vec![],
+                prompt: text,
+                model: row["model"].as_str().unwrap_or(model).into(),
+                entries: vec![],
+                status: Status::Complete,
+            }),
+            Some("assistant") => {
+                if let Some(turn) = history.turns.last_mut() {
+                    let calls = row["tool_calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|call| ToolCall {
+                            id: call["id"].as_str().unwrap_or_default().into(),
+                            name: call["function"]["name"].as_str().unwrap_or_default().into(),
+                            arguments: call["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .into(),
+                        })
+                        .collect();
+                    turn.entries.push(Entry::Assistant { text, calls });
+                }
+            }
+            Some("tool") => {
+                if let Some(turn) = history.turns.last_mut() {
+                    turn.entries.push(Entry::Tool {
+                        id: row["tool_call_id"].as_str().unwrap_or_default().into(),
+                        name: row["name"].as_str().unwrap_or_default().into(),
+                        approved: row["approved"].as_bool().unwrap_or(true),
+                        result: text,
+                    });
+                }
+            }
             _ => {}
         }
-    };
-    if !text.is_empty() { entries.push(Entry::Assistant { text, calls: vec![] }); }
-    client.close();
-    Ok(Turn { context: String::new(), attachments: vec![], prompt, model: format!("remote · {url}"), entries, status })
+    }
+    if let Some(last) = history.turns.last_mut() {
+        if snapshot["running"] == true {
+            last.status = Status::Running;
+        } else if let Some(status) = terminal_status(&snapshot["latest_outcome"]) {
+            last.status = status;
+        }
+    }
+    Ok(history)
+}
+
+pub(super) fn terminal_status(payload: &Value) -> Option<Status> {
+    Some(match payload["status"].as_str()? {
+        "complete" | "completed" => Status::Complete,
+        "interrupted" | "cancelled" => Status::Interrupted,
+        "failed" | "error" => Status::Failed(
+            payload["error"]
+                .as_str()
+                .or_else(|| payload["message"].as_str())
+                .unwrap_or("The gateway turn failed")
+                .into(),
+        ),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_and_interrupted_completions_keep_their_outcomes() {
+        assert_eq!(
+            terminal_status(&json!({"status":"error","error":"provider offline"})),
+            Some(Status::Failed("provider offline".into()))
+        );
+        assert_eq!(
+            terminal_status(&json!({"status":"interrupted"})),
+            Some(Status::Interrupted)
+        );
+    }
+    #[test]
+    fn stock_snapshot_preserves_tool_identity() {
+        let h = history(&json!({"messages":[{"role":"user","content":"clock"},{"role":"assistant","tool_calls":[{"id":"x","function":{"name":"time","arguments":"{}"}}]},{"role":"tool","tool_call_id":"x","content":"ok"}]})).unwrap();
+        assert!(
+            matches!(&h.turns[0].entries[0], Entry::Assistant {calls,..} if calls[0].id == "x")
+        );
+        assert!(matches!(&h.turns[0].entries[1], Entry::Tool{id,..} if id == "x"));
+    }
 }

@@ -154,7 +154,8 @@ impl Provider {
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/v1/chat/completions", post(model)),
+                Router::new()
+                    .route("/v1/chat/completions", post(model)),
             )
             .await
             .unwrap();
@@ -194,6 +195,24 @@ async fn model(Json(request): Json<Value>) -> Response {
         )
             .into_response();
     }
+    let system = messages.first().and_then(|m| m["content"].as_str()).unwrap_or_default();
+    if system.contains("You are Ada, a named Hermes agent") && last["role"] == "user" && last["content"].as_str().is_some_and(|content| content.contains("group-job")) {
+        let body = event(json!({"tool_calls":[{"index":0,"id":"group_job","function":{"name":"terminal","arguments":json!({"command":"read -r line","background":true}).to_string()}}]}), Some("tool_calls"));
+        return ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response();
+    }
+    if system.contains("You are Ada, a named Hermes agent") && last["content"].as_str().is_some_and(|content| content.contains("hold-group")) {
+        let body = stream::once(async move { Ok::<_, Infallible>(Bytes::from(event(json!({"content":"Waiting"}), None))) }).chain(stream::pending());
+        return ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body)).into_response();
+    }
+    if system.contains("You are Ada, a named Hermes agent") && last["content"].as_str().is_some_and(|content| content.contains("fail-group")) {
+        return ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"error\":{\"message\":\"group fixture failed\"}}\n\n").into_response();
+    }
+    if system.contains("You are Ada, a named Hermes agent") || system.contains("You are Grace, a named Hermes agent") {
+        let reply = if system.contains("You are Ada, a named Hermes agent") { "Ada here" }
+            else if messages.iter().any(|message| message["content"].as_str().is_some_and(|content| content.contains("Ada here"))) { "Grace saw Ada" }
+            else { "Grace missed Ada" };
+        return ([(header::CONTENT_TYPE, "text/event-stream")], event(json!({"content":reply}), Some("stop"))).into_response();
+    }
     if last["content"] == "slow" {
         let text = event(json!({"content":"Waiting"}), None);
         let body = stream::once(async move { Ok::<_, Infallible>(Bytes::from(text)) })
@@ -204,6 +223,10 @@ async fn model(Json(request): Json<Value>) -> Response {
         )
             .into_response();
     }
+    if last["role"] == "tool" && messages.iter().any(|message| message["role"] == "user" && (message["content"] == "abandon fixture" || message["content"] == "persist fixture")) {
+        let body = stream::once(async move { Ok::<_, Infallible>(Bytes::from(event(json!({"content":"Waiting"}), None))) }).chain(stream::pending());
+        return ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(body)).into_response();
+    }
     let body = if last["role"] == "tool" {
         let content = last["content"].as_str().unwrap();
         let reply = if content.contains("denied") {
@@ -212,6 +235,19 @@ async fn model(Json(request): Json<Value>) -> Response {
             "Clock read successfully."
         };
         event(json!({"content":reply}), Some("stop"))
+    } else if last["content"] == "persist fixture" {
+        event(json!({"tool_calls":[{"index":0,"id":"persistent_fixture","function":{
+            "name":"terminal","arguments":json!({"command":"read -r line","background":true,"persist_on_release":true}).to_string()
+        }}]}),Some("tool_calls"))
+    } else if last["content"] == "run background fixture" || last["content"] == "abandon fixture" {
+        event(json!({"tool_calls":[{"index":0,"id":"background_fixture","function":{
+            "name":"terminal","arguments":json!({"command":"printf 'background-ready'; read -r line","background":true}).to_string()
+        }}]}),Some("tool_calls"))
+    } else if last["content"] == "run pipe fixture" {
+        assert!(request["tools"].as_array().unwrap().iter().any(|s|s["function"]["name"]=="terminal"));
+        event(json!({"tool_calls":[{"index":0,"id":"fixture_terminal_call","function":{
+            "name":"terminal","arguments":json!({"command":"printf approved > process-proof.txt; printf pipe-probe"}).to_string()
+        }}]}),Some("tool_calls"))
     } else if last["content"]
         .as_str()
         .is_some_and(|s| s.contains("clock"))
@@ -447,6 +483,10 @@ async fn native_turn_survives_reconnect_approval_and_restart_with_rust_history()
         .ok("session.resume", json!({"session_id":sid}))
         .await;
     assert_eq!(restored["message_count"], 4);
+    let retried = restarted.ok("prompt.submit",json!({"session_id":sid,"submission_id":"send-once","text":"Read the clock"})).await;
+    assert_eq!(retried["admission_id"],receipt["admission_id"]);
+    assert_eq!(retried["status"],"terminal");
+    assert_eq!(restarted.call("prompt.submit",json!({"session_id":sid,"submission_id":"send-once","text":"different"})).await["error"]["data"]["reason"],"admission_conflict");
     assert_eq!(restored["info"]["title"], "Renamed clock");
     assert_eq!(
         restarted.ok("session.create", create).await["session_id"],
@@ -501,15 +541,10 @@ async fn legacy_stream_offsets_busy_and_native_interrupt_are_real_transport_oper
             .await["error"]["data"]["reason"],
         "session_busy"
     );
-    assert_eq!(
-        native
-            .call(
-                "prompt.submit",
-                json!({"session_id":sid,"text":"another","queued":true})
-            )
-            .await["error"]["data"]["reason"],
-        "unsupported_control"
-    );
+    let queued = native.ok("prompt.submit",json!({"session_id":sid,"text":"another","queued":true})).await;
+    assert_eq!(queued["status"],"queued");
+    let cancelled = native.ok("prompt.cancel",json!({"session_id":sid,"admission_id":queued["admission_id"]})).await;
+    assert_eq!(cancelled["outcome"],"cancelled");
     assert_eq!(
         native
             .call(
@@ -721,6 +756,141 @@ async fn ported_rust_client_replays_native_completion_after_a_real_disconnect() 
     gateway.shutdown().await.unwrap();
 }
 
+
+#[tokio::test]
+async fn local_agent_process_runs_only_after_gateway_approval() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let sid = client.ok("session.create",json!({"cwd":workspace.path()})).await["session_id"].clone();
+    let marker=workspace.path().join("process-proof.txt");
+    for choice in ["deny","once"] {
+        client.ok("prompt.submit",json!({"session_id":sid,"text":"run pipe fixture"})).await;
+        let pending=client.event("approval.request").await;
+        assert!(!marker.exists());
+        client.ok("approval.respond",json!({"session_id":sid,"prompt_id":pending["payload"]["prompt_id"],
+            "execution_generation":pending["execution_generation"],"choice":choice})).await;
+        client.event("message.complete").await;
+        if choice=="deny" { assert!(!marker.exists()); }
+    }
+    assert_eq!(std::fs::read(marker).unwrap(),b"approved");
+    let history=client.ok("session.history",json!({"session_id":sid})).await;
+    assert!(history["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool" &&
+        m["content"].as_str().is_some_and(|s|s.contains("pipe-probe"))));
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn background_process_controls_survive_detach_and_stay_in_the_owning_session() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut first = Client::native(&gateway).await;
+    let sid = first.ok("session.create", json!({})).await["session_id"].clone();
+    for _ in 0..2 {
+        first.ok("prompt.submit", json!({"session_id":sid,"text":"run background fixture"})).await;
+        let approval = first.event("approval.request").await;
+        first.ok("approval.respond", json!({"session_id":sid,"prompt_id":approval["payload"]["prompt_id"],
+            "execution_generation":approval["execution_generation"],"choice":"once"})).await;
+        first.event("message.complete").await;
+    }
+    first.ok("session.close", json!({"session_id":sid})).await;
+    drop(first);
+    let mut client = Client::native(&gateway).await;
+    let other = client.ok("session.create",json!({})).await["session_id"].clone();
+    assert!(client.call("process.list",json!({"session_id":sid})).await.get("error").is_some());
+    client.ok("session.resume",json!({"session_id":sid})).await;
+    let rows = client.ok("process.list",json!({"session_id":sid})).await;
+    let jobs = rows["processes"].as_array().unwrap();
+    assert_eq!(jobs.len(),2);
+    assert!(jobs.iter().all(|p| p["status"] == "running"));
+    let process = &jobs[0]["session_id"];
+    assert_eq!(client.call("process.kill",json!({"session_id":other,"process_id":process})).await["error"]["code"],4044);
+    assert_eq!(client.ok("process.stop",json!({"session_id":other})).await["killed"],0);
+    assert_eq!(client.ok("process.kill",json!({"session_id":sid,"process_id":process})).await["status"],"killed");
+    assert_eq!(client.ok("process.kill",json!({"session_id":sid,"process_id":process})).await["status"],"already_exited");
+    assert_eq!(client.ok("process.stop",json!({"session_id":sid})).await["killed"],1);
+    assert_eq!(client.ok("process.stop",json!({"session_id":sid})).await["killed"],0);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_turn_releases_only_processes_started_in_that_turn() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let sid = client.ok("session.create", json!({})).await["session_id"].clone();
+    client.ok("prompt.submit", json!({"session_id":sid,"text":"run background fixture"})).await;
+    let approval = client.event("approval.request").await;
+    client.ok("approval.respond", json!({"session_id":sid,"prompt_id":approval["payload"]["prompt_id"],"execution_generation":approval["execution_generation"],"choice":"once"})).await;
+    client.event("message.complete").await;
+    let before = client.ok("process.list", json!({"session_id":sid})).await;
+    let old = before["processes"][0]["session_id"].as_str().unwrap().to_owned();
+    let receipt = client.ok("prompt.submit", json!({"session_id":sid,"submission_id":"abandon","text":"abandon fixture"})).await;
+    let approval = client.event("approval.request").await;
+    client.ok("approval.respond", json!({"session_id":sid,"prompt_id":approval["payload"]["prompt_id"],"execution_generation":approval["execution_generation"],"choice":"once"})).await;
+    let rows = timeout(Duration::from_secs(15), async { loop {
+        let rows = client.ok("process.list", json!({"session_id":sid})).await;
+        if rows["processes"].as_array().unwrap().len() == 2 { break rows; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }}).await.unwrap();
+    let new = rows["processes"].as_array().unwrap().iter().find(|row| row["session_id"] != old).unwrap()["session_id"].as_str().unwrap().to_owned();
+    client.ok("prompt.cancel", json!({"session_id":sid,"admission_id":receipt["admission_id"]})).await;
+    let complete = client.event("message.complete").await;
+    assert_eq!(complete["payload"]["status"], "interrupted");
+    let rows = client.ok("process.list", json!({"session_id":sid})).await;
+    let rows = rows["processes"].as_array().unwrap();
+    assert_eq!(rows.iter().find(|row| row["session_id"] == old).unwrap()["status"], "running");
+    assert_eq!(rows.iter().find(|row| row["session_id"] == new).unwrap()["status"], "exited");
+    assert_eq!(client.ok("process.stop", json!({"session_id":sid})).await["killed"], 1);
+    let receipt = client.ok("prompt.submit", json!({"session_id":sid,"submission_id":"persist","text":"persist fixture"})).await;
+    let approval = client.event("approval.request").await;
+    client.ok("approval.respond", json!({"session_id":sid,"prompt_id":approval["payload"]["prompt_id"],"execution_generation":approval["execution_generation"],"choice":"once"})).await;
+    let id = timeout(Duration::from_secs(15), async { loop {
+        let rows = client.ok("process.list", json!({"session_id":sid})).await;
+        if let Some(row) = rows["processes"].as_array().unwrap().iter().find(|row| row["status"] == "running" && row["persist_on_release"] == true) { break row["session_id"].as_str().unwrap().to_owned(); }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }}).await.unwrap();
+    client.ok("prompt.cancel", json!({"session_id":sid,"admission_id":receipt["admission_id"]})).await;
+    assert_eq!(client.event("message.complete").await["payload"]["status"], "interrupted");
+    let rows = client.ok("process.list", json!({"session_id":sid})).await;
+    assert_eq!(rows["processes"].as_array().unwrap().iter().find(|row| row["session_id"] == id).unwrap()["status"], "running");
+    assert_eq!(client.ok("process.stop", json!({"session_id":sid})).await["killed"], 1);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_member_process_remains_controllable_after_viewer_detach() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let gateway = provider.gateway(&root).await;
+    let library = hermes_library::Library::open(root.path()).unwrap();
+    let ada = library.create_bot("Ada", "", "", "").unwrap();
+    let grace = library.create_bot("Grace", "", "", "").unwrap();
+    let group = library.create_group("Review", &[ada.name, grace.name]).unwrap();
+    let chat = library.group_chat(&group.id).unwrap();
+    let mut first = Client::native(&gateway).await;
+    first.ok("session.resume", json!({"session_id":chat.id})).await;
+    first.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"group-process","text":"group-job"})).await;
+    let approval = first.event("approval.request").await;
+    first.ok("approval.respond", json!({"session_id":chat.id,"prompt_id":approval["payload"]["prompt_id"],"execution_generation":approval["execution_generation"],"choice":"once"})).await;
+    first.event("message.complete").await;
+    first.event("message.complete").await;
+    first.ok("session.close", json!({"session_id":chat.id})).await;
+    drop(first);
+    let mut second = Client::native(&gateway).await;
+    second.ok("session.resume", json!({"session_id":chat.id})).await;
+    let rows = second.ok("process.list", json!({"session_id":chat.id})).await;
+    let jobs = rows["processes"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["status"], "running");
+    assert_eq!(second.ok("process.stop", json!({"session_id":chat.id})).await["killed"], 1);
+    gateway.shutdown().await.unwrap();
+}
+
 /// Settings › Gateways › Remote: the desktop's remote path (connect_remote,
 /// session.create, prompt.submit, approval.respond, message.complete) against
 /// a real gateway on this computer.
@@ -756,31 +926,325 @@ async fn remote_connect_runs_a_whole_turn_with_approval() {
 async fn signed_webhook_runs_the_agent_into_its_own_chat() {
     let provider = Provider::start().await;
     let root = TempDir::new().unwrap();
-    let gateway = Gateway::start(GatewayConfig::new(root.path(), provider.config())).await.unwrap();
+    let gateway = provider.gateway(&root).await;
     let library = hermes_library::Library::open(root.path()).unwrap();
-    let hook = library.create_webhook(hermes_library::webhooks::Webhook { name: "deploys".into(), prompt: "Say hello".into(), events: vec!["push".into()], ..Default::default() }).unwrap();
+    let hook = library.create_webhook(hermes_library::webhooks::Webhook { name: "deploys".into(), prompt: "Read the clock".into(), events: vec!["push".into()], ..Default::default() }).unwrap();
     let body = br#"{"ref":"refs/heads/main"}"#.to_vec();
     let tag = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, hook.secret.as_bytes()), &body);
     let signature = format!("sha256={}", tag.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>());
     let http = reqwest::Client::new();
     let url = format!("{}/webhooks/deploys", gateway.http_url());
-    let post = |sig: String, event: &'static str| http.post(&url).header("x-hub-signature-256", sig).header("x-github-event", event).body(body.clone()).send();
-    assert_eq!(post("sha256=00".into(), "push").await.unwrap().status(), 401, "a bad signature is refused");
-    assert_eq!(post(signature.clone(), "issues").await.unwrap().status(), 200, "a filtered event is ignored");
-    assert_eq!(post(signature, "push").await.unwrap().status(), 202);
-    let hook = timeout(Duration::from_secs(20), async {
+    let post = |sig: String, event: &'static str| http.post(&url).header("x-hub-signature-256", sig).header("x-github-event", event).header("x-github-delivery", "delivery-1").body(body.clone()).send();
+    assert_eq!(post("sha256=00".into(), "push").await.unwrap().status(), 401);
+    assert_eq!(post(signature.clone(), "issues").await.unwrap().status(), 200);
+    let (first, duplicate) = tokio::join!(post(signature.clone(), "push"), post(signature.clone(), "push"));
+    let first = first.unwrap(); let duplicate = duplicate.unwrap();
+    assert_eq!(first.status(), 202); assert_eq!(duplicate.status(), 202);
+    let first: Value = first.json().await.unwrap(); let duplicate: Value = duplicate.json().await.unwrap();
+    assert_eq!(first["receipt"]["admission_id"], duplicate["receipt"]["admission_id"]);
+    let unkeyed = || http.post(&url).header("x-hub-signature-256", &signature).header("x-github-event", "push").body(body.clone()).send();
+    let (a, b) = tokio::join!(unkeyed(), unkeyed());
+    let a = a.unwrap(); let b = b.unwrap();
+    assert_eq!(a.status(), 202); assert_eq!(b.status(), 202);
+    let a: Value = a.json().await.unwrap(); let b: Value = b.json().await.unwrap();
+    assert_ne!(a["delivery_id"], b["delivery_id"]);
+    let changed = br#"{\"ref\":\"refs/heads/other\"}"#.to_vec();
+    let tag = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, hook.secret.as_bytes()), &changed);
+    let changed_sig = format!("sha256={}", tag.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>());
+    assert_eq!(http.post(&url).header("x-hub-signature-256", changed_sig).header("x-github-event", "push").header("x-github-delivery", "delivery-1").body(changed).send().await.unwrap().status(), 409);
+    let hook = library.webhooks().unwrap().remove(0);
+    let chat = library.session(hook.session_id.as_deref().unwrap()).unwrap();
+    assert_eq!(chat.title, "Webhook · deploys");
+    let history: hermes_engine::History = timeout(Duration::from_secs(20), async {
         loop {
-            let hook = library.webhooks().unwrap().remove(0);
-            if hook.deliveries.first().is_some_and(|d| d.status.starts_with("ran") || d.status.starts_with("failed")) { break hook; }
+            if let Ok(bytes) = std::fs::read(chat.directory.join("conversation.json"))
+                && let Ok(history) = serde_json::from_slice::<hermes_engine::History>(&bytes)
+                && history.turns.len() == 3 && history.turns.last().is_some_and(|turn| matches!(turn.status, hermes_engine::Status::Complete)) { break history; }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }).await.unwrap();
-    assert_eq!(hook.deliveries[0].status, "ran (complete)", "{:?}", hook.deliveries);
-    assert_eq!(hook.deliveries[1].status, "ignored (event filter)");
-    let chat = library.session(hook.session_id.as_deref().unwrap()).unwrap();
-    assert_eq!(chat.title, "Webhook · deploys");
-    let history = hermes_engine::Session::open(&chat.directory).unwrap().history().clone();
-    let turn = &history.turns[0];
-    assert!(turn.prompt.contains("Say hello") && turn.prompt.contains("refs/heads/main"));
-    drop(gateway);
+    assert_eq!(history.turns.len(), 3);
+    assert!(history.turns[0].prompt.contains("Read the clock") && history.turns[0].prompt.contains("refs/heads/main"));
+    assert!(serde_json::to_string(&history.turns[0]).unwrap().contains("Tool denied."), "unattended webhook tool calls are denied");
+    timeout(Duration::from_secs(10), async { loop {
+        let hook = library.webhooks().unwrap().remove(0);
+        if hook.deliveries.iter().filter(|delivery| delivery.id.is_some()).count() == 3
+            && hook.deliveries.iter().filter(|delivery| delivery.id.is_some()).all(|delivery| delivery.status == "ran (complete)") { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }}).await.unwrap();
+    gateway.shutdown().await.unwrap();
+    // A crash after completion but before the UI projection is repaired on startup.
+    library.update_delivery_status("deploys", &hook.secret, "delivery-1", "received").unwrap();
+    let gateway = Gateway::start(GatewayConfig::new(root.path(), provider.config())).await.unwrap();
+    timeout(Duration::from_secs(10), async { loop {
+        let hook = library.webhooks().unwrap().remove(0);
+        if hook.deliveries.iter().any(|delivery| delivery.id.as_deref() == Some("delivery-1") && delivery.status == "ran (complete)") { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }}).await.unwrap();
+    let response = http.post(format!("{}/webhooks/deploys", gateway.http_url()))
+        .header("x-hub-signature-256", &signature).header("x-github-event", "push")
+        .header("x-github-delivery", "delivery-1").body(body.clone()).send().await.unwrap();
+    assert_eq!(response.status(), 202);
+    let retry: Value = response.json().await.unwrap();
+    assert_eq!(retry["receipt"]["admission_id"], first["receipt"]["admission_id"]);
+    assert_eq!(retry["receipt"]["status"], "terminal");
+    let history: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    assert_eq!(history.turns.len(), 3);
+    library.record_delivery("deploys", hermes_library::webhooks::Delivery { at: "now".into(), event: "push".into(), status: "test".into(), id: None }, Some("missing-session".into())).unwrap();
+    let unavailable = http.post(format!("{}/webhooks/deploys", gateway.http_url()))
+        .header("x-hub-signature-256", &signature).header("x-github-event", "push")
+        .header("x-github-delivery", "delivery-1").body(body.clone()).send().await.unwrap();
+    assert_eq!(unavailable.status(), 409, "a lost receipt store must not create a new admission");
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_flight_hint_does_not_claim_a_matching_historical_row() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let library = hermes_library::Library::open(root.path()).unwrap();
+    let project = library.add_project(workspace.path()).unwrap();
+    let chat = library.create_session(Some(&project.id), Some("Populated legacy chat")).unwrap();
+    library.set_archived(&chat.id, true).unwrap();
+    let dir = &chat.directory;
+    let file = hermes_engine::Attachment::capture_data_url(dir, "note.txt".into(), "data:text/plain;base64,aGVsbG8=").unwrap();
+    let history = json!({"version":1,"turns":[{"prompt":"same text","model":"old-model","attachments":[file],
+        "entries":[{"role":"assistant","text":"old answer","calls":[]}],"status":{"state":"complete"}}]});
+    std::fs::write(dir.join("conversation.json"),serde_json::to_vec(&history).unwrap()).unwrap();
+    std::fs::write(dir.join("gateway.json"),br#"{"model":"old-model"}"#).unwrap();
+    let queue = json!({"parked":true,"next_id":10,
+        "in_flight":{"entry":{"id":9,"text":"same text","attachments":[file]},"turn_index":0},
+        "entries":[{"id":10,"text":"later","attachments":[file]}]});
+    let path = dir.join("queued-prompts.json");
+    std::fs::write(&path,b"{").unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let params = json!({"session_id":chat.id});
+    assert!(client.call("session.resume",params.clone()).await.get("error").is_some());
+    let preserved: Value = serde_json::from_slice(&std::fs::read(dir.join("conversation.json")).unwrap()).unwrap();
+    assert_eq!(preserved,history);
+    std::fs::write(&path,serde_json::to_vec(&queue).unwrap()).unwrap();
+    let first = client.ok("session.resume",params.clone()).await;
+    let claims = first["pending"].as_array().unwrap().clone();
+    assert_eq!(claims.len(),2);
+    assert_eq!(claims[0]["status"],"unknown");
+    assert_eq!(claims[0]["legacy_turn_index"],0);
+    assert!(claims[0]["turn_index"].is_null());
+    assert_eq!(claims[1]["status"],"parked");
+    assert_eq!(claims[1]["model"],"old-model");
+    let rows = client.ok("session.history",params.clone()).await["messages"].clone();
+    assert_ne!(rows[0]["turn_id"],claims[0]["admission_id"]);
+    assert_eq!(rows[0]["attachments"],json!([file]));
+    drop(client);
+    gateway.shutdown().await.unwrap();
+    let gateway=provider.gateway(&root).await;
+    let mut client=Client::native(&gateway).await;
+    let recovered = client.ok("session.resume", params.clone()).await;
+    assert!(recovered["authority_epoch"].as_u64().unwrap() > first["authority_epoch"].as_u64().unwrap());
+    let mut expected = claims.clone();
+    expected[1]["authority_epoch"] = recovered["authority_epoch"].clone();
+    assert_eq!(recovered["pending"], json!(expected));
+    client.ok("prompt.resolve_unknown",json!({"session_id":chat.id,"admission_id":claims[0]["admission_id"],
+        "execution_generation":claims[0]["execution_generation"]})).await;
+    assert_eq!(client.ok("session.history",params).await["messages"],rows);
+    assert_eq!(file.data(dir).unwrap(),b"hello");
+    let retained=library.session(&chat.id).unwrap();
+    assert_eq!(retained.project_id.as_deref(),Some(project.id.as_str()));
+    assert!(retained.archived);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn crash_checkpoint_holds_follower_until_fenced_resolution_and_preserves_attachments() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let recovery = TempDir::new().unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let sid = client.ok("session.create",json!({"title":"Crash fixture"})).await["session_id"].as_str().unwrap().to_owned();
+    let session = json!({"session_id":sid});
+    let head = client.ok("prompt.submit",json!({"session_id":sid,"text":"slow","submission_id":"head"})).await;
+    client.event("message.delta").await;
+    let attached = client.ok("file.attach", json!({"session_id":sid,"name":"notes.txt","data_url":"data:text/plain;base64,aGVsbG8="})).await;
+    let next = json!({"session_id":sid,"submission_id":"follower","text":"Read the note","queued":true,"attachments":[attached["attachment"]]});
+    let follower = client.ok("prompt.submit",next.clone()).await;
+    assert_eq!(follower["status"],"queued");
+
+    // Copy the actual durable checkpoint while the original owner is still waiting.
+    // The second owner sees exactly the pre-crash bytes and a different process lock.
+    let source = root.path().join("sessions").join(&sid);
+    let copied = recovery.path().join("sessions").join(&sid);
+    std::fs::create_dir_all(copied.join("attachments")).unwrap();
+    std::fs::copy(root.path().join("library.json"),recovery.path().join("library.json")).unwrap();
+    for file in ["gateway.json","conversation.json"] {
+        std::fs::copy(source.join(file),copied.join(file)).unwrap();
+    }
+    let blob = attached["attachment"]["digest"].as_str().unwrap();
+    std::fs::copy(source.join("attachments").join(blob),copied.join("attachments").join(blob)).unwrap();
+    client.socket.close(None).await.unwrap();
+    gateway.shutdown().await.unwrap();
+
+    let gateway = provider.gateway(&recovery).await;
+    let mut client = Client::native(&gateway).await;
+    let restored = client.ok("session.resume",session.clone()).await;
+    assert_eq!(restored["pending"][0]["status"],"unknown");
+    assert_eq!(restored["pending"][1]["status"],"queued");
+    let mut resolve = json!({"session_id":sid,"admission_id":head["admission_id"],"execution_generation":0});
+    assert_eq!(client.call("prompt.resolve_unknown",resolve.clone()).await["error"]["data"]["reason"],"stale_generation");
+    resolve["execution_generation"] = head["execution_generation"].clone();
+    let settled = client.ok("prompt.resolve_unknown",resolve.clone()).await;
+    assert_eq!(settled["outcome"],"interrupted");
+    client.event("message.complete").await;
+    assert_eq!(client.ok("prompt.resolve_unknown",resolve).await,settled);
+    let again = client.ok("prompt.submit",next).await;
+    assert_eq!(again["status"],"terminal");
+    assert_eq!(again["admission_id"],follower["admission_id"]);
+    let history = client.ok("session.resume",session).await;
+    assert_eq!(history["native_history"]["turns"].as_array().unwrap().len(),2);
+    assert_eq!(history["native_history"]["turns"][1]["attachments"][0],attached["attachment"]);
+    assert_eq!(history["native_history"]["turns"][0]["status"]["state"],"interrupted");
+    assert!(history["pending"].as_array().unwrap().is_empty());
+    client.socket.close(None).await.unwrap();
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn due_routine_runs_and_publishes_with_no_desktop() {
+    use hermes_engine::cron::{Draft, RunStatus, Store};
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let store = Store::open_view(root.path()).unwrap();
+    let now = chrono::Utc::now();
+    let job = store.create(Draft { name: "Headless".into(), prompt: "Read the clock".into(), schedule: "in 1m".into(), catch_up: Some(true), ..Draft::default() }, now - chrono::Duration::minutes(2)).unwrap();
+    let gateway = provider.gateway(&root).await;
+    let run = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(run) = store.runs(&job.id).unwrap().into_iter().find(|r| r.status == RunStatus::Completed) { break run; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.unwrap();
+    assert!(run.gateway_session.is_some());
+    let index: Value = serde_json::from_slice(&std::fs::read(root.path().join("routine-chats.json")).unwrap()).unwrap();
+    let chat_id = index[&job.id].as_str().unwrap();
+    let library = hermes_library::Library::open(root.path()).unwrap();
+    let chat = library.session(chat_id).unwrap();
+    let history: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(history.turns[0].prompt, "Read the clock");
+    assert!(run.output.contains("Tool denied."), "scheduled approval requests are denied unattended");
+    gateway.shutdown().await.unwrap();
+    let gateway = provider.gateway(&root).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let history: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(store.runs(&job.id).unwrap().len(), 1);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_routine_retry_reuses_run_and_accepts_approval() {
+    use hermes_engine::cron::{Draft, RunStatus, Store};
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let store = Store::open_view(root.path()).unwrap();
+    let job = store.create(Draft { name: "Manual".into(), prompt: "Read the clock".into(), paused: true, ..Draft::default() }, chrono::Utc::now()).unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let request = json!({"job_id":job.id,"request_id":"trigger-once"});
+    let first = client.ok("cron.trigger", request.clone()).await;
+    let again = client.ok("cron.trigger", request.clone()).await;
+    assert_eq!(first["run_id"], again["run_id"]);
+    assert_eq!(first["session_id"], again["session_id"]);
+    let sid = first["session_id"].as_str().unwrap();
+    let snapshot = client.ok("session.resume", json!({"session_id":sid})).await;
+    let approval = if snapshot["prompts"].as_array().unwrap().is_empty() { client.event("approval.request").await["payload"].clone() } else { snapshot["prompts"][0].clone() };
+    let prompt = approval["prompt_id"].as_str().unwrap();
+    let generation = if snapshot["execution_generation"].as_u64().unwrap_or(0) > 0 { snapshot["execution_generation"].as_u64().unwrap() } else { 1 };
+    client.ok("approval.respond", json!({"session_id":sid,"prompt_id":prompt,"execution_generation":generation,"choice":"once"})).await;
+    timeout(Duration::from_secs(20), async { loop {
+        if store.runs(&job.id).unwrap().iter().any(|run| run.status == RunStatus::Completed) { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }}).await.unwrap();
+    assert_eq!(store.runs(&job.id).unwrap().len(), 1);
+    client.socket.close(None).await.unwrap();
+    gateway.shutdown().await.unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let retried = client.ok("cron.trigger", request).await;
+    assert_eq!(retried["run_id"], first["run_id"]);
+    assert_eq!(store.runs(&job.id).unwrap().len(), 1);
+    client.socket.close(None).await.unwrap();
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_round_runs_each_profile_without_desktop_and_deduplicates_retry() {
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let library = hermes_library::Library::open(root.path()).unwrap();
+    let ada = library.create_bot("Ada", "", "Be terse.", "").unwrap();
+    let grace = library.create_bot("Grace", "", "Be kind.", "").unwrap();
+    let group = library.create_group("Review", &[ada.name, grace.name]).unwrap();
+    let chat = library.group_chat(&group.id).unwrap();
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    client.ok("session.resume", json!({"session_id":chat.id})).await;
+    let request = json!({"session_id":chat.id,"submission_id":"round-once","text":"Review this plan"});
+    let receipt = client.ok("prompt.submit", request.clone()).await;
+    client.socket.close(None).await.unwrap();
+    let history: hermes_engine::History = timeout(Duration::from_secs(20), async { loop {
+        if let Ok(bytes) = std::fs::read(chat.directory.join("conversation.json"))
+            && let Ok(history) = serde_json::from_slice::<hermes_engine::History>(&bytes)
+            && history.turns.len() == 2 && history.turns.last().is_some_and(|turn| matches!(turn.status, hermes_engine::Status::Complete)) { break history; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }}).await.unwrap();
+    let replies: Vec<_> = history.turns.iter().map(|turn| turn.entries.iter().find_map(|entry| if let hermes_engine::Entry::Assistant { text, .. } = entry { Some(text.as_str()) } else { None }).unwrap()).collect();
+    assert_eq!(replies, ["Ada here", "Grace saw Ada"]);
+    gateway.shutdown().await.unwrap();
+    // Reconstruct the durable checkpoint after Ada committed and before Grace
+    // was claimed, then restart with every Desktop client closed.
+    let path = chat.directory.join("conversation.json");
+    let mut checkpoint: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    checkpoint["turns"].as_array_mut().unwrap().pop();
+    let child = checkpoint["authority"]["receipts"].as_array_mut().unwrap().iter_mut()
+        .find(|receipt| receipt["group"]["first"] == false).unwrap();
+    let child_id = child["id"].clone();
+    child["status"] = json!("queued"); child["generation"] = json!(0);
+    child["outcome"] = Value::Null; child["result"] = Value::Null; child["turn_index"] = Value::Null;
+    std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let gateway = provider.gateway(&root).await;
+    timeout(Duration::from_secs(20), async { loop {
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if record["turns"].as_array().unwrap().len() == 2 && record["authority"]["receipts"].as_array().unwrap().iter()
+            .any(|receipt| receipt["id"] == child_id && receipt["status"] == "terminal") { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }}).await.unwrap();
+    let mut client = Client::native(&gateway).await;
+    client.ok("session.resume", json!({"session_id":chat.id})).await;
+    let retry = client.ok("prompt.submit", request).await;
+    assert_eq!(receipt["admission_id"], retry["admission_id"]);
+    let saved: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    assert_eq!(saved.turns.len(), 2);
+    let failed = client.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"fail-once","text":"fail-group"})).await;
+    timeout(Duration::from_secs(20), async { loop {
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let round: Vec<_> = record["authority"]["receipts"].as_array().unwrap().iter()
+            .filter(|row| row["group"]["round"] == failed["admission_id"]).collect();
+        if round.len() == 2 && round.iter().all(|row| row["status"] == "terminal") {
+            assert_eq!(round[1]["outcome"], "cancelled"); break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }}).await.unwrap();
+    let active = client.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"hold","text":"hold-group"})).await;
+    let queued = client.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"queued-round","text":"next","queued":true})).await;
+    client.ok("prompt.cancel", json!({"session_id":chat.id,"admission_id":queued["admission_id"]})).await;
+    let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let round: Vec<_> = record["authority"]["receipts"].as_array().unwrap().iter()
+        .filter(|row| row["group"]["round"] == queued["admission_id"]).collect();
+    assert_eq!(round.len(), 2);
+    assert!(round.iter().all(|row| row["status"] == "terminal" && row["outcome"] == "cancelled"));
+    client.ok("prompt.cancel", json!({"session_id":chat.id,"admission_id":active["admission_id"]})).await;
+    client.socket.close(None).await.unwrap();
+    gateway.shutdown().await.unwrap();
 }

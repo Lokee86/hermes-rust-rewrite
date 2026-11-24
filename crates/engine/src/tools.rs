@@ -69,6 +69,21 @@ impl Context {
         ensure!(root.is_dir(), "Workspace must be a directory");
         let dir = Dir::open_ambient_dir(&root, ambient_authority())
             .context("Could not open workspace")?;
+        #[cfg(windows)]
+        let dir = {
+            // cap-std deliberately denies delete sharing on directory handles:
+            // its path-based Windows operations need that lock. Retain only an
+            // identity handle between calls; scoped_dir reacquires the lock.
+            use std::os::windows::fs::OpenOptionsExt;
+            let identity = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+                .share_mode(0x0000_0007) // READ | WRITE | DELETE
+                .open(&root)?;
+            let identity = Dir::from_std_file(identity);
+            ensure!(same_directory(&dir, &identity)?, "Workspace changed while opening");
+            identity
+        };
         Ok(Self {
             root,
             input_root,
@@ -77,6 +92,20 @@ impl Context {
             write_approved: false,
             checkpoints: None, redact_secrets:false, read_chars:100_000,output_bytes:MAX_OUTPUT_BYTES, output_lines:2000, line_chars:MAX_LINE_BYTES,
         })
+    }
+
+    // On Windows the long-lived handle shares deletion. Never use it for a
+    // capability operation: cap-std requires a non-delete-sharing handle for
+    // confinement. Hold that handle for the entire validation or invocation,
+    // and compare identities while it prevents replacement.
+    #[cfg(windows)]
+    fn scoped_dir(&self) -> Result<Self> {
+        let dir = Dir::open_ambient_dir(&self.root, ambient_authority())
+            .context("Workspace is unavailable")?;
+        ensure!(same_directory(&self.dir, &dir)?, "The original workspace was replaced");
+        let mut scoped = self.clone();
+        scoped.dir = Arc::new(dir);
+        Ok(scoped)
     }
 
     pub(crate) fn configure(&mut self,settings:&crate::settings::ProfileSettings){
@@ -102,6 +131,22 @@ impl Context {
         context.write_approved = approved;
         context
     }
+}
+
+#[cfg(windows)]
+fn same_directory(a: &Dir, b: &Dir) -> Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+    fn identity(dir: &Dir) -> Result<(u32, u32, u32)> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // The borrowed handle remains valid for the duration of the call.
+        unsafe { GetFileInformationByHandle(HANDLE(dir.as_raw_handle()), &mut info)?; }
+        Ok((info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+    }
+    Ok(identity(a)? == identity(b)?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +239,10 @@ fn spec(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 /// Validate structure, bounds and workspace paths before asking for approval.
 /// This reads metadata only; it never executes a tool or reads file content.
 pub fn validate(name: &str, args: &Value, context: &Context) -> Result<Approval> {
+    #[cfg(windows)]
+    let scoped = if name == "get_current_time" { None } else { Some(context.scoped_dir()?) };
+    #[cfg(windows)]
+    let context = scoped.as_ref().unwrap_or(context);
     let operation = parse(name, args, context)?;
     let (summary, mutates_workspace) = match &operation {
         Operation::Clock => ("Read the current system clock in UTC.".to_owned(), false),
@@ -283,6 +332,10 @@ pub fn validate(name: &str, args: &Value, context: &Context) -> Result<Approval>
 /// approval. Errors are returned for the engine to serialize as {"error": ...}.
 /// Successful values never contain an `error` property.
 pub fn invoke(name: &str, args: &Value, context: &Context) -> Result<Value> {
+    #[cfg(windows)]
+    let scoped = if name == "get_current_time" { None } else { Some(context.scoped_dir()?) };
+    #[cfg(windows)]
+    let context = scoped.as_ref().unwrap_or(context);
     // Repeat validation after the approval wait: filesystem paths may change.
     validate(name, args, context)?;
     match parse(name, args, context)? {
@@ -1419,6 +1472,26 @@ fn skill_view(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn idle_context_allows_deletion_and_refuses_replaced_workspace() {
+        use super::*;
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let context = Context::new(&workspace).unwrap();
+        std::fs::remove_dir(&workspace).unwrap();
+        assert!(validate("list_directory", &json!({}), &context).is_err());
+        drop(context);
+
+        std::fs::create_dir(&workspace).unwrap();
+        let context = Context::new(&workspace).unwrap();
+        let moved = parent.path().join("original");
+        std::fs::rename(&workspace, &moved).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        assert!(validate("list_directory", &json!({}), &context).is_err());
+        assert!(invoke("list_directory", &json!({}), &context).is_err());
+    }
     use super::*;
     use tempfile::TempDir;
 

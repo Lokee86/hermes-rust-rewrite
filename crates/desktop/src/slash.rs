@@ -295,7 +295,14 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
         Some("/rollback") => { clear(app); app.update(Message::SettingsView(settings::View::Safety)) }
         Some("/subscription") | Some("/topup") | Some("/usage") => { clear(app); app.update(Message::SettingsView(settings::View::Billing)) }
         Some("/profile") => { clear(app); app.update(Message::Bot(super::bots::Action::Roster(true))) }
-        Some("/pause") => { clear(app); app.queue.parked = true; let _ = app.save_queue(); let t = app.update(Message::Stop); app.note("Paused. Queued messages wait until you resume."); t }
+        Some("/pause") => {
+            clear(app);
+            if arg.eq_ignore_ascii_case("off") {
+                app.update(Message::QueueResume)
+            } else {
+                app.update(Message::QueuePause)
+            }
+        }
         Some("/version") => { clear(app); app.note(format!("Hermes Desktop {} · native Rust build", env!("CARGO_PKG_VERSION"))); Task::none() }
         Some("/whoami") => { clear(app); app.note("You are the local owner of this desktop: all commands are available."); Task::none() }
         Some("/save") => {

@@ -6,11 +6,14 @@ destination=${1:-"$PWD/dist/Hermes.app"}
 if [ -z "${PYO3_CONFIG_FILE:-}" ]; then
     for setting in $(scripts/python-runtime.sh); do export "$setting"; done
 fi
-cargo build --locked --release -p hermes-desktop -p hermes-gateway -p hermes-python-host
+cargo build --locked --release --features embedded-herdr -p hermes-desktop
+cargo build --locked --release -p hermes-python-host
 target_dir=$(cargo metadata --no-deps --format-version 1 | plutil -extract target_directory raw -o - -)
 mkdir -p "$destination/Contents/MacOS" "$destination/Contents/Resources"
 install -m 755 "$target_dir/release/hermes-desktop" "$destination/Contents/MacOS/hermes-desktop"
-install -m 755 "$target_dir/release/hermes-gateway" "$destination/Contents/MacOS/hermes-gateway"
+if [ -f "$destination/Contents/MacOS/hermes-gateway" ]; then
+    rm "$destination/Contents/MacOS/hermes-gateway"
+fi
 install -m 755 "$target_dir/release/hermes-python-host" "$destination/Contents/MacOS/hermes-python-host"
 scripts/bundle-python.sh "$PYO3_PYTHON" "$destination/Contents/Resources/python"
 host="$destination/Contents/MacOS/hermes-python-host"
@@ -26,11 +29,11 @@ codesign --force --sign - "$host"
 cp packaging/macos/Info.plist "$destination/Contents/Info.plist"
 cp assets/icon.icns "$destination/Contents/Resources/Hermes.icns"
 mkdir -p "$destination/Contents/Resources/Notices"
+"$destination/Contents/MacOS/hermes-desktop" --licenses > "$destination/Contents/Resources/Notices/Herdr-THIRD-PARTY-NOTICES"
 for notice in crates/desktop/assets/fonts/*NOTICE.txt crates/desktop/assets/fonts/*LICENSE*.txt; do
     if [ -f "$notice" ]; then cp "$notice" "$destination/Contents/Resources/Notices/"; fi
 done
 cp LICENSE-HERMES-AGENT "$destination/Contents/Resources/Notices/Hermes-LICENSE"
-codesign --force --sign - "$destination/Contents/MacOS/hermes-gateway"
 codesign --force --sign - "$destination"
 scripts/verify-native-macos.sh "$destination"
 printf 'Built %s\n' "$destination"

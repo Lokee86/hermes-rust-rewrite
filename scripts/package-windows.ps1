@@ -9,12 +9,18 @@ try {
     $null = New-Item -ItemType Directory -Path $Destination -Force
     # hermes-python-host embeds this exact CPython; it ships in python\ with its DLLs beside the host.
     if (!$env:PYO3_PYTHON) { $env:PYO3_PYTHON = & (Join-Path $PSScriptRoot "python-runtime.ps1") }
-    cargo build --locked --release -p hermes-desktop -p hermes-gateway -p hermes-python-host
+    cargo build --locked --release --features embedded-herdr -p hermes-desktop
+    if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)" }
+    cargo build --locked --release -p hermes-python-host
     if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)" }
     $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed" }
     Copy-Item "$($meta.target_directory)/release/hermes-desktop.exe" "$root/Hermes.exe"
-    Copy-Item "$($meta.target_directory)/release/hermes-gateway.exe" $root
+    $fixture = & (Join-Path $PSScriptRoot "prepare-herdr.ps1")
+    $fixtureDir = Split-Path -Parent $fixture
+    Copy-Item (Join-Path $fixtureDir "conpty") $root -Recurse
+    Copy-Item (Join-Path $fixtureDir "THIRD-PARTY-NOTICES") "$root/Notices/Herdr-THIRD-PARTY-NOTICES" -Recurse
+    Copy-Item (Join-Path $fixtureDir "LICENSE") "$root/Notices/Herdr-LICENSE"
     Copy-Item "$($meta.target_directory)/release/hermes-python-host.exe" $root
     $prefix = & $env:PYO3_PYTHON -c "import sys; print(sys.base_prefix)"
     # Everything plugins can use; not tests, IDLE, Tk, headers, import libraries or the interpreter executables.
@@ -28,7 +34,11 @@ try {
     Copy-Item "assets/icon.ico" "$root/Hermes.ico"
     Copy-Item "LICENSE-HERMES-AGENT" "$root/Notices/Hermes-LICENSE"
     Get-ChildItem "crates/desktop/assets/fonts" -File | Where-Object { $_.Name -match '(NOTICE|LICENSE).*\.txt$' } | Copy-Item -Destination "$root/Notices"
-    Compress-Archive -Path $root -DestinationPath (Join-Path $Destination "Hermes-windows-$env:PROCESSOR_ARCHITECTURE.zip") -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = Join-Path $stage "Hermes.zip"
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $root, $archive, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+    Copy-Item -LiteralPath $archive -Destination (Join-Path $Destination "Hermes-windows-$env:PROCESSOR_ARCHITECTURE.zip") -Force
 } finally {
     if ($stage -and (Test-Path $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
     Pop-Location

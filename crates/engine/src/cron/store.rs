@@ -22,11 +22,20 @@ pub struct Store {
     root: PathBuf,
     profile: PathBuf,
     owner: Arc<Owner>,
+    gateway: bool,
 }
 #[derive(Debug)]
 struct Owner {
     id: String,
-    _lock: Option<File>,
+    lock: Option<File>,
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.lock {
+            // Release synchronously before another owner starts on this Windows profile.
+            let _ = FileExt::unlock(lock);
+        }
+    }
 }
 #[derive(Serialize, Deserialize, Default)]
 struct Document {
@@ -79,35 +88,68 @@ fn lock_file(path: &Path) -> Result<File> {
 }
 impl Store {
     pub fn open(profile_root: &Path) -> Result<Self> {
-        let profile = profile_root
-            .canonicalize()
-            .context("Could not open profile directory")?;
+        Self::open_mode(profile_root, false, false)
+    }
+    /// Open an editor without acquiring the runner lock or recovering claims.
+    pub fn open_view(profile_root: &Path) -> Result<Self> {
+        Self::open_mode(profile_root, false, true)
+    }
+    /// Acquire the runner lock and adopt durable gateway claims for reconciliation.
+    pub fn open_gateway(profile_root: &Path) -> Result<Self> {
+        let store = Self::open_mode(profile_root, true, false)?;
+        ensure!(store.owns_scheduler(), "Another process owns this profile's scheduler");
+        Ok(store)
+    }
+    fn open_mode(profile_root: &Path, gateway: bool, view: bool) -> Result<Self> {
+        let profile = profile_root.canonicalize().context("Could not open profile directory")?;
         let root = profile.join("cron");
         private_dir(&root)?;
         private_dir(&root.join("runs"))?;
-        let lock = lock_file(&root.join(".runner.lock"))?;
-        let owns = lock.try_lock_exclusive().is_ok();
-        let store = Self {
-            root,
-            profile,
-            owner: Arc::new(Owner {
-                id: id(),
-                _lock: owns.then_some(lock),
-            }),
+        let lock = if view { None } else {
+            let lock = lock_file(&root.join(".runner.lock"))?;
+            match lock.try_lock_exclusive() {
+                Ok(()) => Some(lock),
+                Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => None,
+                Err(error) => return Err(error).context("Could not acquire the scheduler lock"),
+            }
         };
-        if owns {
+        let store = Self { root, profile, owner: Arc::new(Owner { id: id(), lock }), gateway };
+        if store.owns_scheduler() {
             store.transaction(|document| {
-                recover(document, Utc::now());
+                recover(document, Utc::now(), gateway);
+                if gateway {
+                    for run in &mut document.runs {
+                        if run.status.live() && run.gateway_job.is_some() { run.owner = store.owner.id.clone(); }
+                    }
+                }
                 Ok(())
             })?;
         }
         Ok(store)
     }
+    /// Gateway claims retain their original definition across owner restarts.
+    pub fn gateway_claims(&self) -> Result<Vec<Claim>> {
+        ensure!(self.gateway && self.owns_scheduler(), "Gateway scheduler does not own this profile");
+        Ok(self.read()?.runs.into_iter().filter_map(|run| {
+            if !run.status.live() || run.owner != self.owner.id { return None; }
+            run.gateway_job.as_ref().map(|job| Claim { job: (**job).clone(), run: run.clone() })
+        }).collect())
+    }
+    pub fn bind_gateway_session(&self, run_id: &str, session_id: &str) -> Result<()> {
+        ensure!(self.gateway && self.owns_scheduler(), "Gateway scheduler does not own this profile");
+        self.transaction(|document| {
+            let run = document.runs.iter_mut().find(|run| run.id == run_id).context("Run no longer exists")?;
+            ensure!(run.status.live() && run.owner == self.owner.id && run.gateway_job.is_some(), "Run claim is stale");
+            if let Some(existing) = &run.gateway_session { ensure!(existing == session_id, "Run is already bound to another session"); }
+            else { run.gateway_session = Some(session_id.to_owned()); }
+            Ok(())
+        })
+    }
     pub fn profile_root(&self) -> &Path {
         &self.profile
     }
     pub fn owns_scheduler(&self) -> bool {
-        self.owner._lock.is_some()
+        self.owner.lock.is_some()
     }
     fn transaction<T>(&self, operation: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
         let lock = lock_file(&self.root.join(".jobs.lock"))?;
@@ -324,7 +366,7 @@ impl Store {
                     }
                     continue;
                 }
-                let claim = claim(document, index, false, now, &self.owner.id, &self.root)?;
+                let claim = claim(document, index, false, now, &self.owner.id, &self.root, self.gateway, None)?;
                 claims.push(claim);
             }
             prune(document);
@@ -349,7 +391,24 @@ impl Store {
                     .any(|run| run.job_id == id && run.status.live()),
                 "This job already has a running occurrence"
             );
-            let claim = claim(document, index, true, now, &self.owner.id, &self.root)?;
+            let claim = claim(document, index, true, now, &self.owner.id, &self.root, self.gateway, None)?;
+            prune(document);
+            Ok(claim)
+        })
+    }
+    /// A manual trigger may be retried with the same request identity.
+    pub fn claim_gateway_now(&self, job_id: &str, request_id: &str, now: DateTime<Utc>) -> Result<Claim> {
+        ensure!(self.gateway && self.owns_scheduler(), "Gateway scheduler does not own this profile");
+        ensure!(!request_id.is_empty() && request_id.len() <= 200, "Invalid trigger identity");
+        self.transaction(|document| {
+            if let Some(run) = document.runs.iter().find(|run| run.gateway_request_id.as_deref() == Some(request_id)) {
+                ensure!(run.job_id == job_id, "Trigger identity was used for another job");
+                let job = run.gateway_job.as_ref().context("Trigger has no frozen job")?;
+                return Ok(Claim { job: (**job).clone(), run: run.clone() });
+            }
+            let index = document.jobs.iter().position(|job| job.id == job_id).context("Scheduled job not found")?;
+            ensure!(!document.runs.iter().any(|run| run.job_id == job_id && run.status.live()), "This job already has a running occurrence");
+            let claim = claim(document, index, true, now, &self.owner.id, &self.root, true, Some(request_id))?;
             prune(document);
             Ok(claim)
         })
@@ -549,6 +608,8 @@ fn claim(
     now: DateTime<Utc>,
     owner: &str,
     root: &Path,
+    gateway: bool,
+    request_id: Option<&str>,
 ) -> Result<Claim> {
     let job = &mut document.jobs[index];
     let run_id = id();
@@ -585,6 +646,9 @@ fn claim(
         output: String::new(),
         error: None,
         cancel_requested: false,
+        gateway_job: gateway.then(|| Box::new(job.clone())),
+        gateway_session: None,
+        gateway_request_id: request_id.map(str::to_owned),
     };
     let claim = Claim {
         job: job.clone(),
@@ -623,9 +687,9 @@ fn settle(job: &mut Job, run: &mut Run, now: DateTime<Utc>) {
         .into();
     }
 }
-fn recover(document: &mut Document, now: DateTime<Utc>) {
+fn recover(document: &mut Document, now: DateTime<Utc>, preserve_gateway: bool) {
     for run in &mut document.runs {
-        if !run.status.live() {
+        if !run.status.live() || (preserve_gateway && run.gateway_job.is_some()) {
             continue;
         }
         let started = run.status == RunStatus::Running;
@@ -659,12 +723,44 @@ fn prune(document: &mut Document) {
     if document.runs.len() > MAX_RUNS {
         let mut remove = document.runs.len() - MAX_RUNS;
         document.runs.retain(|run| {
-            if remove > 0 && !run.status.live() {
+            // Request identities must remain resolvable; refuse new work when the bounded store is full rather than silently duplicating a retry.
+            if remove > 0 && !run.status.live() && run.gateway_request_id.is_none() {
                 remove -= 1;
                 false
             } else {
                 true
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod gateway_recovery_tests {
+    use super::*;
+    #[test]
+    fn gateway_adopts_claim_with_frozen_definition_and_bound_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let store = Store::open_gateway(dir.path()).unwrap();
+        let job = store.create(Draft { name: "original".into(), prompt: "first".into(), ..Draft::default() }, now).unwrap();
+        let claim = store.claim_now(&job.id, now).unwrap();
+        store.bind_gateway_session(&claim.run.id, "chat-1").unwrap();
+        store.begin(&claim, now).unwrap();
+        store.update(&job.id, Draft { name: "edited".into(), prompt: "second".into(), ..Draft::default() }, now).unwrap();
+        let view = Store::open_view(dir.path()).unwrap();
+        assert!(!view.owns_scheduler());
+        assert_eq!(view.runs(&job.id).unwrap()[0].status, RunStatus::Running);
+        drop(view);
+        drop(store);
+        let restarted = Store::open_gateway(dir.path()).unwrap();
+        let claims = restarted.gateway_claims().unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].run.id, claim.run.id);
+        assert_eq!(claims[0].run.gateway_session.as_deref(), Some("chat-1"));
+        assert_eq!(claims[0].job.prompt, "first");
+        assert_eq!(claims[0].run.status, RunStatus::Running);
+        assert!(restarted.bind_gateway_session(&claim.run.id, "other").is_err());
+        restarted.finish(&claims[0], Outcome::Completed { output: "done".into() }, now).unwrap();
+        assert!(restarted.gateway_claims().unwrap().is_empty());
     }
 }
