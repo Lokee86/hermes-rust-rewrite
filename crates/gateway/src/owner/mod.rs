@@ -145,7 +145,7 @@ impl OwnerConnection {
             // A draining owner can close a control connection without answering it (on Unix
             // the listener's backlog is dropped), which means it is not gone yet.
             match discover(Path::new(&self.profile)).await {
-                Ok(owner) if owner.is_none_or(|o| o.instance != self.instance) => return Ok(()),
+                Ok(owner) if owner.as_ref().is_none_or(|o| o.instance != self.instance) => return Ok(()),
                 Err(e) if Instant::now() >= deadline => return Err(e.context("Gateway is still shutting down")),
                 _ => {}
             }
