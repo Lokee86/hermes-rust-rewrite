@@ -405,7 +405,9 @@ impl Shared {
             legacy_turn_hint: None,
             admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
-            ordinary_chat: matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none(),
+            // Freeze consent at submission, including queued turns that run after a switch.
+            ordinary_chat: matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none()
+                && lock(&session.settings).memory_binding.is_some() && self.native_memory_available(),
             capture: None,
             group: None,
         };

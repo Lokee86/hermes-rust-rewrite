@@ -2,10 +2,10 @@
 use super::*;
 
 #[derive(Deserialize)]
-struct CommittedRecord {
+pub(super) struct CommittedRecord {
     #[serde(flatten)]
-    history: History,
-    authority: Option<Authority>,
+    pub(super) history: History,
+    pub(super) authority: Option<Authority>,
 }
 
 impl Shared {
@@ -16,8 +16,11 @@ impl Shared {
         index: usize,
         history: &History,
     ) -> Option<PendingMemoryCapture> {
-        self.memory.as_ref()?;
-        if !admission.ordinary_chat || admission.turn_index != Some(index) {
+        if !admission.ordinary_chat
+            || admission.turn_index != Some(index)
+            || profile_memory::source_ended(&session.dir)
+            || !self.native_memory_available()
+        {
             return None;
         }
         let turn = history.turns.get(index)?;
@@ -56,17 +59,6 @@ impl Shared {
         Some(capture)
     }
 
-    /// Observe a committed archive or deletion before its gateway reply.
-    pub(super) async fn memory_source_terminal(&self, session_id: &str) -> Result<()> {
-        let Some(memory) = self.memory.clone() else {
-            return Ok(());
-        };
-        let session_id = session_id.to_owned();
-        tokio::task::spawn_blocking(move || memory.terminal_source(&session_id)).await??;
-        self.memory_wake.notify_one();
-        Ok(())
-    }
-
     pub(super) async fn run_memory_capture(self: Arc<Self>) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -75,23 +67,28 @@ impl Shared {
                 biased;
                 _ = self.shutdown.cancelled() => break,
                 _ = self.memory_wake.notified() => {},
-                _ = interval.tick() => {},
+                _ = interval.tick(), if lock(&self.memory).is_some() => {},
             }
-            let Ok(summaries) = self.library.sessions(None) else {
-                continue;
-            };
-            let memory = self.memory.clone().expect("enrolled memory worker");
-            let summaries = match tokio::task::spawn_blocking(move || {
-                let _ = memory.reconcile_tombstones(&summaries);
-                summaries
+            let owner = self.clone();
+            let summaries = match tokio::task::spawn_blocking(move || -> Result<_> {
+                if !owner.native_memory_available() {
+                    return Ok(Vec::new());
+                }
+                let mut summaries = owner.library.sessions(None)?;
+                // Preserve a terminal memory source when archived and restored while disabled.
+                for summary in &mut summaries {
+                    summary.archived |= profile_memory::source_ended(&summary.directory);
+                }
+                let _ = owner.with_selected_memory(|memory| memory.reconcile_tombstones(&summaries));
+                Ok(summaries)
             })
             .await
             {
-                Ok(summaries) => summaries,
-                Err(_) => continue,
+                Ok(Ok(summaries)) => summaries,
+                _ => continue,
             };
             for summary in summaries {
-                if self.shutdown.is_cancelled() {
+                if self.shutdown.is_cancelled() || lock(&self.memory).is_none() {
                     break;
                 }
                 let config = self
@@ -101,7 +98,7 @@ impl Shared {
                     .get(&summary.id)
                     .map(|session| lock(&session.config).clone())
                     .unwrap_or_else(|| self.provider.clone());
-                let memory = self.memory.clone().expect("enrolled memory worker");
+                let owner = self.clone();
                 let library = self.library.clone();
                 let id = summary.id.clone();
                 let staged = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -112,7 +109,12 @@ impl Shared {
                     let Some(authority) = record.authority.as_ref() else {
                         return Ok(None);
                     };
-                    stage_next(&memory, &summary, &record.history, authority, &config)
+                    Ok(owner
+                        .with_selected_memory(|memory| {
+                            stage_next(memory, &summary, &record.history, authority, &config)
+                        })
+                        .transpose()?
+                        .flatten())
                 })
                 .await;
                 let Ok(Ok(Some((marker, outcome)))) = staged else {
@@ -152,14 +154,18 @@ impl Shared {
                 }
             }
         }
-        if let Some(memory) = self.memory.clone() {
+        let memory = lock(&self.memory).take();
+        if let Some(memory) = memory {
             let _ = tokio::task::spawn_blocking(move || memory.stop_processing()).await;
         }
     }
 }
 
-fn read_committed(summary: &SessionSummary) -> Result<Option<CommittedRecord>> {
-    if summary.archived || Settings::read(&summary.directory)?.memory_binding.is_none() {
+pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<CommittedRecord>> {
+    if summary.archived
+        || profile_memory::source_ended(&summary.directory)
+        || Settings::read(&summary.directory)?.memory_binding.is_none()
+    {
         return Ok(None);
     }
     let path = summary.directory.join("conversation.json");

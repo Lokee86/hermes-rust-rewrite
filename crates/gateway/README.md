@@ -102,13 +102,29 @@ At most 64 sessions are loaded and 32 sockets connected. WebSocket frames/messag
 
 Unsupported: queued/steered/redirected inputs, multimodal attachments, edit/regenerate/rewind/branch/compression/reset/delete mutations, cross-profile routing, legacy server-to-client request RPCs, upstream tool/plugin catalogs, process/control-socket discovery, bot/room transports, billing, scheduler, voice, screen/browser control, dashboard settings REST and automatic handoff to a Python gateway. Any optional MCP server is external to Rust; it is connected through the engine, not a fallback to Python.
 
-## Embedded Reliquary
+## Profile memory provider
 
-The selected data directory supplies the profile's existing `reliquary/capture-enrollment-v1.json` and `reliquary/topology-v1.json`. The gateway uses the same service lease as the standalone host. A newly created ordinary native chat binds to the configured General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs do not enter automatic capture.
+Choose a provider in Desktop under **Settings → Memory & Context**, or set `memory_provider` in the profile's `agent-settings.json`. The setting applies to subsequent chat turns.
+
+| Setting | Behavior |
+| --- | --- |
+| `auto` (default) | Use embedded Reliquary when the profile has an available enrollment. Otherwise, use the profile's existing Markdown notes. |
+| `reliquary` | Use the profile's enrolled Reliquary owners for capture and agent-requested queries. Requires a build with the `reliquary` feature. |
+| `notes` | Use Hermes' existing `MEMORY.md`, `USER.md`, and `memory` tool. The agent and user note controls apply independently. |
+| `external` | Expose the designated external provider's MCP tools to the agent. Configure the HTTP MCP endpoint under **Capabilities → Connectors**, select **Use as external memory provider**, and enable memory and MCP tools. The provider defines its tools and storage behavior. |
+| `off` | Disable native capture, memory tools, Markdown note injection, and the designated external memory connector. Other configured tools keep their own settings. |
+
+The default Gateway and Desktop builds include Reliquary. To build either without the native backend, use `cargo build -p hermes-gateway --no-default-features` or `cargo build -p hermes-desktop --no-default-features`. No separate Reliquary process is needed for the embedded provider.
+
+### Reliquary enrollment and capture
+
+The selected data directory supplies the profile's existing `reliquary/capture-enrollment-v1.json` and `reliquary/topology-v1.json`. The provider selector reads an existing enrollment. Creating the REL, PHY, and enrollment for a fresh profile still requires Reliquary setup. The gateway uses the same service lease as the standalone host. A newly created ordinary native chat binds to the configured General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs do not enter automatic capture.
 
 Set the profile's `memory_embedding` in `agent-settings.json` to `{"endpoint_id":"<saved endpoint ID>","dimensions":1024}` using the intended embedding space's actual dimensions. The endpoint ID refers to a saved profile provider in the profile's `providers` store. Background processing uses the chat's configured OpenAI-compatible structured-completion route and that embedding endpoint. An incompatible stored embedding identity or an unavailable route pauses memory work while chat remains available.
 
-The turn commit includes its pending capture. Archive admission and semantic processing record separate progress after that commit. The chat model receives its conversation and enabled profile notes. The background worker processes each pending capture after commit. Archiving or deleting a source fences future capture. If an open Reliquary import defers its archive tombstone, the gateway retains the fence and retries the tombstone.
+The gateway commits the turn and its pending capture together. The background worker records archive admission and semantic processing separately. Archiving or deleting a source fences future capture. If an open Reliquary import defers its archive tombstone, the gateway retains the fence and retries the tombstone.
+
+The chat model can call `memory_query` when it needs prior context. Each query searches the session's bound General or project REL and passes the selected snippets to the requesting model turn. The stored tool entry records the result count. This inspection leaves freshness unchanged.
 
 ## Verification
 

@@ -3,7 +3,7 @@ use super::*;
 
 impl Shared {
     pub(super) async fn catalog_edit(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         params: &Value,
         peer: &Peer,

@@ -6,9 +6,15 @@
 pub mod client;
 pub mod owner;
 pub mod replay;
+#[cfg(feature = "reliquary")]
 mod reliquary;
+#[cfg(feature = "reliquary")]
 mod reliquary_capture;
+#[cfg(feature = "reliquary")]
 mod reliquary_hosted;
+#[cfg(feature = "reliquary")]
+mod reliquary_query;
+mod profile_memory;
 
 mod auth;
 mod rest;
@@ -199,13 +205,6 @@ impl Gateway {
         );
         let library = Library::open(&config.library_root)?;
         let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
-        let memory = match reliquary::EmbeddedMemory::open(library.root(), &profile_name) {
-            Ok(memory) => memory.map(Arc::new),
-            Err(error) => {
-                eprintln!("Reliquary startup failed for this profile: {error:#}");
-                None
-            }
-        };
         let listener = TcpListener::bind(config.bind)
             .await
             .context("Could not bind gateway")?;
@@ -219,8 +218,11 @@ impl Gateway {
             authority_epoch,
             profile_id,
             profile_name,
-            memory,
+            #[cfg(feature = "reliquary")]
+            memory: StdMutex::new(None),
+            #[cfg(feature = "reliquary")]
             memory_wake: tokio::sync::Notify::new(),
+            #[cfg(feature = "reliquary")]
             memory_task: Mutex::new(None),
             library,
             provider: config.provider,
@@ -247,9 +249,11 @@ impl Gateway {
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
-        if shared.memory.is_some() {
+        #[cfg(feature = "reliquary")]
+        {
             let owner = shared.clone();
             *shared.memory_task.lock().await = Some(tokio::spawn(owner.run_memory_capture()));
+            shared.native_memory_available();
         }
         let router = Router::new()
             .route("/health", get(health))
@@ -327,8 +331,11 @@ struct Shared {
     authority_epoch: u64,
     profile_id: String,
     profile_name: String,
-    memory: Option<Arc<reliquary::EmbeddedMemory>>,
+    #[cfg(feature = "reliquary")]
+    memory: StdMutex<Option<Arc<reliquary::EmbeddedMemory>>>,
+    #[cfg(feature = "reliquary")]
     memory_wake: tokio::sync::Notify,
+    #[cfg(feature = "reliquary")]
     memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
@@ -494,6 +501,7 @@ impl Shared {
         for task in tasks {
             let _ = task.await;
         }
+        #[cfg(feature = "reliquary")]
         if let Some(task) = self.memory_task.lock().await.take() {
             let _ = task.await;
         }
@@ -540,7 +548,8 @@ impl Shared {
         let engine = if settings.source == "scheduled" {
             Session::open_scheduled(&dir, &actual_workspace, &profile)
         } else {
-            Session::open_for_profile(&dir, workspace.as_deref(), &profile)
+            let enrolled = profile == self.library.root() && self.native_memory_available();
+            Session::open_for_profile_with_enrollment(&dir, workspace.as_deref(), &profile, enrolled)
         };
         let mut engine = engine.map_err(|e| {
                 RpcError::new(
@@ -1048,7 +1057,7 @@ impl Shared {
                         "Creation identity was previously used with different options");
                 } else {
                     if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
-                        prepared.memory_binding = self.memory.as_ref().and_then(|memory| memory.binding_for_new_session(summary));
+                        prepared.memory_binding = self.new_memory_binding(summary);
                     }
                     if let Some(backend) = local_backend {
                         let cwd = project_workspace.map(Path::to_owned)
@@ -1491,7 +1500,7 @@ impl Shared {
         self: Arc<Self>,
         session: Arc<LiveSession>,
         mut config: Config,
-        admission: Receipt,
+        mut admission: Receipt,
         cancel: CancellationToken,
     ) -> bool {
         config.model.clone_from(&admission.model);
@@ -1536,6 +1545,7 @@ impl Shared {
                 Some(member) if member.first => format!("{}\u{2063}{}\u{2063}\n\n(Group chat \"{}\": you are {}. Reply in your own voice; the other members answer after you.)", admission.text, member.display, member.title, member.display),
                 _ => admission.text.clone(),
             };
+            self.configure_turn_memory(target, &session, &mut admission);
             let result = {
                 let future = target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone());
                 tokio::pin!(future);
@@ -1546,6 +1556,7 @@ impl Shared {
                     }
                 }
             };
+            target.clear_native_query();
             let abandoned = result.is_err() || target.history().turns.get(initial_count).is_some_and(|turn|
                 matches!(turn.status, Status::Interrupted | Status::Failed(_)));
             if abandoned && !self.shutdown.is_cancelled() && let Err(error) = target.release_abandoned_turn(initial_count).await {
@@ -1584,7 +1595,11 @@ impl Shared {
             .unwrap_or_default();
         let payload =
             json!({"text":text,"status":status,"error":error,"partial":status!="complete"});
+        #[cfg(feature = "reliquary")]
         let capture = self.pending_memory_capture(&session, &admission, initial_count, &history);
+        #[cfg(not(feature = "reliquary"))]
+        let capture = None;
+        #[cfg(feature = "reliquary")]
         let has_capture = capture.is_some();
         {
             let mut view = lock(&session.view);
@@ -1631,6 +1646,7 @@ impl Shared {
             self.emit_locked(&session, &id, &mut view, "message.complete", payload);
             view.current_admission = None;
         }
+        #[cfg(feature = "reliquary")]
         if has_capture { self.memory_wake.notify_one(); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,

@@ -170,7 +170,7 @@ impl PendingMemoryCapture {
 }
 
 /// Binary data URLs and embedded base64 are outside the text-only memory boundary.
-fn contains_inline_data(text: &str) -> bool {
+pub fn contains_inline_data(text: &str) -> bool {
     text.trim_start()
         .get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))

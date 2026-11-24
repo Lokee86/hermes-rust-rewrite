@@ -264,7 +264,7 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             let url = if clear { "" } else { &state.url };
             match connector::save(&root, url, &state.token, clear) {
                 Ok(info) => { state.url = info.url; state.token.clear(); state.environment = info.environment; state.has_token = info.has_token; state.tools.clear(); state.error = None;
-                    state.notice = Some(if clear { "Disconnected the MCP server.".into() } else { "Saved. New sessions will offer this server's tools.".into() }); }
+                    state.notice = Some(if clear { "Disconnected the MCP server.".into() } else { "MCP server settings saved.".into() }); }
                 Err(e) => state.error = Some(e.to_string()),
             }
             state.revision = state.revision.wrapping_add(1); state.busy = false;
@@ -645,9 +645,14 @@ fn connectors(app: &Hermes) -> Element<'_, Message> {
     let input = |placeholder: &str, value: &str| text_input(placeholder, value).size(13).padding([7, 10]);
     let mut card = column![
         row![ui::icon("plug", 16, p.accent), column![text("MCP server").size(15).font(ui::medium()),
-            text("Connect a Streamable HTTP MCP server. Its tools are offered to Hermes in new sessions.").size(12).color(p.muted)].spacing(2)].spacing(10),
+            text("Connect a Streamable HTTP MCP server for this profile.").size(12).color(p.muted)].spacing(2)].spacing(10),
         input("https://example.com/mcp", &state.url).on_input(|s| pressed(Action::Url(s))),
         input(token_hint, &state.token).secure(true).on_input(|s| pressed(Action::Token(s))),
+        row![toggler(app.profile_settings.saved.external_memory_connector).size(15)
+            .on_toggle(|on| pressed(Action::Toolset("external_memory_connector", on))),
+            column![text("Use as external memory provider").size(13),
+                text("Offer this server’s tools only when External (MCP) is selected in Memory & Context.").size(12).color(p.muted)
+            ].spacing(2)].spacing(8).align_y(Alignment::Center),
         row![button(text("Save").size(12)).padding([5, 12]).on_press(pressed(Action::Save(false))),
             button(text("Discover tools").size(12)).padding([5, 12]).on_press_maybe((configured && !state.busy).then_some(pressed(Action::DiscoverTools))),
             Space::new().width(Fill),
@@ -670,7 +675,7 @@ const TOOLSETS: [(&str, &str, &str); 5] = [
     ("clock_tools", "System clock", "Read the local date and time."),
     ("file_tools", "Files", "List, search, read and write files in the open project."),
     ("skill_tools", "Skills", "Discover and read installed skills."),
-    ("memory_tool", "Memory", "Save and update persistent memory."),
+    ("memory_tool", "Memory", "Use the selected provider’s memory tools."),
     ("mcp_tools", "MCP", "Tools from the connected MCP server."),
 ];
 

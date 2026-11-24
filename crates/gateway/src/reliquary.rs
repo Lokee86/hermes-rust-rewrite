@@ -297,7 +297,7 @@ impl EmbeddedMemory {
         })
     }
 
-    fn route(&self, binding: &CaptureBinding) -> Result<(OwnerId, &Instance)> {
+    pub(super) fn route(&self, binding: &CaptureBinding) -> Result<(OwnerId, &Instance)> {
         ensure!(
             binding.principal_id == self.principal_id
                 && binding.profile_id == self.profile_id
@@ -374,7 +374,7 @@ impl EmbeddedMemory {
         jobs.clear();
     }
 
-    fn runtime(
+    pub(super) fn runtime(
         &self,
         owner: OwnerId,
         instance: &Instance,
@@ -472,6 +472,55 @@ impl EmbeddedMemory {
                 tombstoned: false,
             },
         )
+    }
+
+    pub(super) fn source_available(
+        &self,
+        source_session: &str,
+        source_message: &str,
+        owner: OwnerId,
+        library: &hermes_library::Library,
+    ) -> Result<bool> {
+        let _guard = self.source_index.lock().expect("memory source index lock");
+        let path = self.source_path(source_session)?;
+        if regular_file(&path.with_extension("terminal"))?.is_some() {
+            return Ok(false);
+        }
+        let Some(file) = regular_file(&path)? else {
+            return Ok(false);
+        };
+        let saved: CopiedSource = read_state(file)?;
+        if saved.terminal || saved.session_id != source_session {
+            return Ok(false);
+        }
+        let (bound_owner, instance) = self.route(&saved.binding)?;
+        if bound_owner != owner {
+            return Ok(false);
+        }
+        let Ok(summary) = library.session(source_session) else {
+            return Ok(false);
+        };
+        if summary.archived
+            || super::profile_memory::source_ended(&summary.directory)
+            || summary.bot.is_some()
+            || !matches!(summary.source, SessionSource::Native)
+        {
+            return Ok(false);
+        }
+        let Some(receipt) = super::reliquary_query::copied_message_receipt(
+            &summary,
+            &saved.binding,
+            source_message,
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(instance
+            .native_import_status(owner, &receipt.import_id)?
+            .is_some_and(|status| {
+                status.source_key == hex(&receipt.source_sha256)
+                    && status.receipt_digest == Some(receipt.receipt_digest)
+            }))
     }
 
     pub(super) fn reconcile_tombstones(&self, summaries: &[SessionSummary]) -> Result<()> {

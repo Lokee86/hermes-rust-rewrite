@@ -208,12 +208,35 @@ async fn model(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): J
     let last = messages.last().unwrap();
     if last["content"] == CONTEXT_PROBE {
         // Observe at the chat request. Background capture of this turn starts after it commits.
+        let has_tool = |name: &str| request["tools"].as_array().unwrap().iter()
+            .any(|tool| tool["function"]["name"] == name);
         let report = json!({
             "memory_requests": memory_requests.load(Ordering::Relaxed),
             "included_fact": messages.iter().any(|message| message.to_string().contains(PROJECT_FACT)),
+            "notes_visible": messages[0]["content"].as_str().unwrap().contains(PROFILE_NOTE),
+            "notes_tool": has_tool("memory"),
+            "query_tool": has_tool("memory_query"),
         });
         return ([(header::CONTENT_TYPE, "text/event-stream")],
                 format!("{}data: [DONE]\n\n", event(json!({"content":report.to_string()}), Some("stop")))).into_response();
+    }
+    if last["role"] == "user" && last["content"] == REQUEST_QUERY {
+        assert!(request["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "memory_query"));
+        assert!(!messages.iter().any(|message| message.to_string().contains(PROJECT_FACT)));
+        let call = json!({"index":0, "id":"explicit_memory_query", "function":{
+            "name":"memory_query", "arguments":json!({"query":"Amethyst Lantern"}).to_string()
+        }});
+        let body = event(json!({"tool_calls":[call]}), Some("tool_calls"));
+        return ([(header::CONTENT_TYPE, "text/event-stream")],
+                format!("{body}data: [DONE]\n\n")).into_response();
+    }
+    if last["role"] == "tool" && last["tool_call_id"] == "explicit_memory_query" {
+        let has_fact = |message: &Value| message.to_string().contains(PROJECT_FACT);
+        assert!(!messages[..messages.len() - 1].iter().any(has_fact));
+        let reply = if has_fact(last) { "Project memory found." } else { "No project memory." };
+        let body = event(json!({"content":reply}), Some("stop"));
+        return ([(header::CONTENT_TYPE, "text/event-stream")],
+                format!("{body}data: [DONE]\n\n")).into_response();
     }
     if last["content"] == "provider-error" {
         return (
@@ -302,6 +325,8 @@ async fn model(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): J
 }
 
 const PROJECT_FACT: &str = "The workspace project is Amethyst Lantern 741.";
+const REQUEST_QUERY: &str = "Look up the project name in memory.";
+const PROFILE_NOTE: &str = "The notes canary is violet.";
 const CONTEXT_PROBE: &str = "How is the Amethyst Lantern project going?";
 
 async fn embed_memory_fixture(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Json<Value> {
@@ -317,16 +342,21 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
     let shape = &schema["schema"]["properties"];
     let value = match schema["name"].as_str().unwrap() {
         "insomnia_authority_disposition_ledger" => {
+            let episode: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let mut turns = serde_json::Map::new();
             for id in shape["turns"]["required"].as_array().unwrap() {
                 let id = id.as_str().unwrap();
-                let clauses = if id.ends_with("-user") {
+                let source = episode["turns"].as_array().unwrap().iter().find(|turn| turn["id"] == id).unwrap();
+                let clauses = if source["role"] == "user" && source["content"] == PROJECT_FACT {
                     json!([{"disposition":"retain", "authority_kind":"direct", "category":"fact",
                         "type":"project", "lifecycle":"current", "proposition":PROJECT_FACT,
                         "authority_source_node_id":"", "grounding_source_node_id":"",
                         "reason":"The user gave the project name."}])
                 } else {
-                    json!([])
+                    json!([{"disposition":"omit", "authority_kind":"none", "category":"none",
+                        "type":"none", "lifecycle":"none", "proposition":"",
+                        "authority_source_node_id":"", "grounding_source_node_id":"",
+                        "reason":"This turn contains no durable project fact."}])
                 };
                 turns.insert(id.into(), clauses);
             }
@@ -362,9 +392,44 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
     json!({"choices":[{"message":{"content":value.to_string()}}]})
 }
 
+#[cfg(feature = "reliquary")]
+async fn memory_capture_receipt(
+    record_path: &std::path::Path,
+    index: usize,
+) -> hermes_engine::memory_capture::CaptureReceipt {
+    timeout(Duration::from_secs(40), async {
+        loop {
+            let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+            let marker = &record["authority"]["receipts"][index]["capture"];
+            if marker["settled"] == true {
+                break serde_json::from_value(marker["receipt"].clone()).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.unwrap_or_else(|_| {
+        let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+        panic!("{} receipt {index} did not settle: {}", record_path.display(), record["authority"]["receipts"][index]["capture"]);
+    })
+}
+
+#[cfg(feature = "reliquary")]
+async fn approved_memory_query(client: &mut Client, sid: &str) -> String {
+    client.ok("prompt.submit", json!({"session_id":sid,"submission_id":"query","text":REQUEST_QUERY})).await;
+    let request = client.event("approval.request").await;
+    assert_eq!(request["payload"]["tool_name"], "memory_query");
+    client.ok("approval.respond", json!({
+        "session_id":sid, "prompt_id":request["payload"]["prompt_id"],
+        "execution_generation":request["execution_generation"], "choice":"once"
+    })).await;
+    let completed = client.event("message.complete").await;
+    assert_eq!(completed["payload"]["status"], "complete");
+    completed["payload"]["text"].as_str().unwrap().to_owned()
+}
+
+#[cfg(feature = "reliquary")]
 #[tokio::test]
 async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval() {
-    use hermes_engine::{credentials::EndpointStore, memory_capture::CaptureReceipt};
+    use hermes_engine::{credentials::EndpointStore, settings::ProfileSettings};
     use hermes_library::Library;
     use reliquary_memory::{
         Gateway as MemoryGateway, HostCredentialBinding, NativeImportState, OwnerGrant,
@@ -374,6 +439,9 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
 
     let provider = Provider::start().await;
     let root = TempDir::new().unwrap();
+    let notes = root.path().join("memories");
+    fs::create_dir(&notes).unwrap();
+    fs::write(notes.join("MEMORY.md"), PROFILE_NOTE).unwrap();
     let project_dir = TempDir::new().unwrap();
     let library = Library::open(root.path()).unwrap();
     let project = library.add_project(project_dir.path()).unwrap();
@@ -422,17 +490,7 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     assert_eq!(committed["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], rel.owner_id().to_string());
 
     // Root may settle semantic processing independently of the conversation.
-    let accepted = timeout(Duration::from_secs(40), async {
-        loop {
-            let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
-            let capture = record["authority"]["receipts"][0]["capture"]["receipt"].clone();
-            if record["authority"]["receipts"][0]["capture"]["settled"] == true {
-                break serde_json::from_value::<CaptureReceipt>(capture).unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }).await.expect("project archive did not finish semantic processing");
-
+    let accepted = memory_capture_receipt(&record_path, 0).await;
     drop(client);
     gateway.shutdown().await.unwrap();
     {
@@ -456,21 +514,92 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     assert_eq!(record["authority"]["receipts"][0]["capture"]["receipt"]["import_id"], accepted.import_id);
 
     let related = next.ok("session.create", json!({"project_id":project.id,"title":"Same project"})).await;
+    let related_id = related["session_id"].as_str().unwrap();
+    let related_record = library.session(related_id).unwrap().directory.join("conversation.json");
+    let read_related = || -> Value { serde_json::from_slice(&fs::read(&related_record).unwrap()).unwrap() };
+    let set_provider = |name: &str| {
+        let settings = json!({"memory_provider": name});
+        ProfileSettings::update(root.path(), settings.as_object().unwrap()).unwrap();
+    };
     provider.memory_requests.store(0, Ordering::Relaxed);
-    next.ok("prompt.submit", json!({"session_id":related["session_id"],"submission_id":"ask","text":CONTEXT_PROBE})).await;
+    next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"ordinary","text":CONTEXT_PROBE})).await;
     let completed = next.event("message.complete").await;
     let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(report, json!({"memory_requests":0,"included_fact":false}));
+    assert_eq!(report, json!({"memory_requests":0,"included_fact":false,
+        "notes_visible":false,"notes_tool":false,"query_tool":true}));
+    memory_capture_receipt(&related_record, 0).await;
+
+    assert_eq!(approved_memory_query(&mut next, related_id).await, "Project memory found.");
+    let record = read_related();
+    assert!(!record.to_string().contains(PROJECT_FACT));
+    let entry = record["turns"][1]["entries"].as_array().unwrap().iter()
+        .find(|entry| entry["role"] == "tool" && entry["name"] == "memory_query").unwrap();
+    assert_eq!(entry["approved"], true);
+    let stored: Value = serde_json::from_str(entry["result"].as_str().unwrap()).unwrap();
+    assert_eq!(stored.as_object().unwrap().len(), 1);
+    assert!(stored["returned"].as_u64().unwrap() > 0);
+
+    set_provider("off");
+    next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"disabled","text":CONTEXT_PROBE})).await;
+    let completed = next.event("message.complete").await;
+    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    for flag in ["query_tool", "notes_tool", "notes_visible", "included_fact"] {
+        assert_eq!(report[flag], false, "{flag} while memory is disabled");
+    }
+    assert!(read_related()["authority"]["receipts"][2]["capture"].is_null());
+
+    set_provider("reliquary");
+    next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"reenabled","text":CONTEXT_PROBE})).await;
+    let completed = next.event("message.complete").await;
+    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(report["query_tool"], true);
+    assert_eq!(report["included_fact"], false);
+    memory_capture_receipt(&related_record, 3).await;
+    assert!(read_related()["authority"]["receipts"][2]["capture"].is_null());
 
     let general_chat = next.ok("session.create", json!({"title":"General chat"})).await;
     let general_id = general_chat["session_id"].as_str().unwrap();
-    next.ok("prompt.submit", json!({"session_id":general_id,"submission_id":"hello","text":"Hello"})).await;
-    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    assert_eq!(approved_memory_query(&mut next, general_id).await, "No project memory.");
     let general_record = library.session(general_id).unwrap().directory.join("conversation.json");
     let record: Value = serde_json::from_slice(&fs::read(general_record).unwrap()).unwrap();
+    assert!(!record.to_string().contains(PROJECT_FACT));
     assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general.owner_id().to_string());
     drop(next);
     restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_memory_ignores_broken_enrollment_and_profile_notes() {
+    use hermes_engine::settings::ProfileSettings;
+    use hermes_library::Library;
+    use std::fs;
+
+    let provider = Provider::start().await;
+    let root = TempDir::new().unwrap();
+    let native = root.path().join("reliquary");
+    fs::create_dir(&native).unwrap();
+    fs::write(native.join("capture-enrollment-v1.json"), b"invalid").unwrap();
+    let notes = root.path().join("memories");
+    fs::create_dir(&notes).unwrap();
+    fs::write(notes.join("MEMORY.md"), PROFILE_NOTE).unwrap();
+    let settings = json!({"memory_provider":"off"});
+    ProfileSettings::update(root.path(), settings.as_object().unwrap()).unwrap();
+
+    let gateway = provider.gateway(&root).await;
+    let mut client = Client::native(&gateway).await;
+    let session = client.ok("session.create", json!({"title":"Disabled memory"})).await;
+    let id = session["session_id"].as_str().unwrap();
+    client.ok("prompt.submit", json!({"session_id":id,"submission_id":"disabled","text":CONTEXT_PROBE})).await;
+    let completed = client.event("message.complete").await;
+    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(report, json!({"memory_requests":0,"included_fact":false,
+        "notes_visible":false,"notes_tool":false,"query_tool":false}));
+    let directory = Library::open(root.path()).unwrap().session(id).unwrap().directory;
+    let record: Value = serde_json::from_slice(&fs::read(directory.join("conversation.json")).unwrap()).unwrap();
+    assert!(record["authority"]["receipts"][0]["capture"].is_null());
+    drop(client);
+    gateway.shutdown().await.unwrap();
+    assert_eq!(provider.memory_requests.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

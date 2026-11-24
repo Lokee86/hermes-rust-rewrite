@@ -6,9 +6,46 @@ use std::{fs, io::Write, path::{Path,PathBuf}, sync::LazyLock, collections::BTre
 
 pub static PERSONALITIES: LazyLock<BTreeMap<String,String>> = LazyLock::new(||
     serde_json::from_str(include_str!("personalities.json")).expect("built-in personality resources"));
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProvider {
+    #[default]
+    Auto,
+    Reliquary,
+    Notes,
+    External,
+    Off,
+}
+
+impl MemoryProvider {
+    pub fn resolve(self, native_enrolled: bool) -> Self {
+        match self {
+            Self::Auto if native_enrolled => Self::Reliquary,
+            Self::Auto => Self::Notes,
+            explicit => explicit,
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "Automatic",
+            Self::Reliquary => "Reliquary",
+            Self::Notes => "Markdown notes",
+            Self::External => "External (MCP)",
+            Self::Off => "Off",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfileSettings {
+    pub memory_provider: MemoryProvider,
+    /// Reserve this profile's HTTP MCP connector for the External memory setting.
+    pub external_memory_connector: bool,
     /// Saved profile endpoint used for shared-space embeddings by embedded Reliquary.
     pub memory_embedding: Option<MemoryEmbedding>,
     pub checkpoints_enabled: bool,
@@ -46,7 +83,7 @@ pub struct MemoryEmbedding {
     pub dimensions: u32,
 }
 impl Default for ProfileSettings {
-    fn default()->Self {Self {memory_embedding: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
+    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, external_memory_connector: false, memory_embedding: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
         memory_enabled:true,user_profile_enabled:true,memory_char_limit:crate::memory::DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:8,
         file_read_max_chars:100_000,tool_output_bytes:50000,tool_output_lines:2000,tool_output_line_length:2000,
@@ -108,13 +145,24 @@ impl ProfileSettings {
             "terminal"|"process_manage"=>self.terminal_tools,
             "list_directory"|"read_file"|"write_file"|"search_files"=>self.file_tools,
             "skills_list"|"skill_view"=>self.skill_tools,
-            "memory"=>self.memory_tool,
+            "memory"|"memory_query"|"refine_query"|"traverse_graph"=>self.memory_tool,
             "delegate_task"=>true,
             _=>self.mcp_tools,
         }
     }
-    pub(crate) fn memory_config(&self,scheduled:bool)->crate::memory::MemoryConfig{
-        crate::memory::MemoryConfig{memory_enabled:self.memory_enabled&&!scheduled,user_profile_enabled:self.user_profile_enabled&&!scheduled,memory_char_limit:self.memory_char_limit,user_char_limit:self.user_char_limit}
+    pub(crate) fn connect_profile_mcp(&self) -> bool {
+        self.mcp_tools && (!self.external_memory_connector
+            || (self.memory_provider == MemoryProvider::External && self.memory_tool))
+    }
+
+    pub(crate) fn memory_config(&self, scheduled: bool, native_enrolled: bool) -> crate::memory::MemoryConfig {
+        let notes = !scheduled && self.memory_provider.resolve(native_enrolled) == MemoryProvider::Notes;
+        crate::memory::MemoryConfig {
+            memory_enabled: notes && self.memory_enabled,
+            user_profile_enabled: notes && self.user_profile_enabled,
+            memory_char_limit: self.memory_char_limit,
+            user_char_limit: self.user_char_limit,
+        }
     }
     pub(crate) fn bound_tool_result(&self,text:String)->String {
         let Ok(mut data)=serde_json::from_str::<serde_json::Value>(&text) else {return text;};
@@ -146,6 +194,59 @@ impl ProfileSettings {
         }
         result["output"]=prefix.into();
         result.to_string()
+    }
+}
+
+#[cfg(test)]
+mod memory_provider_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn existing_profile_keeps_its_notes_preferences_when_switching_providers() {
+        let profile = tempfile::tempdir().unwrap();
+        fs::write(profile.path().join("agent-settings.json"), r#"{"user_profile_enabled":false}"#).unwrap();
+        let settings = ProfileSettings::load(profile.path()).unwrap();
+        assert_eq!(settings.memory_provider, MemoryProvider::Auto);
+        assert!(settings.memory_config(false, false).memory_enabled);
+        assert!(!settings.memory_config(false, false).user_profile_enabled);
+        assert!(!settings.memory_config(false, true).memory_enabled);
+
+        for name in ["reliquary", "off", "external", "notes"] {
+            let changes = json!({"memory_provider": name});
+            ProfileSettings::update(profile.path(), changes.as_object().unwrap()).unwrap();
+            let saved = ProfileSettings::load(profile.path()).unwrap();
+            assert_eq!(json!(saved.memory_provider), name);
+            for enrolled in [false, true] {
+                let notes = saved.memory_config(false, enrolled);
+                assert_eq!(notes.memory_enabled, name == "notes");
+                assert!(!notes.user_profile_enabled);
+                assert!(!saved.memory_config(true, enrolled).memory_enabled);
+            }
+        }
+        let unknown = json!({"memory_provider": "typo"});
+        assert!(ProfileSettings::update(profile.path(), unknown.as_object().unwrap()).is_err());
+        assert_eq!(ProfileSettings::load(profile.path()).unwrap().memory_provider, MemoryProvider::Notes);
+    }
+
+    #[test]
+    fn only_a_designated_memory_connector_follows_the_provider_choice() {
+        let mut settings = ProfileSettings::default();
+        for mode in [MemoryProvider::Auto, MemoryProvider::Reliquary, MemoryProvider::Notes,
+                     MemoryProvider::Off, MemoryProvider::External] {
+            settings.memory_provider = mode;
+            settings.external_memory_connector = false;
+            assert!(settings.connect_profile_mcp());
+            settings.external_memory_connector = true;
+            assert_eq!(settings.connect_profile_mcp(), mode == MemoryProvider::External);
+        }
+        settings.mcp_tools = false;
+        assert!(!settings.connect_profile_mcp());
+        settings.mcp_tools = true;
+        settings.memory_tool = false;
+        assert!(!settings.connect_profile_mcp());
+        settings.external_memory_connector = false;
+        assert!(settings.connect_profile_mcp());
     }
 }
 
