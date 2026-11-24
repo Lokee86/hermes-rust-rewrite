@@ -514,6 +514,20 @@ impl Hermes {
         if !self.draft_files.files.is_empty() || self.draft_files.pending>0 {
             content=content.push(container(self.draft_files.view().map(Message::Attachment)).padding([2,16]));
         }
+        if let Some((scope, hits)) = &self.archive_results
+            && self.archive_scope().as_ref() == Some(scope)
+        {
+            let p = palette(self.dark);
+            let mut results = column![].spacing(10);
+            for (rel, excerpt) in hits {
+                results = results.push(column![text(rel).size(12).font(medium()), text(excerpt).size(12)].spacing(3));
+            }
+            content = content.push(container(column![
+                row![text("Archive results").size(13).font(medium()), Space::new().width(Fill),
+                    icon_button("close", "Dismiss results", Message::DismissArchiveResults, p)].align_y(Alignment::Center),
+                scrollable(results).height(iced::Length::Shrink).width(Fill),
+            ].spacing(8)).padding([8, 20]).max_height(230).width(Fill).style(move |_| panel(p.background, 0.0, Some(p.border))));
+        }
         content.push(self.composer_view()).into()
     }
 
@@ -785,10 +799,19 @@ impl Hermes {
         let p = palette(self.dark);
         let mut list = column![].spacing(6);
         for project in &self.projects {
+            if let Some((id, name)) = &self.workspace_rename && id == &project.id {
+                list = list.push(row![
+                    text_input("Project name", name).size(13).padding(9).style(field_input)
+                        .on_input(Message::WorkspaceName).on_submit(Message::SaveWorkspaceName),
+                    button(text("Save").size(12)).style(primary_button).on_press(Message::SaveWorkspaceName),
+                    button(text("Cancel").size(12)).style(quiet_button).on_press(Message::CancelWorkspaceRename),
+                ].spacing(8).align_y(Alignment::Center));
+                continue;
+            }
             let mut item = button(row![icon("folder", 15, p.muted), column![text(&project.name).size(13), text(project.path.to_string_lossy().into_owned()).size(11).color(p.muted)].spacing(3)].spacing(10).align_y(Alignment::Center))
                 .padding(10).width(Fill).style(quiet_button);
             if !self.running { item = item.on_press(Message::SelectWorkspace(Some(project.id.clone()))); }
-            list = list.push(item);
+            list = list.push(row![item, icon_button("edit", "Rename project", Message::RenameWorkspace(project.id.clone()), p)].align_y(Alignment::Center));
         }
         let mut path = text_input("Project folder", &self.workspace_path).padding(9).size(13).style(field_input);
         let mut browse = button(text("Browse…").size(12)).padding([8, 12]).style(outline_button);

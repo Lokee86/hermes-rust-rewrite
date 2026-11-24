@@ -199,6 +199,8 @@ enum Message {
     Voice(voice::Action),
     PortalStart, PortalBegun(u64, Result<portal::DeviceLogin, String>), PortalFinished(u64, Result<(), String>), PortalCancel,
     WorkspacePath(String), AddWorkspace, SelectWorkspace(Option<String>), BrowseWorkspace, ProjectDiscovery(project_discovery::Action),
+    RenameWorkspace(String), WorkspaceName(String), SaveWorkspaceName, CancelWorkspaceRename, WorkspaceMemorySynced(Result<serde_json::Value,String>),
+    ArchiveResults(ArchiveScope, Result<serde_json::Value, String>), DismissArchiveResults,
     FolderChosen(Result<Option<PathBuf>, String>), Dismiss,
     RenameStart, RenameChanged(String), RenameSave, Copy(String), Link(String),
     Scrolled(bool), JumpToLatest, Shortcut(keyboard::Event),
@@ -244,6 +246,9 @@ impl fmt::Debug for Message {
             Self::Voice(_) => "VoiceAction",
             Self::PortalBegun(..) => "PortalBegun", Self::PortalFinished(..) => "PortalFinished", Self::PortalCancel => "PortalCancel",
             Self::WorkspacePath(_) => "WorkspacePath", Self::AddWorkspace => "AddWorkspace", Self::SelectWorkspace(_) => "SelectWorkspace",
+            Self::RenameWorkspace(_) => "RenameWorkspace", Self::WorkspaceName(_) => "WorkspaceName", Self::SaveWorkspaceName => "SaveWorkspaceName",
+            Self::CancelWorkspaceRename => "CancelWorkspaceRename", Self::WorkspaceMemorySynced(_) => "WorkspaceMemorySynced",
+            Self::ArchiveResults(..) => "ArchiveResults", Self::DismissArchiveResults => "DismissArchiveResults",
             Self::BrowseWorkspace => "BrowseWorkspace", Self::FolderChosen(_) => "FolderChosen", Self::ProjectDiscovery(_) => "ProjectDiscovery",
             Self::Dismiss => "Dismiss", Self::RenameStart => "RenameStart", Self::RenameChanged(_) => "RenameChanged",
             Self::RenameSave => "RenameSave", Self::Copy(_) => "Copy", Self::Link(_) => "Link",
@@ -276,6 +281,13 @@ impl fmt::Debug for Message {
 struct Approval { call: ToolCall, generation: u64, answer: Option<async_channel::Sender<bool>> }
 struct Banner { text: String, error: bool }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ArchiveScope {
+    profile_root: PathBuf,
+    session_id: Option<String>,
+    project_id: Option<String>,
+}
+
 struct Hermes {
     intro_width:f32, backdrop: bool, backdrop_image: Option<iced::widget::image::Handle>, portal_connected: bool, draft_revision:u64, draft_save_pending:bool,
     library: Option<Library>, sessions: Vec<SessionSummary>, current: Option<SessionSummary>,
@@ -283,6 +295,8 @@ struct Hermes {
     session: Option<Arc<tokio::sync::Mutex<Session>>>, history: History,
     rendered: Vec<Vec<Option<markdown::Content>>>, composer: text_editor::Content,
     config: Config, screen: Screen, search: String, workspace_path: String,
+    workspace_rename: Option<(String, String)>,
+    archive_results: Option<(ArchiveScope, Vec<(String, String)>)>,
     banner: Option<Banner>, approvals: Vec<Approval>, chat: chat_view::View, cancellation: Option<CancellationToken>,
     run_id: u64, running: bool, stopping: bool, follow_stream: bool, rename: Option<String>, browsing: bool,
     portal_login: Option<portal::DeviceLogin>, portal_cancel: Option<CancellationToken>, portal_starting: bool, portal_id: u64,
@@ -334,6 +348,8 @@ impl Hermes {
             library: None, sessions: vec![], current: None, project: None, projects: vec![],
             session: None, history: History::default(), rendered: vec![], composer: text_editor::Content::new(),
             config: Preferences::load(), screen: Screen::Chat, search: String::new(), workspace_path: String::new(),
+            workspace_rename: None,
+            archive_results: None,
             banner: None, approvals: vec![], chat: chat_view::View::default(), cancellation: None, run_id: 0, running: false, stopping: false,
             follow_stream: true, rename: None, browsing: false, portal_login: None, portal_cancel: None, portal_starting: false, portal_id: 0,
             files: files::Files::new(), git: git::GitPanel::new(PathBuf::new()), imports: imports::ImportPanel::default(), terminal: terminal::TerminalPane::new(), artifacts: artifacts::Artifacts::default(), closing: false,
@@ -461,6 +477,17 @@ impl Hermes {
     }
     fn chat_project(&self) -> Option<&Project> {
         self.current.as_ref().and_then(|current| current.project_id.as_ref()).and_then(|id| self.projects.iter().find(|project| &project.id == id))
+    }
+    fn archive_scope(&self) -> Option<ArchiveScope> {
+        let (session_id, project_id) = match &self.current {
+            Some(session) => (Some(session.id.clone()), None),
+            None => (None, self.project.as_ref().map(|project| project.id.clone())),
+        };
+        Some(ArchiveScope {
+            profile_root: self.library.as_ref()?.root().to_owned(),
+            session_id,
+            project_id,
+        })
     }
     fn load_backdrop() -> Task<Message> {
         Task::perform(async { tokio::task::spawn_blocking(backdrop::texture).await.map_err(|e|e.to_string()).and_then(|r|r) },Message::BackdropLoaded)
@@ -593,6 +620,15 @@ impl Hermes {
             if self.current.as_ref().is_some_and(|current| current.id == id) { return; }
         }
         self.create_gateway_chat();
+    }
+    fn sync_workspace_memory(&self, root: PathBuf) -> Task<Message> {
+        if !hermes_gateway::stock_plugins::has_memory_plugin() {
+            return Task::none();
+        }
+        Task::perform(
+            local_gateway::catalog_request(root, self.config.clone(), "plugins.memory.sync", serde_json::json!({})),
+            Message::WorkspaceMemorySynced,
+        )
     }
     fn send(&mut self) -> Task<Message> {
         let prompt = self.composer.text().trim().to_owned();
@@ -1166,7 +1202,15 @@ impl Hermes {
                 let path = expand_path(self.workspace_path.trim());
                 if let Some(library) = &self.library {
                     match library.add_project(&path) {
-                        Ok(project) => { self.projects = library.projects().unwrap_or_default(); self.workspace_path.clear(); return self.update(Message::SelectWorkspace(Some(project.id))); }
+                        Ok(project) => {
+                            let root = library.root().to_owned();
+                            self.projects = library.projects().unwrap_or_default();
+                            self.workspace_path.clear();
+                            return Task::batch([
+                                self.update(Message::SelectWorkspace(Some(project.id))),
+                                self.sync_workspace_memory(root),
+                            ]);
+                        }
                         Err(error) => self.error(format!("Could not add workspace: {error:#}")),
                     }
                 }
@@ -1184,6 +1228,55 @@ impl Hermes {
                 }
             }
             Message::AddWorkspace | Message::SelectWorkspace(_) => {},
+            Message::RenameWorkspace(id) => {
+                self.workspace_rename = self.projects.iter().find(|project| project.id == id)
+                    .map(|project| (id, project.name.clone()));
+            }
+            Message::WorkspaceName(name) => {
+                if let Some((_, current)) = &mut self.workspace_rename { *current = name; }
+            }
+            Message::CancelWorkspaceRename => self.workspace_rename = None,
+            Message::SaveWorkspaceName => {
+                if let (Some(library), Some((id, name))) = (&self.library, &self.workspace_rename) {
+                    match library.rename_project(id, name) {
+                        Ok(_) => {
+                            let root = library.root().to_owned();
+                            self.projects = library.projects().unwrap_or_default();
+                            self.project = library.selected_project().unwrap_or_default();
+                            self.workspace_rename = None;
+                            self.banner = None;
+                            return self.sync_workspace_memory(root);
+                        }
+                        Err(error) => self.error(format!("Could not rename project: {error:#}")),
+                    }
+                }
+            }
+            Message::WorkspaceMemorySynced(Ok(value)) if value["projects_ready"] == false => {
+                self.note("Project saved. Its memory file will update after the current memory query.");
+            }
+            Message::WorkspaceMemorySynced(Err(error)) => {
+                self.error(format!("Project saved. Could not update project memory: {error}"));
+            }
+            Message::WorkspaceMemorySynced(Ok(_)) => {}
+            Message::ArchiveResults(scope, result) => {
+                if self.archive_scope().as_ref() == Some(&scope) {
+                    match result {
+                        Ok(data) => {
+                            let hits: Vec<_> = data["hits"].as_array().into_iter().flatten()
+                                .filter_map(|hit| Some((hit["rel"].as_str()?.to_owned(), hit["text"].as_str()?.to_owned())))
+                                .collect();
+                            if hits.is_empty() {
+                                self.archive_results = None;
+                                self.note("No Archive results.");
+                            } else {
+                                self.archive_results = Some((scope, hits));
+                            }
+                        }
+                        Err(error) => self.error(format!("Archive search failed: {error}")),
+                    }
+                }
+            }
+            Message::DismissArchiveResults => self.archive_results = None,
             Message::BrowseWorkspace if !self.running && !self.browsing => {
                 self.browsing = true;
                 return Task::perform(async { tokio::task::spawn_blocking(choose_folder).await.map_err(|e| e.to_string()).and_then(|r| r) }, Message::FolderChosen);

@@ -590,6 +590,8 @@ fn plugins(app: &Hermes) -> Element<'_, Message> {
     let state = &app.capabilities; let p = ui::palette(app.dark);
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     for plugin in PLUGINS.iter() { *counts.entry(&plugin.category).or_default() += 1; }
+    let stock = hermes_gateway::stock_plugins::has_memory_plugin();
+    if stock { *counts.entry("Memory").or_default() += 1; }
     let options: Vec<Facet> = std::iter::once(all("All categories")).chain(counts.iter().map(|(c, n)| facet(c, *n))).collect();
     let selected = options.iter().find(|f| f.value == state.plugin_category).cloned();
     let terms: Vec<String> = state.search.to_lowercase().split_whitespace().map(str::to_owned).collect();
@@ -597,13 +599,27 @@ fn plugins(app: &Hermes) -> Element<'_, Message> {
     let rows: Vec<&Plugin> = PLUGINS.iter().filter(|plugin| state.plugin_category.as_deref().is_none_or(|c| plugin.category == c)
         && (!state.plugins_installed_only || installed(&plugin.name).is_some())
         && terms.iter().all(|t| plugin.name.to_lowercase().contains(t) || plugin.description.to_lowercase().contains(t))).collect();
+    let show_reliquary = stock
+        && state.plugin_category.as_deref().is_none_or(|category| category == "Memory")
+        && terms.iter().all(|term| "reliquary stock memory plugin".contains(term));
     let mut col = column![
         search_bar("Search plugins…", &state.search, p, pick_list(options, selected, |f| pressed(Action::PluginCategory(f))).text_size(12).padding([4, 8]).into()),
-        row![text(format!("{} plugins · {} installed · Agent Plugins packages run here; Python plugins run in the built-in Python.", fmt_count(rows.len()), state.plugins_installed.len())).size(12).color(p.muted).width(Fill),
+        row![text(format!("{} plugins · {} installed · Agent Plugins packages run here; Python plugins run in the built-in Python.", fmt_count(rows.len() + usize::from(show_reliquary)), state.plugins_installed.len() + usize::from(stock))).size(12).color(p.muted).width(Fill),
             toggler(state.plugins_installed_only).label("Installed only").text_size(12).size(16).on_toggle(|v| pressed(Action::PluginsInstalledOnly(v)))].align_y(Alignment::Center),
     ].spacing(14);
     if let Some(error) = &state.error { col = col.push(text(error.clone()).size(12).color(Color::from_rgb8(0xd1, 0x43, 0x43))); }
     else if let Some(notice) = &state.notice { col = col.push(text(notice.clone()).size(12).color(p.muted)); }
+    if show_reliquary {
+        let details = column![
+            text("Reliquary").size(14).font(ui::medium()),
+            text("Stock memory plugin for this profile’s General and project memories.").size(12).color(p.muted),
+        ].spacing(4).width(Fill);
+        col = col.push(container(row![
+            details,
+            button(text("Configure").size(12)).style(ui::quiet_button)
+                .on_press(Message::SettingsView(super::settings::View::Memory)),
+        ].spacing(12).align_y(Alignment::Center)).padding(14).style(move |_| ui::panel(p.card, 8.0, None)));
+    }
     if let Some(name) = &state.plugin_detail { col = col.push(plugin_detail(app, name)); }
     let mut grid = column![].spacing(12);
     for chunk in rows.iter().take(state.limit).collect::<Vec<_>>().chunks(3) {

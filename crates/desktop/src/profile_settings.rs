@@ -2,7 +2,7 @@
 //! record and commits only the controls edited on this page.
 use crate::appearance::text;
 use super::{Hermes, Message, settings::View, ui};
-use hermes_engine::settings::{MemoryProvider, PERSONALITIES, ProfileSettings};
+use hermes_engine::settings::{MemoryEmbedding, MemoryProvider, PERSONALITIES, ProfileSettings};
 use hermes_library::{ArchiveFilter,Library,SessionQuery,SessionSource,SessionSummary};
 use iced::{Alignment, Element, Fill, Task, widget::{button,column,container,pick_list,row,text_input,Space}};
 use std::{collections::BTreeMap,path::{Path,PathBuf},process::{Child,Command}};
@@ -42,12 +42,16 @@ const FIELDS:&[Field]=&[
 #[derive(Clone,Debug)]
 pub(super) enum Action {
     SetMemoryProvider(MemoryProvider),
+    MemorySynced(Result<serde_json::Value, String>),
+    EmbeddingEndpoint(String), EmbeddingDimensions(String), SaveEmbedding,
     Set(&'static str,String,View), Edit(&'static str,String),Apply(View),Browse,DirectoryChosen(Result<Option<PathBuf>,String>),
     Restore(String),RestoreDone(String,Result<serde_json::Value,String>),Delete(String),DeleteDone(String,Result<serde_json::Value,String>),CancelDelete,ConfirmDelete,Maintain,MaintainDone(Result<serde_json::Value,String>),
 }
 #[derive(Default)]
 pub(super) struct State {
     pub saved:ProfileSettings,
+    embedding_endpoint: String,
+    embedding_dimensions: String,
     edits:BTreeMap<&'static str,String>,
     pub archive:Vec<SessionSummary>,
     pub feedback:Option<Result<String,String>>,
@@ -68,7 +72,14 @@ impl State {
     pub fn load(root:&Path)->Self{
         let mut state=Self::default();
         match ProfileSettings::load(root) {
-            Ok(saved)=>state.saved=saved, Err(e)=>state.feedback=Some(Err(e.to_string())),
+            Ok(saved)=>{
+                if let Some(embedding) = &saved.memory_embedding {
+                    state.embedding_endpoint = embedding.endpoint_id.clone();
+                    state.embedding_dimensions = embedding.dimensions.to_string();
+                }
+                state.saved=saved;
+            }
+            Err(e)=>state.feedback=Some(Err(e.to_string())),
         }
         if let Err(e)=state.sync_awake(){state.feedback=Some(Err(e));}
         state
@@ -111,6 +122,54 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
             state.feedback = Some(ProfileSettings::update(lib.root(), &changes)
                 .map(|saved| { state.saved = saved; "Settings saved".into() })
                 .map_err(|e| format!("{e:#}")));
+            if provider == MemoryProvider::Reliquary
+                && hermes_gateway::stock_plugins::has_memory_plugin()
+                && state.feedback.as_ref().is_some_and(Result::is_ok)
+            {
+                let root = lib.root().to_owned();
+                return Task::perform(
+                    super::local_gateway::catalog_request(root, app.config.clone(), "plugins.memory.sync", serde_json::json!({})),
+                    |result| Message::ProfileSetting(Action::MemorySynced(result)),
+                );
+            }
+        }
+        Action::MemorySynced(result) => {
+            if state.saved.memory_provider == MemoryProvider::Reliquary {
+                state.feedback = Some(result.and_then(|result| {
+                    if result["enrolled"] != true {
+                        return Err("This profile's gateway does not have the Reliquary stock plugin.".into());
+                    }
+                    Ok(if state.saved.memory_embedding.is_some() {
+                        "Reliquary enrolled.".into()
+                    } else {
+                        "Reliquary enrolled. Choose an embedding endpoint to process captured turns.".into()
+                    })
+                }));
+            }
+        }
+        Action::EmbeddingEndpoint(id) => state.embedding_endpoint = id,
+        Action::EmbeddingDimensions(dimensions) => state.embedding_dimensions = dimensions,
+        Action::SaveEmbedding => {
+            let result = (|| -> anyhow::Result<_> {
+                let embedding = if state.embedding_endpoint.is_empty() {
+                    None
+                } else {
+                    use anyhow::Context;
+                    let endpoint = hermes_engine::credentials::EndpointStore::open(&lib.root().join("providers"))?
+                        .config(&state.embedding_endpoint)?;
+                    endpoint.openai_chat_url()?;
+                    let dimensions = state.embedding_dimensions.trim().parse::<u32>().ok()
+                        .filter(|dimensions| *dimensions > 0)
+                        .context("Enter the embedding model's positive output dimension")?;
+                    Some(MemoryEmbedding { endpoint_id: state.embedding_endpoint.clone(), dimensions })
+                };
+                let changes = serde_json::Map::from_iter([("memory_embedding".into(), serde_json::json!(embedding))]);
+                ProfileSettings::update(lib.root(), &changes)
+            })();
+            state.feedback = Some(result.map(|saved| {
+                state.saved = saved;
+                "Embedding settings saved.".into()
+            }).map_err(|error| format!("{error:#}")));
         }
         // Switches and pickers save on change, as the original's autosave does.
         Action::Set(key,value,page)=>{state.edits.insert(key,value);return update(app,Action::Apply(page));}
@@ -190,6 +249,48 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
     }
     Task::none()
 }
+
+#[derive(Clone, PartialEq)]
+struct EmbeddingChoice {
+    id: String,
+    label: String,
+}
+
+impl std::fmt::Display for EmbeddingChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
+fn embedding_row(app: &Hermes) -> Element<'_, Message> {
+    let state = &app.profile_settings;
+    let action = Message::ProfileSetting;
+    let mut options = vec![EmbeddingChoice { id: String::new(), label: "None".into() }];
+    options.extend(app.models.endpoints.iter().map(|endpoint| EmbeddingChoice {
+        id: endpoint.id.clone(),
+        label: endpoint.name.clone(),
+    }));
+    let selected = options.iter().find(|option| option.id == state.embedding_endpoint).cloned();
+    let picker = pick_list(options, selected, move |choice| action(Action::EmbeddingEndpoint(choice.id)))
+        .text_size(12).width(145).placeholder("Saved endpoint");
+    let dimensions = text_input("Dimensions", &state.embedding_dimensions)
+        .size(12).padding([5, 7]).width(85)
+        .on_input(move |value| action(Action::EmbeddingDimensions(value)))
+        .on_submit(action(Action::SaveEmbedding));
+    let save = button(text("Save").size(12)).on_press(action(Action::SaveEmbedding));
+    let fields = row![picker, dimensions, save].spacing(5).align_y(Alignment::Center);
+    super::settings::card_row(
+        "Reliquary embeddings",
+        if state.saved.memory_embedding.is_some() {
+            "Choose a saved embedding endpoint from Models and enter its model’s output dimension."
+        } else {
+            "Processing is pending until you save an embedding endpoint and its output dimension."
+        },
+        fields.into(),
+        app.dark,
+    )
+}
+
 pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
     let p=ui::palette(app.dark);let state=&app.profile_settings;
     let title=match page {View::Chat=>"Behavior",View::Workspace=>"Projects & files",View::Memory=>"Persistent memory",View::Safety=>"Approvals",View::Advanced=>"Runtime & tool output",View::Sessions=>"Sessions",_=>""};
@@ -199,9 +300,12 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
     if page == View::Memory {
         use MemoryProvider::{Auto, External, Notes, Off, Reliquary};
         let saved = &state.saved;
+        let stock = hermes_gateway::stock_plugins::has_memory_plugin();
         let description = match saved.memory_provider {
-            Auto => "Use Reliquary when available for this enrolled profile. Otherwise use Markdown notes.",
-            Reliquary => "Use this profile’s enrolled Reliquary memory.",
+            Auto if stock => "Automatically enroll this profile in the Reliquary stock plugin. Choose another provider to opt out.",
+            Auto => "Use this profile’s Markdown notes.",
+            Reliquary if stock => "Enroll this profile with the Reliquary stock plugin. New chats can capture turns and query their assigned memory.",
+            Reliquary => "This build does not include the Reliquary stock plugin.",
             Notes => "Store agent and user notes in this profile’s Markdown files.",
             External if !saved.external_memory_connector =>
                 r#"In Capabilities > Connectors, configure your MCP server and select "Use as external memory provider"."#,
@@ -210,10 +314,18 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
             External => "Use tools from the MCP server designated for memory in Capabilities > Connectors.",
             Off => "Disable built-in memory and the designated external memory connector for this profile.",
         };
-        let selector = pick_list([Auto, Reliquary, Notes, External, Off], Some(saved.memory_provider),
+        let options = if stock || saved.memory_provider == Reliquary {
+            vec![Auto, Reliquary, Notes, External, Off]
+        } else {
+            vec![Auto, Notes, External, Off]
+        };
+        let selector = pick_list(options, Some(saved.memory_provider),
             |choice| Message::ProfileSetting(Action::SetMemoryProvider(choice)))
             .width(165).text_size(13).padding([7, 10]);
         rows.push(super::settings::card_row("Memory provider", description, selector.into(), dark));
+        if stock && matches!(saved.memory_provider, Reliquary | Auto) {
+            rows.push(embedding_row(app));
+        }
     }
     for f in FIELDS.iter().filter(|f|f.page==page){
         if page == View::Memory && !matches!(state.saved.memory_provider, MemoryProvider::Auto | MemoryProvider::Notes) {

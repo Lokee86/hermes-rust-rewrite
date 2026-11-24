@@ -14,6 +14,13 @@ pub fn valid_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') && name != "default"
 }
 
+pub fn name_for_home(home: &Path) -> &str {
+    home.parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+        .and_then(|_| home.file_name()?.to_str())
+        .unwrap_or("default")
+}
+
 fn describe(name: &str, path: &Path, is_default: bool, is_bot: bool) -> Profile {
     let prefs: serde_json::Value = fs::read(path.join("desktop-preferences.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let skill_count = hermes_engine::skill_catalog::status(path).map(|s| s.installed.difference(&s.disabled).count()).unwrap_or(0);

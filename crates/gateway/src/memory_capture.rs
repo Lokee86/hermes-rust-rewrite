@@ -1,5 +1,10 @@
 //! Reconcile copied-source receipts from the committed native record.
 use super::*;
+use hermes_engine::memory_capture::{CaptureReceipt, CapturedReasoningSummary};
+use hermes_library::{
+    SessionSource,
+    memory_plugin::{MemorySources, MemoryStore},
+};
 
 #[derive(Deserialize)]
 pub(super) struct CommittedRecord {
@@ -15,10 +20,11 @@ impl Shared {
         admission: &Receipt,
         index: usize,
         history: &History,
+        reasoning_summaries: Vec<CapturedReasoningSummary>,
     ) -> Option<PendingMemoryCapture> {
         if !admission.ordinary_chat
             || admission.turn_index != Some(index)
-            || profile_memory::source_ended(&session.dir)
+            || source_ended(&session.dir)
         {
             return None;
         }
@@ -44,6 +50,8 @@ impl Shared {
             committed_ns,
             turn,
         )
+        .ok()?
+        .with_reasoning_summaries(turn, reasoning_summaries)
         .ok()?;
         let config = lock(&session.config);
         if !config.api_key.is_empty()
@@ -52,6 +60,15 @@ impl Shared {
                 .ok()?
                 .iter()
                 .any(|row| row.content.contains(&config.api_key))
+        {
+            return None;
+        }
+        if !config.api_key.is_empty()
+            && capture.verified_echo(turn).ok()?.iter().any(|event| {
+                [&event.content, &event.name, &event.correlation_id]
+                    .iter()
+                    .any(|value| value.contains(&config.api_key))
+            })
         {
             return None;
         }
@@ -70,13 +87,14 @@ impl Shared {
             }
             let owner = self.clone();
             let summaries = match tokio::task::spawn_blocking(move || -> Result<_> {
-                if owner.memory.with_selected(|_| ()).is_none() {
+                owner.memory.refresh_projects(false)?;
+                if !owner.memory.active() {
                     return Ok(Vec::new());
                 }
                 let mut summaries = owner.library.sessions(None)?;
                 // Preserve a terminal memory source when archived and restored while disabled.
                 for summary in &mut summaries {
-                    summary.archived |= profile_memory::source_ended(&summary.directory);
+                    summary.archived |= source_ended(&summary.directory);
                 }
                 let _ = owner
                     .memory
@@ -113,7 +131,13 @@ impl Shared {
                     Ok(owner
                         .memory
                         .with_selected(|memory| {
-                            stage_next(memory, &summary, &record.history, authority, &config)
+                            stage_next(
+                                memory.as_ref(),
+                                &summary,
+                                &record.history,
+                                authority,
+                                &config,
+                            )
                         })
                         .transpose()?
                         .flatten())
@@ -163,7 +187,7 @@ impl Shared {
 
 pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<CommittedRecord>> {
     if summary.archived
-        || profile_memory::source_ended(&summary.directory)
+        || source_ended(&summary.directory)
         || Settings::read(&summary.directory)?.memory_binding.is_none()
     {
         return Ok(None);
@@ -177,7 +201,7 @@ pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<Committe
 }
 
 fn stage_next(
-    memory: &reliquary::EmbeddedMemory,
+    memory: &dyn MemoryStore,
     summary: &SessionSummary,
     history: &History,
     authority: &Authority,
@@ -250,4 +274,123 @@ fn install_capture_update(
         CaptureUpdate::Settled => saved.settled = true,
     }
     Ok(())
+}
+
+const ENDED: &str = "gateway-memory-ended";
+
+/// Keep the terminal capture fence even when the plugin is disabled.
+pub(super) fn source_ended(directory: &Path) -> bool {
+    directory.join(ENDED).try_exists().unwrap_or(true)
+}
+
+impl Shared {
+    pub(super) async fn memory_source_terminal(self: &Arc<Self>, session_id: &str) -> Result<()> {
+        let shared = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Ok(directory) = shared.library.session_dir(&session_id)
+                && Settings::read(&directory)?.memory_binding.is_some()
+            {
+                match File::create_new(directory.join(ENDED)) {
+                    Ok(file) => file.sync_all()?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            shared
+                .memory
+                .with_selected(|memory| memory.terminal_source(&session_id))
+                .transpose()?;
+            Ok(())
+        })
+        .await?
+    }
+}
+
+pub(super) struct CaptureSources(pub Library);
+
+fn eligible_source(summary: &SessionSummary, binding: &CaptureBinding) -> bool {
+    !summary.archived
+        && !source_ended(&summary.directory)
+        && summary.bot.is_none()
+        && matches!(summary.source, SessionSource::Native)
+        && summary.project_id == binding.project_id
+}
+
+impl MemorySources for CaptureSources {
+    fn check_session(&self, session_id: &str, binding: &CaptureBinding) -> Result<()> {
+        use hermes_engine::settings::{MemoryProvider, ProfileSettings};
+        let settings = ProfileSettings::load(self.0.root())?;
+        ensure!(
+            settings.memory_tool
+                && settings.memory_provider.resolve(true) == MemoryProvider::Reliquary,
+            "Native memory is disabled"
+        );
+        let summary = self.0.session(session_id)?;
+        ensure!(
+            eligible_source(&summary, binding)
+                && Settings::read(&summary.directory)?.memory_binding.as_ref() == Some(binding),
+            "Native session binding is unavailable"
+        );
+        Ok(())
+    }
+
+    fn copied_message_receipt(
+        &self,
+        session_id: &str,
+        binding: &CaptureBinding,
+        message_uid: &str,
+    ) -> Result<Option<CaptureReceipt>> {
+        let Ok(summary) = self.0.session(session_id) else {
+            return Ok(None);
+        };
+        if !eligible_source(&summary, binding) {
+            return Ok(None);
+        }
+        verify_copied_message(&summary, binding, message_uid)
+    }
+}
+
+fn verify_copied_message(
+    summary: &SessionSummary,
+    binding: &CaptureBinding,
+    message_uid: &str,
+) -> Result<Option<CaptureReceipt>> {
+    let Some(record) = read_committed(summary)? else {
+        return Ok(None);
+    };
+    let Some(authority) = record.authority else {
+        return Ok(None);
+    };
+    for admission in &authority.receipts {
+        let Some(marker) = &admission.capture else {
+            continue;
+        };
+        let Some(receipt) = &marker.receipt else {
+            continue;
+        };
+        if !message_uid.starts_with(&format!("generation-{}-", marker.generation)) {
+            continue;
+        }
+        ensure!(
+            &marker.binding == binding
+                && marker.session_id == summary.id
+                && marker.admission_id == admission.id
+                && marker.generation == admission.generation
+                && Some(marker.turn_index) == admission.turn_index
+                && admission.status == "terminal",
+            "copied memory does not match its native admission"
+        );
+        let turn = record
+            .history
+            .turns
+            .get(marker.turn_index)
+            .context("memory source turn disappeared")?;
+        return Ok(marker
+            .verified_rows(turn)?
+            .iter()
+            .any(|row| row.message_uid == message_uid)
+            .then(|| receipt.clone()));
+    }
+    Ok(None)
 }

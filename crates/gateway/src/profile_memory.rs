@@ -1,56 +1,20 @@
-//! Resolve profile selection before binding, querying or capturing a chat.
+//! Select and run the profile's stock memory plugin.
 use super::*;
+use hermes_engine::settings::{MemoryProvider, ProfileSettings};
+use hermes_library::memory_plugin::{MemoryStore, MemoryTurn};
 
-const ENDED: &str = "gateway-memory-ended";
-
-/// An archive is permanent for memory capture even if the chat is later restored.
-/// Keep this fence in the native conversation while its provider is turned off.
-#[cfg(feature = "reliquary")]
-pub(super) fn source_ended(directory: &Path) -> bool {
-    directory.join(ENDED).try_exists().unwrap_or(true)
-}
-
-impl Shared {
-    pub(super) async fn memory_source_terminal(self: &Arc<Self>, session_id: &str) -> Result<()> {
-        let shared = self.clone();
-        let session_id = session_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            if let Ok(directory) = shared.library.session_dir(&session_id)
-                && Settings::read(&directory)?.memory_binding.is_some()
-            {
-                let path = directory.join(ENDED);
-                match File::create_new(path) {
-                    Ok(file) => file.sync_all()?,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            #[cfg(feature = "reliquary")]
-            shared
-                .memory
-                .with_selected(|memory| memory.terminal_source(&session_id))
-                .transpose()?;
-            Ok(())
-        })
-        .await?
-    }
-}
-
-/// Profile-owned native handles can mount files, stop and join processing jobs.
-#[cfg(feature = "reliquary")]
 pub(super) struct NativeSlot {
-    home: PathBuf,
+    library: Library,
     profile_name: String,
-    mounted: StdMutex<Option<Arc<reliquary::EmbeddedMemory>>>,
+    mounted: StdMutex<Option<Arc<dyn MemoryStore>>>,
     active: std::sync::atomic::AtomicBool,
     pub(super) wake: tokio::sync::Notify,
 }
 
-#[cfg(feature = "reliquary")]
 impl NativeSlot {
-    pub(super) fn new(home: &Path, profile: &str) -> Arc<Self> {
+    pub(super) fn new(library: Library, profile: &str) -> Arc<Self> {
         Arc::new(Self {
-            home: home.to_owned(),
+            library,
             profile_name: profile.to_owned(),
             mounted: StdMutex::new(None),
             active: false.into(),
@@ -62,81 +26,217 @@ impl NativeSlot {
         self.active.load(Ordering::Acquire)
     }
 
+    fn open_selected(&self, mounted: &mut Option<Arc<dyn MemoryStore>>) -> Result<()> {
+        let Some(plugin) = stock_plugins::memory_plugin() else {
+            return Ok(());
+        };
+        let configured = ProfileSettings::load(self.library.root())?.memory_provider;
+        if !matches!(configured, MemoryProvider::Auto | MemoryProvider::Reliquary) {
+            self.unmount(mounted);
+        } else if mounted.is_none() {
+            *mounted = plugin.open(&self.library, &self.profile_name, true)?;
+            self.active.store(mounted.is_some(), Ordering::Release);
+            if mounted.is_some() {
+                self.wake.notify_one();
+            }
+        }
+        Ok(())
+    }
+
     /// Always run on the blocking pool. Joins can wait for hosted model calls.
     pub(super) fn with_selected<T>(
         &self,
-        operation: impl FnOnce(&Arc<reliquary::EmbeddedMemory>) -> T,
+        operation: impl FnOnce(&Arc<dyn MemoryStore>) -> T,
     ) -> Option<T> {
-        use hermes_engine::settings::{MemoryProvider, ProfileSettings};
         let mut mounted = lock(&self.mounted);
-        let configured = ProfileSettings::load(&self.home).map(|settings| settings.memory_provider);
-        if !matches!(
-            configured,
-            Ok(MemoryProvider::Auto | MemoryProvider::Reliquary)
-        ) {
-            if let Some(previous) = mounted.take() {
-                self.active.store(false, Ordering::Release);
-                previous.stop_processing();
-            }
+        if let Err(error) = self.open_selected(&mut mounted) {
+            eprintln!("Could not open profile memory: {error:#}");
             return None;
-        }
-        if mounted.is_none() {
-            match reliquary::EmbeddedMemory::open(&self.home, &self.profile_name) {
-                Ok(Some(memory)) => {
-                    *mounted = Some(Arc::new(memory));
-                    self.active.store(true, Ordering::Release);
-                    self.wake.notify_one();
-                }
-                Ok(None) => return None,
-                Err(error) => {
-                    eprintln!("Could not open profile memory: {error:#}");
-                    return None;
-                }
-            }
         }
         mounted.as_ref().map(operation)
     }
 
-    pub(super) fn shutdown(&self) {
+    /// Refresh assignments once outstanding tool queries release their store.
+    pub(super) fn refresh_projects(&self, sync_inactive: bool) -> Result<bool> {
+        let mut mounted = lock(&self.mounted);
+        self.open_selected(&mut mounted)?;
+        if let Some(store) = mounted.as_ref()
+            && store.projects_changed(&self.library.projects()?)
+        {
+            if Arc::strong_count(store) > 1 {
+                return Ok(false);
+            }
+            self.unmount(&mut mounted);
+            self.open_selected(&mut mounted)?;
+        }
+        if sync_inactive
+            && mounted.is_none()
+            && let Some(plugin) = stock_plugins::memory_plugin()
+        {
+            plugin.sync_inactive_projects(&self.library, &self.profile_name)?;
+        }
+        Ok(true)
+    }
+
+    fn unmount(&self, mounted: &mut Option<Arc<dyn MemoryStore>>) {
         self.active.store(false, Ordering::Release);
-        if let Some(memory) = lock(&self.mounted).take() {
+        if let Some(memory) = mounted.take() {
             memory.stop_processing();
         }
+    }
+
+    pub(super) fn shutdown(&self) {
+        self.unmount(&mut lock(&self.mounted));
     }
 }
 
 #[derive(Default)]
 pub(super) struct Selected {
-    #[cfg(feature = "reliquary")]
-    native: Option<Arc<reliquary::EmbeddedMemory>>,
+    native: Option<Arc<dyn MemoryStore>>,
 }
 
 impl Shared {
+    pub(super) async fn user_archive_search(&self, params: &Value, peer: &Peer) -> RpcResult {
+        if !peer.local_native {
+            return Err(RpcError::new(
+                4403,
+                "permission_denied",
+                "Archive commands require the private profile client",
+            ));
+        }
+        if params.as_object().is_none_or(|fields| {
+            fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "session_id" | "project_id" | "query" | "include_related"
+                )
+            }) || fields
+                .get("include_related")
+                .is_some_and(|value| !value.is_boolean())
+        }) {
+            return Err(RpcError::invalid("Invalid Archive search options"));
+        }
+        let query = required_string(params, "query")?.trim().to_owned();
+        if query.is_empty()
+            || query.len() > 4096
+            || hermes_engine::memory_capture::contains_inline_data(&query)
+        {
+            return Err(RpcError::invalid("Enter a bounded Archive search query"));
+        }
+        let requested_project = optional_string(params, "project_id")?;
+        let (project_id, config) = if optional_string(params, "session_id")?.is_some() {
+            if requested_project.is_some() {
+                return Err(RpcError::invalid(
+                    "A session supplies its own Archive scope",
+                ));
+            }
+            let session = self.resolve(params).await?;
+            let project_id = lock(&session.summary).project_id.clone();
+            let config = lock(&session.config).clone();
+            (project_id, config)
+        } else if params.get("project_id").is_some() {
+            (requested_project.map(str::to_owned), self.provider.clone())
+        } else {
+            (
+                self.library
+                    .selected_project()
+                    .map_err(RpcError::internal)?
+                    .map(|project| project.id),
+                self.provider.clone(),
+            )
+        };
+        let include_related = params["include_related"].as_bool().unwrap_or(false);
+        let slot = self.memory.clone();
+        let sources = memory_capture::CaptureSources(self.library.clone());
+        tokio::task::spawn_blocking(move || {
+            slot.refresh_projects(false)?;
+            let projects = slot.library.projects()?;
+            let results = slot
+                .with_selected(|store| {
+                    store.search_user_archive(
+                        &sources,
+                        &projects,
+                        project_id.as_deref(),
+                        include_related,
+                        &query,
+                        &config,
+                    )
+                })
+                .context("The Reliquary stock plugin is unavailable for this profile")??;
+            Ok::<_, anyhow::Error>(json!({"hits":results}))
+        })
+        .await
+        .map_err(RpcError::internal)?
+        .map_err(RpcError::internal)
+    }
+
     pub(super) async fn selected_memory(&self) -> Selected {
-        #[cfg(feature = "reliquary")]
-        {
-            let slot = self.memory.clone();
-            let native = tokio::task::spawn_blocking(move || slot.with_selected(Arc::clone))
-                .await
-                .ok()
-                .flatten();
-            Selected { native }
+        if !stock_plugins::has_memory_plugin() {
+            return Selected::default();
         }
-        #[cfg(not(feature = "reliquary"))]
-        {
-            Selected::default()
+        let slot = self.memory.clone();
+        let native = tokio::task::spawn_blocking(move || slot.with_selected(Arc::clone))
+            .await
+            .ok()
+            .flatten();
+        Selected { native }
+    }
+
+    pub(super) async fn refresh_memory(&self) -> Result<Selected> {
+        if !stock_plugins::has_memory_plugin() {
+            return Ok(Selected::default());
         }
+        let slot = self.memory.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = slot.refresh_projects(false) {
+                if ProfileSettings::load(slot.library.root())?.memory_provider
+                    == MemoryProvider::Auto
+                {
+                    eprintln!("Could not refresh profile memory: {error:#}");
+                    return Ok(Selected::default());
+                }
+                return Err(error);
+            }
+            Ok(Selected {
+                native: slot.with_selected(Arc::clone),
+            })
+        })
+        .await?
+    }
+
+    pub(super) async fn sync_memory_plugin(&self, peer: &Peer) -> RpcResult {
+        if !peer.local_native {
+            return Err(RpcError::new(
+                4403,
+                "permission_denied",
+                "Plugin settings require the private profile client",
+            ));
+        }
+        let slot = self.memory.clone();
+        tokio::task::spawn_blocking(move || {
+            let projects_ready = slot.refresh_projects(true)?;
+            Ok::<_, anyhow::Error>(
+                json!({"enrolled":slot.active(), "projects_ready":projects_ready}),
+            )
+        })
+        .await
+        .map_err(RpcError::internal)?
+        .map_err(RpcError::internal)
     }
 }
 
-#[cfg(feature = "reliquary")]
 impl Selected {
     pub(super) fn native(&self) -> bool {
         self.native.is_some()
     }
-    pub(super) fn binding(&self, summary: &SessionSummary) -> Option<CaptureBinding> {
-        self.native.as_ref()?.binding_for_new_session(summary)
+
+    pub(super) fn binding(&self, summary: &SessionSummary) -> Result<Option<CaptureBinding>> {
+        match &self.native {
+            Some(store) => store.binding_for_new_session(summary),
+            None => Ok(None),
+        }
     }
+
     pub(super) fn configure_turn(
         &self,
         target: &mut Session,
@@ -154,41 +254,30 @@ impl Selected {
         let query = self.native.as_ref().and_then(|memory| {
             if !admission.ordinary_chat
                 || summary.archived
-                || source_ended(&session.dir)
+                || memory_capture::source_ended(&session.dir)
                 || !admission.attachments.is_empty()
                 || !hermes_engine::references::parse(&admission.text).is_empty()
             {
                 return None;
             }
             let binding = lock(&session.settings).memory_binding.clone()?;
-            let query = reliquary_query::GatewayMemoryQuery::new(
-                memory.clone(),
-                library.clone(),
-                binding,
-                summary.id,
-                admission.id.clone(),
-            );
-            Some(Arc::new(query) as Arc<dyn hermes_engine::native_memory::MemoryQuery>)
+            Some(
+                memory.clone().query(
+                    Arc::new(memory_capture::CaptureSources(library.clone())),
+                    binding,
+                    MemoryTurn {
+                        session_id: summary.id,
+                        admission_id: admission.id.clone(),
+                        admitted_ns: admission.admitted_ns,
+                        calendar_zone: ProfileSettings::load(library.root())
+                            .ok()
+                            .map(|settings| settings.timezone)
+                            .filter(|zone| !zone.is_empty())
+                            .unwrap_or_else(|| "UTC".into()),
+                    },
+                ),
+            )
         });
         target.set_native_memory(self.native(), query);
-    }
-}
-
-#[cfg(not(feature = "reliquary"))]
-impl Selected {
-    pub(super) fn native(&self) -> bool {
-        false
-    }
-    pub(super) fn binding(&self, _: &SessionSummary) -> Option<CaptureBinding> {
-        None
-    }
-    pub(super) fn configure_turn(
-        &self,
-        target: &mut Session,
-        _: &Library,
-        _: &LiveSession,
-        _: &mut Receipt,
-    ) {
-        target.set_native_memory(false, None);
     }
 }

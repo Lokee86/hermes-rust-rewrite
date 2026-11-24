@@ -11,6 +11,8 @@ use iced::{Alignment, Color, Element, Fill, Task, widget::{Space, button, column
 const COMMANDS: &[(&str, &[&str], &str, bool)] = &[
     ("/agents", &["/tasks"], "Show active agents and running tasks", false),
     ("/approvals", &[], "Show or set the persistent dangerous-command approval mode", true),
+    ("/archive", &[], "Search the current REL's Archive", true),
+    ("/archive-tree", &[], "Search the Archive across authorized parent and child RELs", true),
     ("/battery", &[], "Toggle a color-coded battery indicator in the status bar", false),
     ("/bg", &["/background"], "Run a prompt in a separate background session", true),
     ("/blueprint", &["/bp"], "Set up an automation from a blueprint template", false),
@@ -184,6 +186,23 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
     let canonical = COMMANDS.iter().find(|(name, aliases, _, _)| *name == word || aliases.contains(&word.as_str())).map(|c| c.0);
     let clear = |app: &mut Hermes| { app.composer = text_editor::Content::new(); let _ = app.save_draft(); app.slash = State::default(); };
     let task = match canonical {
+        Some("/archive" | "/archive-tree") => {
+            if arg.is_empty() {
+                app.note("Enter an Archive search query after the command.");
+                return Some(Task::none());
+            }
+            let Some(scope) = app.archive_scope() else { return Some(Task::none()); };
+            let params = serde_json::json!({
+                "session_id":scope.session_id, "project_id":scope.project_id,
+                "query":arg, "include_related":canonical == Some("/archive-tree")
+            });
+            clear(app);
+            app.archive_results = None;
+            Task::perform(
+                super::local_gateway::catalog_request(scope.profile_root.clone(), app.config.clone(), "plugins.memory.archive_search", params),
+                move |result| Message::ArchiveResults(scope.clone(), result),
+            )
+        }
         Some("/new") => { clear(app); app.update(Message::NewChat) }
         Some("/stop") => { clear(app); app.update(Message::Stop) }
         Some("/retry") => {

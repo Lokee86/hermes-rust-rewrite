@@ -26,6 +26,24 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const SUPERVISOR: &str = "none";
 
 pub(super) fn try_profile_lock(root: &Path) -> Result<Option<File>> {
+    let _renames = lock_profile_renames(root)?;
+    try_local_owner_lock(root)
+}
+
+/// Serialize startup with profile moves. The file is outside the directory
+/// being renamed, since Windows rejects a move with the owner file open.
+pub(super) fn lock_profile_renames(root: &Path) -> Result<Option<File>> {
+    let Some(profiles) = root.parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "profiles")) else {
+        return Ok(None);
+    };
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(profiles.join(".gateway-profile-renames.lock"))?;
+    file.lock()?;
+    Ok(Some(file))
+}
+
+pub(super) fn try_local_owner_lock(root: &Path) -> Result<Option<File>> {
     let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("gateway-owner.lock"))?;
     match lock.try_lock() {

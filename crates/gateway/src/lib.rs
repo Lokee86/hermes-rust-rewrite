@@ -6,14 +6,8 @@
 pub mod client;
 pub mod owner;
 pub mod replay;
-#[cfg(feature = "reliquary")]
-mod reliquary;
-#[cfg(feature = "reliquary")]
-mod reliquary_capture;
-#[cfg(feature = "reliquary")]
-mod reliquary_hosted;
-#[cfg(feature = "reliquary")]
-mod reliquary_query;
+pub mod stock_plugins;
+mod memory_capture;
 mod profile_memory;
 
 mod auth;
@@ -107,6 +101,8 @@ pub const METHODS: &[&str] = &[
     "catalog.session.set",
     "catalog.session.delete",
     "catalog.archive_inactive",
+    "plugins.memory.sync",
+    "plugins.memory.archive_search",
     "process.list",
     "process.kill",
     "process.stop",
@@ -187,7 +183,8 @@ impl Gateway {
     pub async fn start(config: GatewayConfig) -> Result<RunningGateway> {
         fs::create_dir_all(&config.library_root)?;
         let lock = owner::try_profile_lock(&config.library_root)?.context("An owner is running for this profile")?;
-        Self::start_profile(config, "default".into(), "default".into(), lock).await
+        let name = hermes_library::profiles::name_for_home(&config.library_root).to_owned();
+        Self::start_profile(config, "default".into(), name, lock).await
     }
     async fn start_profile(mut config: GatewayConfig, profile_id: String, profile_name: String, owner_lock: File) -> Result<RunningGateway> {
         ensure!(
@@ -217,10 +214,8 @@ impl Gateway {
             _owner_lock: owner_lock,
             authority_epoch,
             profile_id,
-            #[cfg(feature = "reliquary")]
-            memory: profile_memory::NativeSlot::new(library.root(), &profile_name),
+            memory: profile_memory::NativeSlot::new(library.clone(), &profile_name),
             profile_name,
-            #[cfg(feature = "reliquary")]
             memory_task: Mutex::new(None),
             library,
             provider: config.provider,
@@ -247,8 +242,7 @@ impl Gateway {
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
-        #[cfg(feature = "reliquary")]
-        {
+        if stock_plugins::has_memory_plugin() {
             let owner = shared.clone();
             *shared.memory_task.lock().await = Some(tokio::spawn(owner.run_memory_capture()));
             shared.selected_memory().await;
@@ -329,9 +323,7 @@ struct Shared {
     authority_epoch: u64,
     profile_id: String,
     profile_name: String,
-    #[cfg(feature = "reliquary")]
     memory: Arc<profile_memory::NativeSlot>,
-    #[cfg(feature = "reliquary")]
     memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
@@ -497,7 +489,6 @@ impl Shared {
         for task in tasks {
             let _ = task.await;
         }
-        #[cfg(feature = "reliquary")]
         if let Some(task) = self.memory_task.lock().await.take() {
             let _ = task.await;
         }
@@ -789,6 +780,8 @@ impl Shared {
                     .await
             }
             "catalog.session.set" | "catalog.session.delete" | "catalog.archive_inactive" => self.catalog_edit(method,params,peer).await,
+            "plugins.memory.sync" => self.sync_memory_plugin(peer).await,
+            "plugins.memory.archive_search" => self.user_archive_search(params, peer).await,
             "process.list" | "process.kill" | "process.stop" => {
                 let session = self.attached(params, peer).await?;
                 let mut controls = vec![session.processes.clone()];
@@ -1044,7 +1037,13 @@ impl Shared {
                 creation_fingerprint: Some(fingerprint.clone()), metadata_revision: 0,
                 execution_generation: 0, generation_options: options, memory_binding: None, shell_policy: None,
             };
-            let selected_memory = self.selected_memory().await;
+            let default_project = if project.is_none() {
+                self.library.default_project().map_err(RpcError::internal)?
+            } else {
+                None
+            };
+            let project = project.or_else(|| default_project.as_ref().map(|project| project.id.as_str()));
+            let selected_memory = self.refresh_memory().await.map_err(RpcError::internal)?;
             let local_backend = (peer.local_native && matches!(source, "cli" | "tui" | "gui"))
                 .then(|| shell_exec::backend(self.library.root()));
             let summary = self.library.create_initialized_session_with_workspace(project, Some(title), key.as_deref(), |summary, project_workspace| {
@@ -1054,7 +1053,7 @@ impl Shared {
                         "Creation identity was previously used with different options");
                 } else {
                     if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
-                        prepared.memory_binding = selected_memory.binding(summary);
+                        prepared.memory_binding = selected_memory.binding(summary)?;
                     }
                     if let Some(backend) = local_backend {
                         let cwd = project_workspace.map(Path::to_owned)
@@ -1530,8 +1529,8 @@ impl Shared {
             Ok(())
         })();
         let prior = engine.history().clone();
-        let (result, history) = if let Err(error) = preparation {
-            (Err(error), prior)
+        let (result, history, reasoning_summaries) = if let Err(error) = preparation {
+            (Err(error), prior, Vec::new())
         } else {
             let target = if let Some(member) = &admission.group {
                 let target = members.get_mut(&member.name).expect("prepared member");
@@ -1559,7 +1558,7 @@ impl Shared {
             if abandoned && !self.shutdown.is_cancelled() && let Err(error) = target.release_abandoned_turn(initial_count).await {
                 self.emit(&session, "error", json!({"message":format!("Could not release abandoned processes: {error:#}")}));
             }
-            (result, target.history().clone())
+            (result, target.history().clone(), target.take_reasoning_summaries())
         };
         while let Ok(event) = rx.try_recv() {
             self.handle_event(&session, event, &mut stream, &cancel);
@@ -1592,13 +1591,9 @@ impl Shared {
             .unwrap_or_default();
         let payload =
             json!({"text":text,"status":status,"error":error,"partial":status!="complete"});
-        #[cfg(feature = "reliquary")]
         let capture = if admission.ordinary_chat && self.selected_memory().await.native() {
-            self.pending_memory_capture(&session, &admission, initial_count, &history)
+            self.pending_memory_capture(&session, &admission, initial_count, &history, reasoning_summaries)
         } else { None };
-        #[cfg(not(feature = "reliquary"))]
-        let capture = None;
-        #[cfg(feature = "reliquary")]
         let has_capture = capture.is_some();
         {
             let mut view = lock(&session.view);
@@ -1645,7 +1640,6 @@ impl Shared {
             self.emit_locked(&session, &id, &mut view, "message.complete", payload);
             view.current_admission = None;
         }
-        #[cfg(feature = "reliquary")]
         if has_capture { self.memory.wake.notify_one(); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,

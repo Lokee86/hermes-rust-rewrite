@@ -108,28 +108,40 @@ Choose a provider in Desktop under **Settings → Memory & Context**, or set `me
 
 | Setting | Behavior |
 | --- | --- |
-| `auto` (default) | Use embedded Reliquary when the profile has an available enrollment. Otherwise, use the profile's existing Markdown notes. |
-| `reliquary` | Use the profile's enrolled Reliquary owners for capture and agent-requested queries. Requires a build with the `reliquary` feature. |
+| `auto` (default) | Enroll the profile and use the Reliquary stock plugin. Builds without Reliquary use the profile's Markdown notes. |
+| `reliquary` | Enroll the profile and use its Reliquary owners for capture and agent-requested queries. Requires a build with the `reliquary` feature. |
 | `notes` | Use Hermes' existing `MEMORY.md`, `USER.md`, and `memory` tool. The agent and user note controls apply independently. |
 | `external` | Expose the designated external provider's MCP tools to the agent. Configure the HTTP MCP endpoint under **Capabilities → Connectors**, select **Use as external memory provider**, and enable memory and MCP tools. The provider defines its tools and storage behavior. |
 | `off` | Disable native capture, memory tools, Markdown note injection, and the designated external memory connector. Other configured tools keep their own settings. |
 
-Reliquary is embedded by default in official Desktop and Gateway builds; `auto` still falls back to Markdown notes when the profile has no Reliquary enrollment. No separate Reliquary process is needed. Reliquary is MPL-2.0 software pinned to commit `a428108e69b4b119adabd3311f10ba47ca1e5830`; its corresponding source and license links are recorded in the repository's [`RELIQUARY-NOTICE`](../../RELIQUARY-NOTICE) and in every official release archive. For a lightweight build, pass `--no-default-features` to `cargo build -p hermes-gateway` or `cargo build -p hermes-desktop`. In these builds, `auto` uses Markdown notes and an explicit `reliquary` selection reports that the provider is unavailable.
+Gateway and Desktop include the Reliquary stock plugin by default. Desktop lists it under **Capabilities → Plugins**. To build without it, pass `--no-default-features` to `cargo build -p hermes-gateway` or `cargo build -p hermes-desktop`. An explicit `reliquary` selection reports that the provider is unavailable in those builds. Reliquary's MPL-2.0 license and corresponding source links are recorded in [`RELIQUARY-NOTICE`](../../RELIQUARY-NOTICE) and packaged with official releases.
 
 ### Reliquary enrollment and capture
 
-The selected data directory supplies the profile's existing `reliquary/capture-enrollment-v1.json` and `reliquary/topology-v1.json`. The provider selector reads an existing enrollment. Creating the REL, PHY, and enrollment for a fresh profile still requires Reliquary setup. The gateway uses the same service lease as the standalone host. A newly created ordinary native chat binds to the configured General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs do not enter automatic capture.
+**Automatic** and **Reliquary** enroll a private PHY named for the profile and `general.rel` in `reliquary/<profile>/` beside the installation. Each project has a named REL under that profile's `projects/` folder. The plugin uses the profile data area when the installation location is read-only. Project renames update the REL filename. Renaming a profile with its gateway stopped updates the folder and PHY filename. Both operations preserve owner IDs and existing chat bindings. Filenames use filesystem-safe display names and suffixes when names collide.
 
-Set the profile's `memory_embedding` in `agent-settings.json` to `{"endpoint_id":"<saved endpoint ID>","dimensions":1024}` using the intended embedding space's actual dimensions. The endpoint ID refers to a saved profile provider in the profile's `providers` store. Background processing uses the chat's configured OpenAI-compatible structured-completion route and that embedding endpoint. An incompatible stored embedding identity or an unavailable route pauses memory work while chat remains available.
+Existing manual enrollments still use their registered owner files and the original service lease. A profile rename updates any registered paths that moved with the profile and preserves the original owner identities and external paths. A newly created ordinary chat binds to its assigned General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs are excluded from automatic capture.
 
-The gateway commits the turn and its pending capture together. The background worker records archive admission and semantic processing separately. Archiving or deleting a source fences future capture. If an open Reliquary import defers its archive tombstone, the gateway retains the fence and retries the tombstone.
+The installation-adjacent owners are stored separately from Hermes profile exports. A profile imported into another data directory gets independent owners on enrollment.
 
-The chat model can call `memory_query` when it needs prior context. Each query searches the session's bound General or project REL and passes the selected snippets to the requesting model turn. The stored tool entry records the result count. This inspection leaves freshness unchanged.
+Choose an embedding endpoint and its actual output dimension under **Settings → Memory & Context**. Save the endpoint in **Settings → Models** first. Gateway-only setups can set `memory_embedding` in the profile's `agent-settings.json` using `{"endpoint_id":"<saved endpoint ID>","dimensions":1024}` with the dimensions of the chosen model. Processing uses the chat's configured OpenAI-compatible structured-completion route and the saved embedding endpoint. An incompatible stored embedding identity or an unavailable route pauses processing while chat remains available.
+
+The gateway commits the turn and its pending capture together. Archive records the user prompt, assistant commentary, and the final assistant response in order. Echo records bounded, redacted model-round activity, tool calls and results, and provider-supplied reasoning summaries. The background worker records Archive admission and semantic processing separately. Archiving or deleting a source fences future capture. If an open Reliquary import defers its Archive tombstone, the gateway retains the fence and retries the tombstone.
+
+### Reliquary retrieval
+
+The model can call `memory_query` to search processed memories in the chat's bound General or project REL. `refine_query` and `traverse_graph` use results from the same turn. These tools leave freshness unchanged.
+
+`archive_search` accepts a natural-language time reference such as “last Tuesday.” It uses the profile's configured calendar timezone, with UTC as the fallback, and defaults to the date of the original message. Pass `basis: "mentioned"` to filter on dates discussed in the messages. A query without a resolvable time reference returns `temporal_query_required` and suggests `memory_query`. `archive_read` and `echo_read` accept only an exact reference returned to the model during the current turn. Successful retrieval content goes to the requesting model round. The stored tool entry records its result count.
+
+In Desktop, `/archive <query>` searches the current General or project Archive. `/archive-tree <query>` includes the related General or project RELs accessible from that scope. The commands accept hybrid search without a time reference and display results in Desktop.
 
 ## Verification
 
 ```sh
 cargo test -p hermes-gateway
+cargo test -p hermes-gateway --test websocket stock_reliquary_enrolls_renames_and_recalls_only_on_request
+cargo test -p hermes-reliquary-plugin --features native
 cargo clippy -p hermes-gateway --all-targets -- -D warnings
 ```
 

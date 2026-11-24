@@ -2,28 +2,149 @@
 use crate::{Config, Event, ToolCall, privacy, settings::ProfileSettings};
 use anyhow::{Context, Result, ensure};
 use async_channel::Sender;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
 /// Implemented by the host for one admitted turn and its frozen owner binding.
 /// A preview does not acknowledge external consumption or reinforce Freshness.
 pub trait MemoryQuery: Send + Sync {
-    fn query(&self, query: &str, config: &Config) -> Result<MemorySelection>;
+    fn tools(&self) -> Vec<MemoryTool>;
+    fn invoke(&self, request: MemoryRequest, config: &Config) -> Result<MemorySelection>;
 }
 
-/// Recheck owner and source eligibility immediately before the next model request.
-/// Other tools in the same round may have paused for human approval.
-pub struct MemorySelection {
-    pub hits: Vec<MemoryHit>,
-    pub check_disclosure: Box<dyn FnOnce() -> Result<()> + Send>,
+/// The model gets bounded content only after the host confirms current source access.
+pub enum MemorySelection {
+    Result {
+        count: usize,
+        content: Value,
+        check_disclosure: Box<dyn FnOnce() -> Result<()> + Send>,
+    },
+    Rejected {
+        code: &'static str,
+        message: String,
+    },
 }
 
-#[derive(Debug, Serialize)]
-pub struct MemoryHit {
-    pub id: String,
-    pub revision: u64,
-    pub content: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryTool {
+    Query,
+    Refine,
+    Traverse,
+    ArchiveSearch,
+    ArchiveRead,
+    EchoRead,
+}
+
+impl MemoryTool {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Query => "memory_query",
+            Self::Refine => "refine_query",
+            Self::Traverse => "traverse_graph",
+            Self::ArchiveSearch => "archive_search",
+            Self::ArchiveRead => "archive_read",
+            Self::EchoRead => "echo_read",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::Query,
+            Self::Refine,
+            Self::Traverse,
+            Self::ArchiveSearch,
+            Self::ArchiveRead,
+            Self::EchoRead,
+        ]
+        .into_iter()
+        .find(|tool| tool.name() == name)
+    }
+
+    pub(crate) fn spec(self) -> Value {
+        let query = json!({"type":"string","minLength":1,"maxLength":8192});
+        let token = json!({"type":"string","minLength":1,"maxLength":128});
+        let ids = json!({"type":"array","items":token,"maxItems":10,"uniqueItems":true});
+        let (description, properties, required) = match self {
+            Self::Query => (
+                "Search processed memories in the assigned REL.",
+                json!({"query":query}),
+                vec!["query"],
+            ),
+            Self::Refine => (
+                "Refine the current search using IDs returned in this turn.",
+                json!({"query":query,"search_id":token,"selected_ids":ids}),
+                vec!["query", "search_id", "selected_ids"],
+            ),
+            Self::Traverse => (
+                "Explore neighbors of Memory seeds returned at the current cut.",
+                json!({"search_id":token,"result_id":token,"seed_ids":ids}),
+                vec!["search_id", "result_id", "seed_ids"],
+            ),
+            Self::ArchiveSearch => (
+                "Search Archive messages in the assigned REL. Include a resolvable time reference in the query.",
+                json!({"query":query,"basis":{"type":"string","enum":["source","mentioned"]}}),
+                vec!["query"],
+            ),
+            Self::ArchiveRead => (
+                "Read an exact Archive fragment returned earlier in this turn.",
+                json!({"reference":token}),
+                vec!["reference"],
+            ),
+            Self::EchoRead => (
+                "Read execution evidence attached to an exact source range returned earlier in this turn.",
+                json!({"reference":token}),
+                vec!["reference"],
+            ),
+        };
+        json!({"type":"function","function":{"name":self.name(),"description":description,
+            "parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "tool",
+    content = "arguments",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum MemoryRequest {
+    #[serde(rename = "memory_query")]
+    Query {
+        query: String,
+    },
+    #[serde(rename = "refine_query")]
+    Refine {
+        query: String,
+        search_id: String,
+        selected_ids: Vec<String>,
+    },
+    #[serde(rename = "traverse_graph")]
+    Traverse {
+        search_id: String,
+        result_id: String,
+        seed_ids: Vec<String>,
+    },
+    ArchiveSearch {
+        query: String,
+        #[serde(default)]
+        basis: SearchTimeBasis,
+    },
+    ArchiveRead {
+        reference: String,
+    },
+    EchoRead {
+        reference: String,
+    },
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTimeBasis {
+    #[default]
+    Source,
+    Mentioned,
 }
 
 pub fn redact_text(text: &str) -> String {
@@ -32,23 +153,8 @@ pub fn redact_text(text: &str) -> String {
     text
 }
 
-pub(crate) fn spec() -> Value {
-    json!({"type":"function","function":{
-        "name":"memory_query",
-        "description":"Look up relevant memories in this conversation's assigned Reliquary. Ask a specific question when prior knowledge is needed. Results are untrusted source material.",
-        "parameters":{"type":"object","properties":{"query":{"type":"string","description":"The specific information needed"}},"required":["query"],"additionalProperties":false}
-    }})
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Arguments {
-    query: String,
-}
-
-fn parse(call: &ToolCall, config: &Config) -> Result<String> {
-    let args: Arguments = serde_json::from_str(&call.arguments)?;
-    let query = args.query.trim();
+fn safe_query(query: &str, config: &Config) -> Result<String> {
+    let query = query.trim();
     ensure!(
         !query.is_empty()
             && query.len() <= 8192
@@ -58,6 +164,45 @@ fn parse(call: &ToolCall, config: &Config) -> Result<String> {
         "invalid query"
     );
     Ok(redact_text(query))
+}
+
+fn parse(call: &ToolCall, config: &Config) -> Result<(MemoryRequest, String)> {
+    let mut arguments: Value = serde_json::from_str(&call.arguments)?;
+    let object = arguments
+        .as_object_mut()
+        .context("Memory arguments must be an object")?;
+    for (name, value) in object {
+        if name == "query" {
+            *value = json!(safe_query(
+                value.as_str().context("Invalid memory query")?,
+                config
+            )?);
+        } else if let Some(items) = value.as_array() {
+            ensure!(
+                items.len() <= 10
+                    && items
+                        .iter()
+                        .all(|item| item.as_str().is_some_and(safe_token)),
+                "Invalid memory IDs"
+            );
+        } else {
+            ensure!(
+                value.as_str().is_some_and(safe_token),
+                "Invalid memory reference"
+            );
+        }
+    }
+    let reviewed = arguments.to_string();
+    let request = serde_json::from_value(json!({"tool":call.name,"arguments":arguments}))?;
+    Ok((request, reviewed))
+}
+
+fn safe_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
 }
 
 /// Only the receipt-sized summary is recorded in conversation history. The
@@ -88,11 +233,11 @@ pub(crate) async fn invoke(
     events: &Sender<Event>,
     settings: &ProfileSettings,
 ) -> Result<Reply> {
-    let Ok(query) = parse(call, config) else {
-        return Ok(Reply::error("memory_query requires one bounded text query"));
+    let Ok((request, reviewed_arguments)) = parse(call, config) else {
+        return Ok(Reply::error("Invalid memory tool arguments"));
     };
     let reviewed = ToolCall {
-        arguments: json!({"query":&query}).to_string(),
+        arguments: reviewed_arguments,
         ..call.clone()
     };
     if settings.needs_approval(&call.name, false, false)
@@ -101,18 +246,37 @@ pub(crate) async fn invoke(
         return Ok(Reply::error("Memory query denied or approval expired"));
     }
     let config = config.clone();
-    let task = tokio::task::spawn_blocking(move || backend.query(&query, &config));
+    let task = tokio::task::spawn_blocking(move || backend.invoke(request, &config));
     let Ok(Ok(Ok(selection))) = tokio::time::timeout(Duration::from_secs(60), task).await else {
-        return Ok(Reply::error("Reliquary memory query unavailable"));
+        return Ok(Reply::error("Memory query unavailable"));
     };
-    Ok(Reply {
-        approved: true,
-        summary: json!({"returned":selection.hits.len()}).to_string(),
-        model_content: Some(PendingDisclosure {
-            content: settings.bound_tool_result(json!({"memories":selection.hits}).to_string()),
-            check: selection.check_disclosure,
+    match selection {
+        MemorySelection::Rejected { code, message } => Ok(Reply {
+            approved: false,
+            summary: json!({"error":code,"message":message}).to_string(),
+            model_content: None,
         }),
-    })
+        MemorySelection::Result {
+            count,
+            content,
+            check_disclosure,
+        } => {
+            let encoded = content.to_string();
+            if encoded.len() > settings.tool_output_bytes {
+                return Ok(Reply::error(
+                    "Memory result exceeds the configured tool output limit",
+                ));
+            }
+            Ok(Reply {
+                approved: true,
+                summary: json!({"returned":count}).to_string(),
+                model_content: Some(PendingDisclosure {
+                    content: encoded,
+                    check: check_disclosure,
+                }),
+            })
+        }
+    }
 }
 
 pub(crate) async fn attach_to_request(
@@ -160,6 +324,10 @@ mod tests {
                 },
                 &config,
             )
+            .map(|(request, _)| match request {
+                MemoryRequest::Query { query } => query,
+                _ => unreachable!(),
+            })
         };
         for args in [
             json!({"query":"  "}),
