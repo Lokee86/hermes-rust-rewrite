@@ -87,7 +87,7 @@ const TERMINAL_ONLY: &[&str] = &["/busy", "/clear", "/copy", "/cron", "/exit", "
 pub(super) struct Item { pub name: String, pub description: String, pub group: &'static str }
 
 #[derive(Default)]
-pub(super) struct State { pub index: usize, pub dismissed_for: Option<String>, catalog: Vec<Item>, catalog_profile: Option<String>, pending_exec: Option<(String,String)> }
+pub(super) struct State { pub index: usize, pub dismissed_for: Option<String>, catalog: Vec<Item>, catalog_profile: Option<String>, plugin_no_args: std::collections::HashSet<String> }
 impl State { pub fn reset_picker(&mut self) { self.index=0; self.dismissed_for=None; } }
 
 pub(super) fn refresh(app: &mut Hermes) -> Task<Message> {
@@ -97,19 +97,6 @@ pub(super) fn refresh(app: &mut Hermes) -> Task<Message> {
     if app.slash.catalog_profile.as_deref()!=Some(profile.as_str()){app.slash.catalog.clear();app.slash.catalog_profile=Some(profile.clone());}
     Task::perform(async move { conn.request("commands.catalog", serde_json::json!({})).await },
         move |result| Message::Slash(Action::CatalogLoaded(profile,result)))
-}
-
-pub(super) fn session_ready(app: &mut Hermes) -> Task<Message> {
-    let Some((name,args)) = app.slash.pending_exec.take() else { return Task::none() };
-    plugin_exec(app, name, args)
-}
-
-fn plugin_exec(app: &mut Hermes, name: String, args: String) -> Task<Message> {
-    let (Ok(conn), Some(sid)) = (app.chat_connection(), app.chat.sid.clone()) else {
-        app.error("The profile gateway session is not ready for this plugin command."); return Task::none();
-    };
-    Task::perform(async move { conn.request("slash.exec", serde_json::json!({"session_id":sid,"command":format!("/{name} {args}").trim_end()})).await },
-        |result| Message::Slash(Action::PluginFinished(result)))
 }
 
 /// The completion list for the composer's text, or empty when no popup should show.
@@ -164,8 +151,8 @@ fn reference_items(app: &Hermes, line: &str) -> Option<Vec<Item>> {
 }
 
 /// Keys the composer hands to the popup while it is open.
-#[derive(Clone, Debug)]
-pub(super) enum Action { Up, Down, Pick(usize), Accept, Dismiss, CatalogLoaded(String,Result<serde_json::Value,String>), PluginFinished(Result<serde_json::Value,String>) }
+#[derive(Clone)]
+pub(super) enum Action { Up, Down, Pick(usize), Accept, Dismiss, CatalogLoaded(String,Result<serde_json::Value,String>), PluginFinished(std::sync::Arc<super::remote::Connection>,String,u64,Result<serde_json::Value,String>) }
 
 pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
     let action = match action {
@@ -173,17 +160,20 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         if app.slash.catalog_profile.as_deref()==Some(profile.as_str()) && let Ok(value) = result {
             let commands = value["commands"].as_object();
             let plugin_map = value["plugin_commands"].as_object();
-            app.slash.catalog = commands.into_iter().flat_map(|commands| commands.iter()).filter_map(|(name,meta)| {
-                let name = name.trim_start_matches('/');
-                let description = meta["description"].as_str().or_else(|| plugin_map.and_then(|map|map.get(name)).and_then(serde_json::Value::as_str));
-                (!name.is_empty() && description.is_some()).then(|| Item { name: format!("/{name}"), description: description.unwrap_or("Plugin command").to_owned(), group:"Plugins" })
+            app.slash.plugin_no_args.clear();
+            app.slash.catalog = plugin_map.into_iter().flat_map(|map|map.iter()).filter_map(|(name,description)| {
+                let command=format!("/{name}");
+                let meta=commands.and_then(|map|map.get(&command));
+                if meta.and_then(|meta|meta["argument_mode"].as_str())==Some("none"){app.slash.plugin_no_args.insert(command.clone());}
+                let description=meta.and_then(|meta|meta["description"].as_str()).or_else(||description.as_str()).unwrap_or("Plugin command");
+                (!name.is_empty()).then(||Item {name:command,description:description.to_owned(),group:"Plugins"})
             }).collect();
             app.slash.catalog.sort_by(|a,b|a.name.cmp(&b.name));
         }
         return Task::none();
     },
-    Action::PluginFinished(result) => {
-        match result { Ok(value) => app.note(value["output"].as_str().unwrap_or_default().to_owned()), Err(error) => app.error(error) }
+    Action::PluginFinished(connection,session_id,epoch,result) => {
+        if app.plugin_target_is_current(&connection,&session_id,epoch) {match result { Ok(value) => app.note(value["output"].as_str().unwrap_or_default().to_owned()), Err(error) => app.error(error) }}
         return Task::none();
     },
     action => action,
@@ -210,13 +200,14 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             }
             // A complete command that takes no argument runs on Enter.
             let typed = app.composer.text().trim().to_lowercase();
-            let takes_arg = COMMANDS.iter().find(|c| c.0 == item.name).is_none_or(|c| c.3);
+            let takes_arg = COMMANDS.iter().find(|c| c.0 == item.name).map(|c|c.3).unwrap_or_else(||!app.slash.plugin_no_args.contains(&item.name));
             if typed == item.name && !takes_arg { return app.update(Message::Send); }
             app.composer = text_editor::Content::with_text(&format!("{} ", item.name));
             app.composer.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
             app.slash.index = 0;
             return iced::widget::operation::focus(super::COMPOSER_ID);
         }
+        Action::CatalogLoaded(..) | Action::PluginFinished(..) => unreachable!(),
     }
     Task::none()
 }
@@ -231,10 +222,7 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
     let clear = |app: &mut Hermes| { app.composer = text_editor::Content::new(); let _ = app.save_draft(); app.slash.reset_picker(); };
     if canonical.is_none() && app.slash.catalog.iter().any(|item| item.name == word) {
         clear(app);
-        let _ = app.chat_connection();
-        if app.chat.sid.is_some() && app.chat.ready { return Some(plugin_exec(app, word[1..].to_owned(), arg.to_owned())); }
-        app.slash.pending_exec = Some((word[1..].to_owned(), arg.to_owned()));
-        return Some(app.update(Message::NewChat));
+        return Some(app.run_plugin_command(word[1..].to_owned(),arg.to_owned()));
     }
     let task = match canonical {
         Some("/archive" | "/archive-tree") => {

@@ -16,7 +16,9 @@ pub(super) struct View {
     quick_prompt: Option<String>,
     terminal_status: Option<(u64, hermes_engine::Status)>,
     pub tasks: Vec<Task<Message>>,
+    pending_plugin: Option<PendingPluginCommand>,
 }
+struct PendingPluginCommand { connection: Arc<remote::Connection>, name:String, args:String, epoch:u64, session_id:Option<String> }
 pub(super) struct Queued {
     pub id: String,
     pub status: String,
@@ -130,7 +132,7 @@ impl Hermes {
         self.composer = text_editor::Content::with_text(&prompt);
         self.send()
     }
-    fn chat_connection(&mut self) -> Result<Arc<remote::Connection>, String> {
+    pub(super) fn chat_connection(&mut self) -> Result<Arc<remote::Connection>, String> {
         let root = self
             .library
             .as_ref()
@@ -147,9 +149,33 @@ impl Hermes {
             detach.cancel();
         }
         let conn = remote::Connection::new(root, route, self.config.clone());
+        if self.chat.pending_plugin.as_ref().is_some_and(|pending|!Arc::ptr_eq(&pending.connection,&conn)){self.chat.pending_plugin=None;}
         self.chat.connection = Some(conn.clone());
         self.chat.ready = false;
         Ok(conn)
+    }
+
+    pub(super) fn run_plugin_command(&mut self,name:String,args:String)->Task<Message>{
+        let connection=match self.chat_connection(){Ok(conn)=>conn,Err(error)=>{self.error(error);return Task::none()}};
+        let epoch=self.run_id;
+        if let Some(session_id)=self.chat.sid.clone().filter(|_|self.chat.ready){
+            return dispatch_plugin_command(connection,session_id,epoch,name,args);
+        }
+        let session_id=self.chat.sid.clone();
+        self.chat.pending_plugin=Some(PendingPluginCommand{connection,name,args,epoch,session_id:session_id.clone()});
+        if session_id.is_some(){Task::none()}else{self.update(Message::NewChat)}
+    }
+
+    pub(super) fn plugin_target_is_current(&self,connection:&Arc<remote::Connection>,session_id:&str,epoch:u64)->bool{
+        epoch==self.run_id && self.chat.sid.as_deref()==Some(session_id) && self.chat.ready
+            && self.chat.connection.as_ref().is_some_and(|current|Arc::ptr_eq(current,connection))
+    }
+
+    fn dispatch_pending_plugin(&mut self,session_id:&str)->Task<Message>{
+        let Some(pending)=self.chat.pending_plugin.take() else{return Task::none()};
+        if pending.epoch!=self.run_id || pending.session_id.as_deref()!=Some(session_id)
+            || self.chat.connection.as_ref().is_none_or(|conn|!Arc::ptr_eq(conn,&pending.connection)) { return Task::none(); }
+        dispatch_plugin_command(pending.connection,session_id.to_owned(),pending.epoch,pending.name,pending.args)
     }
     pub fn find_chat(&self, id: &str) -> Option<SessionSummary> {
         self.sessions
@@ -166,6 +192,7 @@ impl Hermes {
                 return;
             }
         };
+        if self.chat.pending_plugin.as_ref().is_some_and(|pending|pending.session_id.as_deref()!=Some(summary.id.as_str()) || !Arc::ptr_eq(&pending.connection,&conn)) {self.chat.pending_plugin=None;}
         if self.current.as_ref().is_some_and(|s| s.id == summary.id) && self.chat.ready {
             self.screen = Screen::Chat;
             return;
@@ -464,8 +491,12 @@ impl Hermes {
             Update::Created(result) => {
                 self.chat.creating = false;
                 match result {
-                    Err(e) => self.error(e),
+                    Err(e) => {if self.chat.pending_plugin.as_ref().is_some_and(|pending|pending.epoch==self.run_id){self.chat.pending_plugin=None;}self.error(e)},
                     Ok(id) => {
+                        if let Some(pending)=self.chat.pending_plugin.as_mut(){
+                            if pending.epoch==self.run_id && self.chat.connection.as_ref().is_some_and(|conn|Arc::ptr_eq(conn,&pending.connection)) {pending.session_id=Some(id.clone());}
+                            else {self.chat.pending_plugin=None;}
+                        }
                         let Some(library) = &self.library else {
                             return Task::none();
                         };
@@ -568,7 +599,8 @@ impl Hermes {
                     }
                 }
                 self.accept_snapshot(history);
-                followup = Task::batch([super::slash::session_ready(self), super::slash::refresh(self)]);
+                let plugin= self.chat.sid.clone().map(|sid|self.dispatch_pending_plugin(&sid)).unwrap_or_else(Task::none);
+                followup = Task::batch([plugin, super::slash::refresh(self)]);
                 self.approvals = snapshot["prompts"]
                     .as_array()
                     .map(|v| v.iter().collect::<Vec<_>>())
@@ -728,4 +760,10 @@ impl Hermes {
         }
         followup
     }
+}
+
+fn dispatch_plugin_command(connection:Arc<remote::Connection>,session_id:String,epoch:u64,name:String,args:String)->Task<Message>{
+    let target=connection.clone();let target_session=session_id.clone();
+    Task::perform(async move{connection.request("slash.exec",json!({"session_id":session_id,"command":format!("/{name} {args}").trim_end()})).await},
+        move |result|Message::Slash(super::slash::Action::PluginFinished(target,target_session,epoch,result)))
 }
