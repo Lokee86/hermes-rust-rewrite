@@ -13,7 +13,6 @@
 //! Unsupported registrations are reported with the plugin metadata.
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyCFunction, PyDict, PyTuple};
 use serde_json::Value;
 use std::ffi::CString;
 use std::sync::Arc;
@@ -84,6 +83,23 @@ fn install(target: &Path, requirements: &[String]) -> i32 {
     }).unwrap_or_else(|e| { eprintln!("{e}"); 1 })
 }
 
+#[pyclass]
+struct Services {
+    wire: Arc<wire::Wire>,
+}
+
+#[pymethods]
+impl Services {
+    fn request(&self, py: Python<'_>, operation: &str, encoded: &str) -> PyResult<String> {
+        let params = serde_json::from_str(encoded)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let result = py
+            .detach(|| self.wire.service(operation, params))
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(result.to_string())
+    }
+}
+
 fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
     start();
     let Ok(plugin_dir) = plugin_dir.canonicalize() else {
@@ -102,20 +118,9 @@ fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
         } else {
             None
         };
-        let service = if std::env::var("HERMES_PLUGIN_SERVICES").as_deref() == Ok("1") {
-            let wire = wire.clone();
-            Some(PyCFunction::new_closure(py, None, None,
-                move |args: &Bound<'_, PyTuple>, _: Option<&Bound<'_, PyDict>>| -> PyResult<String> {
-                    let (operation, encoded): (String, String) = args.extract()?;
-                    let params = serde_json::from_str(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))?;
-                    let result = args.py().detach(|| wire.service(&operation, params))
-                        .map_err(PyRuntimeError::new_err)?;
-                    Ok(result.to_string())
-                },
-            )?)
-        } else {
-            None
-        };
+        let service = (std::env::var("HERMES_PLUGIN_SERVICES").as_deref() == Ok("1"))
+            .then(|| Py::new(py, Services { wire: wire.clone() }))
+            .transpose()?;
         let packages = packages.map(|path| path.to_string_lossy().into_owned());
         Ok(helper.getattr("start")?.call1((
             plugin_dir.to_string_lossy(), name, packages, home, compat, service, env!("CARGO_PKG_VERSION"),
