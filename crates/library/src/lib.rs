@@ -312,7 +312,7 @@ impl Library {
         self.with_catalog(true, |catalog| {
             let session = find_session_mut(catalog, id)?;
             let path = self.checked_directory(id)?.join("conversation.json");
-            let history: History = serde_json::from_reader(File::open(path)?)
+            let history: History = serde_json::from_slice(&fs::read(path)?)
                 .context("Could not refresh the conversation title")?;
             if session.title == "New chat" && let Some(title) = title_from_history(&history) {
                 session.title = title;

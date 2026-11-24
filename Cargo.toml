@@ -19,3 +19,8 @@ incremental = false
 
 [profile.release]
 strip = true
+
+# Lore uses the Quinn extensions shipped by this exact Reliquary revision. quinn-proto is only in the
+# build graph with the optional `reliquary` feature, so default builds compile none of it.
+[patch.crates-io]
+quinn-proto = { git = "https://github.com/Lokee86/Reliquary.git", rev = "d94af8c1da7453137fa0afb8d71914a3699e81aa" }

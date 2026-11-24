@@ -87,6 +87,14 @@ impl Config {
         Ok(())
     }
 
+    /// The validated OpenAI-compatible chat route for host-owned structured inference.
+    pub fn openai_chat_url(&self) -> Result<Url> {
+        self.validate()?;
+        let (protocol, url) = self.endpoint()?;
+        ensure!(protocol == Protocol::OpenAi, "profile requires an OpenAI-compatible inference endpoint");
+        Ok(url)
+    }
+
     fn endpoint(&self) -> Result<(Protocol, Url)> {
         let mut url =
             Url::parse(self.base_url.trim()).map_err(|_| anyhow!("Invalid provider URL"))?;

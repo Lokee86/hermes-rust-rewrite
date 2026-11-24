@@ -85,7 +85,7 @@ fn shell<'a>(
         (View::Appearance, "Appearance", "palette", "display color light dark system theme typeface backdrop font size zoom reopen"),
         (View::Workspace, "Workspace", "folder", "files projects working directory"),
         (View::Safety, "Safety", "shield", "approval timeout permissions"),
-        (View::Memory, "Memory & Context", "brain", "agent memory user profile character limit"),
+        (View::Memory, "Memory & Context", "brain", "memory provider Reliquary Markdown notes external MCP user profile character limit"),
         (View::Voice, "Voice", "mic", "dictation speech microphone read aloud"),
         (View::Advanced, "Advanced", "settings", "runtime output keep awake"),
         (View::Vault, "Credential Vault", "key", "password login credential domain"),

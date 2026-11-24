@@ -32,6 +32,10 @@ pub(super) struct Receipt {
     #[serde(default)]
     pub(super) unattended: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) capture: Option<PendingMemoryCapture>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) ordinary_chat: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) group: Option<GroupMember>,
 }
 
@@ -159,6 +163,8 @@ impl Authority {
                 legacy_turn_hint: turn_index,
                 admitted_ns: 0,
                 unattended: false,
+                ordinary_chat: false,
+                capture: None,
                 group: None,
             });
         }
@@ -366,7 +372,7 @@ impl Shared {
             model: turn.model.clone(), options: GenerationOptions::default(), sequence: authority.receipts.len() as u64 + 1,
             generation: authority.generation, owner_epoch: Some(self.authority_epoch), status: "terminal".into(), outcome: Some("published".into()),
             result: Some(payload), turn_index: Some(turn_index), admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), unattended: true,
-            legacy_turn_hint: None, group: None,
+            capture: None, ordinary_chat: false, legacy_turn_hint: None, group: None,
         });
         authority.persist(&session.writer, Some(&history))?;
         engine.accept_committed_history(history.clone());
@@ -382,6 +388,9 @@ impl Shared {
         let sid = summary.id.clone();
         let config = lock(&session.config).clone();
         let options = lock(&session.settings).generation_options.clone();
+        let bound = lock(&session.settings).memory_binding.is_some();
+        let ordinary_chat = matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none()
+            && bound && self.selected_memory().await.native();
         let mut candidate = Receipt {
             id: new_id(),
             input_id: input,
@@ -399,6 +408,9 @@ impl Shared {
             legacy_turn_hint: None,
             admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
             unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
+            // Freeze consent at submission, including queued turns that run after a switch.
+            ordinary_chat,
+            capture: None,
             group: None,
         };
         let first = {

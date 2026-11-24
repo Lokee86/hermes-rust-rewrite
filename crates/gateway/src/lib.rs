@@ -6,6 +6,15 @@
 pub mod client;
 pub mod owner;
 pub mod replay;
+#[cfg(feature = "reliquary")]
+mod reliquary;
+#[cfg(feature = "reliquary")]
+mod reliquary_capture;
+#[cfg(feature = "reliquary")]
+mod reliquary_hosted;
+#[cfg(feature = "reliquary")]
+mod reliquary_query;
+mod profile_memory;
 
 mod auth;
 mod rest;
@@ -20,6 +29,7 @@ use authority::{Authority, Receipt};
 mod telegram_host;
 use hermes_engine::{
     Attachment, ConversationWriter,
+    memory_capture::{CaptureBinding, PendingMemoryCapture},
     models::GenerationOptions,
 };
 use anyhow::{Context, Result, ensure};
@@ -207,7 +217,11 @@ impl Gateway {
             _owner_lock: owner_lock,
             authority_epoch,
             profile_id,
+            #[cfg(feature = "reliquary")]
+            memory: profile_memory::NativeSlot::new(library.root(), &profile_name),
             profile_name,
+            #[cfg(feature = "reliquary")]
+            memory_task: Mutex::new(None),
             library,
             provider: config.provider,
             token: config.token,
@@ -233,6 +247,12 @@ impl Gateway {
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
+        #[cfg(feature = "reliquary")]
+        {
+            let owner = shared.clone();
+            *shared.memory_task.lock().await = Some(tokio::spawn(owner.run_memory_capture()));
+            shared.selected_memory().await;
+        }
         let router = Router::new()
             .route("/health", get(health))
             .route("/", get(auth::landing))
@@ -309,6 +329,10 @@ struct Shared {
     authority_epoch: u64,
     profile_id: String,
     profile_name: String,
+    #[cfg(feature = "reliquary")]
+    memory: Arc<profile_memory::NativeSlot>,
+    #[cfg(feature = "reliquary")]
+    memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
     token: String,
@@ -361,6 +385,8 @@ struct Settings {
     execution_generation: u64,
     #[serde(default)]
     generation_options: GenerationOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_binding: Option<CaptureBinding>,
     #[serde(default)]
     shell_policy: Option<shell_exec::Policy>,
 }
@@ -471,6 +497,10 @@ impl Shared {
         for task in tasks {
             let _ = task.await;
         }
+        #[cfg(feature = "reliquary")]
+        if let Some(task) = self.memory_task.lock().await.take() {
+            let _ = task.await;
+        }
     }
 
     fn has_session_capacity(sessions: &mut HashMap<String, Arc<LiveSession>>) -> bool {
@@ -514,7 +544,8 @@ impl Shared {
         let engine = if settings.source == "scheduled" {
             Session::open_scheduled(&dir, &actual_workspace, &profile)
         } else {
-            Session::open_for_profile(&dir, workspace.as_deref(), &profile)
+            let enrolled = profile == self.library.root() && self.selected_memory().await.native();
+            Session::open_for_profile_with_enrollment(&dir, workspace.as_deref(), &profile, enrolled)
         };
         let mut engine = engine.map_err(|e| {
                 RpcError::new(
@@ -1011,8 +1042,9 @@ impl Shared {
             let mut prepared = Settings {
                 source: source.into(), model, cwd, creation_key: key.clone(),
                 creation_fingerprint: Some(fingerprint.clone()), metadata_revision: 0,
-                execution_generation: 0, generation_options: options, shell_policy: None,
+                execution_generation: 0, generation_options: options, memory_binding: None, shell_policy: None,
             };
+            let selected_memory = self.selected_memory().await;
             let local_backend = (peer.local_native && matches!(source, "cli" | "tui" | "gui"))
                 .then(|| shell_exec::backend(self.library.root()));
             let summary = self.library.create_initialized_session_with_workspace(project, Some(title), key.as_deref(), |summary, project_workspace| {
@@ -1021,6 +1053,9 @@ impl Shared {
                     ensure!(existing.creation_key == prepared.creation_key && existing.creation_fingerprint == prepared.creation_fingerprint,
                         "Creation identity was previously used with different options");
                 } else {
+                    if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
+                        prepared.memory_binding = selected_memory.binding(summary);
+                    }
                     if let Some(backend) = local_backend {
                         let cwd = project_workspace.map(Path::to_owned)
                             .or_else(|| prepared.cwd.clone())
@@ -1462,7 +1497,7 @@ impl Shared {
         self: Arc<Self>,
         session: Arc<LiveSession>,
         mut config: Config,
-        admission: Receipt,
+        mut admission: Receipt,
         cancel: CancellationToken,
     ) -> bool {
         config.model.clone_from(&admission.model);
@@ -1507,6 +1542,7 @@ impl Shared {
                 Some(member) if member.first => format!("{}\u{2063}{}\u{2063}\n\n(Group chat \"{}\": you are {}. Reply in your own voice; the other members answer after you.)", admission.text, member.display, member.title, member.display),
                 _ => admission.text.clone(),
             };
+            self.selected_memory().await.configure_turn(target, &self.library, &session, &mut admission);
             let result = {
                 let future = target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone());
                 tokio::pin!(future);
@@ -1517,6 +1553,7 @@ impl Shared {
                     }
                 }
             };
+            target.clear_native_query();
             let abandoned = result.is_err() || target.history().turns.get(initial_count).is_some_and(|turn|
                 matches!(turn.status, Status::Interrupted | Status::Failed(_)));
             if abandoned && !self.shutdown.is_cancelled() && let Err(error) = target.release_abandoned_turn(initial_count).await {
@@ -1555,6 +1592,14 @@ impl Shared {
             .unwrap_or_default();
         let payload =
             json!({"text":text,"status":status,"error":error,"partial":status!="complete"});
+        #[cfg(feature = "reliquary")]
+        let capture = if admission.ordinary_chat && self.selected_memory().await.native() {
+            self.pending_memory_capture(&session, &admission, initial_count, &history)
+        } else { None };
+        #[cfg(not(feature = "reliquary"))]
+        let capture = None;
+        #[cfg(feature = "reliquary")]
+        let has_capture = capture.is_some();
         {
             let mut view = lock(&session.view);
             let mut authority = view.authority.clone();
@@ -1568,6 +1613,7 @@ impl Shared {
                 receipt.status = "terminal".into();
                 receipt.outcome = Some(status.into());
                 receipt.result = Some(payload.clone());
+                receipt.capture = capture;
             }
             if status != "complete" && let Some(group) = &admission.group { authority.cancel_group(&group.round); }
             if let Err(error) = authority.persist(&session.writer, Some(&history)) {
@@ -1599,6 +1645,8 @@ impl Shared {
             self.emit_locked(&session, &id, &mut view, "message.complete", payload);
             view.current_admission = None;
         }
+        #[cfg(feature = "reliquary")]
+        if has_capture { self.memory.wake.notify_one(); }
         match self.library.touch_session(&id) {
             Ok(summary)=>*lock(&session.summary)=summary,
             Err(error)=>self.emit(&session,"error",json!({"message":format!("Conversation saved, but catalog update failed: {error:#}")})),
@@ -1774,8 +1822,8 @@ struct StoredConversation {
 }
 
 fn read_record(dir: &Path) -> Result<StoredConversation> {
-    match File::open(dir.join("conversation.json")) {
-        Ok(file) => serde_json::from_reader(file).context("Could not read conversation history"),
+    match fs::read(dir.join("conversation.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("Could not read conversation history"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoredConversation::default()),
         Err(e) => Err(e.into()),
     }

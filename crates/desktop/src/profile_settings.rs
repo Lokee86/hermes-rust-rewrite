@@ -2,7 +2,7 @@
 //! record and commits only the controls edited on this page.
 use crate::appearance::text;
 use super::{Hermes, Message, settings::View, ui};
-use hermes_engine::settings::{PERSONALITIES,ProfileSettings};
+use hermes_engine::settings::{MemoryProvider, PERSONALITIES, ProfileSettings};
 use hermes_library::{ArchiveFilter,Library,SessionQuery,SessionSource,SessionSummary};
 use iced::{Alignment, Element, Fill, Task, widget::{button,column,container,pick_list,row,text_input,Space}};
 use std::{collections::BTreeMap,path::{Path,PathBuf},process::{Child,Command}};
@@ -17,9 +17,9 @@ const FIELDS:&[Field]=&[
     field(View::Chat,"timezone","Timezone","Timezone for the agent and local clock. Leave blank for the system default.",Kind::Text),
     field(View::Workspace,"default_directory","Default project folder","Working directory for new chats outside a selected project.",Kind::Directory),
     field(View::Workspace,"file_read_max_chars","File read character limit","Maximum characters returned by one file read.",Kind::Count),
-    field(View::Memory,"memory_enabled","Agent memory","Let Hermes maintain persistent notes about its work.",Kind::Check),
+    field(View::Memory,"memory_enabled","Agent notes","Keep agent notes in MEMORY.md.",Kind::Check),
     field(View::Memory,"memory_char_limit","Memory character limit","Maximum combined length of agent memory entries.",Kind::Count),
-    field(View::Memory,"user_profile_enabled","User profile","Let Hermes keep persistent notes about your preferences.",Kind::Check),
+    field(View::Memory,"user_profile_enabled","User notes","Keep preference notes in USER.md.",Kind::Check),
     field(View::Memory,"user_char_limit","User profile character limit","Maximum combined length of user profile entries.",Kind::Count),
     field(View::Safety,"redact_secrets","Redact secrets","Mask detected credentials in text sent to the model.",Kind::Check),
     field(View::Safety,"approval_timeout","Approval timeout","Seconds to wait for a response before declining a tool request.",Kind::Count),
@@ -28,7 +28,7 @@ const FIELDS:&[Field]=&[
     field(View::Advanced,"clock_tools","System clock","Allow Hermes to request the local time tool.",Kind::Check),
     field(View::Advanced,"file_tools","File tools","Allow Hermes to request directory listing, search, read and write tools.",Kind::Check),
     field(View::Advanced,"skill_tools","Skills","Allow Hermes to discover and read workspace skills.",Kind::Check),
-    field(View::Advanced,"memory_tool","Memory tool","Allow Hermes to request changes to saved memory.",Kind::Check),
+    field(View::Advanced,"memory_tool","Memory tools","Allow Hermes to call the selected provider’s memory tools.",Kind::Check),
     field(View::Advanced,"mcp_tools","MCP tools","Connect to the configured MCP server and offer its tools to Hermes.",Kind::Check),
     field(View::Advanced,"max_turns","Maximum iterations","Maximum tool-call rounds per agent turn.",Kind::Count),
     field(View::Advanced,"tool_output_bytes","Maximum output bytes","Size limit for each tool result.",Kind::Count),
@@ -41,6 +41,7 @@ const FIELDS:&[Field]=&[
 ];
 #[derive(Clone,Debug)]
 pub(super) enum Action {
+    SetMemoryProvider(MemoryProvider),
     Set(&'static str,String,View), Edit(&'static str,String),Apply(View),Browse,DirectoryChosen(Result<Option<PathBuf>,String>),
     Restore(String),RestoreDone(String,Result<serde_json::Value,String>),Delete(String),DeleteDone(String,Result<serde_json::Value,String>),CancelDelete,ConfirmDelete,Maintain,MaintainDone(Result<serde_json::Value,String>),
 }
@@ -105,6 +106,12 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
     let Some(lib)=app.library.clone() else{return Task::none()};
     let state=&mut app.profile_settings;
     match action {
+        Action::SetMemoryProvider(provider) => {
+            let changes = serde_json::Map::from_iter([("memory_provider".into(), serde_json::json!(provider))]);
+            state.feedback = Some(ProfileSettings::update(lib.root(), &changes)
+                .map(|saved| { state.saved = saved; "Settings saved".into() })
+                .map_err(|e| format!("{e:#}")));
+        }
         // Switches and pickers save on change, as the original's autosave does.
         Action::Set(key,value,page)=>{state.edits.insert(key,value);return update(app,Action::Apply(page));}
         Action::Edit(key,value)=>{state.edits.insert(key,value);state.feedback=None;}
@@ -189,7 +196,29 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
     let dark=app.dark;
     let mut body=column![super::settings::section_title(title,dark)].spacing(8);
     let mut rows=Vec::new();
+    if page == View::Memory {
+        use MemoryProvider::{Auto, External, Notes, Off, Reliquary};
+        let saved = &state.saved;
+        let description = match saved.memory_provider {
+            Auto => "Use Reliquary when available for this enrolled profile. Otherwise use Markdown notes.",
+            Reliquary => "Use this profile’s enrolled Reliquary memory.",
+            Notes => "Store agent and user notes in this profile’s Markdown files.",
+            External if !saved.external_memory_connector =>
+                r#"In Capabilities > Connectors, configure your MCP server and select "Use as external memory provider"."#,
+            External if !saved.mcp_tools || !saved.memory_tool =>
+                "Enable both MCP tools and Memory tools in Advanced to use the external provider.",
+            External => "Use tools from the MCP server designated for memory in Capabilities > Connectors.",
+            Off => "Disable built-in memory and the designated external memory connector for this profile.",
+        };
+        let selector = pick_list([Auto, Reliquary, Notes, External, Off], Some(saved.memory_provider),
+            |choice| Message::ProfileSetting(Action::SetMemoryProvider(choice)))
+            .width(165).text_size(13).padding([7, 10]);
+        rows.push(super::settings::card_row("Memory provider", description, selector.into(), dark));
+    }
     for f in FIELDS.iter().filter(|f|f.page==page){
+        if page == View::Memory && !matches!(state.saved.memory_provider, MemoryProvider::Auto | MemoryProvider::Notes) {
+            continue;
+        }
         let key=f.key;let value=state.value(f);
         let control:Element<'_,Message>=match f.kind {
             Kind::Check=>super::settings::switch(value=="true",move|b|Message::ProfileSetting(Action::Set(key,b.to_string(),page)),dark),

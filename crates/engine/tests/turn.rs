@@ -7,6 +7,81 @@ use tempfile::tempdir;
 
 type Requests = Arc<Mutex<Vec<Value>>>;
 
+#[tokio::test]
+async fn external_memory_connector_follows_live_profile_selection() {
+    use hermes_engine::{connector, settings::ProfileSettings};
+
+    async fn mcp(State(requests): State<Requests>, Json(request): Json<Value>) -> Json<Value> {
+        requests.lock().unwrap().push(request.clone());
+        let result = match request["method"].as_str().unwrap() {
+            "initialize" => json!({
+                "protocolVersion":request["params"]["protocolVersion"], "capabilities":{"tools":{}}
+            }),
+            "notifications/initialized" => return Json(Value::Null),
+            "tools/list" => json!({"tools":[{
+                "name":"lookup", "description":"Find a memory", "inputSchema":{"type":"object"}
+            }]}),
+            "tools/call" => {
+                assert_eq!(request["params"]["name"], "lookup");
+                json!({"content":[{"type":"text","text":"external answer"}]})
+            }
+            method => panic!("unexpected memory connector method: {method}"),
+        };
+        Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
+    }
+
+    async fn model(Json(body): Json<Value>) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+        let tools = body["tools"].as_array().unwrap();
+        let offers = |name: &str| tools.iter().any(|s| s["function"]["name"] == name);
+        assert!(!offers("memory_query"));
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        let (delta, finish) = if last["role"] == "tool" {
+            assert!(last["content"].as_str().unwrap().contains("external answer"));
+            (json!({"content":"found"}), "stop")
+        } else if last["content"] == "external" {
+            assert!(offers("mcp__lookup"));
+            assert!(!offers("memory"));
+            (json!({"tool_calls":[{"index":0,"id":"lookup-1","type":"function","function":{
+                "name":"mcp__lookup","arguments":"{}"
+            }}]}), "tool_calls")
+        } else {
+            assert!(!offers("mcp__lookup"));
+            assert_eq!(offers("memory"), last["content"] == "notes");
+            (json!({"content":"ok"}), "stop")
+        };
+        let data = json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        Sse::new(stream::iter([Ok(SseEvent::default().data(data.to_string())), Ok(SseEvent::default().data("[DONE]"))]))
+    }
+
+    let seen = Requests::default();
+    let server = Router::new().route("/mcp", post(mcp)).with_state(seen.clone())
+        .route("/v1/chat/completions", post(model));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap(); });
+    let profile = tempdir().unwrap();
+    let chat = tempdir().unwrap();
+    let config = Config { base_url: format!("{url}/v1"), model:"fixture".into(), api_key:String::new() };
+    connector::save(profile.path(), &format!("{url}/mcp"), "", false).unwrap();
+    let mut session = Session::open_for_profile(chat.path(), None, profile.path()).unwrap();
+    let (events, _receiver) = async_channel::unbounded();
+    let mut external_count = 0;
+    for selection in ["external", "off", "notes"] {
+        let patch = json!({"external_memory_connector":true, "memory_provider":selection, "approval_mode":"off"});
+        ProfileSettings::update(profile.path(), patch.as_object().unwrap()).unwrap();
+        session.turn(config.clone(), selection.into(), events.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(session.history().turns.last().unwrap().status, Status::Complete);
+        let requests = seen.lock().unwrap();
+        if selection == "external" {
+            assert_eq!(requests.iter().filter(|r| r["method"] == "tools/call").count(), 1);
+            external_count = requests.len();
+        } else {
+            assert_eq!(requests.len(), external_count, "deselected memory server was contacted");
+        }
+    }
+    server.abort();
+}
+
 async fn fake_model(State(requests): State<Requests>, Json(body): Json<Value>)
     -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
     let mut requests = requests.lock().unwrap();
