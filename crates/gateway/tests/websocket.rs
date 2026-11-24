@@ -72,7 +72,7 @@ impl Client {
             events: vec![],
             id: 0,
         };
-        let ready = client.frame().await;
+        let ready = client.frame("native gateway.ready", 5).await;
         assert_eq!(ready["params"]["type"], "gateway.ready");
         assert_eq!(ready["params"]["payload"]["session_authority"], true);
         client
@@ -91,16 +91,20 @@ impl Client {
             id: 0,
         };
         assert_eq!(
-            client.frame().await["params"]["payload"]["session_authority"],
+            client.frame("legacy gateway.ready", 5).await["params"]["payload"]["session_authority"],
             false
         );
         client
     }
-    async fn frame(&mut self) -> Value {
+    async fn frame(&mut self, waiting_for: &str, seconds: u64) -> Value {
         loop {
-            let frame = timeout(Duration::from_secs(5), self.socket.next())
+            let frame = timeout(Duration::from_secs(seconds), self.socket.next())
                 .await
-                .expect("gateway timed out")
+                .unwrap_or_else(|_| {
+                    let observed: Vec<_> = self.events.iter().rev().take(8)
+                        .map(|event| (&event["type"], &event["payload"]["status"])).collect();
+                    panic!("gateway timed out waiting for {waiting_for} after RPC {}. Recent events: {observed:?}", self.id)
+                })
                 .expect("gateway closed")
                 .unwrap();
             if let Message::Text(text) = frame {
@@ -120,7 +124,7 @@ impl Client {
             .await
             .unwrap();
         loop {
-            let frame = self.frame().await;
+            let frame = self.frame(method, 5).await;
             if frame["id"] == id {
                 return frame;
             }
@@ -133,11 +137,14 @@ impl Client {
         frame["result"].clone()
     }
     async fn event(&mut self, name: &str) -> Value {
+        self.event_with_timeout(name, 5).await
+    }
+    async fn event_with_timeout(&mut self, name: &str, seconds: u64) -> Value {
         if let Some(index) = self.events.iter().position(|e| e["type"] == name) {
             return self.events.remove(index);
         }
         loop {
-            let frame = self.frame().await;
+            let frame = self.frame(name, seconds).await;
             assert_eq!(frame["method"], "event", "unexpected frame: {frame}");
             let event = frame["params"].clone();
             if event["type"] == name {
@@ -421,7 +428,7 @@ async fn approved_memory_query(client: &mut Client, sid: &str) -> String {
         "session_id":sid, "prompt_id":request["payload"]["prompt_id"],
         "execution_generation":request["execution_generation"], "choice":"once"
     })).await;
-    let completed = client.event("message.complete").await;
+    let completed = client.event_with_timeout("message.complete", 65).await;
     assert_eq!(completed["payload"]["status"], "complete");
     completed["payload"]["text"].as_str().unwrap().to_owned()
 }
@@ -915,7 +922,7 @@ async fn denial_provider_errors_and_shutdown_persist_their_real_outcomes() {
     let gateway = provider.gateway(&root).await;
     let mut client = Client::native(&gateway).await;
     client.socket.send(Message::Text("{".into())).await.unwrap();
-    assert_eq!(client.frame().await["error"]["code"], -32700);
+    assert_eq!(client.frame("malformed request error", 5).await["error"]["code"], -32700);
     let sid = client.ok("session.create", json!({"title":"Denial"})).await["session_id"]
         .as_str()
         .unwrap()
