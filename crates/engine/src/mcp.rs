@@ -1,6 +1,7 @@
 //! MCP client for an explicitly configured tool server: Streamable HTTP, or a
 //! local stdio process (Agent Plugins v1 `"type": "stdio"` servers).
 use anyhow::{Context, Result, bail, ensure};
+use crate::plugin_worker::Worker;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{Client, Url, header::ACCEPT};
@@ -14,6 +15,7 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 enum Transport {
     Http { client: Client, url: Url, token: Option<String>, headers: Vec<(String, String)>, session: Option<String> },
     Stdio { child: tokio::process::Child, stdin: tokio::process::ChildStdin, lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>> },
+    Plugin(Worker),
 }
 
 /// How to start a stdio server.
@@ -45,6 +47,29 @@ impl Mcp {
         let stdin = child.stdin.take().context("No stdin")?;
         let lines = BufReader::new(child.stdout.take().context("No stdout")?).lines();
         Self { transport: Transport::Stdio { child, stdin, lines }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into(), hooks: vec![] }.handshake().await
+    }
+
+    pub(crate) async fn connect_plugin(worker: Worker, prefix: &str) -> Result<Self> {
+        Self {
+            transport: Transport::Plugin(worker),
+            version: VERSION.into(),
+            next_id: 0,
+            tools: BTreeMap::new(),
+            prefix: prefix.into(),
+            hooks: vec![],
+        }.handshake().await
+    }
+
+    pub(crate) fn plugin_view(&self) -> Option<Self> {
+        let Transport::Plugin(worker) = &self.transport else { return None };
+        Some(Self {
+            transport: Transport::Plugin(worker.clone()),
+            version: self.version.clone(),
+            next_id: 0,
+            tools: self.tools.clone(),
+            prefix: self.prefix.clone(),
+            hooks: self.hooks.clone(),
+        })
     }
 
     async fn handshake(mut self) -> Result<Self> {
@@ -88,6 +113,9 @@ impl Mcp {
     }
 
     async fn notify(&mut self, body: Value) -> Result<()> {
+        if matches!(self.transport, Transport::Plugin(_)) {
+            return Ok(()); // The embedded worker is initialized by its request/reply handshake.
+        }
         if let Transport::Stdio { stdin, .. } = &mut self.transport {
             stdin.write_all(format!("{body}\n").as_bytes()).await?; stdin.flush().await?; return Ok(());
         }
@@ -97,6 +125,9 @@ impl Mcp {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        if let Transport::Plugin(worker) = &self.transport {
+            return worker.request(method, params).await;
+        }
         self.next_id += 1;
         let id = self.next_id;
         let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});

@@ -143,14 +143,23 @@ impl CompletionInference {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<Self> {
-        let config = target.config(home, Some(chat), model)?;
-        let reasoning_object =
-            reqwest::Url::parse(&config.base_url)?.host_str() == Some("openrouter.ai");
         let options = GenerationOptions {
             reasoning_effort: reasoning_effort.map(str::to_owned),
-            reasoning_object,
             ..Default::default()
         };
+        Self::with_options(home, chat, target, model, options).await
+    }
+
+    pub(crate) async fn with_options(
+        home: &Path,
+        chat: &Config,
+        target: &InferenceTarget,
+        model: Option<&str>,
+        mut options: GenerationOptions,
+    ) -> Result<Self> {
+        let config = target.config(home, Some(chat), model)?;
+        options.reasoning_object =
+            reqwest::Url::parse(&config.base_url)?.host_str() == Some("openrouter.ai");
         options.validate()?;
         let route = TaskProvider::open(config, options).await?;
         route.provider.validate_structured_options()?;

@@ -5,7 +5,7 @@
 //! its skills join the skill store and its MCP servers (streamable-http or
 //! stdio) are connected for every turn while the plugin is enabled. Python
 //! (`plugin.yaml` + `__init__.py`) plugins run in hermes-python-host, which
-//! embeds the CPython runtime shipped with the app and implements `ctx` itself;
+//! embeds the CPython runtime shipped with the app and implements PluginHost;
 //! their `python_dependencies` are installed (wheels only) into the plugin's
 //! data folder. A plugin that imports Hermes internals falls back to an
 //! installed Hermes Python agent: assets/python_plugin_bridge.py loads it with
@@ -15,6 +15,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs, path::{Component, Path, PathBuf}, process::Command};
+
+mod runtime;
+pub use runtime::{PluginCommand, PluginRuntime, PluginStatus, PythonMemory, PythonPlugin};
 
 const PLUGIN_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
@@ -27,6 +30,8 @@ pub struct CatalogEntry { pub name: String, pub title: String, pub repo: String,
 pub struct Installed {
     pub name: String, pub title: String, pub version: String, pub description: String, pub sha: String,
     pub enabled: bool, pub servers: Vec<String>, pub skills: Vec<String>,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 fn dir(root: &Path) -> PathBuf { root.join("plugins") }
@@ -46,7 +51,7 @@ fn save(root: &Path, list: &[Installed]) -> Result<()> {
     Ok(())
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && !name.contains("--") && !name.contains("..")
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
         && name.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
@@ -85,6 +90,11 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
         ensure!(out.status.success(), "Could not install the plugin's Python packages ({}): {}", package.python_dependencies.join(", "),
             String::from_utf8_lossy(&out.stderr).lines().chain(String::from_utf8_lossy(&out.stdout).lines()).filter(|l| l.contains("ERROR") || l.contains("rror:")).collect::<Vec<_>>().join(" ").trim());
     }
+    let mut list = installed(root)?;
+    let revision = list.iter().find(|plugin| plugin.name == entry.name).map_or(0, |plugin| plugin.revision);
+    if list.iter().any(|plugin| plugin.name == entry.name) {
+        crate::settings::ProfileSettings::invalidate_plugin_memory(root, &entry.name)?;
+    }
     let target = dir(root).join(&entry.name);
     if target.exists() { fs::remove_dir_all(&target)?; }
     copy_tree(&source, &target)?;
@@ -92,8 +102,8 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
     crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
     let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
         version: package.version, description: package.description, sha: entry.sha.clone(), enabled: true,
-        servers: package.servers.keys().cloned().collect(), skills: package.skills.into_iter().map(|(s, _)| s).collect() };
-    let mut list = installed(root)?;
+        servers: package.servers.keys().cloned().collect(), skills: package.skills.into_iter().map(|(s, _)| s).collect(),
+        revision: revision.saturating_add(1) };
     list.retain(|p| p.name != entry.name);
     list.push(record.clone());
     save(root, &list)?;
@@ -103,7 +113,11 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
 pub fn set_enabled(root: &Path, name: &str, on: bool) -> Result<()> {
     let mut list = installed(root)?;
     let plugin = list.iter_mut().find(|p| p.name == name).context("That plugin is not installed")?;
-    plugin.enabled = on;
+    if plugin.enabled != on {
+        crate::settings::ProfileSettings::invalidate_plugin_memory(root, name)?;
+        plugin.revision = plugin.revision.saturating_add(1);
+        plugin.enabled = on;
+    }
     let ids: Vec<String> = plugin.skills.iter().map(|s| format!("plugin/{name}/{s}")).collect();
     save(root, &list)?;
     for id in ids { crate::skill_catalog::enable(root, &id, on)?; }
@@ -150,6 +164,9 @@ pub fn config(root: &Path, name: &str) -> serde_json::Map<String, Value> {
 pub fn set_config(root: &Path, name: &str, values: &serde_json::Map<String, Value>) -> Result<()> {
     ensure!(valid_name(name), "That plugin name is not valid");
     let path = config_path(root, name);
+    if config(root, name) != *values {
+        crate::settings::ProfileSettings::invalidate_plugin_memory(root, name)?;
+    }
     fs::create_dir_all(path.parent().context("No data directory")?)?;
     let temp = tempfile::NamedTempFile::new_in(path.parent().context("No data directory")?)?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o600))?; }
@@ -166,6 +183,7 @@ pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     let before = list.len();
     list.retain(|p| p.name != name);
     ensure!(list.len() < before, "That plugin is not installed");
+    crate::settings::ProfileSettings::invalidate_plugin_memory(root, name)?;
     crate::skill_catalog::put_documents(root, &format!("plugin/{name}/"), vec![])?;
     let target = dir(root).join(name);
     if target.exists() { fs::remove_dir_all(target)?; }
@@ -198,7 +216,7 @@ const PACKAGES: &str = "python-packages";
 pub fn python_host() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let name = format!("hermes-python-host{}", std::env::consts::EXE_SUFFIX);
-    let depth = if cfg!(test) { 5 } else { 1 };
+    let depth = if cfg!(debug_assertions) { 5 } else { 1 };
     exe.ancestors().skip(1).take(depth).map(|dir| dir.join(&name)).find(|p| p.is_file())
 }
 
@@ -323,10 +341,15 @@ fn prefix(server: &str) -> String {
     format!("mcp_{clean}")
 }
 
-/// Connect every enabled plugin's servers. A server that fails is reported, not fatal.
-pub(crate) async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
+#[cfg(test)]
+async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
+    PluginRuntime::new(root.to_path_buf(), None).tool_connections().await
+}
+
+/// Connect Agent Plugins v1 servers. Embedded Python has its own profile-owned activation.
+async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
     let (mut live, mut errors) = (vec![], vec![]);
-    for plugin in installed(root).unwrap_or_default().into_iter().filter(|p| p.enabled && !p.servers.is_empty()) {
+    for plugin in installed(root).unwrap_or_default().into_iter().filter(|p| p.enabled && !p.servers.is_empty() && !p.servers.iter().any(|kind| kind == "python") && valid_name(&p.name)) {
         let plugin_root = dir(root).join(&plugin.name);
         let data = root.join("plugin-data").join(&plugin.name);
         let package = match read_package(&plugin_root) { Ok(p) => p, Err(e) => { errors.push(format!("{}: {e:#}", plugin.title)); continue } };
@@ -348,7 +371,7 @@ pub(crate) async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
                     if let Err(e) = &result && format!("{e:#}").contains("401") { errors.push(format!("{} › {name}: needs sign-in (Capabilities › Plugins › Sign in)", plugin.title)); continue }
                     result
                 }
-                Server::Python => connect_python(&plugin_root, &data, &config_env, &prefix(&plugin.name)).await,
+                Server::Python => continue,
                 Server::Stdio { command, args, mut env, cwd } => {
                     let command = match command.strip_prefix("./") { Some(rel) => match inside(&plugin_root, rel) { Some(p) => p.to_string_lossy().into_owned(), None => { errors.push(format!("{name}: bad command path")); continue } }, None => command };
                     let cwd = match cwd { Some(c) => PathBuf::from(expand(&c)), None => plugin_root.clone() };
@@ -367,28 +390,17 @@ pub(crate) async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
     (live, errors)
 }
 
-/// A Python plugin: in hermes-python-host first; if it is missing or the plugin does not load
-/// there (it imports Hermes internals), through an installed Hermes Python agent.
-async fn connect_python(plugin_root: &Path, data: &Path, config_env: &[(String, String)], prefix: &str) -> Result<Mcp> {
+/// The installed-agent compatibility path serves legacy tools.
+async fn connect_python_bridge(plugin_root: &Path, data: &Path, config_env: &[(String, String)], prefix: &str) -> Result<Mcp> {
     let mut env = config_env.to_vec();
     env.push(("PLUGIN_ROOT".into(), plugin_root.to_string_lossy().into_owned()));
     env.push(("PLUGIN_DATA".into(), data.to_string_lossy().into_owned()));
-    let embedded = match python_host() {
-        Some(host) => {
-            let args = vec!["serve".to_owned(), plugin_root.to_string_lossy().into_owned(), data.join(PACKAGES).to_string_lossy().into_owned()];
-            match Mcp::connect_stdio(Stdio { command: host.to_string_lossy().into_owned(), args, env: env.clone(), cwd: plugin_root.to_path_buf() }, prefix).await {
-                Ok(mcp) => return Ok(mcp),
-                Err(e) => e,
-            }
-        }
-        None => anyhow::anyhow!("this build has no Python runtime"),
-    };
-    let Some((python, agent)) = python_hermes() else { bail!("{embedded:#}") };
+    let (python, agent) = python_hermes().context("The installed Hermes agent is unavailable")?;
     let bridge = data.join("python_plugin_bridge.py");
     if fs::read_to_string(&bridge).ok().as_deref() != Some(BRIDGE) { fs::create_dir_all(data)?; fs::write(&bridge, BRIDGE)?; }
     let args = vec!["-I".to_owned(), bridge.to_string_lossy().into_owned(), agent.to_string_lossy().into_owned(), plugin_root.to_string_lossy().into_owned()];
     Mcp::connect_stdio(Stdio { command: python.to_string_lossy().into_owned(), args, env, cwd: plugin_root.to_path_buf() }, prefix).await
-        .with_context(|| format!("built-in Python: {embedded:#}; installed Hermes agent"))
+        .context("Installed Hermes agent tool bridge failed")
 }
 
 #[cfg(test)]
