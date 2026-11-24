@@ -242,8 +242,14 @@ impl TurnMemory {
                 None,
             ));
         };
+        let mut args = Value::Object(args);
+        scrub(&mut args, &config.api_key);
+        let review = ToolCall {
+            arguments: args.to_string(),
+            ..call.clone()
+        };
         if settings.needs_approval(&call.name, false, true)
-            && !request_approval(call.clone(), events, settings.approval_timeout).await?
+            && !request_approval(review, events, settings.approval_timeout).await?
         {
             let (approved, error) = denied();
             return Ok((approved, error, None));
@@ -254,8 +260,6 @@ impl TurnMemory {
         let Some(settings) = self.tools_enabled(profile) else {
             return Ok(unavailable());
         };
-        let mut args = Value::Object(args);
-        scrub(&mut args, &config.api_key);
         let Ok(result) = Self::request(
             &self.provider,
             "handle_tool_call",
@@ -304,7 +308,12 @@ fn scrub(value: &mut Value, protected: &str) {
     match value {
         Value::String(text) => *text = privacy::redact_capture(text, &[protected]),
         Value::Array(items) => items.iter_mut().for_each(|item| scrub(item, protected)),
-        Value::Object(fields) => fields.values_mut().for_each(|item| scrub(item, protected)),
+        Value::Object(fields) => {
+            if !protected.is_empty() {
+                fields.retain(|key, _| !key.contains(protected));
+            }
+            fields.values_mut().for_each(|item| scrub(item, protected));
+        }
         _ => {}
     }
 }
@@ -346,5 +355,16 @@ mod tests {
         assert_eq!(messages[1]["content"], marker);
         assert_eq!(messages[4]["content"], "ephemeral");
         assert!(attach_tool_results(&mut messages, 2, vec![(0, "bad position".into())]).is_err());
+    }
+
+    #[test]
+    fn provider_payload_scrubs_credentials_nested_in_values_and_keys() {
+        let credential = "synthetic-opaque-provider-value";
+        let mut payload = json!({"outer":[{(credential):"secret key name","query":credential}],"keep":"ordinary"});
+        scrub(&mut payload, credential);
+        assert_eq!(
+            payload,
+            json!({"outer":[{"query":"[REDACTED]"}],"keep":"ordinary"})
+        );
     }
 }
