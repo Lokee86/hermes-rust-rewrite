@@ -84,6 +84,16 @@ const STOCK: &[&str] = &[
     "suggestions",
     "timestamps",
     "ts",
+    "title",
+    "tools",
+    "topic",
+    "topup",
+    "undo",
+    "usage",
+    "version",
+    "v",
+    "wake",
+    "whoami",
     "model",
     "quit",
     "exit",
@@ -108,7 +118,7 @@ fn plugin_claims<'a>(
 ) {
     let mut claims: HashMap<String, Vec<(&PluginStatus, &PluginCommand)>> = HashMap::new();
     for status in inventory {
-        if status.issue.is_some() || !status.unsupported.is_empty() {
+        if status.issue.is_some() {
             continue;
         }
         for command in &status.commands {
@@ -147,8 +157,8 @@ impl Shared {
             let path = format!("/{name}");
             pairs.push(json!([path, command.description]));
             canon.insert(path.clone(), path.clone());
-            metadata.insert(path.clone(), json!({"argument_mode":command.argument_mode,"args_hint":command.args_hint,"desktop":null}));
-            plugin_commands.insert(name.clone(), json!({"description":command.description,"args_hint":command.args_hint,"argument_mode":command.argument_mode}));
+            metadata.insert(path.clone(), json!({"description":command.description,"argument_mode":command.argument_mode,"args_hint":command.args_hint,"desktop":null}));
+            plugin_commands.insert(name.clone(), json!(command.description));
         }
         let statuses: Vec<Value> = inventory.iter().map(|status| {
             let conflict_names: Vec<_> = conflicts.iter()
@@ -366,14 +376,18 @@ mod tests {
 
     #[test]
     fn command_claims_omit_builtin_and_ambiguous_names() {
+        let mut partial = status("partial", "still-available");
+        partial.unsupported.push("memory provider".into());
         let inventory = vec![
             status("one", "hello_world"),
             status("two", "hello-world"),
             status("three", "help"),
+            partial,
         ];
         let (unique, conflicts) = plugin_claims(&inventory);
         assert!(!unique.contains_key("hello-world"));
         assert!(!unique.contains_key("help"));
+        assert!(unique.contains_key("still-available"));
         assert_eq!(conflicts.get("hello-world").unwrap(), &["one", "two"]);
     }
 
@@ -442,7 +456,7 @@ def register(host):
             .unwrap();
         assert_eq!(first_catalog, second_catalog);
         assert_eq!(
-            first_catalog["plugin_commands"]["fixture-greet"]["description"],
+            first_catalog["plugin_commands"]["fixture-greet"],
             "Fixture greeting"
         );
         assert_eq!(
