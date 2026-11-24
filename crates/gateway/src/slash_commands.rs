@@ -439,7 +439,7 @@ def execute(args, *, source=None, session_id=None, session_key=None, platform=No
 
 def register(host):
     host.register_command("fixture-greet", execute, description="Fixture greeting",
-        args_hint="<text>", argument_mode="raw")
+        args_hint="<text>", argument_mode="mixed")
 "#,
         )
         .unwrap();
@@ -485,7 +485,7 @@ def register(host):
         );
         assert_eq!(
             first_catalog["commands"]["/fixture-greet"]["argument_mode"],
-            "raw"
+            "mixed"
         );
 
         let created = rpc(
