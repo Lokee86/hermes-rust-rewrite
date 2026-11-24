@@ -85,7 +85,7 @@ class _Inference:
 
     async def _request(self, operation, args, kwargs):
         payload = json.dumps({"args": args, "kwargs": kwargs}, allow_nan=False)
-        return json.loads(await asyncio.to_thread(self._service, operation, payload))
+        return json.loads(await asyncio.to_thread(self._service.request, operation, payload))
 
     async def aembed(self, *args, **kwargs):
         return await self._request("aembed", args, kwargs)
