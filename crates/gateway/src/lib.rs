@@ -1822,8 +1822,8 @@ struct StoredConversation {
 }
 
 fn read_record(dir: &Path) -> Result<StoredConversation> {
-    match File::open(dir.join("conversation.json")) {
-        Ok(file) => serde_json::from_reader(file).context("Could not read conversation history"),
+    match fs::read(dir.join("conversation.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("Could not read conversation history"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoredConversation::default()),
         Err(e) => Err(e.into()),
     }

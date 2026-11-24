@@ -169,8 +169,8 @@ pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<Committe
         return Ok(None);
     }
     let path = summary.directory.join("conversation.json");
-    match File::open(path) {
-        Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
