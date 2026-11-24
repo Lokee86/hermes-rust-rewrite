@@ -282,6 +282,42 @@ fn local_session_key(profile_name: &str, session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Config, Gateway, GatewayConfig};
+    use axum::{Json, Router, extract::State, routing::post};
+    use std::{
+        fs,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tempfile::TempDir;
+    use tokio::net::TcpListener;
+
+    async fn model_request(
+        State(requests): State<Arc<AtomicUsize>>,
+        Json(_): Json<Value>,
+    ) -> Json<Value> {
+        requests.fetch_add(1, Ordering::SeqCst);
+        Json(
+            json!({"choices":[{"message":{"role":"assistant","content":"unexpected model call"}}]}),
+        )
+    }
+
+    fn local_peer() -> Peer {
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        Peer {
+            id: "slash-test-peer".into(),
+            tx,
+            stop: crate::CancellationToken::new(),
+            canonical: true,
+            local_native: true,
+        }
+    }
+
+    async fn rpc(shared: &Arc<Shared>, peer: &Peer, method: &str, params: Value) -> RpcResult {
+        shared.dispatch(method, &params, peer).await
+    }
 
     fn status(id: &str, name: &str) -> PluginStatus {
         PluginStatus {
@@ -339,5 +375,165 @@ mod tests {
         assert!(!unique.contains_key("hello-world"));
         assert!(!unique.contains_key("help"));
         assert_eq!(conflicts.get("hello-world").unwrap(), &["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn attached_clients_discover_and_execute_local_plugin_without_model_turn() {
+        if hermes_engine::plugins::python_host().is_none() {
+            return;
+        }
+        let home = TempDir::new().unwrap();
+        let plugin_dir = home.path().join("plugins/fixture-command");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.yaml"),
+            "name: fixture-command\nversion: 0.0.1\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("__init__.py"),
+            r#"
+import json
+
+def execute(args, *, source=None, session_id=None, session_key=None, platform=None):
+    return json.dumps({"args": args, "source": vars(source), "session_id": session_id,
+        "session_key": session_key, "platform": platform})
+
+def register(host):
+    host.register_command("fixture-greet", execute, description="Fixture greeting",
+        args_hint="<text>", argument_mode="raw")
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("plugins/installed.json"),
+            json!([{
+                "name":"fixture-command", "title":"Fixture Command", "version":"0.0.1",
+                "description":"", "sha":"fixture", "enabled":true,
+                "servers":["python"], "skills":[]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let model_address = listener.local_addr().unwrap();
+        let model_requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(model_request))
+            .with_state(model_requests.clone());
+        let model = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = Config {
+            base_url: format!("http://{model_address}/v1"),
+            model: "fixture-model".into(),
+            api_key: "fixture-secret".into(),
+        };
+        let gateway = Gateway::start(GatewayConfig::new(home.path(), config))
+            .await
+            .unwrap();
+        let first = local_peer();
+        let second = local_peer();
+
+        let first_catalog = rpc(&gateway.shared, &first, "commands.catalog", json!({}))
+            .await
+            .unwrap();
+        let second_catalog = rpc(&gateway.shared, &second, "commands.catalog", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(first_catalog, second_catalog);
+        assert_eq!(
+            first_catalog["plugin_commands"]["fixture-greet"]["description"],
+            "Fixture greeting"
+        );
+        assert_eq!(
+            first_catalog["commands"]["/fixture-greet"]["argument_mode"],
+            "raw"
+        );
+
+        let created = rpc(
+            &gateway.shared,
+            &first,
+            "session.create",
+            json!({"source":"gui"}),
+        )
+        .await
+        .unwrap();
+        let session_id = created["session_id"]
+            .as_str()
+            .or_else(|| created["stored_session_id"].as_str())
+            .expect("session.create returns its session id")
+            .to_owned();
+        rpc(
+            &gateway.shared,
+            &second,
+            "session.resume",
+            json!({"session_id":session_id}),
+        )
+        .await
+        .unwrap();
+        let executed = rpc(
+            &gateway.shared,
+            &second,
+            "slash.exec",
+            json!({
+                "session_id":session_id, "command":"FIXTURE_GREET  hello world"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(executed["type"], "exec");
+        let callback: Value = serde_json::from_str(executed["output"].as_str().unwrap()).unwrap();
+        assert_eq!(callback["args"], " hello world");
+        assert_eq!(callback["session_id"], session_id);
+        assert_eq!(
+            callback["session_key"],
+            local_session_key(&gateway.shared.profile_name, &session_id)
+        );
+        assert_eq!(callback["platform"], "local");
+        assert_eq!(callback["source"]["platform"], "local");
+        assert_eq!(callback["source"]["chat_id"], session_id);
+        assert_eq!(callback["source"]["chat_type"], "dm");
+        assert_eq!(
+            callback["source"]["profile_name"],
+            gateway.shared.profile_name
+        );
+
+        assert!(
+            rpc(
+                &gateway.shared,
+                &first,
+                "slash.exec",
+                json!({
+                    "session_id":session_id, "command":"prefix-fixture-greet hi"
+                })
+            )
+            .await
+            .is_err()
+        );
+        hermes_engine::plugins::set_enabled(
+            gateway.shared.library.root(),
+            "fixture-command",
+            false,
+        )
+        .unwrap();
+        let refreshed = rpc(&gateway.shared, &first, "commands.catalog", json!({}))
+            .await
+            .unwrap();
+        assert!(refreshed["plugin_commands"]["fixture-greet"].is_null());
+        assert!(
+            rpc(
+                &gateway.shared,
+                &second,
+                "slash.exec",
+                json!({
+                    "session_id":session_id, "command":"fixture-greet hi"
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(model_requests.load(Ordering::SeqCst), 0);
+        gateway.shutdown().await.unwrap();
+        model.abort();
     }
 }
