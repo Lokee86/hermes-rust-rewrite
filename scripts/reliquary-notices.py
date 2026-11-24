@@ -35,7 +35,7 @@ def notices():
 
     lore = root("lore").parent
     quinn = root("quinn-proto")
-    return {
+    return source_url, {
         "Hermes-Rust-LICENSE": Path("LICENSE"),
         "Hermes-LICENSE": Path("LICENSE-HERMES-AGENT"),
         "Reliquary-NOTICE": notice,
@@ -77,12 +77,21 @@ def verify(archive, sources):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("stage").add_argument("destination", type=Path)
+    stage = commands.add_parser("stage")
+    stage.add_argument("destination", type=Path)
+    stage.add_argument("executable", type=Path)
+    stage.add_argument("--save-runtime-notices", type=Path)
     commands.add_parser("verify").add_argument("archive", nargs="+", type=Path)
     args = parser.parse_args()
-    sources = notices()
+    source_url, sources = notices()
     if args.command == "stage":
+        # Piping a Windows GUI executable through PowerShell can discard its stdout.
+        output = subprocess.check_output([args.executable.resolve(), "--licenses"], timeout=60)
+        if source_url.encode() not in output:
+            raise SystemExit(f"{args.executable} does not report the locked Reliquary source")
         args.destination.mkdir(parents=True, exist_ok=True)
+        if args.save_runtime_notices:
+            args.save_runtime_notices.write_bytes(output)
         for name, path in sources.items():
             shutil.copyfile(path, args.destination / name)
     else:

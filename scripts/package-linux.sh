@@ -23,9 +23,8 @@ scripts/bundle-python.sh "$PYO3_PYTHON" "$stage/lib/hermes/python"
 "$stage/bin/hermes-python-host" --version | grep -q " $stage/lib/hermes/python\$" || { echo "hermes-python-host does not run the bundled Python" >&2; exit 1; }
 install -m644 assets/icon.png "$stage/share/icons/hicolor/512x512/apps/com.nousresearch.hermes.rust-development.png"
 install -m644 packaging/linux/com.nousresearch.hermes.rust-development.desktop "$stage/share/applications/"
-"$PYO3_PYTHON" scripts/reliquary-notices.py stage "$stage/share/licenses/hermes"
-"$stage/bin/hermes" --licenses > "$stage/share/licenses/hermes/Herdr-THIRD-PARTY-NOTICES"
-grep -Fq 'https://github.com/Lokee86/Reliquary/archive/' "$stage/share/licenses/hermes/Herdr-THIRD-PARTY-NOTICES"
+"$PYO3_PYTHON" scripts/reliquary-notices.py stage "$stage/share/licenses/hermes" "$stage/bin/hermes" \
+    --save-runtime-notices "$stage/share/licenses/hermes/Herdr-THIRD-PARTY-NOTICES"
 for notice in crates/desktop/assets/fonts/*NOTICE.txt crates/desktop/assets/fonts/*LICENSE*.txt; do
   if [ -f "$notice" ]; then install -m644 "$notice" "$stage/share/licenses/hermes/"; fi
 done
