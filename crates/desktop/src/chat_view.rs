@@ -687,6 +687,11 @@ impl Hermes {
                             self.statusbar.streamed(delta.len());
                         }
                     }
+                    "memory.recall" => {
+                        if let Ok(status) = serde_json::from_value(p.clone()) {
+                            self.show_memory_recall(status);
+                        }
+                    }
                     "subagent.progress" => {
                         if let Ok(progress) =
                             serde_json::from_value::<hermes_engine::subagents::Progress>(p.clone())

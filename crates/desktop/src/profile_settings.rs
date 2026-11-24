@@ -7,7 +7,9 @@ use hermes_engine::settings::{MemoryProvider, PERSONALITIES, ProfileSettings};
 use hermes_reliquary_plugin::{EmbeddingNormalization, HostedEmbeddingSettings, HostedModelRoute, HostedSwitchboardConfig, ModelSlot};
 use hermes_library::{ArchiveFilter,Library,SessionQuery,SessionSource,SessionSummary};
 use iced::{Alignment, Element, Fill, Task, widget::{button,column,container,pick_list,row,text_input,Space}};
-use std::{collections::BTreeMap,path::{Path,PathBuf},process::{Child,Command}};
+use std::{collections::BTreeMap,path::{Path,PathBuf},process::Child};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum Kind { Text, Count, Check, Personality, Directory }
@@ -43,8 +45,9 @@ const FIELDS:&[Field]=&[
 ];
 #[derive(Clone,Debug)]
 pub(super) enum Action {
-    SetMemoryProvider(MemoryProvider),
-    SetMemoryProviderId(String), MemoryProvidersLoaded(Result<serde_json::Value,String>), MemoryProviderSet(Result<serde_json::Value,String>),
+    SetMemoryProviderId(String),
+    MemoryProvidersLoaded(PathBuf, Result<serde_json::Value, String>),
+    MemoryProviderSet(PathBuf, Result<serde_json::Value, String>),
     #[cfg(feature = "reliquary")]
     SwitchboardEndpoint(ModelSlot, String),
     #[cfg(feature = "reliquary")]
@@ -85,8 +88,14 @@ struct MemoryChoice { id:String, label:String }
 impl std::fmt::Display for MemoryChoice { fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { f.write_str(&self.label) } }
 
 pub(super) fn load_memory_providers(app:&mut Hermes)->Task<Message>{
+    let Some(root) = app.library.as_ref().map(|library| library.root().to_owned()) else {
+        return Task::none();
+    };
     let Ok(conn)=app.chat_connection() else{return Task::none()};
-    Task::perform(async move{conn.request("memory.providers",serde_json::json!({})).await},|r|Message::ProfileSetting(Action::MemoryProvidersLoaded(r)))
+    Task::perform(
+        async move { conn.request("memory.providers", serde_json::json!({})).await },
+        move |result| Message::ProfileSetting(Action::MemoryProvidersLoaded(root.clone(), result)),
+    )
 }
 impl Drop for State{fn drop(&mut self){self.release_awake();}}
 impl State {
@@ -189,22 +198,53 @@ fn nonempty(value: String) -> Option<String> {
 }
 pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
     match action {
-        Action::SetMemoryProvider(provider) => return set_memory_provider(app, provider.as_id().to_string()),
         Action::SetMemoryProviderId(id) => return set_memory_provider(app,id),
         action => return update_other(app,action),
     }
 }
 fn set_memory_provider(app:&mut Hermes,id:String)->Task<Message>{
+    let Some(root) = app.library.as_ref().map(|library| library.root().to_owned()) else {
+        return Task::none();
+    };
     let Ok(conn)=app.chat_connection() else {app.profile_settings.feedback=Some(Err("The profile gateway is unavailable.".into()));return Task::none()};
-    Task::perform(async move{conn.request("memory.provider.set",serde_json::json!({"provider":id})).await},|r|Message::ProfileSetting(Action::MemoryProviderSet(r)))
+    Task::perform(
+        async move { conn.request("memory.provider.set", serde_json::json!({"provider":id})).await },
+        move |result| Message::ProfileSetting(Action::MemoryProviderSet(root.clone(), result)),
+    )
 }
 fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
     let Some(lib)=app.library.clone() else{return Task::none()};
     let state=&mut app.profile_settings;
     match action {
-        Action::MemoryProvidersLoaded(result) => match result { Ok(value)=>{if let Some(id)=value["selected"].as_str(){if let Ok(provider)=MemoryProvider::from_id(id){state.saved.memory_provider=provider;}}state.memory_inventory=Some(value)},Err(error)=>state.feedback=Some(Err(error)) },
-        Action::MemoryProviderSet(result) => match result { Ok(value)=>{state.memory_inventory=Some(value.clone());if let Some(id)=value["selected"].as_str(){if let Ok(provider)=MemoryProvider::from_id(id){state.saved.memory_provider=provider;}}state.feedback=Some(Ok("Memory provider saved.".into()));},Err(error)=>state.feedback=Some(Err(error)) },
-        Action::SetMemoryProvider(_) | Action::SetMemoryProviderId(_) => unreachable!(),
+        Action::MemoryProvidersLoaded(root, result) if root == lib.root() => {
+            match result {
+                Ok(value) => {
+                    if let Some(id) = value["selected"].as_str()
+                        && let Ok(provider) = MemoryProvider::from_id(id)
+                    {
+                        state.saved.memory_provider = provider;
+                    }
+                    state.memory_inventory = Some(value);
+                }
+                Err(error) => state.feedback = Some(Err(error)),
+            }
+        }
+        Action::MemoryProviderSet(root, result) if root == lib.root() => {
+            match result {
+                Ok(value) => {
+                    if let Some(id) = value["selected"].as_str()
+                        && let Ok(provider) = MemoryProvider::from_id(id)
+                    {
+                        state.saved.memory_provider = provider;
+                    }
+                    state.memory_inventory = Some(value);
+                    state.feedback = Some(Ok("Memory provider saved.".into()));
+                }
+                Err(error) => state.feedback = Some(Err(error)),
+            }
+        }
+        Action::MemoryProvidersLoaded(..) | Action::MemoryProviderSet(..) => {}
+        Action::SetMemoryProviderId(_) => unreachable!(),
         #[cfg(feature = "reliquary")]
         Action::SwitchboardEndpoint(slot, endpoint) => {
             let route = if endpoint.is_empty() {
@@ -510,8 +550,8 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
             External if !saved.mcp_tools || !saved.memory_tool =>
                 "Enable both MCP tools and Memory tools in Advanced to use the external provider.",
             External => "Use tools from the MCP server designated for memory in Capabilities > Connectors.",
-            Off => "Disable built-in memory and the designated external memory connector for this profile.",
-            MemoryProvider::Plugin(id) => state.memory_inventory.as_ref().and_then(|v|v["providers"].as_array()).into_iter().flatten().find(|p|p["id"]==format!("plugin:{id}")).and_then(|p|p["reason"].as_str()).unwrap_or("Use the selected installed Python memory provider."),
+            Off => "Turn off persistent memory for this profile.",
+            MemoryProvider::Plugin(_) => "Use the selected installed Python memory provider.",
         };
         let saved_id=saved.memory_provider.as_id().to_string();
         let selected_id = state.memory_inventory.as_ref().and_then(|v|v["selected"].as_str()).unwrap_or(&saved_id);

@@ -466,6 +466,14 @@ impl Hermes {
     }
     fn error(&mut self, text: impl Into<String>) { self.banner = Some(Banner { text: text.into(), error: true }); }
     fn note(&mut self, text: impl Into<String>) { self.banner = Some(Banner { text: text.into(), error: false }); }
+    fn show_memory_recall(&mut self, status: hermes_engine::RecallStatus) {
+        if status.count == 0 {
+            self.note(format!("{} recalled context", status.provider_label));
+        } else {
+            let noun = if status.count == 1 { "memory" } else { "memories" };
+            self.note(format!("{} recalled {} {noun}", status.provider_label, status.count));
+        }
+    }
     fn is_portal(&self) -> bool { portal::is_portal(&self.config.base_url) }
     fn portal_config(&self) -> Config {
         Config { base_url: portal::INFERENCE.into(), model: if self.is_portal() { self.config.model.clone() } else { std::env::var("HERMES_RUST_MODEL").unwrap_or_else(|_| portal::AUTO_MODEL.into()) }, api_key: String::new() }
@@ -945,6 +953,7 @@ impl Hermes {
                         }
                     }
                     Event::Approval { call, answer } => self.approvals.push(Approval { call, generation: id, answer: Some(answer) }),
+                    Event::MemoryRecall(status) => self.show_memory_recall(status),
                     Event::Subagent(progress) => {
                         let list = &mut self.subagents;
                         match list.iter_mut().find(|p| p.id == progress.id) { Some(slot) => *slot = progress, None => list.push(progress) }
