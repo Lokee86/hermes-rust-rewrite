@@ -1,14 +1,23 @@
-//! Supply Hermes-owned inference to Reliquary's hosted Switchboard.
+//! Execute Reliquary Switchboard routes through Hermes' authenticated inference.
+
+use super::switchboard::switchboard_config;
 use anyhow::{Context, Result};
-use hermes_engine::{Config, inference::ProfileInference};
+use hermes_engine::{
+    Config,
+    inference::{CompletionInference, EmbeddingInference, InferenceTarget},
+};
 use reliquary_memory::{
-    ConfiguredRuntime, EmbeddingEndpoint, EmbeddingEndpointError, EmbeddingNormalization,
-    GeneralEndpoint, GeneralEndpointError, HostedEmbeddingInputSemantics, HostedInferenceIdentity,
+    ConfiguredRuntime, ConfiguredRuntimeError, EmbeddingEndpoint, EmbeddingEndpointError,
+    EmbeddingNormalization, GeneralEndpoint, GeneralEndpointError, ModelSlot,
     SwitchboardEmbeddingMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    path::Path,
+    sync::Arc,
+};
 use tokio::runtime::Handle;
 
 /// Persist the non-secret identity of the selected embedding space.
@@ -21,15 +30,15 @@ pub(super) struct EmbeddingIdentity {
     normalization: String,
 }
 
-// Reliquary invokes these ports from its processing workers or Hermes' blocking pool.
-struct Hosted {
-    inference: ProfileInference,
+// Reliquary invokes these endpoints from its workers or Hermes' blocking pool.
+struct Completion {
+    inference: CompletionInference,
     executor: Handle,
 }
 
-impl GeneralEndpoint for Hosted {
+impl GeneralEndpoint for Completion {
     fn model(&self) -> &str {
-        &self.inference.chat_route().model
+        &self.inference.route().model
     }
 
     fn complete_json(
@@ -47,9 +56,15 @@ impl GeneralEndpoint for Hosted {
     }
 }
 
-impl EmbeddingEndpoint for Hosted {
+struct Embedding {
+    inference: EmbeddingInference,
+    executor: Handle,
+    normalization: EmbeddingNormalization,
+}
+
+impl EmbeddingEndpoint for Embedding {
     fn model(&self) -> Option<&str> {
-        Some(&self.inference.embedding_route().model)
+        Some(&self.inference.route().model)
     }
 
     fn dimensions(&self) -> u32 {
@@ -57,7 +72,7 @@ impl EmbeddingEndpoint for Hosted {
     }
 
     fn normalization(&self) -> EmbeddingNormalization {
-        EmbeddingNormalization::None
+        self.normalization
     }
 
     fn supports_bounded_embedding(&self) -> bool {
@@ -78,9 +93,30 @@ impl EmbeddingEndpoint for Hosted {
         inputs: &[String],
         max: usize,
     ) -> Result<Vec<Vec<f32>>, EmbeddingEndpointError> {
-        self.executor
+        let mut vectors = self
+            .executor
             .block_on(self.inference.embed(inputs, max))
-            .map_err(|_| EmbeddingEndpointError::Failure("Hermes embedding request failed".into()))
+            .map_err(|_| {
+                EmbeddingEndpointError::Failure("Hermes embedding request failed".into())
+            })?;
+        if self.normalization == EmbeddingNormalization::L2 {
+            for vector in &mut vectors {
+                let norm = vector
+                    .iter()
+                    .map(|value| f64::from(*value).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if !norm.is_finite() || norm == 0.0 {
+                    return Err(EmbeddingEndpointError::InvalidResponse(
+                        "zero or non-finite embedding",
+                    ));
+                }
+                for value in vector {
+                    *value = (f64::from(*value) / norm) as f32;
+                }
+            }
+        }
+        Ok(vectors)
     }
 }
 
@@ -88,32 +124,86 @@ pub(super) fn from_profile(
     home: &Path,
     chat: &Config,
 ) -> Result<Option<(ConfiguredRuntime, EmbeddingIdentity)>> {
-    let executor = Handle::try_current().context("Hermes inference runtime is unavailable")?;
-    let Some(inference) = executor.block_on(ProfileInference::open(home, chat))? else {
+    let config = switchboard_config(home)?;
+    let Some(route) = config.model(ModelSlot::Embedding) else {
         return Ok(None);
     };
-    let embedding_route = inference.embedding_route();
-    let chat_route = inference.chat_route();
+    let settings = route
+        .embedding
+        .as_ref()
+        .context("Missing Switchboard embedding settings")?;
+    let executor = Handle::try_current().context("Hermes inference runtime is unavailable")?;
+    let target = InferenceTarget::parse(&route.endpoint)?;
+    let inference = executor.block_on(EmbeddingInference::open(
+        home,
+        &target,
+        route.model.as_deref(),
+        settings.dimensions,
+    ))?;
+    let resolved = inference.route();
     let metadata = EmbeddingIdentity {
-        provider: embedding_route.provider.clone(),
-        model: embedding_route.model.clone(),
+        provider: resolved.provider.clone(),
+        model: resolved.model.clone(),
         dimensions: inference.dimensions(),
-        normalization: "none".into(),
+        normalization: match settings.normalization {
+            EmbeddingNormalization::None => "none",
+            EmbeddingNormalization::L2 => "l2",
+        }
+        .into(),
         input_type_handling: "shared".into(),
     };
-    let identity = HostedInferenceIdentity::new(
-        &chat_route.provider,
-        &chat_route.model,
-        &metadata.provider,
-        &metadata.model,
-        metadata.dimensions,
-        HostedEmbeddingInputSemantics::Shared,
-        EmbeddingNormalization::None,
-    )?;
-    let host = Arc::new(Hosted {
+    let embedding = Arc::new(Embedding {
         inference,
-        executor,
+        executor: executor.clone(),
+        normalization: settings.normalization,
     });
-    let runtime = ConfiguredRuntime::hosted(host.clone(), host, identity)?;
+    let mut completions = BTreeMap::<_, (String, Arc<dyn GeneralEndpoint>)>::new();
+    for slot in ModelSlot::ALL {
+        if slot == ModelSlot::Embedding {
+            continue;
+        }
+        let Some(route) = config.model(slot) else {
+            continue;
+        };
+        let key = (&route.endpoint, &route.model, &route.reasoning_effort);
+        if let Entry::Vacant(binding) = completions.entry(key) {
+            let target = InferenceTarget::parse(&route.endpoint)
+                .with_context(|| format!("Invalid Hermes selection for {}", slot.object_key()))?;
+            let inference = executor
+                .block_on(CompletionInference::open(
+                    home,
+                    chat,
+                    &target,
+                    route.model.as_deref(),
+                    route.reasoning_effort.as_deref(),
+                ))
+                .with_context(|| {
+                    format!(
+                        "Could not resolve Hermes inference for {}",
+                        slot.object_key()
+                    )
+                })?;
+            let provider = inference.route().provider.clone();
+            binding.insert((
+                provider,
+                Arc::new(Completion {
+                    inference,
+                    executor: executor.clone(),
+                }),
+            ));
+        }
+    }
+    let runtime = ConfiguredRuntime::hosted_switchboard(
+        &config,
+        |slot, route| {
+            completions
+                .get(&(&route.endpoint, &route.model, &route.reasoning_effort))
+                .cloned()
+                .ok_or(ConfiguredRuntimeError::Setup {
+                    route: slot.object_key(),
+                })
+        },
+        |_, _| Ok((metadata.provider.clone(), embedding.clone())),
+    )?;
     Ok(Some((runtime, metadata)))
 }

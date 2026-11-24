@@ -221,6 +221,13 @@ async fn model(
 ) -> Response {
     if let Some(schema) = request["response_format"].get("json_schema") {
         assert_hermes_inference(&headers);
+        let route = match schema["name"].as_str().unwrap() {
+            "insomnia_authority_disposition_ledger" | "insomnia_memory_wording" => "insomnia",
+            "insomnia_memory_ownership" => "metadata",
+            "decision_response" => "recall",
+            _ => "general",
+        };
+        assert_memory_route(&headers, &request, route);
         memory_requests.fetch_add(1, Ordering::Relaxed);
         return Json(structured_memory_fixture(&request, schema)).into_response();
     }
@@ -400,16 +407,23 @@ fn assert_hermes_inference(headers: &HeaderMap) {
         "expected the Hermes provider transport");
 }
 
+fn assert_memory_route(headers: &HeaderMap, request: &Value, route: &str) {
+    assert_eq!(request["model"], format!("fixture-{route}"));
+    let auth = headers.get(header::AUTHORIZATION).unwrap().to_str().unwrap();
+    assert_eq!(auth, format!("Bearer fixture-{route}-key"));
+}
+
 async fn embed_memory_fixture(
     State(memory_requests): State<Arc<AtomicUsize>>,
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Json<Value> {
     assert_hermes_inference(&headers);
+    assert_memory_route(&headers, &request, "embedding");
     memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
     let data = (0..inputs.len()).map(|index| {
-        json!({"index": index, "embedding": [1.0, 0.0]})
+        json!({"index": index, "embedding": [3.0, 4.0]})
     }).collect::<Vec<_>>();
     Json(json!({"model": request["model"], "data": data}))
 }
@@ -575,9 +589,14 @@ impl PortableGateway {
 async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     use hermes_engine::{credentials::EndpointStore, settings::ProfileSettings};
     use hermes_library::Library;
+    use hermes_reliquary_plugin::{
+        EmbeddingNormalization, HostedEmbeddingSettings, HostedModelRoute, ModelSlot,
+        save_switchboard_config, switchboard_config,
+    };
     use std::{fs, path::Path};
 
     let provider = Provider::start().await;
+    let memory_provider = Provider::start().await;
     let sandbox = TempDir::new().unwrap();
     let install = sandbox.path().join("install");
     fs::create_dir(&install).unwrap();
@@ -641,13 +660,40 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
 
     // Capture works before a model route is saved. Processing resumes after configuration.
     assert_eq!(provider.memory_requests.load(Ordering::Relaxed), 0);
-    let endpoint = EndpointStore::open(&library.root().join("providers")).unwrap()
-        .save(Some("fixture-embeddings"), "Embeddings", &Config {
-            model: "fixture-embeddings".into(), ..provider.config()
-        }).unwrap();
-    let settings = json!({"memory_embedding":{"endpoint_id":endpoint.id,"dimensions":2}});
-    ProfileSettings::update(library.root(), settings.as_object().unwrap()).unwrap();
+    let vault = EndpointStore::open(&library.root().join("providers")).unwrap();
+    let route = |name: &str, embedding| {
+        let endpoint = vault
+            .save(Some(name), name, &Config {
+                model: format!("saved-{name}-default"),
+                api_key: format!("fixture-{name}-key"),
+                ..memory_provider.config()
+            })
+            .unwrap();
+        Some(HostedModelRoute {
+            endpoint: format!("endpoint:{}", endpoint.id),
+            model: Some(format!("fixture-{name}")),
+            reasoning_effort: None,
+            embedding,
+        })
+    };
+    let general = route("general", None);
+    save_switchboard_config(
+        library.root(),
+        &[
+            (ModelSlot::General, general.clone()),
+            (ModelSlot::EntityResolution, general),
+            (ModelSlot::Insomnia, route("insomnia", None)),
+            (ModelSlot::InsomniaMetadata, route("metadata", None)),
+            (ModelSlot::MemoryRetrievalDecision, route("recall", None)),
+            (ModelSlot::Embedding, route("embedding", Some(HostedEmbeddingSettings {
+                dimensions: 2,
+                normalization: EmbeddingNormalization::L2,
+            }))),
+        ],
+    ).unwrap();
     let accepted = memory_capture_receipt(&record_path, 0).await;
+    assert_eq!(provider.memory_requests.load(Ordering::Relaxed), 0);
+    assert!(memory_provider.memory_requests.load(Ordering::Relaxed) > 0);
 
     library.rename_project(&project.id, "Amethyst").unwrap();
     assert_eq!(gateway.reconcile_memory().await["projects_ready"], true);
@@ -671,6 +717,10 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     assert!(state.join("projects").join("Second project.rel").is_file());
 
     let library = Library::open(profiles.profile_path("office").unwrap()).unwrap();
+    assert_eq!(
+        switchboard_config(library.root()).unwrap().model(ModelSlot::Insomnia).unwrap().endpoint,
+        "endpoint:insomnia",
+    );
     let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
     let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
     let mut next = restarted.client().await;

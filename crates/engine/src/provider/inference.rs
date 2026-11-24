@@ -6,6 +6,22 @@ const RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl Provider {
+    pub(crate) async fn resolve_for_inference(&self) -> Result<Option<Self>> {
+        if !self.config.api_key.trim().is_empty()
+            || !(crate::portal::is_portal(&self.config.base_url)
+                || crate::accounts::for_base_url(&self.config.base_url).is_some())
+        {
+            return Ok(None);
+        }
+        let config = Self::resolve_config(self.config.clone()).await?;
+        Ok(Some(Self::new_with_options(config, self.options.clone())?))
+    }
+
+    pub(crate) fn validate_structured_options(&self) -> Result<()> {
+        self.options
+            .apply(&mut json!({}), self.protocol == Protocol::Anthropic)
+    }
+
     pub(crate) async fn complete_json(
         &self,
         system: &str,
@@ -20,12 +36,13 @@ impl Provider {
         ];
         let content = match self.protocol {
             Protocol::OpenAi => {
-                let body = json!({
+                let mut body = json!({
                     "model":model, "messages":messages,
                     "response_format":{"type":"json_schema","json_schema":{
                         "name":name,"strict":true,"schema":schema
                     }}
                 });
+                self.options.apply(&mut body, false)?;
                 let reply = self
                     .request_json(&self.endpoint, &body, RESPONSE_BYTES)
                     .await?;
@@ -45,6 +62,7 @@ impl Provider {
                 let mut body = anthropic_body(model, messages, &[])?;
                 body["stream"] = json!(false);
                 body["output_config"] = json!({"format":{"type":"json_schema","schema":schema}});
+                self.options.apply(&mut body, true)?;
                 let reply = self
                     .request_json(&self.endpoint, &body, RESPONSE_BYTES)
                     .await?;
@@ -62,6 +80,10 @@ impl Provider {
             }
             Protocol::Responses => {
                 let mut body = responses_body(model, messages, &[]);
+                if let Some(effort) = &self.options.reasoning_effort {
+                    let effort = if effort == "ultra" { "max" } else { effort };
+                    body["reasoning"] = json!({"effort":effort});
+                }
                 body["text"] = json!({"format":{"type":"json_schema", "name":name,
                     "strict":true, "schema":schema}});
                 let request = self

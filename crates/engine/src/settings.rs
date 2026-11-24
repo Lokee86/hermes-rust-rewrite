@@ -46,7 +46,7 @@ pub struct ProfileSettings {
     pub memory_provider: MemoryProvider,
     /// Reserve this profile's HTTP MCP connector for the External memory setting.
     pub external_memory_connector: bool,
-    /// Saved profile endpoint used for shared-space embeddings by embedded Reliquary.
+    /// Legacy embedding selection used before the profile saves Switchboard routes.
     pub memory_embedding: Option<MemoryEmbedding>,
     pub checkpoints_enabled: bool,
     pub checkpoint_max_snapshots: usize,

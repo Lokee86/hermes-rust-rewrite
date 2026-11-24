@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Config, credentials::EndpointStore, settings::ProfileSettings};
+use crate::{Config, credentials::EndpointStore};
 use axum::{Json, Router, http::HeaderMap, routing::post};
 use serde_json::{Value, json};
 use std::sync::mpsc;
@@ -14,7 +14,7 @@ async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn profile_inference_uses_distinct_saved_chat_and_embedding_endpoints() {
+async fn independently_selected_targets_use_exact_saved_credentials_and_model_overrides() {
     let (chat_tx, chat_rx) = mpsc::channel();
     let (embed_tx, embed_rx) = mpsc::channel();
     let router = Router::new()
@@ -42,33 +42,79 @@ async fn profile_inference_uses_distinct_saved_chat_and_embedding_endpoints() {
     let (base, server) = serve(router).await;
     let profile = tempfile::tempdir().unwrap();
     let endpoints = EndpointStore::open(&profile.path().join("providers")).unwrap();
+    endpoints
+        .save(
+            Some("other-at-same-scope"),
+            "Different account at same scope",
+            &Config {
+                base_url: format!("{base}/chat/v1"),
+                model: "other-saved-model".into(),
+                api_key: "other-secret".into(),
+            },
+        )
+        .unwrap();
+    let completion = endpoints
+        .save(
+            Some("completion"),
+            "Completion fixture",
+            &Config {
+                base_url: format!("{base}/chat/v1"),
+                model: "saved-completion-model".into(),
+                api_key: "completion-secret".into(),
+            },
+        )
+        .unwrap();
     let embedding = endpoints
         .save(
-            None,
+            Some("embedding"),
             "Embedding fixture",
             &Config {
                 base_url: format!("{base}/embed/v1"),
-                model: "embedding-fixture".into(),
+                model: "saved-embedding-model".into(),
                 api_key: "embedding-secret".into(),
             },
         )
         .unwrap();
-    let settings = json!({"memory_embedding": {
-        "endpoint_id": embedding.id,
-        "dimensions": 3
-    }});
-    ProfileSettings::update(profile.path(), settings.as_object().unwrap()).unwrap();
     let chat = Config {
-        base_url: format!("{base}/chat/v1"),
+        base_url: format!("{base}/unexpected/v1"),
         model: "chat-fixture".into(),
         api_key: "chat-secret".into(),
     };
 
-    let inference = ProfileInference::open(profile.path(), &chat)
-        .await
-        .unwrap()
-        .unwrap();
-    let parsed = inference
+    let completion_target = InferenceTarget::parse(&format!("endpoint:{}", completion.id)).unwrap();
+    let embedding_target = InferenceTarget::parse(&format!("endpoint:{}", embedding.id)).unwrap();
+    let completion = CompletionInference::open(
+        profile.path(),
+        &chat,
+        &completion_target,
+        Some("completion-override"),
+        Some("low"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(completion.route().model, "completion-override");
+    assert_eq!(completion.route().provider, format!("{base}/chat/v1"));
+    let embedding = EmbeddingInference::open(
+        profile.path(),
+        &embedding_target,
+        Some("embedding-fixture"),
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(embedding.route().model, "embedding-fixture");
+    assert_eq!(embedding.route().provider, format!("{base}/embed/v1"));
+    assert_eq!(embedding.dimensions(), 3);
+    assert!(chat_rx.try_recv().is_err());
+    assert!(embed_rx.try_recv().is_err());
+
+    let other_profile = tempfile::tempdir().unwrap();
+    assert!(
+        CompletionInference::open(other_profile.path(), &chat, &completion_target, None, None)
+            .await
+            .is_err()
+    );
+    let parsed = completion
         .complete_json(
             "Return the requested object.",
             "A synthetic fixture request.",
@@ -78,7 +124,7 @@ async fn profile_inference_uses_distinct_saved_chat_and_embedding_endpoints() {
         .await
         .unwrap();
     assert_eq!(parsed, json!({"accepted":true}));
-    let vectors = inference
+    let vectors = embedding
         .embed(
             &[
                 "first synthetic input".into(),
@@ -91,12 +137,13 @@ async fn profile_inference_uses_distinct_saved_chat_and_embedding_endpoints() {
     assert_eq!(vectors, vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]);
 
     let (headers, body) = chat_rx.recv().unwrap();
-    assert_eq!(headers["authorization"], "Bearer chat-secret");
+    assert_eq!(headers["authorization"], "Bearer completion-secret");
     assert_eq!(
         headers["user-agent"],
         concat!("HermesRust/", env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(body["model"], "chat-fixture");
+    assert_eq!(body["model"], "completion-override");
+    assert_eq!(body["reasoning_effort"], "low");
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(
         body["messages"][0]["content"],
@@ -121,7 +168,7 @@ async fn profile_inference_uses_distinct_saved_chat_and_embedding_endpoints() {
     assert_eq!(body["dimensions"], 3);
 
     assert!(
-        inference
+        embedding
             .embed(&["bounded synthetic input".into()], 16)
             .await
             .is_err()
@@ -130,29 +177,74 @@ async fn profile_inference_uses_distinct_saved_chat_and_embedding_endpoints() {
 }
 
 #[tokio::test]
-async fn profile_without_embedding_selection_returns_none_without_network_requests() {
-    let (request_tx, request_rx) = mpsc::channel();
-    let router = Router::new().fallback(move || {
-        let request_tx = request_tx.clone();
-        async move {
-            request_tx.send(()).unwrap();
-            Json(json!({"unexpected":true}))
-        }
-    });
+async fn chat_and_managed_account_targets_use_hermes_defaults_without_auth_at_bind() {
+    let (tx, rx) = mpsc::channel();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(
+            move |headers: HeaderMap, Json(body): Json<Value>| async move {
+                tx.send((headers, body)).unwrap();
+                Json(json!({"choices":[{"message":{"content":"{}"}}]}))
+            },
+        ),
+    );
     let (base, server) = serve(router).await;
     let profile = tempfile::tempdir().unwrap();
     let chat = Config {
         base_url: format!("{base}/v1"),
-        model: "chat-fixture".into(),
-        api_key: "chat-secret".into(),
+        model: "chat-default".into(),
+        api_key: "chat-fixture-key".into(),
     };
+    let selected = InferenceTarget::parse("chat").unwrap();
+    let completion = CompletionInference::open(profile.path(), &chat, &selected, None, None)
+        .await
+        .unwrap();
+    assert_eq!(completion.route().model, "chat-default");
+    assert!(rx.try_recv().is_err());
+    completion
+        .complete_json("system", "input", "result", &json!({"type":"object"}))
+        .await
+        .unwrap();
+    let (headers, body) = rx.recv().unwrap();
+    assert_eq!(headers["authorization"], "Bearer chat-fixture-key");
+    assert_eq!(body["model"], "chat-default");
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("reasoning").is_none());
 
     assert!(
-        ProfileInference::open(profile.path(), &chat)
+        EmbeddingInference::open(profile.path(), &selected, None, 3)
             .await
-            .unwrap()
-            .is_none()
+            .is_err()
     );
-    assert!(request_rx.try_recv().is_err());
+    for id in ["openai-codex", "qwen-oauth", "minimax-oauth", "xai-oauth"] {
+        let key = format!("account:{id}");
+        let account = InferenceTarget::parse(&key).unwrap();
+        assert_eq!(account.key(), key);
+        let expected = crate::accounts::provider(id).unwrap();
+        let completion = CompletionInference::open(profile.path(), &chat, &account, None, None)
+            .await
+            .unwrap();
+        assert_eq!(completion.route().model, expected.default_model);
+        assert_eq!(completion.route().provider, expected.base_url);
+    }
+    let codex = InferenceTarget::parse("account:openai-codex").unwrap();
+    assert!(
+        EmbeddingInference::open(profile.path(), &codex, Some("not-embeddings"), 3)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        InferenceTarget::parse("account:nous").unwrap().key(),
+        "account:nous"
+    );
+    for invalid in [
+        "account:anthropic",
+        "account:claude-code",
+        "account:unknown",
+        "endpoint:",
+        "chat:",
+    ] {
+        assert!(InferenceTarget::parse(invalid).is_err());
+    }
     server.abort();
 }

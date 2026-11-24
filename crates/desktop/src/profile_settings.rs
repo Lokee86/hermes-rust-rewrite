@@ -2,7 +2,9 @@
 //! record and commits only the controls edited on this page.
 use crate::appearance::text;
 use super::{Hermes, Message, settings::View, ui};
-use hermes_engine::settings::{MemoryEmbedding, MemoryProvider, PERSONALITIES, ProfileSettings};
+use hermes_engine::settings::{MemoryProvider, PERSONALITIES, ProfileSettings};
+#[cfg(feature = "reliquary")]
+use hermes_reliquary_plugin::{EmbeddingNormalization, HostedEmbeddingSettings, HostedModelRoute, HostedSwitchboardConfig, ModelSlot};
 use hermes_library::{ArchiveFilter,Library,SessionQuery,SessionSource,SessionSummary};
 use iced::{Alignment, Element, Fill, Task, widget::{button,column,container,pick_list,row,text_input,Space}};
 use std::{collections::BTreeMap,path::{Path,PathBuf},process::{Child,Command}};
@@ -43,15 +45,34 @@ const FIELDS:&[Field]=&[
 pub(super) enum Action {
     SetMemoryProvider(MemoryProvider),
     MemorySynced(Result<serde_json::Value, String>),
-    EmbeddingEndpoint(String), EmbeddingDimensions(String), SaveEmbedding,
+    #[cfg(feature = "reliquary")]
+    SwitchboardEndpoint(ModelSlot, String),
+    #[cfg(feature = "reliquary")]
+    SwitchboardModel(ModelSlot, String),
+    #[cfg(feature = "reliquary")]
+    SwitchboardReasoning(ModelSlot, String),
+    #[cfg(feature = "reliquary")]
+    SwitchboardDimensions(String),
+    #[cfg(feature = "reliquary")]
+    SwitchboardNormalization(String),
+    #[cfg(feature = "reliquary")]
+    SaveSwitchboard,
     Set(&'static str,String,View), Edit(&'static str,String),Apply(View),Browse,DirectoryChosen(Result<Option<PathBuf>,String>),
     Restore(String),RestoreDone(String,Result<serde_json::Value,String>),Delete(String),DeleteDone(String,Result<serde_json::Value,String>),CancelDelete,ConfirmDelete,Maintain,MaintainDone(Result<serde_json::Value,String>),
 }
 #[derive(Default)]
 pub(super) struct State {
     pub saved:ProfileSettings,
-    embedding_endpoint: String,
-    embedding_dimensions: String,
+    #[cfg(feature = "reliquary")]
+    switchboard: Option<HostedSwitchboardConfig>,
+    #[cfg(feature = "reliquary")]
+    switchboard_edits: Vec<(ModelSlot, Option<HostedModelRoute>)>,
+    #[cfg(feature = "reliquary")]
+    switchboard_dimensions: String,
+    #[cfg(feature = "reliquary")]
+    switchboard_normalization: String,
+    #[cfg(feature = "reliquary")]
+    switchboard_embedding_dirty: bool,
     edits:BTreeMap<&'static str,String>,
     pub archive:Vec<SessionSummary>,
     pub feedback:Option<Result<String,String>>,
@@ -73,17 +94,36 @@ impl State {
         let mut state=Self::default();
         match ProfileSettings::load(root) {
             Ok(saved)=>{
-                if let Some(embedding) = &saved.memory_embedding {
-                    state.embedding_endpoint = embedding.endpoint_id.clone();
-                    state.embedding_dimensions = embedding.dimensions.to_string();
-                }
                 state.saved=saved;
             }
             Err(e)=>state.feedback=Some(Err(e.to_string())),
         }
+        #[cfg(feature = "reliquary")]
+        {
+            match hermes_reliquary_plugin::switchboard_config(root) {
+                Ok(config) => state.switchboard = Some(config),
+                Err(error) => state.feedback=Some(Err(format!("Could not load Reliquary Switchboard settings: {error:#}"))),
+            }
+            state.sync_switchboard_embedding();
+        }
         if let Err(e)=state.sync_awake(){state.feedback=Some(Err(e));}
         state
     }
+    #[cfg(feature = "reliquary")]
+    fn sync_switchboard_embedding(&mut self) {
+        let embedding = self.switchboard.as_ref()
+            .and_then(|config| config.model(ModelSlot::Embedding))
+            .and_then(|route| route.embedding.as_ref());
+        self.switchboard_dimensions = embedding
+            .map(|settings| settings.dimensions.to_string())
+            .unwrap_or_default();
+        self.switchboard_normalization = match embedding.map(|settings| settings.normalization) {
+            Some(EmbeddingNormalization::L2) => "L2",
+            _ => "None",
+        }.into();
+        self.switchboard_embedding_dirty = false;
+    }
+
     pub fn archived(&mut self,lib:&Library){
         match lib.list_sessions(&SessionQuery{archive:ArchiveFilter::Archived,..Default::default()}){
             Ok(archive)=>self.archive=archive,Err(e)=>self.feedback=Some(Err(e.to_string())),
@@ -113,6 +153,31 @@ impl State {
         self.sync_awake()
     }
 }
+#[cfg(feature = "reliquary")]
+fn switchboard_route(state: &State, slot: ModelSlot) -> Option<&HostedModelRoute> {
+    let pending = state.switchboard_edits.iter().rev().find(|(edited,_)|*edited==slot)
+        .map(|(_,route)|route.as_ref());
+    effective_route(pending,state.switchboard.as_ref().and_then(|config|config.model(slot)))
+}
+#[cfg(any(feature = "reliquary", test))]
+fn effective_route<'a, T>(pending: Option<Option<&'a T>>, saved: Option<&'a T>) -> Option<&'a T> {
+    match pending { Some(route) => route, None => saved }
+}
+#[cfg(feature = "reliquary")]
+fn route_for_edit(state: &State, slot: ModelSlot) -> Option<HostedModelRoute> {
+    switchboard_route(state,slot).cloned()
+}
+#[cfg(feature = "reliquary")]
+fn switchboard_edit(state: &mut State, slot: ModelSlot, route: Option<HostedModelRoute>) {
+    if let Some((_,existing))=state.switchboard_edits.iter_mut().find(|(edited,_)|*edited==slot) {
+        *existing=route;
+    } else { state.switchboard_edits.push((slot,route)); }
+    state.feedback=None;
+}
+#[cfg(feature = "reliquary")]
+fn nonempty(value: String) -> Option<String> {
+    let value=value.trim().to_owned(); (!value.is_empty()).then_some(value)
+}
 pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
     let Some(lib)=app.library.clone() else{return Task::none()};
     let state=&mut app.profile_settings;
@@ -139,37 +204,84 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
                     if result["enrolled"] != true {
                         return Err("This profile's gateway does not have the Reliquary stock plugin.".into());
                     }
-                    Ok(if state.saved.memory_embedding.is_some() {
-                        "Reliquary enrolled.".into()
-                    } else {
-                        "Reliquary enrolled. Choose an embedding endpoint to process captured turns.".into()
-                    })
+                    Ok("Reliquary enrolled.".into())
                 }));
             }
         }
-        Action::EmbeddingEndpoint(id) => state.embedding_endpoint = id,
-        Action::EmbeddingDimensions(dimensions) => state.embedding_dimensions = dimensions,
-        Action::SaveEmbedding => {
+        #[cfg(feature = "reliquary")]
+        Action::SwitchboardEndpoint(slot, endpoint) => {
+            let route = if endpoint.is_empty() {
+                None
+            } else {
+                let (model, reasoning_effort, embedding) = route_for_edit(state, slot)
+                    .map(|route| (route.model, route.reasoning_effort, route.embedding))
+                    .unwrap_or_default();
+                Some(HostedModelRoute { endpoint, model, reasoning_effort, embedding })
+            };
+            switchboard_edit(state, slot, route);
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SwitchboardModel(slot, model) => {
+            if let Some(mut route) = route_for_edit(state, slot) {
+                route.model = nonempty(model);
+                switchboard_edit(state, slot, Some(route));
+            }
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SwitchboardReasoning(slot, effort) => {
+            if let Some(mut route) = route_for_edit(state, slot) {
+                route.reasoning_effort = (effort != "Default").then_some(effort);
+                switchboard_edit(state, slot, Some(route));
+            }
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SwitchboardDimensions(value) => {
+            state.switchboard_dimensions = value;
+            state.switchboard_embedding_dirty = true;
+            state.feedback = None;
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SwitchboardNormalization(value) => {
+            state.switchboard_normalization = value;
+            state.switchboard_embedding_dirty = true;
+            state.feedback = None;
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SaveSwitchboard => {
             let result = (|| -> anyhow::Result<_> {
-                let embedding = if state.embedding_endpoint.is_empty() {
-                    None
-                } else {
-                    use anyhow::Context;
-                    let endpoint = hermes_engine::credentials::EndpointStore::open(&lib.root().join("providers"))?
-                        .config(&state.embedding_endpoint)?;
-                    endpoint.openai_chat_url()?;
-                    let dimensions = state.embedding_dimensions.trim().parse::<u32>().ok()
-                        .filter(|dimensions| *dimensions > 0)
-                        .context("Enter the embedding model's positive output dimension")?;
-                    Some(MemoryEmbedding { endpoint_id: state.embedding_endpoint.clone(), dimensions })
-                };
-                let changes = serde_json::Map::from_iter([("memory_embedding".into(), serde_json::json!(embedding))]);
-                ProfileSettings::update(lib.root(), &changes)
+                let slot = ModelSlot::Embedding;
+                let route_edited = state.switchboard_edits.iter().any(|(edited, _)| *edited == slot);
+                let mut embedding_applied = false;
+                if let Some(mut route) = route_for_edit(state, slot)
+                    && (route_edited || state.switchboard_embedding_dirty)
+                {
+                    let dimensions = state.switchboard_dimensions.trim().parse::<u32>()
+                        .ok().filter(|value| *value > 0)
+                        .ok_or_else(|| anyhow::anyhow!("Enter the embedding model’s positive output dimension."))?;
+                    let normalization = match state.switchboard_normalization.as_str() {
+                        "L2" => EmbeddingNormalization::L2,
+                        _ => EmbeddingNormalization::None,
+                    };
+                    route.embedding = Some(HostedEmbeddingSettings { dimensions, normalization });
+                    switchboard_edit(state, slot, Some(route));
+                    embedding_applied = true;
+                }
+                let saved = hermes_reliquary_plugin::save_switchboard_config(
+                    lib.root(), &state.switchboard_edits,
+                )?;
+                Ok((saved, embedding_applied))
             })();
-            state.feedback = Some(result.map(|saved| {
-                state.saved = saved;
-                "Embedding settings saved.".into()
-            }).map_err(|error| format!("{error:#}")));
+            state.feedback = Some(match result {
+                Ok((saved, embedding_applied)) => {
+                    state.switchboard_edits.clear();
+                    state.switchboard = Some(saved);
+                    if !state.switchboard_embedding_dirty || embedding_applied {
+                        state.sync_switchboard_embedding();
+                    }
+                    Ok("Reliquary Switchboard settings saved.".into())
+                }
+                Err(error) => Err(format!("{error:#}")),
+            });
         }
         // Switches and pickers save on change, as the original's autosave does.
         Action::Set(key,value,page)=>{state.edits.insert(key,value);return update(app,Action::Apply(page));}
@@ -250,45 +362,134 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
     Task::none()
 }
 
+#[cfg(feature = "reliquary")]
 #[derive(Clone, PartialEq)]
-struct EmbeddingChoice {
-    id: String,
-    label: String,
+struct SwitchboardEndpointChoice { value: String, label: String }
+#[cfg(feature = "reliquary")]
+impl std::fmt::Display for SwitchboardEndpointChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.label) }
 }
-
-impl std::fmt::Display for EmbeddingChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.label)
+#[cfg(feature = "reliquary")]
+fn slot_name(slot: ModelSlot) -> &'static str {
+    match slot {
+        ModelSlot::General => "General",
+        ModelSlot::Insomnia => "Insomnia",
+        ModelSlot::InsomniaMetadata => "Insomnia metadata",
+        ModelSlot::EntityExtraction => "Entity extraction",
+        ModelSlot::GeneralDecision => "General decision",
+        ModelSlot::EntityResolutionDecision => "Entity resolution decision",
+        ModelSlot::MemoryRetrievalDecision => "Memory retrieval decision",
+        ModelSlot::EntityResolution => "Entity resolution",
+        ModelSlot::Dream => "Dream",
+        ModelSlot::Embedding => "Embeddings",
     }
 }
+#[cfg(feature = "reliquary")]
+fn switchboard_route_row(app: &Hermes, slot: ModelSlot) -> Element<'_, Message> {
+    use hermes_engine::{accounts, inference::InferenceTarget};
 
-fn embedding_row(app: &Hermes) -> Element<'_, Message> {
-    let state = &app.profile_settings;
-    let action = Message::ProfileSetting;
-    let mut options = vec![EmbeddingChoice { id: String::new(), label: "None".into() }];
-    options.extend(app.models.endpoints.iter().map(|endpoint| EmbeddingChoice {
-        id: endpoint.id.clone(),
-        label: endpoint.name.clone(),
+    let current = switchboard_route(&app.profile_settings, slot);
+    let endpoint = current.map(|route| route.endpoint.as_str()).unwrap_or("");
+    let no_route_label = match slot {
+        ModelSlot::Embedding => "No embedding route",
+        ModelSlot::General | ModelSlot::EntityExtraction | ModelSlot::EntityResolution => "No route configured",
+        _ => "Use fallback",
+    };
+    let mut options = vec![SwitchboardEndpointChoice {
+        value: String::new(),
+        label: no_route_label.into(),
+    }];
+    if slot != ModelSlot::Embedding {
+        options.extend([
+            SwitchboardEndpointChoice {
+                value: InferenceTarget::Chat.key(),
+                label: "Current chat".into(),
+            },
+            SwitchboardEndpointChoice {
+                value: InferenceTarget::Account("nous".into()).key(),
+                label: "Nous Portal account".into(),
+            },
+        ]);
+        options.extend(accounts::CATALOG.iter().filter_map(|account| {
+            let value = InferenceTarget::Account(account.id.into()).key();
+            InferenceTarget::parse(&value).ok().map(|_| SwitchboardEndpointChoice {
+                value,
+                label: account.name.into(),
+            })
+        }));
+    }
+    options.extend(app.models.endpoints.iter().map(|saved| SwitchboardEndpointChoice {
+        value: InferenceTarget::Endpoint(saved.id.clone()).key(),
+        label: saved.name.clone(),
     }));
-    let selected = options.iter().find(|option| option.id == state.embedding_endpoint).cloned();
-    let picker = pick_list(options, selected, move |choice| action(Action::EmbeddingEndpoint(choice.id)))
-        .text_size(12).width(145).placeholder("Saved endpoint");
-    let dimensions = text_input("Dimensions", &state.embedding_dimensions)
-        .size(12).padding([5, 7]).width(85)
-        .on_input(move |value| action(Action::EmbeddingDimensions(value)))
-        .on_submit(action(Action::SaveEmbedding));
-    let save = button(text("Save").size(12)).on_press(action(Action::SaveEmbedding));
-    let fields = row![picker, dimensions, save].spacing(5).align_y(Alignment::Center);
-    super::settings::card_row(
-        "Reliquary embeddings",
-        if state.saved.memory_embedding.is_some() {
-            "Choose a saved embedding endpoint from Models and enter its model’s output dimension."
-        } else {
-            "Processing is pending until you save an embedding endpoint and its output dimension."
-        },
-        fields.into(),
+    if !endpoint.is_empty() && !options.iter().any(|choice| choice.value == endpoint) {
+        options.push(SwitchboardEndpointChoice {
+            value: endpoint.into(),
+            label: "Unavailable route".into(),
+        });
+    }
+    let selected = options.iter().find(|choice| choice.value == endpoint).cloned();
+    let picker = pick_list(options, selected, move |choice| {
+        Message::ProfileSetting(Action::SwitchboardEndpoint(slot, choice.value))
+    }).text_size(11).width(165);
+    let mut controls = row![picker].spacing(5).align_y(Alignment::Center);
+    if let Some(route) = current {
+        let model = text_input("Model override (optional)", route.model.as_deref().unwrap_or(""))
+            .size(11)
+            .padding([5, 7])
+            .width(165)
+            .on_input(move |value| Message::ProfileSetting(Action::SwitchboardModel(slot, value)));
+        controls = controls.push(model);
+        if slot != ModelSlot::Embedding && !slot.is_decision() {
+            let choices = ["Default", "none", "minimal", "low", "medium", "high", "xhigh", "max"]
+                .into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let selected = route.reasoning_effort.clone().unwrap_or_else(|| "Default".into());
+            let reasoning = pick_list(choices, Some(selected), move |value| {
+                Message::ProfileSetting(Action::SwitchboardReasoning(slot, value))
+            }).text_size(11).width(90);
+            controls = controls.push(reasoning);
+        }
+    }
+    let description = match slot {
+        ModelSlot::General => "Default completion route for Reliquary. Initially uses the Hermes chat model.",
+        ModelSlot::EntityResolution => "Required for completed-turn processing. Initially uses the Hermes chat model.",
+        ModelSlot::EntityExtraction => "Optional route for entity extraction.",
+        ModelSlot::Embedding if app.models.endpoints.is_empty() => "Add a saved OpenAI-compatible endpoint under Models.",
+        ModelSlot::Embedding => "Choose the endpoint used for indexing and recall.",
+        _ => "Optional override. Reliquary applies its fallback when this slot is unset.",
+    };
+    super::settings::card_row(slot_name(slot), description, controls.into(), app.dark)
+}
+
+#[cfg(feature = "reliquary")]
+fn switchboard_rows(app: &Hermes) -> Vec<Element<'_, Message>> {
+    let mut rows = ModelSlot::ALL.into_iter()
+        .map(|slot| switchboard_route_row(app, slot))
+        .collect::<Vec<_>>();
+    let state = &app.profile_settings;
+    let dimensions = text_input("Dimensions", &state.switchboard_dimensions)
+        .size(11)
+        .padding([5, 7])
+        .width(90)
+        .on_input(|value| Message::ProfileSetting(Action::SwitchboardDimensions(value)));
+    let normalization = if state.switchboard_normalization.is_empty() {
+        "None".into()
+    } else {
+        state.switchboard_normalization.clone()
+    };
+    let norm = pick_list(vec!["None".to_owned(), "L2".into()], Some(normalization), |value| {
+        Message::ProfileSetting(Action::SwitchboardNormalization(value))
+    }).text_size(11).width(90);
+    let save = button(text("Save Switchboard").size(12))
+        .on_press(Message::ProfileSetting(Action::SaveSwitchboard));
+    let controls = row![dimensions, norm, save].spacing(6).align_y(Alignment::Center);
+    rows.push(super::settings::card_row(
+        "Embedding settings",
+        "Set the model’s output dimensions and normalization.",
+        controls.into(),
         app.dark,
-    )
+    ));
+    rows
 }
 
 pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
@@ -324,7 +525,8 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
             .width(165).text_size(13).padding([7, 10]);
         rows.push(super::settings::card_row("Memory provider", description, selector.into(), dark));
         if stock && matches!(saved.memory_provider, Reliquary | Auto) {
-            rows.push(embedding_row(app));
+            #[cfg(feature = "reliquary")]
+            rows.extend(switchboard_rows(app));
         }
     }
     for f in FIELDS.iter().filter(|f|f.page==page){
@@ -371,4 +573,18 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
         body=body.push(button(text("Import sessions…").size(13)).on_press(Message::Navigate(super::Screen::Import)));
     }
     super::settings::settings_content(container(body).width(Fill).into())
+}
+
+#[cfg(test)]
+mod switchboard_tests {
+    use super::effective_route;
+
+    #[test]
+    fn staged_clear_hides_saved_route_and_staged_route_replaces_it() {
+        let saved = String::from("saved");
+        let pending = String::from("pending");
+        assert!(effective_route(Some(None), Some(&saved)).is_none());
+        assert_eq!(effective_route(None, Some(&saved)), Some(&saved));
+        assert_eq!(effective_route(Some(Some(&pending)), Some(&saved)), Some(&pending));
+    }
 }

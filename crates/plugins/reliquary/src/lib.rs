@@ -5,6 +5,12 @@ mod hosted;
 mod memory;
 mod query;
 mod storage;
+mod switchboard;
+
+pub use switchboard::{
+    EmbeddingNormalization, HostedEmbeddingSettings, HostedModelRoute, HostedSwitchboardConfig,
+    ModelSlot, save_switchboard_config, switchboard_config,
+};
 
 use anyhow::Result;
 use hermes_library::{
