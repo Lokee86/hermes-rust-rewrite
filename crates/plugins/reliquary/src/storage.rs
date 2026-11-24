@@ -322,16 +322,32 @@ fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn relocate_legacy_owner_paths(topology: &mut Topology, from: &Path, to: &Path) {
+    let from = legacy_comparison_path(from);
     for owner in topology.owners.values_mut() {
         let Ok(path) = normalized_absolute_path(&owner.path) else {
             continue;
         };
-        if let Ok(relative) = path.strip_prefix(from) {
+        if let Ok(relative) = legacy_comparison_path(&path).strip_prefix(&from) {
             if !relative.as_os_str().is_empty() {
                 owner.path = to.join(relative);
             }
         }
     }
+}
+
+fn legacy_comparison_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str() {
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(dos) = text.strip_prefix(r"\\?\")
+            && Path::new(dos).is_absolute()
+        {
+            return PathBuf::from(dos);
+        }
+    }
+    path.to_owned()
 }
 
 fn checked_folder(name: &str) -> Result<()> {

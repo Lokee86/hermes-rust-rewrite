@@ -1,4 +1,5 @@
 use super::*;
+use hermes_engine::memory_capture::CaptureBinding;
 use serde_json::{Value, json};
 use std::{sync::mpsc, thread, time::Duration};
 
@@ -12,8 +13,10 @@ fn legacy_profile(temp: &Path) -> (Library, PathBuf, OwnerId, OwnerId, OwnerId) 
     let phy = Phylactery::create(directory.join("work.phy")).unwrap();
     let external_path = temp.join("external.rel");
     let external = Rel::create(&external_path).unwrap();
+    let general_path = general.path().to_str().unwrap();
+    let general_path = general_path.strip_prefix(r"\\?\").unwrap_or(general_path);
     let owners = json!({
-        general.owner_id().to_string(): {"kind":"rel", "path":general.path()},
+        general.owner_id().to_string(): {"kind":"rel", "path":general_path},
         project.owner_id().to_string(): {"kind":"rel", "path":project.path()},
         phy.owner_id().to_string(): {"kind":"phylactery", "path":phy.path()},
         external.owner_id().to_string(): {"kind":"rel", "path":external_path},
@@ -54,6 +57,17 @@ fn legacy_profile(temp: &Path) -> (Library, PathBuf, OwnerId, OwnerId, OwnerId) 
 
 fn legacy_topology(home: &Path) -> Value {
     serde_json::from_slice(&fs::read(home.join("reliquary").join(TOPOLOGY)).unwrap()).unwrap()
+}
+
+fn assert_legacy_binding(memory: &EmbeddedMemory, general: OwnerId, phy: OwnerId) {
+    let binding = CaptureBinding {
+        profile_id: "work".into(),
+        principal_id: "legacy-principal".into(),
+        project_id: None,
+        rel_id: general.to_string(),
+        phy_id: phy.to_string(),
+    };
+    assert_eq!(memory.route(&binding).unwrap().0, general);
 }
 
 #[test]
@@ -104,15 +118,14 @@ fn renaming_pre_managed_profile_rebases_only_profile_owned_paths() {
     let memory = open_at(&library, "office", false, &adjacent)
         .unwrap()
         .unwrap();
-    assert_eq!(memory.general, general);
-    assert_eq!(memory.phy, phy);
+    assert_legacy_binding(&memory, general, phy);
     assert_eq!(Rel::open(&external_path).unwrap().owner_id(), external_id);
 }
 
 #[test]
 fn opening_renamed_legacy_profile_recovers_interrupted_path_rewrite() {
     let temp = tempfile::tempdir().unwrap();
-    let (catalog, old_home, general, _project, _phy) = legacy_profile(temp.path());
+    let (catalog, old_home, general, _project, phy) = legacy_profile(temp.path());
     let directory = old_home.join("reliquary");
     let intent = LegacyRelocation {
         version: 1,
@@ -137,7 +150,7 @@ fn opening_renamed_legacy_profile_recovers_interrupted_path_rewrite() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(memory.general, general);
+    assert_legacy_binding(&memory, general, phy);
     let topology = legacy_topology(&new_home);
     assert_eq!(topology["profile_id"], "work");
     assert_eq!(
