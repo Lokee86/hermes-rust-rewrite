@@ -3,6 +3,7 @@ pub use attachment::Attachment;
 pub mod herdr;
 mod history;
 mod mcp;
+mod plugin_hooks;
 pub mod connector;
 pub mod skill_catalog;
 pub mod plugins;
@@ -273,7 +274,9 @@ impl Session {
             self.publish(events)?;
             ensure!(round < self.settings.max_turns, "Stopped after {} rounds of tool calls",self.settings.max_turns);
             for call in calls {
-                let (approved, result) = if call.name == "memory_query" {
+                let (approved, result) = if let Some(message) = plugin_hooks::pre_tool_call(&mut mcp, &call).await {
+                    (false, json!({"error": message}).to_string())
+                } else if call.name == "memory_query" {
                     if let Some(query) = &native {
                         let reply = native_memory::invoke(query.clone(), &call, provider.config(), events, &self.settings).await?;
                         if let Some(content) = reply.model_content {
@@ -288,6 +291,7 @@ impl Session {
                     let value = subagents::delegate(&args, provider.config().clone(), provider.options().clone(), &self.profile_root, self.tools.workspace_root(), self.native_enrolled, events, cancel.clone()).await;
                     (true, value.to_string())
                 } else { handle_tool(&call, index, events, &self.tools, self.processes.as_mut(), self.memory.as_mut(), &mut mcp, &self.settings,&self.profile_root).await? };
+                let result = if approved { plugin_hooks::after_tool_call(&mut mcp, &call, result).await } else { result };
                 let result=if call.name=="read_file" {result}else{self.settings.bound_tool_result(result)};
                 self.history.turns[index].entries.push(Entry::Tool { id:call.id, name:call.name, approved, result });
                 self.publish(events)?;

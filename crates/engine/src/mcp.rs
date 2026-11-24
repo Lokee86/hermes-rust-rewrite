@@ -26,6 +26,8 @@ pub(crate) struct Mcp {
     /// Exposed name → (server-side tool name, definition).
     tools: BTreeMap<String, Value>,
     prefix: String,
+    /// Hermes lifecycle hooks the server serves through `hermes/hook` (hermes-python-host).
+    hooks: Vec<String>,
 }
 
 impl Mcp {
@@ -33,7 +35,7 @@ impl Mcp {
     pub(crate) async fn connect_http(url:&str,token:Option<String>,headers:Vec<(String,String)>,prefix:&str)->Result<Self>{
         let url=crate::connector::validated(url)?;
         let client = Client::builder().timeout(Duration::from_secs(45)).redirect(reqwest::redirect::Policy::none()).build()?;
-        Self { transport: Transport::Http { client, url, token, headers, session: None }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into() }.handshake().await
+        Self { transport: Transport::Http { client, url, token, headers, session: None }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into(), hooks: vec![] }.handshake().await
     }
     pub(crate) async fn connect_stdio(spec: Stdio, prefix: &str) -> Result<Self> {
         let mut command = tokio::process::Command::new(&spec.command);
@@ -42,7 +44,7 @@ impl Mcp {
         let mut child = command.spawn().with_context(|| format!("Could not start {}", spec.command))?;
         let stdin = child.stdin.take().context("No stdin")?;
         let lines = BufReader::new(child.stdout.take().context("No stdout")?).lines();
-        Self { transport: Transport::Stdio { child, stdin, lines }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into() }.handshake().await
+        Self { transport: Transport::Stdio { child, stdin, lines }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into(), hooks: vec![] }.handshake().await
     }
 
     async fn handshake(mut self) -> Result<Self> {
@@ -51,6 +53,7 @@ impl Mcp {
         ensure!([VERSION, "2025-03-26", "2024-11-05"].contains(&protocol), "Unsupported MCP protocol version {protocol}");
         ensure!(hello.pointer("/capabilities/tools").is_some(), "MCP server does not offer tools");
         self.version = protocol.to_owned();
+        self.hooks = hello.pointer("/capabilities/experimental/hermes/hooks").and_then(Value::as_array).map(|h| h.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         self.notify(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await?;
         let mut cursor = None;
         let mut seen_cursors = std::collections::HashSet::<String>::new();
@@ -142,6 +145,12 @@ impl Mcp {
         self.tools.iter().map(|(name,tool)| json!({"type":"function","function":{"name":name,"description":tool["description"].as_str().unwrap_or("External MCP tool"),"parameters":tool["inputSchema"]}})).collect()
     }
     pub fn contains(&self, name: &str) -> bool { self.tools.contains_key(name) }
+    pub(crate) fn has_hook(&self, hook: &str) -> bool { self.hooks.iter().any(|h| h == hook) }
+    /// Run a Hermes lifecycle hook on the server; its callbacks' non-null results.
+    pub(crate) async fn hook(&mut self, hook: &str, kwargs: Value) -> Result<Vec<Value>> {
+        let reply = self.request("hermes/hook", json!({"name": hook, "kwargs": kwargs})).await?;
+        Ok(reply["results"].as_array().cloned().unwrap_or_default())
+    }
 
     pub async fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
         let tool = self.tools.get(name).context("Unknown MCP tool")?;

@@ -1370,8 +1370,10 @@ mod tests {
             environment: &[],
             trusted_programs: &[],
         };
-        let ordinary = root.path().join("output.txt");
-        let sibling = root.path().with_extension("sibling").join("output.txt");
+        // Operands are compared lexically with the canonical session directory (macOS temp
+        // directories sit behind the /var -> /private/var link).
+        let ordinary = cwd.join("output.txt");
+        let sibling = cwd.with_extension("sibling").join("output.txt");
         assert_eq!(
             session_operand(ordinary.to_str().unwrap(), Some(&context)),
             Some("output.txt")
@@ -1380,7 +1382,7 @@ mod tests {
             session_operand(sibling.to_str().unwrap(), Some(&context)),
             None
         );
-        let script = root.path().join("probe.py");
+        let script = cwd.join("probe.py");
         assert!(local_python_script(
             &[script.to_str().unwrap()],
             native_shell(),
