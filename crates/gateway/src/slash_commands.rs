@@ -341,7 +341,7 @@ mod tests {
     fn local_peer() -> Peer {
         let (tx, _rx) = tokio::sync::mpsc::channel(32);
         Peer {
-            id: "slash-test-peer".into(),
+            id: crate::new_id(),
             tx,
             stop: crate::CancellationToken::new(),
             canonical: true,
