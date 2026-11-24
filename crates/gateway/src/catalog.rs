@@ -35,7 +35,10 @@ impl Shared {
             .await
             .map_err(RpcError::internal)?
             .map_err(RpcError::internal)?;
-            for id in &archived { self.memory_source_terminal(id).await.map_err(RpcError::internal)?; }
+            for id in &archived {
+                self.fence_python_source(id, python_memory::TerminalReason::Archive).await.map_err(RpcError::internal)?;
+                self.memory_source_terminal(id).await.map_err(RpcError::internal)?;
+            }
             return Ok(json!({"archived":archived}));
         }
         let id = required_string(params, "session_id")?.to_owned();
@@ -56,13 +59,21 @@ impl Shared {
                 if archived.is_none() && pinned.is_none() {
                     return Err(RpcError::invalid("A changed catalog flag is required"));
                 }
+                // Recover the terminal fence if an earlier owner stopped between
+                // committing the archive and handing it off to memory.
+                if archived == Some(false) && self.library.session(&id).is_ok_and(|s| s.archived) {
+                    self.fence_python_source(&id, python_memory::TerminalReason::Archive).await.map_err(RpcError::internal)?;
+                }
                 let summary = tokio::task::spawn_blocking(move || {
                     library.set_session_flags(&selected, archived, pinned)
                 })
                 .await
                 .map_err(RpcError::internal)?
                 .map_err(RpcError::internal)?;
-                if archived == Some(true) { self.memory_source_terminal(&id).await.map_err(RpcError::internal)?; }
+                if archived == Some(true) {
+                    self.fence_python_source(&id, python_memory::TerminalReason::Archive).await.map_err(RpcError::internal)?;
+                    self.memory_source_terminal(&id).await.map_err(RpcError::internal)?;
+                }
                 let live = self.sessions.lock().await.get(&id).cloned();
                 if let Some(live) = live {
                     *lock(&live.summary) = summary.clone();
@@ -84,10 +95,16 @@ impl Shared {
                     }
                     sessions.remove(&id);
                 }
+                if self.library.session(&id).is_ok_and(|s| s.archived) {
+                    // Save the destinations before deleting the record that
+                    // identifies which providers received its history.
+                    self.fence_python_source(&id, python_memory::TerminalReason::Archive).await.map_err(RpcError::internal)?;
+                }
                 tokio::task::spawn_blocking(move || library.delete_archived_if_present(&selected))
                     .await
                     .map_err(RpcError::internal)?
                     .map_err(RpcError::internal)?;
+                self.fence_python_source(&id, python_memory::TerminalReason::Delete).await.map_err(RpcError::internal)?;
                 self.memory_source_terminal(&id).await.map_err(RpcError::internal)?;
                 Ok(json!({"deleted":true,"session_id":id}))
             }
