@@ -294,6 +294,11 @@ impl Shared {
         matches!(summary.source, hermes_library::SessionSource::Native)
             && summary.bot.is_none()
             && !summary.archived
+            && !summary
+                .directory
+                .join("backup-source.json")
+                .try_exists()
+                .unwrap_or(true)
             && matches!(
                 settings.source.as_str(),
                 "gui" | "desktop" | "cli" | "tui" | "acp"
@@ -580,20 +585,27 @@ impl Shared {
             }
             let history = source.history_for(selection, Some(index));
             let messages = provider_messages(&source.history, &history, index, &source.protected());
-            let prefix = format!("generation-{}-", receipt.generation);
-            let current = |role| {
+            let user_uid = format!("generation-{}-user", receipt.generation);
+            let assistant_uid = source
+                .history
+                .turns
+                .get(index)
+                .and_then(|turn| {
+                    turn.entries
+                        .iter()
+                        .rposition(|entry| matches!(entry, Entry::Assistant { .. }))
+                })
+                .map(|entry| format!("generation-{}-assistant-{entry}", receipt.generation));
+            let committed_text = |uid: &str| {
                 messages
                     .iter()
-                    .rev()
-                    .find(|message| {
-                        message["role"] == role
-                            && message["message_uid"]
-                                .as_str()
-                                .is_some_and(|uid| uid.starts_with(&prefix))
-                    })
+                    .find(|message| message["message_uid"].as_str() == Some(uid))
                     .and_then(|message| message["content"].as_str())
             };
-            let (Some(user), Some(assistant)) = (current("user"), current("assistant")) else {
+            let (Some(user), Some(assistant)) = (
+                committed_text(&user_uid),
+                assistant_uid.as_deref().and_then(committed_text),
+            ) else {
                 self.update_python_delivery(
                     &source.summary,
                     receipt,
