@@ -201,7 +201,11 @@ impl Shared {
         ]
         .into_iter()
         .map(|choice| {
-            if choice == MemoryProvider::Reliquary && !native_available {
+            // Choosing Reliquary enrolls the profile, so it need not be mounted to be offered.
+            let offered = native_available
+                || (stock_plugins::has_memory_plugin()
+                    && settings.memory_provider != MemoryProvider::Reliquary);
+            if choice == MemoryProvider::Reliquary && !offered {
                 json!({"id":choice.as_id(),"label":choice.to_string(),"status":"unavailable",
                     "reason":"Native Reliquary is unavailable for this profile"})
             } else {
