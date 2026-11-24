@@ -114,7 +114,7 @@ Choose a provider in Desktop under **Settings → Memory & Context**, or set `me
 | `external` | Expose the designated external provider's MCP tools to the agent. Configure the HTTP MCP endpoint under **Capabilities → Connectors**, select **Use as external memory provider**, and enable memory and MCP tools. The provider defines its tools and storage behavior. |
 | `off` | Disable native capture, memory tools, Markdown note injection, and the designated external memory connector. Other configured tools keep their own settings. |
 
-The default Gateway and Desktop builds include Reliquary. To build either without the native backend, use `cargo build -p hermes-gateway --no-default-features` or `cargo build -p hermes-desktop --no-default-features`. No separate Reliquary process is needed for the embedded provider.
+Reliquary is off by default: Gateway, Desktop and the release packages are built without it, and `auto` then uses Markdown notes. Reliquary does not yet publish a license, so builds that include it are for local development only and must not be distributed. To build with the native backend, use `cargo build -p hermes-gateway --features reliquary` or `cargo build -p hermes-desktop --features reliquary`. No separate Reliquary process is needed for the embedded provider.
 
 ### Reliquary enrollment and capture
 
