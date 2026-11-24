@@ -540,7 +540,7 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
         let saved = &state.saved;
         let stock = hermes_gateway::stock_plugins::has_memory_plugin();
         let description = match &saved.memory_provider {
-            Auto if stock => "Automatically enroll this profile in the Reliquary stock plugin. Choose another provider to opt out.",
+            Auto if stock => "Use Reliquary if this profile is already enrolled. Otherwise use its Markdown notes.",
             Auto => "Use this profile’s Markdown notes.",
             Reliquary if stock => "Enroll this profile with the Reliquary stock plugin. New chats can capture turns and query their assigned memory.",
             Reliquary => "This build does not include the Reliquary stock plugin.",

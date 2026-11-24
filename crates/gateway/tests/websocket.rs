@@ -619,10 +619,28 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     ProfileSettings::update(library.root(), disabled.as_object().unwrap()).unwrap();
     let gateway = PortableGateway::start(&binary, library.root(), &provider.config()).await;
     assert_eq!(gateway.reconcile_memory().await["enrolled"], false);
-    let state = install.join("reliquary").join("work");
-    assert!(!state.exists());
-    let settings = json!({"memory_provider":"auto", "approval_mode":"manual"});
-    ProfileSettings::update(library.root(), settings.as_object().unwrap()).unwrap();
+    let store = profiles.root().join("plugin-data").join("reliquary_store");
+    let state = store.join("work");
+    let select = |provider: &str| {
+        let settings = json!({"memory_provider":provider, "approval_mode":"manual"});
+        ProfileSettings::update(library.root(), settings.as_object().unwrap()).unwrap();
+    };
+    // Automatic keeps an unenrolled profile on its Markdown notes and creates nothing.
+    select("auto");
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], false);
+    assert!(!store.exists());
+    let mut unenrolled = gateway.client().await;
+    let chat = unenrolled.ok("session.create", json!({"title":"Unenrolled"})).await;
+    unenrolled.ok("prompt.submit", json!({"session_id":chat["session_id"],"submission_id":"notes","text":CONTEXT_PROBE})).await;
+    let report = context_report(&unenrolled.event("message.complete").await);
+    assert_eq!(report["notes_visible"], true);
+    assert_eq!(report["query_tool"], false);
+    drop(unenrolled);
+    select("reliquary");
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], true);
+    assert!(!install.join("reliquary").exists());
+    // An existing enrollment stays in use under Automatic.
+    select("auto");
     assert_eq!(gateway.reconcile_memory().await["enrolled"], true);
     assert!(state.join("work.phy").is_file());
     assert!(state.join("general.rel").is_file());
@@ -706,7 +724,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
 
     assert_eq!(hermes_gateway::stock_plugins::rename_profile(&profiles, "work", "office").unwrap(), None);
     assert!(!state.exists());
-    let state = install.join("reliquary").join("office");
+    let state = store.join("office");
     assert!(state.join("office.phy").is_file());
     assert!(!state.join("work.phy").exists());
     let relocated = read_topology(&state);

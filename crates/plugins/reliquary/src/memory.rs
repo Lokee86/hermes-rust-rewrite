@@ -724,7 +724,12 @@ impl MemoryStore for EmbeddedMemory {
 }
 
 pub(super) fn ensure_directory(dir: &Path) -> Result<()> {
-    match fs::create_dir(dir) {
+    #[allow(unused_mut)]
+    let mut builder = fs::DirBuilder::new();
+    // Copied conversations are private to the user.
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
