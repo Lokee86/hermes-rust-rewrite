@@ -169,38 +169,8 @@ impl PendingMemoryCapture {
     }
 }
 
-/// Immutable prompt data with a one-shot acknowledgement after a successful
-/// model response. A dropped sender means no confirmed consumption.
-pub struct TurnRecall {
-    context: String,
-    delivered: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl TurnRecall {
-    pub fn new(context: String) -> (Self, tokio::sync::oneshot::Receiver<()>) {
-        let (delivered, receipt) = tokio::sync::oneshot::channel();
-        (
-            Self {
-                context,
-                delivered: Some(delivered),
-            },
-            receipt,
-        )
-    }
-
-    pub(crate) fn context(&self) -> &str {
-        &self.context
-    }
-
-    pub(crate) fn confirm(&mut self) {
-        if let Some(delivered) = self.delivered.take() {
-            let _ = delivered.send(());
-        }
-    }
-}
-
 /// Binary data URLs and embedded base64 are outside the text-only memory boundary.
-pub fn contains_inline_data(text: &str) -> bool {
+fn contains_inline_data(text: &str) -> bool {
     text.trim_start()
         .get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
@@ -208,16 +178,6 @@ pub fn contains_inline_data(text: &str) -> bool {
             .as_bytes()
             .windows(8)
             .any(|part| part.eq_ignore_ascii_case(b";base64,"))
-}
-
-/// Apply the same unconditional egress scrub to a Reliquary query or projection.
-pub fn redact_text(text: &str) -> String {
-    let mut messages = [json!({"role":"user", "content":text})];
-    privacy::redact_messages(&mut messages);
-    messages[0]["content"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned()
 }
 
 #[cfg(test)]

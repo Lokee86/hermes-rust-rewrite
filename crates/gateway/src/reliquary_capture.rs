@@ -219,56 +219,6 @@ fn stage_next(
     Ok(None)
 }
 
-pub(super) fn copied_message_receipt(
-    summary: &SessionSummary,
-    binding: &CaptureBinding,
-    message_uid: &str,
-) -> Result<Option<hermes_engine::memory_capture::CaptureReceipt>> {
-    let Some(record) = read_committed(summary)? else {
-        return Ok(None);
-    };
-    let Some(authority) = record.authority else {
-        return Ok(None);
-    };
-    for admission in &authority.receipts {
-        let Some(marker) = &admission.capture else {
-            continue;
-        };
-        let Some(receipt) = &marker.receipt else {
-            continue;
-        };
-        if ![
-            format!("generation-{}-user", marker.generation),
-            format!("generation-{}-assistant", marker.generation),
-        ]
-        .iter()
-        .any(|id| id == message_uid)
-        {
-            continue;
-        }
-        ensure!(
-            &marker.binding == binding
-                && marker.session_id == summary.id
-                && marker.admission_id == admission.id
-                && marker.generation == admission.generation
-                && Some(marker.turn_index) == admission.turn_index
-                && admission.status == "terminal",
-            "copied memory does not match its native admission"
-        );
-        let turn = record
-            .history
-            .turns
-            .get(marker.turn_index)
-            .context("memory source turn disappeared")?;
-        return Ok(marker
-            .verified_rows(turn)?
-            .iter()
-            .any(|row| row.message_uid == message_uid)
-            .then(|| receipt.clone()));
-    }
-    Ok(None)
-}
-
 enum CaptureUpdate {
     Staged(hermes_engine::memory_capture::CaptureReceipt),
     Settled,

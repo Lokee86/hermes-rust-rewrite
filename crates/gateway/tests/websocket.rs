@@ -1,6 +1,7 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes},
+    extract::State,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
@@ -9,7 +10,15 @@ use futures_util::{SinkExt, StreamExt, stream};
 use hermes_engine::Config;
 use hermes_gateway::{Gateway, GatewayConfig, RunningGateway};
 use serde_json::{Value, json};
-use std::{convert::Infallible, net::SocketAddr, time::Duration};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -140,6 +149,7 @@ impl Client {
 }
 struct Provider {
     address: SocketAddr,
+    memory_requests: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 impl Drop for Provider {
@@ -151,17 +161,20 @@ impl Provider {
     async fn start() -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
+        let memory_requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&memory_requests);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new()
                     .route("/v1/chat/completions", post(model))
-                    .route("/v1/embeddings", post(embed_memory_fixture)),
+                    .route("/v1/embeddings", post(embed_memory_fixture))
+                    .with_state(observed),
             )
             .await
             .unwrap();
         });
-        Self { address, task }
+        Self { address, memory_requests, task }
     }
     fn config(&self) -> Config {
         Config {
@@ -186,21 +199,21 @@ fn event(delta: Value, finish: Option<&str>) -> String {
         json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
     )
 }
-async fn model(Json(request): Json<Value>) -> Response {
+async fn model(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Response {
     if let Some(schema) = request["response_format"].get("json_schema") {
+        memory_requests.fetch_add(1, Ordering::Relaxed);
         return Json(structured_memory_fixture(&request, schema)).into_response();
     }
     let messages = request["messages"].as_array().unwrap();
     let last = messages.last().unwrap();
-    if last["content"] == "Recall the Amethyst Lantern project." {
-        let context = messages[0]["content"].as_str().unwrap();
-        let reply = if context.contains(PROJECT_FACT) {
-            "The project fact reached the model."
-        } else {
-            "No project fact in context."
-        };
+    if last["content"] == CONTEXT_PROBE {
+        // Observe at the chat request. Background capture of this turn starts after it commits.
+        let report = json!({
+            "memory_requests": memory_requests.load(Ordering::Relaxed),
+            "included_fact": messages.iter().any(|message| message.to_string().contains(PROJECT_FACT)),
+        });
         return ([(header::CONTENT_TYPE, "text/event-stream")],
-                format!("{}data: [DONE]\n\n", event(json!({"content":reply}), Some("stop")))).into_response();
+                format!("{}data: [DONE]\n\n", event(json!({"content":report.to_string()}), Some("stop")))).into_response();
     }
     if last["content"] == "provider-error" {
         return (
@@ -289,8 +302,10 @@ async fn model(Json(request): Json<Value>) -> Response {
 }
 
 const PROJECT_FACT: &str = "The workspace project is Amethyst Lantern 741.";
+const CONTEXT_PROBE: &str = "How is the Amethyst Lantern project going?";
 
-async fn embed_memory_fixture(Json(request): Json<Value>) -> Json<Value> {
+async fn embed_memory_fixture(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Json<Value> {
+    memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
     let data = (0..inputs.len()).map(|index| {
         json!({"index": index, "embedding": [1.0, 0.0]})
@@ -348,7 +363,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn enrolled_reliquary_project_chat_captures_and_recalls_across_gateway_restart() {
+async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval() {
     use hermes_engine::{credentials::EndpointStore, memory_capture::CaptureReceipt};
     use hermes_library::Library;
     use reliquary_memory::{
@@ -429,6 +444,7 @@ async fn enrolled_reliquary_project_chat_captures_and_recalls_across_gateway_res
         )]).install(&reader).unwrap().0.authenticate(token).unwrap();
         let status = instance.native_import_status(owner, &accepted.import_id).unwrap().unwrap();
         assert_eq!(status.state, NativeImportState::Completed);
+        assert!(instance.has_active_vectors(owner).unwrap());
         assert_eq!(status.receipt_digest, Some(accepted.receipt_digest));
     }
     let restarted = provider.gateway(&root).await;
@@ -440,12 +456,19 @@ async fn enrolled_reliquary_project_chat_captures_and_recalls_across_gateway_res
     assert_eq!(record["authority"]["receipts"][0]["capture"]["receipt"]["import_id"], accepted.import_id);
 
     let related = next.ok("session.create", json!({"project_id":project.id,"title":"Same project"})).await;
-    next.ok("prompt.submit", json!({"session_id":related["session_id"],"submission_id":"ask","text":"Recall the Amethyst Lantern project."})).await;
-    assert_eq!(next.event("message.complete").await["payload"]["text"], "The project fact reached the model.");
+    provider.memory_requests.store(0, Ordering::Relaxed);
+    next.ok("prompt.submit", json!({"session_id":related["session_id"],"submission_id":"ask","text":CONTEXT_PROBE})).await;
+    let completed = next.event("message.complete").await;
+    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(report, json!({"memory_requests":0,"included_fact":false}));
 
-    let general = next.ok("session.create", json!({"title":"General chat"})).await;
-    next.ok("prompt.submit", json!({"session_id":general["session_id"],"submission_id":"ask","text":"Recall the Amethyst Lantern project."})).await;
-    assert_eq!(next.event("message.complete").await["payload"]["text"], "No project fact in context.");
+    let general_chat = next.ok("session.create", json!({"title":"General chat"})).await;
+    let general_id = general_chat["session_id"].as_str().unwrap();
+    next.ok("prompt.submit", json!({"session_id":general_id,"submission_id":"hello","text":"Hello"})).await;
+    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    let general_record = library.session(general_id).unwrap().directory.join("conversation.json");
+    let record: Value = serde_json::from_slice(&fs::read(general_record).unwrap()).unwrap();
+    assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general.owner_id().to_string());
     drop(next);
     restarted.shutdown().await.unwrap();
 }

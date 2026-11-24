@@ -9,7 +9,6 @@ pub mod replay;
 mod reliquary;
 mod reliquary_capture;
 mod reliquary_hosted;
-mod reliquary_recall;
 
 mod auth;
 mod rest;
@@ -222,7 +221,6 @@ impl Gateway {
             profile_name,
             memory,
             memory_wake: tokio::sync::Notify::new(),
-            memory_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             memory_task: Mutex::new(None),
             library,
             provider: config.provider,
@@ -331,7 +329,6 @@ struct Shared {
     profile_name: String,
     memory: Option<Arc<reliquary::EmbeddedMemory>>,
     memory_wake: tokio::sync::Notify,
-    memory_slots: Arc<tokio::sync::Semaphore>,
     memory_task: Mutex<Option<JoinHandle<()>>>,
     library: Library,
     provider: Config,
@@ -1511,10 +1508,6 @@ impl Shared {
         self.emit(&session, "message.start", json!({"turn_id":stream.id}));
         self.emit(&session, "session.info", self.info(&session));
         let (tx, rx) = async_channel::bounded(1024);
-        let (recall, memory_confirmation) = match self.prepare_turn_recall(&session, &admission, &config, &cancel).await {
-            Some((recall, confirmation)) => (Some(recall), Some(confirmation)),
-            None => (None, None),
-        };
         let mut engine = session.engine.lock().await;
         let initial_count = engine.history().turns.len();
         let mut members = session.member_engines.lock().await;
@@ -1544,12 +1537,7 @@ impl Shared {
                 _ => admission.text.clone(),
             };
             let result = {
-                let future = async {
-                    match recall {
-                        Some(recall) => target.run_admitted_turn_with_recall(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone(), recall).await,
-                        None => target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone()).await,
-                    }
-                };
+                let future = target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone());
                 tokio::pin!(future);
                 loop {
                     tokio::select! {
@@ -1567,11 +1555,6 @@ impl Shared {
         };
         while let Ok(event) = rx.try_recv() {
             self.handle_event(&session, event, &mut stream, &cancel);
-        }
-        if let Some(confirmation) = memory_confirmation {
-            // Give Root a chance to record the current selection before staging
-            // this new turn can advance the owner cut.
-            let _ = tokio::time::timeout(Duration::from_secs(1), confirmation).await;
         }
         if admission.group.is_some() { engine.accept_committed_history(history.clone()); }
         drop(members);
