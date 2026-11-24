@@ -340,6 +340,12 @@ const REQUEST_QUERY: &str = "Look up the project name in memory.";
 const PROFILE_NOTE: &str = "The notes canary is violet.";
 const CONTEXT_PROBE: &str = "How is the Amethyst Lantern project going?";
 
+fn context_report(completed: &Value) -> Value {
+    assert_eq!(completed["payload"]["status"], "complete", "{completed}");
+    serde_json::from_str(completed["payload"]["text"].as_str().unwrap())
+        .unwrap_or_else(|error| panic!("invalid context probe response: {error}: {completed}"))
+}
+
 async fn embed_memory_fixture(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Json<Value> {
     memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
@@ -535,7 +541,7 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     provider.memory_requests.store(0, Ordering::Relaxed);
     next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"ordinary","text":CONTEXT_PROBE})).await;
     let completed = next.event("message.complete").await;
-    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    let report = context_report(&completed);
     assert_eq!(report, json!({"memory_requests":0,"included_fact":false,
         "notes_visible":false,"notes_tool":false,"query_tool":true}));
     memory_capture_receipt(&related_record, 0).await;
@@ -553,7 +559,7 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     set_provider("off");
     next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"disabled","text":CONTEXT_PROBE})).await;
     let completed = next.event("message.complete").await;
-    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    let report = context_report(&completed);
     for flag in ["query_tool", "notes_tool", "notes_visible", "included_fact"] {
         assert_eq!(report[flag], false, "{flag} while memory is disabled");
     }
@@ -562,7 +568,7 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     set_provider("reliquary");
     next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"reenabled","text":CONTEXT_PROBE})).await;
     let completed = next.event("message.complete").await;
-    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    let report = context_report(&completed);
     assert_eq!(report["query_tool"], true);
     assert_eq!(report["included_fact"], false);
     memory_capture_receipt(&related_record, 3).await;
@@ -602,7 +608,7 @@ async fn disabled_memory_ignores_broken_enrollment_and_profile_notes() {
     let id = session["session_id"].as_str().unwrap();
     client.ok("prompt.submit", json!({"session_id":id,"submission_id":"disabled","text":CONTEXT_PROBE})).await;
     let completed = client.event("message.complete").await;
-    let report: Value = serde_json::from_str(completed["payload"]["text"].as_str().unwrap()).unwrap();
+    let report = context_report(&completed);
     assert_eq!(report, json!({"memory_requests":0,"included_fact":false,
         "notes_visible":false,"notes_tool":false,"query_tool":false}));
     let directory = Library::open(root.path()).unwrap().session(id).unwrap().directory;
