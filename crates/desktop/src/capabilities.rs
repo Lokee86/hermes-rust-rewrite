@@ -113,6 +113,11 @@ pub(super) fn open(app: &mut Hermes) -> Task<Message> {
 
 fn reset_paging(state: &mut State) { state.limit = PAGE; state.detail = None; state.document = None; }
 
+fn refresh_runtime_plugins(app:&mut Hermes)->Task<Message>{
+    let Ok(conn)=app.chat_connection() else{return Task::none()};
+    Task::perform(async move{conn.request("commands.catalog",json!({})).await},|result|Message::Capability(Action::RuntimePlugins(result)))
+}
+
 pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
     let status_conn = if matches!(&action,Action::Show(Page::Plugins)){app.chat_connection().ok()}else{None};
     let root = app.library.as_ref().map(|lib| lib.root().to_owned());
