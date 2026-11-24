@@ -2,13 +2,12 @@
 //! through the gateway. The field names correspond to the desktop settings.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::{Path,PathBuf}, sync::LazyLock, collections::BTreeMap};
+use std::{borrow::Cow, fs, io::Write, path::{Path,PathBuf}, sync::LazyLock, collections::BTreeMap};
 
 pub static PERSONALITIES: LazyLock<BTreeMap<String,String>> = LazyLock::new(||
     serde_json::from_str(include_str!("personalities.json")).expect("built-in personality resources"));
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum MemoryProvider {
     #[default]
     Auto,
@@ -16,15 +15,54 @@ pub enum MemoryProvider {
     Notes,
     External,
     Off,
+    Plugin(String),
 }
 
 impl MemoryProvider {
-    pub fn resolve(self, native_enrolled: bool) -> Self {
+    pub fn resolve(&self, native_enrolled: bool) -> Self {
         match self {
             Self::Auto if native_enrolled => Self::Reliquary,
             Self::Auto => Self::Notes,
-            explicit => explicit,
+            explicit => explicit.clone(),
         }
+    }
+
+    pub fn as_id(&self) -> Cow<'_, str> {
+        match self {
+            Self::Auto => "auto".into(),
+            Self::Reliquary => "reliquary".into(),
+            Self::Notes => "notes".into(),
+            Self::External => "external".into(),
+            Self::Off => "off".into(),
+            Self::Plugin(id) => format!("plugin:{id}").into(),
+        }
+    }
+
+    pub fn from_id(value: &str) -> Result<Self> {
+        Ok(match value {
+            "auto" => Self::Auto,
+            "reliquary" => Self::Reliquary,
+            "notes" => Self::Notes,
+            "external" => Self::External,
+            "off" => Self::Off,
+            _ => {
+                let id = value.strip_prefix("plugin:").context("Unknown memory provider")?;
+                ensure!(crate::plugins::valid_name(id), "Invalid memory plugin ID");
+                Self::Plugin(id.into())
+            }
+        })
+    }
+}
+
+impl Serialize for MemoryProvider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_id().as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Self::from_id(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -36,6 +74,7 @@ impl std::fmt::Display for MemoryProvider {
             Self::Notes => "Markdown notes",
             Self::External => "External (MCP)",
             Self::Off => "Off",
+            Self::Plugin(id) => id,
         })
     }
 }
@@ -44,6 +83,7 @@ impl std::fmt::Display for MemoryProvider {
 #[serde(default)]
 pub struct ProfileSettings {
     pub memory_provider: MemoryProvider,
+    pub memory_provider_revision: u64,
     /// Reserve this profile's HTTP MCP connector for the External memory setting.
     pub external_memory_connector: bool,
     /// Legacy embedding selection used before the profile saves Switchboard routes.
@@ -83,7 +123,7 @@ pub struct MemoryEmbedding {
     pub dimensions: u32,
 }
 impl Default for ProfileSettings {
-    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, external_memory_connector: false, memory_embedding: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
+    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, memory_provider_revision: 0, external_memory_connector: false, memory_embedding: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
         memory_enabled:true,user_profile_enabled:true,memory_char_limit:crate::memory::DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:8,
         file_read_max_chars:100_000,tool_output_bytes:50000,tool_output_lines:2000,tool_output_line_length:2000,
@@ -112,16 +152,46 @@ impl ProfileSettings {
         Ok(())
     }
     pub fn update(root:&Path, changes:&serde_json::Map<String, serde_json::Value>)->Result<Self>{
+        Self::update_locked(root, |previous| {
+            let mut current=serde_json::to_value(previous)?;
+            let fields=current.as_object_mut().context("Invalid profile settings")?;
+            for (key,value) in changes {
+                ensure!(key != "memory_provider_revision" && fields.contains_key(key),"Unknown profile setting {key}");
+                fields.insert(key.clone(),value.clone());
+            }
+            let mut next:Self=serde_json::from_value(current)?;
+            if next.memory_provider != previous.memory_provider {
+                next.advance_memory_provider_revision()?;
+            }
+            Ok(next)
+        })
+    }
+
+    /// Retain the saved choice while invalidating deliveries admitted under a removed activation.
+    pub fn invalidate_plugin_memory(root: &Path, plugin_id: &str) -> Result<Self> {
+        Self::update_locked(root, |previous| {
+            let mut next = previous.clone();
+            if matches!(&next.memory_provider, MemoryProvider::Plugin(id) if id == plugin_id) {
+                next.advance_memory_provider_revision()?;
+            }
+            Ok(next)
+        })
+    }
+
+    fn advance_memory_provider_revision(&mut self) -> Result<()> {
+        self.memory_provider_revision = self.memory_provider_revision.checked_add(1)
+            .context("Memory provider revision is exhausted")?;
+        Ok(())
+    }
+
+    fn update_locked(root: &Path, modify: impl FnOnce(&Self) -> Result<Self>) -> Result<Self> {
         let lock=fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(root.join("agent-settings.lock"))?;
         fs2::FileExt::lock_exclusive(&lock)?;
-        let mut current=serde_json::to_value(Self::load(root)?)?;
-        let fields=current.as_object_mut().context("Invalid profile settings")?;
-        for (key,value) in changes {
-            ensure!(fields.contains_key(key),"Unknown profile setting {key}");
-            fields.insert(key.clone(),value.clone());
+        let previous = Self::load(root)?;
+        let next = modify(&previous)?;
+        if next != previous {
+            next.save(root)?;
         }
-        let next:Self=serde_json::from_value(current)?;
-        next.save(root)?;
         Ok(next)
     }
     fn save(&self,root:&Path)->Result<()> {
@@ -234,12 +304,13 @@ mod memory_provider_tests {
     fn only_a_designated_memory_connector_follows_the_provider_choice() {
         let mut settings = ProfileSettings::default();
         for mode in [MemoryProvider::Auto, MemoryProvider::Reliquary, MemoryProvider::Notes,
-                     MemoryProvider::Off, MemoryProvider::External] {
+                     MemoryProvider::Off, MemoryProvider::External, MemoryProvider::Plugin("recall".into())] {
+            let external = mode == MemoryProvider::External;
             settings.memory_provider = mode;
             settings.external_memory_connector = false;
             assert!(settings.connect_profile_mcp());
             settings.external_memory_connector = true;
-            assert_eq!(settings.connect_profile_mcp(), mode == MemoryProvider::External);
+            assert_eq!(settings.connect_profile_mcp(), external);
         }
         settings.mcp_tools = false;
         assert!(!settings.connect_profile_mcp());
@@ -248,6 +319,27 @@ mod memory_provider_tests {
         assert!(!settings.connect_profile_mcp());
         settings.external_memory_connector = false;
         assert!(settings.connect_profile_mcp());
+    }
+
+    #[test]
+    fn selection_and_activation_changes_persist_a_new_revision() {
+        let profile = tempfile::tempdir().unwrap();
+        let root = profile.path();
+        let select = |name: &str| {
+            ProfileSettings::update(root, json!({"memory_provider": name}).as_object().unwrap())
+        };
+        let plugin = select("plugin:recall").unwrap();
+        assert_eq!(plugin.memory_provider, MemoryProvider::Plugin("recall".into()));
+        assert_eq!(plugin.memory_provider_revision, 1);
+        assert_eq!(select("plugin:recall").unwrap().memory_provider_revision, 1);
+        assert_eq!(select("off").unwrap().memory_provider_revision, 2);
+        assert_eq!(select("plugin:recall").unwrap().memory_provider_revision, 3);
+        assert_eq!(ProfileSettings::invalidate_plugin_memory(root, "other").unwrap().memory_provider_revision, 3);
+        assert_eq!(ProfileSettings::invalidate_plugin_memory(root, "recall").unwrap().memory_provider_revision, 4);
+        assert!(select("plugin:../recall").is_err());
+        let saved = ProfileSettings::load(root).unwrap();
+        assert_eq!(saved.memory_provider.as_id(), "plugin:recall");
+        assert_eq!(saved.memory_provider_revision, 4);
     }
 }
 

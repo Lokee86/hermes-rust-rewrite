@@ -4,7 +4,7 @@ Audit of the Rust port, updated 23 November 2026. The reference is the public No
 
 ## What runs
 
-The bundle holds three Cargo-built native programs: `hermes-desktop` (Iced 0.14, a multi-window daemon), `hermes-gateway` and `hermes-python-host`. The Rust engine runs turns, streams replies, asks for approval and saves results. There is no Electron, Tauri or Node runtime. HTML artifacts preview in the OS webview (wry: WKWebView, WebView2, WebKitGTK); the global ⌘⇧Space hotkey uses the `global-hotkey` crate. Python plugins run in `hermes-python-host`, which embeds the CPython runtime shipped in the package (python-build-standalone 3.13: `libpython3.13.dylib` on macOS, `libpython3.13.so` on Linux, `python313.dll` on Windows) and implements the plugin `ctx` in Rust, so no Python install is needed. A plugin's `python_dependencies` install as wheels into its data folder. A plugin that imports Hermes internals falls back to an installed Hermes Python agent (`engine/assets/python_plugin_bridge.py`). The "hey hermes" wake-word model still needs that agent (`desktop/assets/wake_listener.py`); without it the wake word falls back to spotting the phrase in live dictation.
+The bundle holds three Cargo-built native programs: `hermes-desktop` (Iced 0.14, a multi-window daemon), `hermes-gateway` and `hermes-python-host`. The Rust engine runs turns, streams replies, asks for approval and saves results. There is no Electron, Tauri or Node runtime. HTML artifacts preview in the OS webview (wry: WKWebView, WebView2, WebKitGTK); the global ⌘⇧Space hotkey uses the `global-hotkey` crate. Python plugins run in `hermes-python-host`, which embeds the CPython runtime shipped in the package (python-build-standalone 3.13: `libpython3.13.dylib` on macOS, `libpython3.13.so` on Linux, `python313.dll` on Windows) and supplies `PluginHost` as the positional plugin registration object. Existing Python plugins can use `register(ctx)`. A plugin's `python_dependencies` install as wheels into its data folder. The profile gateway keeps embedded workers available for tools, supported hooks, plugin slash commands, and selected memory providers. The installed-agent bridge remains a legacy tool path. The "hey hermes" wake-word model still needs that agent (`desktop/assets/wake_listener.py`); without it the wake word falls back to spotting the phrase in live dictation.
 
 Evidence levels below: **verified live** means driven against real services or the real window on Apple Silicon macOS; **tested** means automated behaviour tests (158 pass, `cargo test --workspace`); **built** means compiled and reviewed but not exercised end to end. Windows and Linux are built in CI (`.github/workflows/desktop-native-rust.yml`) and have not been driven by hand.
 
@@ -57,7 +57,7 @@ The published OpenRPC file declares **263 unique method names**. The Rust gatewa
 | client | `client.capabilities` | — |
 | clipboard | — | `clipboard.paste` |
 | command | — | `command.dispatch`, `command.resolve` |
-| commands | — | `commands.catalog` |
+| commands | `commands.catalog` for installed plugin commands | Built-in command catalog parity |
 | complete | — | `complete.path`, `complete.slash` |
 | config | — | `config.get`, `config.set`, `config.show` |
 | connection | — | `connection.respond` |
@@ -101,7 +101,7 @@ The published OpenRPC file declares **263 unique method names**. The Rust gatewa
 | shared_metrics | — | `shared_metrics.desktop_daily`, `shared_metrics.desktop_dislike`, `shared_metrics.desktop_feature_use`, `shared_metrics.desktop_friction`, `shared_metrics.desktop_onboarding`, `shared_metrics.set`, `shared_metrics.slash_command`, `shared_metrics.startup_latency`, `shared_metrics.status`, `shared_metrics.update_run` |
 | shell | — | `shell.exec` |
 | skills | — | `skills.manage`, `skills.reload` |
-| slash | — | `slash.exec` |
+| slash | `slash.exec` for plugin commands in an attached local session | Built-in gateway dispatch parity |
 | spawn_tree | — | `spawn_tree.list`, `spawn_tree.load`, `spawn_tree.save` |
 | subagent | — | `subagent.interrupt`, `subagent.list`, `subagent.roster`, `subagent.steer`, `subagent.tail` |
 | subscription | — | `subscription.change`, `subscription.preview`, `subscription.resume`, `subscription.state`, `subscription.upgrade` |

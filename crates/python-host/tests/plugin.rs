@@ -2,6 +2,8 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 const PLUGIN: &str = r#"
 import asyncio, json
@@ -30,21 +32,65 @@ def register(ctx):
     ctx.register_tool("hidden", "shout", schema("hidden"), _shout, check_fn=lambda: False)
     ctx.register_tool("needs_key", "shout", schema("needs_key"), _shout, requires_env=["HERMES_TEST_UNSET_KEY"])
     ctx.register_hook("pre_tool_call", _guard)
-    ctx.register_command("shout", lambda raw: raw)  # not supported in the desktop app: skipped
+    ctx.register_command("shout", lambda raw: raw)
     ctx.register_tool("config_echo", "shout", schema("config_echo"), lambda args: ctx.get_config("volume", "quiet"))
 "#;
 
-struct Host { child: std::process::Child, out: BufReader<std::process::ChildStdout>, next: u64 }
+struct Host { child: std::process::Child, out: Receiver<String>, next: u64 }
 impl Host {
+    fn new(mut child: std::process::Child) -> Self {
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let (send, out) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {child, out, next: 0}
+    }
+
+    fn send(&mut self, message: Value) {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        stdin.write_all(format!("{message}\n").as_bytes()).unwrap();
+    }
+
+    fn read(&mut self, method: &str) -> Value {
+        let line = self.out.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|err| {
+            panic!("No reply from the plugin ({}) for {method}: {err}", self.child.id())
+        });
+        serde_json::from_str(&line).unwrap_or_else(|_| panic!("not JSON-RPC: {line:?}"))
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Value {
         self.next += 1;
-        let stdin = self.child.stdin.as_mut().unwrap();
-        writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": self.next, "method": method, "params": params})).unwrap();
-        let mut line = String::new();
-        self.out.read_line(&mut line).unwrap();
-        let reply: Value = serde_json::from_str(&line).unwrap_or_else(|_| panic!("not JSON-RPC: {line:?}"));
+        self.send(json!({"jsonrpc": "2.0", "id": self.next, "method": method, "params": params}));
+        let reply = self.read(method);
         assert_eq!(reply["id"], self.next);
         reply
+    }
+
+    fn expect_exit(&mut self) {
+        drop(self.child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "Plugin exited with {status}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "Plugin did not exit after stdin closed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -55,11 +101,10 @@ fn a_plugin_registers_tools_and_hooks_through_the_rust_ctx() {
     std::fs::create_dir_all(&plugin).unwrap();
     std::fs::write(plugin.join("plugin.yaml"), "name: shout\n").unwrap();
     std::fs::write(plugin.join("__init__.py"), PLUGIN).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hermes-python-host")).arg("serve").arg(&plugin)
+    let child = Command::new(env!("CARGO_BIN_EXE_hermes-python-host")).arg("serve").arg(&plugin)
         .env("PLUGIN_CONFIG_VOLUME", "loud").env_remove("HERMES_TEST_UNSET_KEY")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    let out = BufReader::new(child.stdout.take().unwrap());
-    let mut host = Host { child, out, next: 0 };
+    let mut host = Host::new(child);
 
     let hello = host.request("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(hello["result"]["capabilities"]["experimental"]["hermes"]["hooks"], json!(["pre_tool_call"]));
@@ -83,8 +128,7 @@ fn a_plugin_registers_tools_and_hooks_through_the_rust_ctx() {
     let allowed = host.request("hermes/hook", json!({"name": "pre_tool_call", "kwargs": {"tool_name": "terminal", "args": {"command": "ls"}}}));
     assert_eq!(allowed["result"]["results"], json!([]));
 
-    drop(host.child.stdin.take());
-    assert!(host.child.wait().unwrap().success());
+    host.expect_exit();
 }
 
 #[test]
@@ -93,7 +137,133 @@ fn a_plugin_that_fails_to_load_exits_with_an_error() {
     let plugin = dir.path().join("needs-hermes");
     std::fs::create_dir_all(&plugin).unwrap();
     std::fs::write(plugin.join("__init__.py"), "from hermes_cli.config import load_config\ndef register(ctx): pass\n").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_hermes-python-host")).arg("serve").arg(&plugin).stdin(Stdio::null()).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_hermes-python-host")).arg("serve").arg(&plugin)
+        .env_remove("HERMES_HOME").stdin(Stdio::null()).output().unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stderr).contains("hermes_cli"));
+}
+
+const COMMAND_AND_MEMORY: &str = r#"
+from pathlib import Path
+
+profile_activations = 0
+
+class FixtureMemory:
+    name = "Fixture Memory"
+
+    def initialize(self, session_id, **kwargs):
+        self.session_id = session_id
+        self.results = []
+
+    async def sync_turn(self, user, assistant, *, session_id):
+        assert session_id == self.session_id
+        self.results.append(f"{user}:{assistant}")
+
+    def prefetch(self, query):
+        return {"session_id": self.session_id, "results": self.results}
+
+async def echo(source, session_id, **kwargs):
+    return f"{session_id}:{source}:{kwargs['platform']}"
+
+def register(host):
+    global profile_activations
+    handle = host.register_command(" /ECHO ", echo, "Echo the args", " words ")
+    def dispose(raw):
+        handle.dispose()
+        handle.dispose()
+    host.register_command("dispose", dispose)
+    host.register_memory_provider(FixtureMemory())
+    host.register_memory_observer(None)
+    if hasattr(host, "llm"):
+        profile_activations += 1
+        host.register_command("session-source", lambda raw, source: source.session_id)
+        host.on_unload(lambda: Path(host.get_config("trace")).write_text(str(profile_activations)))
+"#;
+
+fn launch_plugin(src: &str, allow_services: bool) -> (tempfile::TempDir, Host) {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("fixture");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(plugin.join("__init__.py"), src).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hermes-python-host"));
+    cmd.arg("serve")
+        .arg(plugin)
+        .env("PLUGIN_CONFIG_TRACE", dir.path().join("trace"))
+        .env_remove("HERMES_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    if allow_services {
+        cmd.env("HERMES_PLUGIN_SERVICES", "1");
+    } else {
+        cmd.env_remove("HERMES_PLUGIN_SERVICES");
+    }
+    let child = cmd.spawn().unwrap();
+    (dir, Host::new(child))
+}
+
+#[test]
+fn commands_and_session_memory_share_one_plugin_activation() {
+    let (dir, mut host) = launch_plugin(COMMAND_AND_MEMORY, true);
+    let info = host.request("hermes/describe", json!({}));
+    assert_eq!(info["result"]["provider"], "Fixture Memory");
+    assert_eq!(info["result"]["commands"][0], json!({
+        "name": "echo", "description": "Echo the args", "args_hint": "words", "argument_mode": "text",
+    }));
+    assert_eq!(info["result"]["unsupported"], json!(["register_memory_observer"]));
+
+    let context = json!({"source": {"session_id": "a"}, "session_id": "a", "platform": "local"});
+    let echo = host.request("hermes/command", json!({"name": "echo", "arguments": "hello", "context": context}));
+    assert_eq!(echo["result"], "a:hello:local");
+    let source = host.request("hermes/command", json!({"name": "session-source", "context": context}));
+    assert_eq!(source["result"], "a");
+    let disposed = host.request("hermes/command", json!({"name": "dispose"}));
+    assert_eq!(disposed.get("result"), Some(&Value::Null));
+    assert!(host.request("hermes/command", json!({"name": "echo"})).get("error").is_some());
+
+    for session_id in ["a", "b", "a"] {
+        assert_eq!(host.request("hermes/memory.open", json!({"session_id": session_id}))["result"]["available"], true);
+    }
+    let invoke = |host: &mut Host, session_id: &str, method: &str, args: Value, kwargs: Value| {
+        host.request("hermes/memory.call", json!({
+            "session_id": session_id, "method": method, "args": args, "kwargs": kwargs,
+        }))
+    };
+    assert!(invoke(&mut host, "a", "sync_turn", json!(["foo", "bar"]), json!({"session_id": "a"})).get("result").is_some());
+    assert_eq!(invoke(&mut host, "a", "prefetch", json!(["q"]), json!({}))["result"], json!({"session_id": "a", "results": ["foo:bar"]}));
+    assert_eq!(invoke(&mut host, "b", "prefetch", json!(["q"]), json!({}))["result"], json!({"session_id": "b", "results": []}));
+    assert!(invoke(&mut host, "a", "__init__", json!([]), json!({})).get("error").is_some());
+    let _ = host.request("hermes/memory.close", json!({"session_id": "a"}));
+    assert!(invoke(&mut host, "a", "prefetch", json!(["q"]), json!({})).get("error").is_some());
+    assert!(host.request("hermes/unload", json!({})).get("result").is_some());
+    host.expect_exit();
+    assert_eq!(std::fs::read_to_string(dir.path().join("trace")).unwrap(), "1");
+}
+
+#[test]
+fn gateway_services_work_during_registration_and_an_async_command() {
+    let (_dir, mut host) = launch_plugin(r#"
+async def register(host):
+    await host.llm.aembed(["setup"], timeout=5)
+    async def ask(raw):
+        answer = await host.llm.acomplete_structured(input=raw, timeout=5)
+        return answer["parsed"]
+    host.register_command("ask", ask)
+"#, true);
+    let setup = host.read("registration service request");
+    assert_eq!(setup["method"], "hermes/service");
+    assert!(setup["id"].as_str().unwrap().starts_with("host:"));
+    assert_eq!(setup["params"]["operation"], "aembed");
+    assert_eq!(setup["params"]["args"], json!([["setup"]]));
+    host.send(json!({"jsonrpc": "2.0", "id": setup["id"], "result": {}}));
+    host.send(json!({"jsonrpc": "2.0", "id": 1, "method": "hermes/command",
+        "params": {"name": "ask", "arguments": "question"}}));
+    let inference = host.read("command service request");
+    assert_eq!(inference["method"], "hermes/service");
+    assert_eq!(inference["params"]["operation"], "acomplete_structured");
+    assert_eq!(inference["params"]["kwargs"]["input"], "question");
+    host.send(json!({"jsonrpc": "2.0", "id": inference["id"], "result": {"parsed": "answer"}}));
+    let reply = host.read("command reply");
+    assert_eq!(reply["id"], 1);
+    assert_eq!(reply["result"], "answer");
+    host.expect_exit();
 }

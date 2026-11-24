@@ -1,6 +1,7 @@
 //! MCP client for an explicitly configured tool server: Streamable HTTP, or a
 //! local stdio process (Agent Plugins v1 `"type": "stdio"` servers).
 use anyhow::{Context, Result, bail, ensure};
+use crate::plugin_worker::Worker;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{Client, Url, header::ACCEPT};
@@ -14,6 +15,7 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 enum Transport {
     Http { client: Client, url: Url, token: Option<String>, headers: Vec<(String, String)>, session: Option<String> },
     Stdio { child: tokio::process::Child, stdin: tokio::process::ChildStdin, lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>> },
+    Plugin(Worker),
 }
 
 /// How to start a stdio server.
@@ -47,6 +49,35 @@ impl Mcp {
         Self { transport: Transport::Stdio { child, stdin, lines }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into(), hooks: vec![] }.handshake().await
     }
 
+    pub(crate) async fn connect_plugin(worker: Worker, prefix: &str) -> Result<Self> {
+        Self {
+            transport: Transport::Plugin(worker),
+            version: VERSION.into(),
+            next_id: 0,
+            tools: BTreeMap::new(),
+            prefix: prefix.into(),
+            hooks: vec![],
+        }.handshake().await
+    }
+
+    /// This turn's view of a shared plugin worker. Tools are listed again because a plugin's
+    /// `check_fn` can change between turns; a busy worker keeps its last known list.
+    pub(crate) async fn plugin_view(&self) -> Option<Self> {
+        let Transport::Plugin(worker) = &self.transport else { return None };
+        let mut view = Self {
+            transport: Transport::Plugin(worker.clone()),
+            version: self.version.clone(),
+            next_id: 0,
+            tools: BTreeMap::new(),
+            prefix: self.prefix.clone(),
+            hooks: self.hooks.clone(),
+        };
+        if !matches!(tokio::time::timeout(Duration::from_secs(5), view.list_tools()).await, Ok(Ok(()))) {
+            view.tools = self.tools.clone();
+        }
+        Some(view)
+    }
+
     async fn handshake(mut self) -> Result<Self> {
         let hello = tokio::time::timeout(Duration::from_secs(30), self.request("initialize", json!({"protocolVersion":VERSION, "capabilities":{}, "clientInfo":{"name":"hermes-desktop-rust","version":env!("CARGO_PKG_VERSION")}}))).await.context("MCP server did not answer initialize")??;
         let protocol = hello["protocolVersion"].as_str().context("No MCP protocol version")?;
@@ -55,6 +86,11 @@ impl Mcp {
         self.version = protocol.to_owned();
         self.hooks = hello.pointer("/capabilities/experimental/hermes/hooks").and_then(Value::as_array).map(|h| h.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
         self.notify(json!({"jsonrpc":"2.0","method":"notifications/initialized"})).await?;
+        self.list_tools().await?;
+        Ok(self)
+    }
+
+    async fn list_tools(&mut self) -> Result<()> {
         let mut cursor = None;
         let mut seen_cursors = std::collections::HashSet::<String>::new();
         loop {
@@ -74,7 +110,7 @@ impl Mcp {
                 ensure!(seen_cursors.len() < 32 && seen_cursors.insert(c.clone()), "Invalid MCP pagination");
             } else { break; }
         }
-        Ok(self)
+        Ok(())
     }
 
     fn http(&self, body: Value) -> Option<reqwest::RequestBuilder> {
@@ -88,6 +124,9 @@ impl Mcp {
     }
 
     async fn notify(&mut self, body: Value) -> Result<()> {
+        if matches!(self.transport, Transport::Plugin(_)) {
+            return Ok(()); // The embedded worker is initialized by its request/reply handshake.
+        }
         if let Transport::Stdio { stdin, .. } = &mut self.transport {
             stdin.write_all(format!("{body}\n").as_bytes()).await?; stdin.flush().await?; return Ok(());
         }
@@ -97,6 +136,9 @@ impl Mcp {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        if let Transport::Plugin(worker) = &self.transport {
+            return worker.request(method, params).await;
+        }
         self.next_id += 1;
         let id = self.next_id;
         let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});

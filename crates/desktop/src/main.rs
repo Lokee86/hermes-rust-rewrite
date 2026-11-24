@@ -466,6 +466,14 @@ impl Hermes {
     }
     fn error(&mut self, text: impl Into<String>) { self.banner = Some(Banner { text: text.into(), error: true }); }
     fn note(&mut self, text: impl Into<String>) { self.banner = Some(Banner { text: text.into(), error: false }); }
+    fn show_memory_recall(&mut self, status: hermes_engine::RecallStatus) {
+        if status.count == 0 {
+            self.note(format!("{} recalled context", status.provider_label));
+        } else {
+            let noun = if status.count == 1 { "memory" } else { "memories" };
+            self.note(format!("{} recalled {} {noun}", status.provider_label, status.count));
+        }
+    }
     fn is_portal(&self) -> bool { portal::is_portal(&self.config.base_url) }
     fn portal_config(&self) -> Config {
         Config { base_url: portal::INFERENCE.into(), model: if self.is_portal() { self.config.model.clone() } else { std::env::var("HERMES_RUST_MODEL").unwrap_or_else(|_| portal::AUTO_MODEL.into()) }, api_key: String::new() }
@@ -894,11 +902,14 @@ impl Hermes {
             }
             Message::Edit(_) if self.reasoning.anchor.is_some()=>return Task::none(),
             Message::Edit(action) => {
+                let was_slash = self.composer.text().trim_start().starts_with('/');
                 let changed = action.is_edit(); self.composer.perform(action);
                 if changed {
                     self.slash.index = 0;
+                    let entered_slash = !was_slash && self.composer.text().trim_start().starts_with('/');
                     self.draft_revision=self.draft_revision.wrapping_add(1);
-                    if !self.draft_save_pending { self.draft_save_pending=true; return self.draft_timer(); }
+                    if !self.draft_save_pending { self.draft_save_pending=true; return Task::batch([self.draft_timer(), if entered_slash { slash::refresh(self) } else { Task::none() }]); }
+                    if entered_slash { return slash::refresh(self); }
                 }
             }
             Message::IntroSize(size) => self.intro_width=size.width,
@@ -942,6 +953,7 @@ impl Hermes {
                         }
                     }
                     Event::Approval { call, answer } => self.approvals.push(Approval { call, generation: id, answer: Some(answer) }),
+                    Event::MemoryRecall(status) => self.show_memory_recall(status),
                     Event::Subagent(progress) => {
                         let list = &mut self.subagents;
                         match list.iter_mut().find(|p| p.id == progress.id) { Some(slot) => *slot = progress, None => list.push(progress) }
@@ -1572,6 +1584,7 @@ impl Hermes {
                 self.profile_settings.feedback=None; self.settings_view = view; self.screen = Screen::Provider;
                 if view==settings::View::Safety{return checkpoint_ui::update(self,checkpoint_ui::Action::Refresh);}
                 if view==settings::View::Billing{return billing::update(self,billing::Action::Refresh);}
+                if view==settings::View::Memory{return profile_settings::load_memory_providers(self);}
                 if view==settings::View::Models && self.models.catalog.is_empty() && !self.models.loading && self.ready() {return self.update(Message::Models(models::Action::Refresh));} }
             Message::SettingsSearch(query) => self.settings_query = query,
             Message::SettingsApply => {

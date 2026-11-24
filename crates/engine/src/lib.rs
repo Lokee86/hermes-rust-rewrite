@@ -3,6 +3,8 @@ pub use attachment::Attachment;
 pub mod herdr;
 mod history;
 mod mcp;
+mod plugin_inference;
+mod plugin_worker;
 mod plugin_hooks;
 pub mod connector;
 pub mod skill_catalog;
@@ -11,6 +13,8 @@ pub mod mcp_oauth;
 pub mod memory;
 pub mod memory_capture;
 pub mod native_memory;
+mod python_memory;
+pub use python_memory::RecallStatus;
 pub mod settings;
 mod privacy;
 mod processes;
@@ -49,10 +53,14 @@ pub enum Event {
     Approval { call: ToolCall, answer: Sender<bool> },
     /// A delegated child agent changed state (Agents page spawn tree).
     Subagent(subagents::Progress),
+    /// The selected provider contributed recall context to the current turn.
+    MemoryRecall(RecallStatus),
 }
 
 pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
     notes_config: memory::MemoryConfig, native_enrolled: bool, native_query: Option<Arc<dyn native_memory::MemoryQuery>>,
+    plugin_runtime: Option<Arc<plugins::PluginRuntime>>,
+    python_memory: Option<plugins::PythonMemory>,
     reasoning_summaries: Vec<memory_capture::CapturedReasoningSummary>,
 }
 
@@ -94,6 +102,14 @@ impl Session {
         self.native_query = query;
     }
     pub fn clear_native_query(&mut self) { self.native_query = None; }
+    /// Use the profile gateway's shared plugin activations.
+    pub fn set_plugin_runtime(&mut self, runtime: Arc<plugins::PluginRuntime>) {
+        self.plugin_runtime = Some(runtime);
+    }
+    /// Bind the selected provider instance to the next admitted turn.
+    pub fn set_python_memory(&mut self, memory: Option<plugins::PythonMemory>) {
+        self.python_memory = memory;
+    }
     pub fn take_reasoning_summaries(&mut self) -> Vec<memory_capture::CapturedReasoningSummary> {
         std::mem::take(&mut self.reasoning_summaries)
     }
@@ -120,7 +136,7 @@ impl Session {
         let memory = Self::open_notes(profile_root,config.clone())?;
         let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled,settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, reasoning_summaries:Vec::new() })
+        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
     }
     /// Create an independently configured profile view over this session's
     /// exclusive writer and transcript. The caller serializes all turns.
@@ -133,7 +149,7 @@ impl Session {
             .with_checkpoints(profile_root, settings.checkpoints_enabled, settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
         let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false,
-            settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, reasoning_summaries:Vec::new() };
+            settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() };
         // Terminals belong to the gateway's authorized profile while tools and
         // memory continue to use the member's profile.
         let mut registry = processes::Registry::new(session.tools.workspace_root(), &session.directory);
@@ -168,6 +184,7 @@ impl Session {
     }
 
     async fn execute(&mut self, config:Config, options:models::GenerationOptions, prompt:String, attachments:Vec<Attachment>, events:Sender<Event>, cancel:CancellationToken, save_terminal: bool) -> Result<()> {
+        let python_memory = self.python_memory.take();
         options.validate()?;
         Attachment::validate_set(&attachments)?;
         let prompt = prompt.trim().to_owned();
@@ -195,7 +212,7 @@ impl Session {
             result = async {
                 let config = Provider::resolve_config(config).await?;
                 self.history.turns[index].model = config.model.clone();
-                self.run_model(index, &Provider::new_with_options(config,options)?, &events, &cancel).await
+                self.run_model(index, &Provider::new_with_options(config,options)?, python_memory, &events, &cancel).await
             } => match result {
                 Ok(()) => Status::Complete,
                 Err(err) => Status::Failed(format!("{err:#}")),
@@ -206,21 +223,31 @@ impl Session {
         Ok(())
     }
 
-    async fn run_model(&mut self, index: usize, provider: &Provider, events: &Sender<Event>, cancel: &CancellationToken) -> Result<()> {
+    async fn run_model(&mut self, index: usize, provider: &Provider, python_memory: Option<plugins::PythonMemory>, events: &Sender<Event>, cancel: &CancellationToken) -> Result<()> {
         self.reasoning_summaries.clear();
+        let runtime = self.plugin_runtime.get_or_insert_with(|| {
+            plugins::PluginRuntime::new(self.profile_root.clone(), Some(provider.config().clone()))
+        }).clone();
         let turn = &self.history.turns[index];
-        let selected = self.settings.memory_provider.resolve(self.native_enrolled);
+        let selected = self.settings.memory_provider.clone().resolve(self.native_enrolled);
+        let memory_eligible = !self.scheduled && !self.child && turn.attachments.is_empty()
+            && turn.context.is_empty() && !memory_capture::contains_inline_data(&turn.prompt)
+            && references::parse(&turn.prompt).is_empty()
+            && (provider.config().api_key.is_empty() || !turn.prompt.contains(&provider.config().api_key));
         let native = self.native_query.take().filter(|_| {
-            selected == settings::MemoryProvider::Reliquary && self.settings.memory_tool
-                && !self.scheduled && !self.child && turn.attachments.is_empty()
-                && turn.context.is_empty() && !memory_capture::contains_inline_data(&turn.prompt)
-                && references::parse(&turn.prompt).is_empty()
-                && (provider.config().api_key.is_empty() || !turn.prompt.contains(&provider.config().api_key))
+            memory_eligible && selected == settings::MemoryProvider::Reliquary && self.settings.memory_tool
         });
         let mut memory_results = Vec::new();
+        let mut python_results = Vec::new();
         let mut mcp: Vec<mcp::Mcp> = if self.settings.connect_profile_mcp() {connector::connect(&self.profile_root).await.context("Could not connect configured MCP server")?.into_iter().collect()}else{vec![]};
         // Enabled catalog plugins (Agent Plugins v1) add their MCP servers; one that fails is skipped.
-        if self.settings.mcp_tools { let (live, errors) = plugins::connect_all(&self.profile_root).await; mcp.extend(live); for e in errors { eprintln!("plugin server unavailable: {e}"); } }
+        if self.settings.mcp_tools {
+            let (live, errors) = runtime.tool_connections().await;
+            mcp.extend(live);
+            for error in errors {
+                eprintln!("plugin server unavailable: {error}");
+            }
+        }
         let mut specs = tools::tool_specs();
         if !self.child { specs.push(subagents::spec()); }
         if let Some(spec) = self.memory.as_ref().and_then(|memory| memory.tool_spec()) { specs.push(spec); }
@@ -230,6 +257,20 @@ impl Session {
             }));
         }
         if self.processes.is_some() { specs.extend(processes::specs()); }
+        let python = if memory_eligible
+            && let Some(binding) = python_memory
+            && runtime.is_current(&binding.plugin).await
+            && let Ok(settings) = settings::ProfileSettings::load(&self.profile_root)
+            && python_memory::TurnMemory::selection_matches(&binding, &settings)
+        {
+            Some(
+                python_memory::TurnMemory::prepare(
+                    binding, turn, index, provider.config(), &settings, &specs,
+                ).await
+            )
+        } else {
+            None
+        };
         specs.retain(|spec| spec["function"]["name"].as_str().is_some_and(|name| {
             self.settings.tool_enabled(name) && (selected != settings::MemoryProvider::Reliquary
                 || native_memory::MemoryTool::from_name(name).is_none())
@@ -245,6 +286,17 @@ impl Session {
             } else {
                 prompt.push_str(&format!("\nSystem local UTC offset: {}.",chrono::Local::now().format("%:z")));
             }
+            let active_python = if let Some(memory) = &python && runtime.is_current(memory.plugin()).await {
+                memory.active_selection(&self.profile_root).map(|settings| (memory, settings.memory_tool))
+            } else {
+                None
+            };
+            if let Some((memory, _)) = active_python {
+                memory.append_context(&mut prompt);
+                if round == 0 && let Some(status) = &memory.recall_status {
+                    let _ = events.try_send(Event::MemoryRecall(status.clone()));
+                }
+            }
             messages[0]["content"]=Value::String(prompt);
             let notes = self.memory.as_ref().map(|store| store.frozen_context()).unwrap_or_default();
             if !notes.is_empty() {
@@ -259,12 +311,20 @@ impl Session {
                     memory_results.clear();
                 }
             }
+            if let Some((_, true)) = active_python {
+                python_memory::attach_tool_results(
+                    &mut messages, self.history.turns[index].entries.len(), std::mem::take(&mut python_results),
+                )?;
+            } else {
+                python_results.clear();
+            }
             self.history.turns[index].entries.push(Entry::Assistant { text: String::new(), calls: vec![] });
             self.publish(events)?;
             let mut saved = Instant::now();
             if self.settings.redact_secrets {privacy::redact_messages(&mut messages);}
             let native_tools = native.as_ref().map(|query| query.tools()).unwrap_or_default();
             let advertised: Vec<_> = specs.iter().cloned()
+                .chain(active_python.filter(|(_, enabled)| *enabled).into_iter().flat_map(|(memory, _)| memory.tools.iter().cloned()))
                 .chain(native_tools.iter().copied().map(native_memory::MemoryTool::spec)).collect();
             let output = provider.stream_with_evidence(messages, &advertised, |delta| {
                 if let Some(Entry::Assistant { text, .. }) = self.history.turns[index].entries.last_mut() {
@@ -315,9 +375,17 @@ impl Session {
                     } else {
                         (false, json!({"error":"Native memory query unavailable in this turn"}).to_string())
                     }
+                } else if let Some(memory) = &python && memory.owns_tool(&call.name) {
+                    let (approved, summary, content) = memory.invoke(
+                        &call, &self.profile_root, events, provider.config(), &runtime,
+                    ).await?;
+                    if let Some(content) = content {
+                        python_results.push((self.history.turns[index].entries.len(), content));
+                    }
+                    (approved, summary)
                 } else if call.name == "delegate_task" && !self.child {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                    let value = subagents::delegate(&args, provider.config().clone(), provider.options().clone(), &self.profile_root, self.tools.workspace_root(), self.native_enrolled, events, cancel.clone()).await;
+                    let value = subagents::delegate(&args, provider.config().clone(), provider.options().clone(), &self.profile_root, self.tools.workspace_root(), self.native_enrolled, runtime.clone(), events, cancel.clone()).await;
                     (true, value.to_string())
                 } else { handle_tool(&call, index, events, &self.tools, self.processes.as_mut(), self.memory.as_mut(), &mut mcp, &self.settings,&self.profile_root).await? };
                 let result = if approved { plugin_hooks::after_tool_call(&mut mcp, &call, result).await } else { result };

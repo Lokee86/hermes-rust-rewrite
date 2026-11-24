@@ -30,7 +30,7 @@ pub(super) enum Action {
     PluginCategory(Facet), Toolset(&'static str, bool),
     PluginInstall(String), PluginInstalled(String, Result<String, String>), PluginEnable(String, bool), PluginRemove(String), PluginsInstalledOnly(bool),
     PluginOpen(String), PluginClose, PluginField(String, String), PluginSaveConfig, PluginSignIn(String), PluginSignedIn(String, Result<usize, String>),
-    DiscoverSkills, SkillsReady(u64, Result<Value, String>),
+    DiscoverSkills, SkillsReady(u64, Result<Value, String>), RuntimePlugins(Result<Value,String>),
     Url(String), Token(String), Save(bool), DiscoverTools, ToolsReady(u64, Result<Vec<String>, String>),
 }
 
@@ -51,7 +51,7 @@ pub(super) struct State {
     status: skill_catalog::Status, installing: BTreeSet<String>, detail: Option<String>, document: Option<String>,
     sources: Vec<Facet>, categories: Vec<Facet>, plugin_category: Option<String>,
     plugins_installed: Vec<hermes_engine::plugins::Installed>, plugin_busy: BTreeSet<String>, plugins_installed_only: bool,
-    plugin_detail: Option<String>, plugin_form: std::collections::BTreeMap<String, String>,
+    plugin_detail: Option<String>, plugin_form: std::collections::BTreeMap<String, String>, gateway_plugins: Vec<Value>,
     local: Vec<Value>, url: String, token: String, has_token: bool, environment: bool, tools: Vec<String>, busy: bool, revision: u64,
 }
 
@@ -113,7 +113,13 @@ pub(super) fn open(app: &mut Hermes) -> Task<Message> {
 
 fn reset_paging(state: &mut State) { state.limit = PAGE; state.detail = None; state.document = None; }
 
+fn refresh_runtime_plugins(app:&mut Hermes)->Task<Message>{
+    let Ok(conn)=app.chat_connection() else{return Task::none()};
+    Task::perform(async move{conn.request("commands.catalog",json!({})).await},|result|Message::Capability(Action::RuntimePlugins(result)))
+}
+
 pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
+    let status_conn = if matches!(&action,Action::Show(Page::Plugins)){app.chat_connection().ok()}else{None};
     let root = app.library.as_ref().map(|lib| lib.root().to_owned());
     let workspace = matches!(action, Action::DiscoverSkills).then(|| app.workspace()).flatten();
     let state = &mut app.capabilities;
@@ -122,8 +128,12 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             state.revision = state.revision.wrapping_add(1); state.busy = false; state.page = page; state.error = None; state.notice = None;
             reset_paging(state);
             if page == Page::Skills { return update(app, Action::DiscoverSkills); }
-            if page == Page::Plugins && let Some(root) = &root { state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default(); }
+            if page == Page::Plugins {
+                if let Some(root) = &root { state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default(); }
+                if let Some(conn)=status_conn {return Task::perform(async move{conn.request("commands.catalog",json!({})).await},|r|Message::Capability(Action::RuntimePlugins(r)));}
+            }
         }
+        Action::RuntimePlugins(result)=>match result{Ok(value)=>{state.gateway_plugins=value["plugin_status"].as_array().cloned().unwrap_or_default();return super::slash::refresh(app);},Err(error)=>state.error=Some(format!("Could not refresh plugin status: {error}"))},
         Action::Search(s) => { state.search = s; reset_paging(state); }
         Action::Loaded(result) => {
             state.loading = false;
@@ -200,7 +210,7 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         Action::PluginField(key, value) => { state.plugin_form.insert(key, value); }
         Action::PluginSaveConfig => if let (Some(root), Some(name)) = (&root, &state.plugin_detail) {
             let values = state.plugin_form.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
-            match hermes_engine::plugins::set_config(root, name, &values) { Ok(()) => state.notice = Some("Plugin settings saved. They apply from the next message.".into()), Err(e) => state.error = Some(format!("{e:#}")) }
+            match hermes_engine::plugins::set_config(root, name, &values) { Ok(()) => {state.notice = Some("Plugin settings saved. They apply from the next message.".into());return refresh_runtime_plugins(app);}, Err(e) => state.error = Some(format!("{e:#}")) }
         },
         Action::PluginSignIn(name) => {
             let Some(root) = root else { return Task::none() };
@@ -231,16 +241,20 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         }
         Action::PluginInstalled(name, result) => {
             state.plugin_busy.remove(&name);
+            let succeeded=result.is_ok();
             match result { Ok(note) => { state.notice = Some(note); state.error = None; } Err(e) => { state.notice = None; state.error = Some(e); } }
             if let Some(root) = &root { state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default(); }
+            if succeeded{return refresh_runtime_plugins(app);}
         }
         Action::PluginEnable(name, on) => if let Some(root) = &root {
             if let Err(e) = hermes_engine::plugins::set_enabled(root, &name, on) { state.error = Some(format!("{e:#}")); }
             state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default();
+            return refresh_runtime_plugins(app);
         },
         Action::PluginRemove(name) => if let Some(root) = &root {
             match hermes_engine::plugins::uninstall(root, &name) { Ok(()) => state.notice = Some("Plugin removed.".into()), Err(e) => state.error = Some(format!("{e:#}")) }
             state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default();
+            return refresh_runtime_plugins(app);
         },
         Action::Toolset(key, on) => {
             let Some(root) = root else { return Task::none() };
@@ -619,6 +633,18 @@ fn plugins(app: &Hermes) -> Element<'_, Message> {
             button(text("Configure").size(12)).style(ui::quiet_button)
                 .on_press(Message::SettingsView(super::settings::View::Memory)),
         ].spacing(12).align_y(Alignment::Center)).padding(14).style(move |_| ui::panel(p.card, 8.0, None)));
+    }
+    if !state.gateway_plugins.is_empty() {
+        let mut statuses=column![text("Plugin runtime status").size(13).font(ui::medium())].spacing(6);
+        for plugin in &state.gateway_plugins {
+            let title=plugin["title"].as_str().or(plugin["id"].as_str()).unwrap_or("Plugin");
+            let issue=plugin["issue"].as_str();
+            let unsupported=plugin["unsupported"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+            let conflicts=plugin["conflicts"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+            let detail=issue.map(str::to_owned).or_else(||(!unsupported.is_empty()).then(||format!("Unsupported: {unsupported}"))).or_else(||(!conflicts.is_empty()).then(||format!("Command conflicts: {conflicts}"))).unwrap_or_else(||"Ready".into());
+            statuses=statuses.push(row![text(title.to_owned()).size(12).width(180),text(detail).size(12).color(if issue.is_some(){Color::from_rgb8(0xd1,0x43,0x43)}else{p.muted})].spacing(10));
+        }
+        col=col.push(container(statuses).padding(14).width(Fill).style(move |_|ui::panel(p.card,8.0,Some(p.border))));
     }
     if let Some(name) = &state.plugin_detail { col = col.push(plugin_detail(app, name)); }
     let mut grid = column![].spacing(12);
