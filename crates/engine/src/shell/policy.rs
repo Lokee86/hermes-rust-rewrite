@@ -1284,6 +1284,18 @@ mod tests {
         }
     }
 
+    /// A directory as a user would type it: canonical (macOS temp directories sit behind the
+    /// /var -> /private/var link, Windows CI's behind an 8.3 RUNNER~1 name) and, on Windows,
+    /// drive-qualified rather than verbatim.
+    fn typed_path(path: &Path) -> std::path::PathBuf {
+        let canonical = path.canonicalize().unwrap();
+        #[cfg(windows)]
+        if let Some(plain) = canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            return plain.into();
+        }
+        canonical
+    }
+
     #[cfg(windows)]
     #[test]
     fn reads_from_the_chat_starting_directory() {
@@ -1291,11 +1303,12 @@ mod tests {
             .prefix("composer-")
             .tempdir()
             .unwrap();
-        let chat = root.path().join("chat");
-        let sibling = root.path().join("sibling");
+        let base = typed_path(root.path());
+        let chat = base.join("chat");
+        let sibling = base.join("sibling");
         std::fs::create_dir(&chat).unwrap();
         std::fs::create_dir(&sibling).unwrap();
-        let config = root.path().join(".config");
+        let config = base.join(".config");
         std::fs::create_dir(&config).unwrap();
         std::fs::write(config.join("notes.txt"), "listing fixture").unwrap();
         let notes = sibling.join("notes.txt");
@@ -1370,10 +1383,9 @@ mod tests {
             environment: &[],
             trusted_programs: &[],
         };
-        // Operands are compared lexically with the canonical session directory (macOS temp
-        // directories sit behind the /var -> /private/var link).
-        let ordinary = cwd.join("output.txt");
-        let sibling = cwd.with_extension("sibling").join("output.txt");
+        let typed = typed_path(root.path());
+        let ordinary = typed.join("output.txt");
+        let sibling = typed.with_extension("sibling").join("output.txt");
         assert_eq!(
             session_operand(ordinary.to_str().unwrap(), Some(&context)),
             Some("output.txt")
@@ -1382,7 +1394,7 @@ mod tests {
             session_operand(sibling.to_str().unwrap(), Some(&context)),
             None
         );
-        let script = cwd.join("probe.py");
+        let script = typed.join("probe.py");
         assert!(local_python_script(
             &[script.to_str().unwrap()],
             native_shell(),
