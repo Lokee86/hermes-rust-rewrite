@@ -1,0 +1,14 @@
+[package]
+name = "hermes-python-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pyo3 = "0.30"
+serde_json = "1"
+
+[build-dependencies]
+pyo3-build-config = "0.30"
+
+[dev-dependencies]
+tempfile = "3"
