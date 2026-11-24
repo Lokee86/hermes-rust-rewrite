@@ -408,9 +408,10 @@ impl Shared {
             && attachments.is_empty()
             && hermes_engine::references::parse(&text).is_empty()
             && !hermes_engine::memory_capture::contains_inline_data(&text)
+            && (config.api_key.is_empty() || !text.contains(&config.api_key))
             && self.python_source_is_active(&summary, &lock(&session.settings))
         {
-            self.python_selection_at_admission().await
+            self.python_selection_at_admission()
         } else {
             None
         };

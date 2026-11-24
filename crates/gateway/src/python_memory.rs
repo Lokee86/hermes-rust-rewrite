@@ -340,10 +340,19 @@ impl Shared {
         PythonSelection::configured(&ProfileSettings::load(self.library.root()).ok()?)
     }
 
-    pub(super) async fn python_selection_at_admission(&self) -> Option<PythonSelection> {
+    pub(super) fn python_selection_at_admission(&self) -> Option<PythonSelection> {
         let selection = self.configured_python()?;
-        self.python_plugin(&selection.id).await?;
-        (self.configured_python().as_ref() == Some(&selection)).then_some(selection)
+        // A prompt receipt must not wait for Python worker startup. The
+        // configured ID is pinned here, and preparation verifies its handle.
+        hermes_engine::plugins::installed(self.library.root())
+            .ok()?
+            .iter()
+            .any(|plugin| {
+                plugin.name == selection.id
+                    && plugin.enabled
+                    && plugin.servers.iter().any(|kind| kind == "python")
+            })
+            .then_some(selection)
     }
 
     async fn python_plugin(&self, id: &str) -> Option<PythonPlugin> {
@@ -472,6 +481,7 @@ impl Shared {
         let finished = committed_ns?;
         let summary = lock(&session.summary);
         let turn = history.turns.get(index)?;
+        let config = lock(&session.config);
         if handle.session_id != summary.id
             || handle.selection_revision != pin.revision
             || self.configured_python().as_ref() != Some(pin)
@@ -482,6 +492,7 @@ impl Shared {
             || !matches!(turn.status, Status::Complete)
             || !turn.attachments.is_empty()
             || !turn.context.is_empty()
+            || (!config.api_key.is_empty() && turn.prompt.contains(&config.api_key))
         {
             return None;
         }
