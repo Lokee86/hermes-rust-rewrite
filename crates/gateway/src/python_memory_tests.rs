@@ -4,6 +4,7 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep, timeout};
 
 const FIXTURE_ID: &str = "fixture-memory";
+const SYNTHETIC_NOTE_KEY: &str = "sk-synthetic-fixture-zcDx17NEs4TqZ11V";
 
 fn install_provider(root: &Path) {
     let dir = root.join("plugins").join(FIXTURE_ID);
@@ -213,13 +214,13 @@ async fn provider_recalls_committed_context_and_switches_without_crossing_revisi
         &gateway.shared,
         &owner,
         &first,
-        "A first fact. local-gateway-fixture-secret",
+        &format!("A first fact. {SYNTHETIC_NOTE_KEY}"),
     )
     .await;
     completed(&mut events).await;
     let handoff = wait_for_handoffs(home.path(), 1).await.pop().unwrap();
     assert_eq!(handoff["session"], first);
-    assert!(!handoff.to_string().contains(&config.api_key));
+    assert!(!handoff.to_string().contains(SYNTHETIC_NOTE_KEY));
     let messages = handoff["messages"].as_array().unwrap();
     assert!(messages.len() >= 2);
     assert!(
@@ -229,6 +230,15 @@ async fn provider_recalls_committed_context_and_switches_without_crossing_revisi
             .starts_with("generation-")
     );
     assert!(messages[0]["timestamp"].as_f64().unwrap() > 0.0);
+
+    send_prompt(
+        &gateway.shared,
+        &owner,
+        &first,
+        &format!("This uses {}.", config.api_key),
+    )
+    .await;
+    completed(&mut events).await;
 
     send_prompt(
         &gateway.shared,
