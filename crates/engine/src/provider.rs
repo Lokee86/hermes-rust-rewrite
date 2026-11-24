@@ -2,7 +2,7 @@ use crate::{Entry, History, Status, ToolCall};
 use anyhow::{Result, anyhow, bail, ensure};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
-use reqwest::{Client, Response, Url, header::HeaderValue};
+use reqwest::{Client, RequestBuilder, Response, Url, header::HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -19,6 +19,8 @@ const MAX_REPLY_BYTES: usize = 1_048_576;
 const MAX_TOOL_CALLS: usize = 8;
 const MAX_ARGUMENT_BYTES: usize = 65_536;
 const MAX_STREAM_BYTES: usize = 16 * 1_048_576;
+
+mod inference;
 
 #[derive(Clone)]
 pub struct Config {
@@ -87,7 +89,7 @@ impl Config {
         Ok(())
     }
 
-    /// The validated OpenAI-compatible chat route for host-owned structured inference.
+    /// Validate and resolve an OpenAI-compatible provider route.
     pub fn openai_chat_url(&self) -> Result<Url> {
         self.validate()?;
         let (protocol, url) = self.endpoint()?;
@@ -679,6 +681,12 @@ impl Provider {
     pub fn new(config: Config) -> Result<Self> {
         Self::new_with_options(config,crate::models::GenerationOptions::default())
     }
+
+    pub(crate) async fn resolve_config(config: Config) -> Result<Config> {
+        let config = crate::portal::resolve(config).await?;
+        crate::accounts::resolve(config).await
+    }
+
     pub fn new_with_options(config:Config,options:crate::models::GenerationOptions)->Result<Self> {
         options.validate()?;
         config.validate()?;
@@ -766,11 +774,17 @@ impl Provider {
             Protocol::Responses => responses_body(self.config.model.trim(), messages, tools),
         };
         if self.protocol != Protocol::Responses { self.options.apply(&mut body,self.protocol==Protocol::Anthropic)?; }
+        let request = self.post(&self.endpoint, &body, "text/event-stream");
+        let response = Self::send_request(request).await?;
+        self.read_stream(response, emit).await
+    }
+
+    fn post(&self, endpoint: &Url, body: &Value, accept: &str) -> RequestBuilder {
         let mut request = self
             .client
-            .post(self.endpoint.clone())
-            .header("accept", "text/event-stream")
-            .json(&body);
+            .post(endpoint.clone())
+            .header("accept", accept)
+            .json(body);
         let key = self.config.api_key.trim();
         match self.protocol {
             Protocol::Anthropic => {
@@ -778,7 +792,7 @@ impl Provider {
                 if !key.is_empty() {
                     request = request.header("x-api-key", key);
                     // OAuth gateways (MiniMax) authenticate the bearer token.
-                    if self.endpoint.path().contains("/anthropic/") { request = request.bearer_auth(key); }
+                    if endpoint.path().contains("/anthropic/") { request = request.bearer_auth(key); }
                 }
             }
             Protocol::Responses => {
@@ -792,6 +806,10 @@ impl Provider {
                 }
             }
         }
+        request
+    }
+
+    async fn send_request(request: RequestBuilder) -> Result<Response> {
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
                 anyhow!("Model provider connection timed out")
@@ -802,6 +820,14 @@ impl Provider {
         if !response.status().is_success() {
             return Err(http_error(response).await);
         }
+        Ok(response)
+    }
+
+    async fn read_stream(
+        &self,
+        response: Response,
+        emit: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<ProviderOutput> {
         let content_type = response
             .headers()
             .get("content-type")

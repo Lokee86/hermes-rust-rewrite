@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -214,8 +214,13 @@ fn event(delta: Value, finish: Option<&str>) -> String {
         json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
     )
 }
-async fn model(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Response {
+async fn model(
+    State(memory_requests): State<Arc<AtomicUsize>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
     if let Some(schema) = request["response_format"].get("json_schema") {
+        assert_hermes_inference(&headers);
         memory_requests.fetch_add(1, Ordering::Relaxed);
         return Json(structured_memory_fixture(&request, schema)).into_response();
     }
@@ -389,7 +394,18 @@ fn context_report(completed: &Value) -> Value {
         .unwrap_or_else(|error| panic!("invalid context probe response: {error}: {completed}"))
 }
 
-async fn embed_memory_fixture(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Json<Value> {
+fn assert_hermes_inference(headers: &HeaderMap) {
+    let user_agent = headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok());
+    assert!(user_agent.is_some_and(|value| value.starts_with("HermesRust/")),
+        "expected the Hermes provider transport");
+}
+
+async fn embed_memory_fixture(
+    State(memory_requests): State<Arc<AtomicUsize>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    assert_hermes_inference(&headers);
     memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
     let data = (0..inputs.len()).map(|index| {

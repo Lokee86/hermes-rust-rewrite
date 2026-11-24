@@ -20,6 +20,7 @@ pub mod shell;
 pub mod cron;
 pub mod checkpoint;
 mod provider;
+pub mod inference;
 pub mod models;
 pub mod credentials;
 pub mod portal;
@@ -192,8 +193,7 @@ impl Session {
             biased;
             _ = cancel.cancelled() => Status::Interrupted,
             result = async {
-                let config = portal::resolve(config).await?;
-                let config = accounts::resolve(config).await?;
+                let config = Provider::resolve_config(config).await?;
                 self.history.turns[index].model = config.model.clone();
                 self.run_model(index, &Provider::new_with_options(config,options)?, &events, &cancel).await
             } => match result {

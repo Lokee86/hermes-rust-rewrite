@@ -136,22 +136,18 @@ impl MemoryQuery for GatewayMemoryQuery {
                 SearchTimeBasis::Source => TemporalBasis::Source,
                 SearchTimeBasis::Mentioned => TemporalBasis::Mentioned,
             };
-            let runtime = match self.memory.runtime(owner, instance, config) {
-                Ok(Some(runtime)) => runtime,
-                unavailable => {
-                    if let Err(error) = reliquary_memory::resolve_archive_temporal_query(
-                        query,
-                        basis,
-                        self.turn.admitted_ns,
-                        &self.turn.calendar_zone,
-                    ) {
-                        return Ok(temporal_required(error.to_string()));
-                    }
-                    return Err(unavailable
-                        .err()
-                        .unwrap_or_else(|| anyhow::anyhow!("Missing memory model route")));
-                }
-            };
+            if let Err(error) = reliquary_memory::resolve_archive_temporal_query(
+                query,
+                basis,
+                self.turn.admitted_ns,
+                &self.turn.calendar_zone,
+            ) {
+                return Ok(temporal_required(error.to_string()));
+            }
+            let runtime = self
+                .memory
+                .runtime(owner, instance, config)?
+                .context("Missing memory model route")?;
             let result = match retrieval.search_chat_archive(
                 query,
                 basis,

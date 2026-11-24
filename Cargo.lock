@@ -2986,7 +2986,6 @@ dependencies = [
  "hermes-engine",
  "hermes-library",
  "reliquary-memory",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
