@@ -6,6 +6,7 @@
 mod bots;
 pub mod webhooks;
 pub mod profiles;
+pub mod memory_plugin;
 mod import;
 mod lifecycle;
 mod native_backup;
@@ -247,10 +248,7 @@ impl Library {
         request_key: Option<&str>,
         initialize: impl FnOnce(&SessionSummary, Option<&Path>) -> Result<()>,
     ) -> Result<SessionSummary> {
-        let default_project = if project_id.is_none(){
-            hermes_engine::settings::ProfileSettings::load(&self.root)?.default_directory
-                .map(|path|self.add_project(&path)).transpose()?
-        }else{None};
+        let default_project = if project_id.is_none() { self.default_project()? } else { None };
         let project_id=project_id.or_else(||default_project.as_ref().map(|p|p.id.as_str()));
         self.with_catalog(true, |catalog| {
             let workspace = project_id.map(|id| ensure_project(catalog, id).map(|project| project.path.clone())).transpose()?;
@@ -392,6 +390,26 @@ impl Library {
             catalog.projects.push(project.clone());
             Ok(project)
         })
+    }
+
+    pub fn rename_project(&self, id: &str, name: &str) -> Result<Project> {
+        let name = name.trim();
+        ensure!(
+            !name.is_empty() && name.chars().count() <= 200 && !name.chars().any(char::is_control),
+            "Project names must contain 1–200 printable characters"
+        );
+        self.with_catalog(true, |catalog| {
+            let project = catalog.projects.iter_mut().find(|project| project.id == id)
+                .context("Workspace does not exist in this library")?;
+            project.name = name.to_owned();
+            Ok(project.clone())
+        })
+    }
+
+    /// Materialize the default workspace before preparing a new session.
+    pub fn default_project(&self) -> Result<Option<Project>> {
+        hermes_engine::settings::ProfileSettings::load(&self.root)?.default_directory
+            .map(|path| self.add_project(&path)).transpose()
     }
 
     pub fn select_project(&self, id: Option<&str>) -> Result<()> {

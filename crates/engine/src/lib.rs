@@ -20,6 +20,7 @@ pub mod shell;
 pub mod cron;
 pub mod checkpoint;
 mod provider;
+pub mod inference;
 pub mod models;
 pub mod credentials;
 pub mod portal;
@@ -52,6 +53,7 @@ pub enum Event {
 
 pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
     notes_config: memory::MemoryConfig, native_enrolled: bool, native_query: Option<Arc<dyn native_memory::MemoryQuery>>,
+    reasoning_summaries: Vec<memory_capture::CapturedReasoningSummary>,
 }
 
 impl Session {
@@ -92,6 +94,9 @@ impl Session {
         self.native_query = query;
     }
     pub fn clear_native_query(&mut self) { self.native_query = None; }
+    pub fn take_reasoning_summaries(&mut self) -> Vec<memory_capture::CapturedReasoningSummary> {
+        std::mem::take(&mut self.reasoning_summaries)
+    }
     pub fn open_scheduled(dir:&Path, workspace:&Path, profile_root:&Path)->Result<Self> {
         Self::open_with_memory(dir,Some(workspace),profile_root,true,false)
     }
@@ -115,7 +120,7 @@ impl Session {
         let memory = Self::open_notes(profile_root,config.clone())?;
         let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled,settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None })
+        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, reasoning_summaries:Vec::new() })
     }
     /// Create an independently configured profile view over this session's
     /// exclusive writer and transcript. The caller serializes all turns.
@@ -128,7 +133,7 @@ impl Session {
             .with_checkpoints(profile_root, settings.checkpoints_enabled, settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
         let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false,
-            settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None };
+            settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, reasoning_summaries:Vec::new() };
         // Terminals belong to the gateway's authorized profile while tools and
         // memory continue to use the member's profile.
         let mut registry = processes::Registry::new(session.tools.workspace_root(), &session.directory);
@@ -188,8 +193,7 @@ impl Session {
             biased;
             _ = cancel.cancelled() => Status::Interrupted,
             result = async {
-                let config = portal::resolve(config).await?;
-                let config = accounts::resolve(config).await?;
+                let config = Provider::resolve_config(config).await?;
                 self.history.turns[index].model = config.model.clone();
                 self.run_model(index, &Provider::new_with_options(config,options)?, &events, &cancel).await
             } => match result {
@@ -203,6 +207,7 @@ impl Session {
     }
 
     async fn run_model(&mut self, index: usize, provider: &Provider, events: &Sender<Event>, cancel: &CancellationToken) -> Result<()> {
+        self.reasoning_summaries.clear();
         let turn = &self.history.turns[index];
         let selected = self.settings.memory_provider.resolve(self.native_enrolled);
         let native = self.native_query.take().filter(|_| {
@@ -219,14 +224,16 @@ impl Session {
         let mut specs = tools::tool_specs();
         if !self.child { specs.push(subagents::spec()); }
         if let Some(spec) = self.memory.as_ref().and_then(|memory| memory.tool_spec()) { specs.push(spec); }
-        if native.is_some() { specs.push(native_memory::spec()); }
         for server in &mcp {
             specs.extend(server.specs().into_iter().filter(|spec| {
                 self.processes.is_none() || !matches!(spec["function"]["name"].as_str(), Some("terminal"|"process_manage"))
             }));
         }
         if self.processes.is_some() { specs.extend(processes::specs()); }
-        specs.retain(|spec|spec["function"]["name"].as_str().is_some_and(|name|self.settings.tool_enabled(name)));
+        specs.retain(|spec| spec["function"]["name"].as_str().is_some_and(|name| {
+            self.settings.tool_enabled(name) && (selected != settings::MemoryProvider::Reliquary
+                || native_memory::MemoryTool::from_name(name).is_none())
+        }));
         for round in 0..=self.settings.max_turns {
             let mut messages = provider::messages(&self.history, &self.directory)?;
             let mut prompt=messages[0]["content"].as_str().context("Missing system prompt")?.to_owned();
@@ -256,7 +263,10 @@ impl Session {
             self.publish(events)?;
             let mut saved = Instant::now();
             if self.settings.redact_secrets {privacy::redact_messages(&mut messages);}
-            let calls = provider.stream_with_tools(messages, &specs, |delta| {
+            let native_tools = native.as_ref().map(|query| query.tools()).unwrap_or_default();
+            let advertised: Vec<_> = specs.iter().cloned()
+                .chain(native_tools.iter().copied().map(native_memory::MemoryTool::spec)).collect();
+            let output = provider.stream_with_evidence(messages, &advertised, |delta| {
                 if let Some(Entry::Assistant { text, .. }) = self.history.turns[index].entries.last_mut() {
                     text.push_str(delta);
                 }
@@ -267,17 +277,36 @@ impl Session {
                 }
                 Ok(())
             }).await?;
+            let calls = output.calls;
+            if selected == settings::MemoryProvider::Reliquary && self.native_enrolled
+                && !output.reasoning_summary.trim().is_empty()
+            {
+                let mut text = privacy::redact_capture(&output.reasoning_summary, &[&provider.config().api_key]);
+                text.truncate(text.floor_char_boundary(text.len().min(8192)));
+                self.reasoning_summaries.push(memory_capture::CapturedReasoningSummary {
+                    entry_index: self.history.turns[index].entries.len() - 1,
+                    text,
+                });
+            }
             if calls.is_empty() { for server in &mut mcp { server.close().await; } return Ok(()); }
             if let Some(Entry::Assistant { calls: dest, .. }) = self.history.turns[index].entries.last_mut() {
                 dest.clone_from(&calls);
             }
             self.publish(events)?;
             ensure!(round < self.settings.max_turns, "Stopped after {} rounds of tool calls",self.settings.max_turns);
+            let mut memory_called = false;
             for call in calls {
                 let (approved, result) = if let Some(message) = plugin_hooks::pre_tool_call(&mut mcp, &call).await {
                     (false, json!({"error": message}).to_string())
-                } else if call.name == "memory_query" {
-                    if let Some(query) = &native {
+                } else if selected == settings::MemoryProvider::Reliquary
+                    && let Some(tool) = native_memory::MemoryTool::from_name(&call.name)
+                {
+                    if memory_called {
+                        (false, json!({"error":"Call one memory tool per model round so results can be checked and returned first"}).to_string())
+                    } else if let Some(query) = &native && native_tools.contains(&tool)
+                        && settings::ProfileSettings::load(&self.profile_root)?.memory_tool
+                    {
+                        memory_called = true;
                         let reply = native_memory::invoke(query.clone(), &call, provider.config(), events, &self.settings).await?;
                         if let Some(content) = reply.model_content {
                             memory_results.push((self.history.turns[index].entries.len(), content));

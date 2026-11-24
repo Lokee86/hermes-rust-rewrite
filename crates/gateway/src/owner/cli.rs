@@ -9,6 +9,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Handle shared command-line roles before starting the desktop or gateway.
+pub fn dispatch_role() -> Option<i32> {
+    #[cfg(feature = "reliquary")]
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--licenses") {
+        println!("{}", include_str!("../../../../RELIQUARY-NOTICE"));
+        return Some(hermes_engine::herdr::dispatch_role().unwrap_or(0));
+    }
+    hermes_engine::herdr::dispatch_role()
+}
+
 pub async fn serve(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut port = 8765;
     let mut host: IpAddr = "127.0.0.1".parse()?;
@@ -87,11 +97,7 @@ pub async fn serve(args: impl IntoIterator<Item = String>) -> Result<()> {
     };
     let control = transport::Listener::bind(&root)?;
     let profile = super::profile_id(&root)?;
-    let name = root
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|s| s == "profiles"))
-        .and_then(|_| root.file_name()?.to_str())
-        .unwrap_or("default");
+    let name = hermes_library::profiles::name_for_home(&root);
     let gateway = Gateway::start_profile(config, profile, name.into(), lock).await?;
     println!(
         "{}",

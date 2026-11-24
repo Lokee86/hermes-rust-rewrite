@@ -121,7 +121,7 @@ impl Store {
         serde_json::to_writer_pretty(&mut file, &next)?;
         file.write_all(b"\n")?;
         file.as_file().sync_all()?;
-        persist_conversation(file, &self.dir.join("conversation.json"))
+        persist_with_retry(file, &self.dir.join("conversation.json"))
             .context("Could not replace the saved conversation")?;
         *current = next;
         #[cfg(unix)]
@@ -131,14 +131,14 @@ impl Store {
 }
 
 #[cfg(not(windows))]
-fn persist_conversation(file: NamedTempFile, path: &Path) -> Result<File, tempfile::PersistError> {
+pub(crate) fn persist_with_retry(file: NamedTempFile, path: &Path) -> Result<File, tempfile::PersistError> {
     file.persist(path)
 }
 
 #[cfg(windows)]
-fn persist_conversation(mut file: NamedTempFile, path: &Path) -> Result<File, tempfile::PersistError> {
+pub(crate) fn persist_with_retry(mut file: NamedTempFile, path: &Path) -> Result<File, tempfile::PersistError> {
     // Windows may briefly deny replacing a file held by a reader. Retry the same
-    // synced file, keeping the previous conversation intact on every failure.
+    // synced file, keeping the previous version intact on every failure.
     for delay_ms in [5, 10, 20, 40, 80, 160] {
         match file.persist(path) {
             Err(error) if matches!(error.error.raw_os_error(), Some(5 | 32 | 33)) => {
@@ -175,12 +175,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(30));
             drop(reader);
         });
-        persist_conversation(denied.file, &path).unwrap();
+        persist_with_retry(denied.file, &path).unwrap();
         release.join().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
 
         let reader = hold_reader();
-        let denied = persist_conversation(pending(b"next"), &path).unwrap_err();
+        let denied = persist_with_retry(pending(b"next"), &path).unwrap_err();
         assert!(matches!(denied.error.raw_os_error(), Some(5 | 32 | 33)));
         drop(reader);
         assert_eq!(fs::read(&path).unwrap(), b"new");

@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
-reliquary = ["dep:reliquary-memory"]
+default = ["reliquary"]
+reliquary = ["dep:hermes-reliquary-plugin", "hermes-reliquary-plugin/native"]
 
 [dependencies]
-reliquary-memory = { git = "https://github.com/Lokee86/Reliquary.git", rev = "d94af8c1da7453137fa0afb8d71914a3699e81aa", optional = true }
+hermes-reliquary-plugin = { path = "../plugins/reliquary", optional = true }
 anyhow.workspace = true
 hermes-engine = { path = "../engine" }
 hermes-library = { path = "../library" }

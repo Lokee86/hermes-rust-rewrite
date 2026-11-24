@@ -58,6 +58,65 @@ fn user_messages() -> Vec<Value> {
     vec![json!({"role":"user","content":"Hello"})]
 }
 
+#[tokio::test]
+async fn structured_completion_uses_the_native_provider_request() {
+    let router = Router::new()
+        .route(
+            "/v1/messages",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["x-api-key"], "anthropic-fixture-key");
+                assert_eq!(headers["anthropic-version"], "2023-06-01");
+                assert_eq!(body["system"], "Output JSON.");
+                assert_eq!(body["stream"], false);
+                assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+                Json(json!({
+                    "stop_reason":"end_turn",
+                    "content":[{"type":"text","text":"{\"ok\":true}"}],
+                }))
+            }),
+        )
+        .route(
+            "/responses",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer codex-fixture-token");
+                assert_eq!(headers["originator"], "hermes-agent");
+                assert_eq!(body["instructions"], "Output JSON.");
+                assert_eq!(body["store"], false);
+                assert_eq!(body["text"]["format"]["name"], "fixture_schema");
+                sse(concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"ok\\\":true}\"}\n\n",
+                    "data: {\"type\":\"response.completed\"}\n\n",
+                ))
+            }),
+        );
+    let (base, server) = serve(router).await;
+    let anthropic = Provider::new(Config {
+        api_key: "anthropic-fixture-key".into(),
+        ..config(format!("{base}/v1/messages"))
+    })
+    .unwrap();
+    let mut codex = Provider::new(Config {
+        api_key: "codex-fixture-token".into(),
+        ..config(&base)
+    })
+    .unwrap();
+    // Keep the Codex wire path under test without making an account request.
+    codex.protocol = Protocol::Responses;
+    codex.endpoint = format!("{base}/responses").parse().unwrap();
+    let schema = json!({
+        "type":"object", "properties":{"ok":{"type":"boolean"}},
+        "required":["ok"], "additionalProperties":false,
+    });
+    for provider in [anthropic, codex] {
+        assert_eq!(
+            provider.complete_json("Output JSON.", "Hello", "fixture_schema", &schema)
+                .await.unwrap(),
+            json!({"ok":true}),
+        );
+    }
+    server.abort();
+}
+
 #[test]
 fn endpoint_detection_preserves_explicit_paths_and_supports_ipv6_loopback() {
     for (base, protocol, endpoint) in [

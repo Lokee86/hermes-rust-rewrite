@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -39,10 +39,14 @@ struct Client {
 }
 impl Client {
     async fn native(gateway: &RunningGateway) -> Self {
+        Self::native_at(&gateway.http_url(), &gateway.websocket_url(), gateway.token()).await
+    }
+
+    async fn native_at(origin: &str, websocket: &str, token: &str) -> Self {
         let http = reqwest::Client::new();
         let ticket: Value = http
-            .post(format!("{}/api/auth/ws-ticket", gateway.http_url()))
-            .bearer_auth(gateway.token())
+            .post(format!("{origin}/api/auth/ws-ticket"))
+            .bearer_auth(token)
             .send()
             .await
             .unwrap()
@@ -51,7 +55,7 @@ impl Client {
             .json()
             .await
             .unwrap();
-        let mut request = format!("{}?native_dial=1", gateway.websocket_url())
+        let mut request = format!("{websocket}?native_dial=1")
             .into_client_request()
             .unwrap();
         request.headers_mut().insert(
@@ -210,13 +214,64 @@ fn event(delta: Value, finish: Option<&str>) -> String {
         json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
     )
 }
-async fn model(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Response {
+async fn model(
+    State(memory_requests): State<Arc<AtomicUsize>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
     if let Some(schema) = request["response_format"].get("json_schema") {
+        assert_hermes_inference(&headers);
+        let route = match schema["name"].as_str().unwrap() {
+            "insomnia_authority_disposition_ledger" | "insomnia_memory_wording" => "insomnia",
+            "insomnia_memory_ownership" => "metadata",
+            "decision_response" => "recall",
+            _ => "general",
+        };
+        assert_memory_route(&headers, &request, route);
         memory_requests.fetch_add(1, Ordering::Relaxed);
         return Json(structured_memory_fixture(&request, schema)).into_response();
     }
     let messages = request["messages"].as_array().unwrap();
     let last = messages.last().unwrap();
+    let send = |delta, finish| {
+        ([(header::CONTENT_TYPE, "text/event-stream")],
+            format!("{}data: [DONE]\n\n", event(delta, Some(finish)))).into_response()
+    };
+    let tool = |id: &str, name: &str, args: Value| json!({"index":0,"id":id,"function":{
+        "name":name,"arguments":args.to_string()
+    }});
+    if last["role"] == "user" && last["content"] == PROJECT_FACT {
+        return send(json!({"content":"Checking the Amethyst Lantern clock.",
+            "tool_calls":[tool("archive_fixture_clock", "get_current_time", json!({}))]}), "tool_calls");
+    }
+    if last["tool_call_id"] == "archive_fixture_clock" {
+        return send(json!({"content":"The Amethyst Lantern clock check is complete."}), "stop");
+    }
+    if last["role"] == "user" && last["content"] == "Inspect the archived clock check." {
+        assert!(request["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "archive_search"));
+        assert!(!request["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "echo_read"));
+        return send(json!({"tool_calls":[tool("unfiltered_archive", "archive_search", json!({"query":"Amethyst Lantern"}))]}), "tool_calls");
+    }
+    if last["tool_call_id"] == "unfiltered_archive" {
+        let reply: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+        assert_eq!(reply["error"], "temporal_query_required");
+        return send(json!({"tool_calls":[tool("dated_archive", "archive_search", json!({"query":"Amethyst Lantern today"}))]}), "tool_calls");
+    }
+    if last["tool_call_id"] == "dated_archive" {
+        let reply: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+        let hits = reply["hits"].as_array().expect("expected dated Archive results");
+        let hit = hits.iter().find(|hit| {
+            hit["messages"].to_string().contains("Checking the Amethyst Lantern clock.")
+        }).unwrap_or_else(|| panic!("missing archived commentary in {reply}"));
+        assert!(hits.iter().any(|hit| hit["messages"].to_string().contains("The Amethyst Lantern clock check is complete.")), "missing archived final reply in {reply}");
+        assert!(request["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "echo_read"));
+        return send(json!({"tool_calls":[tool("exact_echo", "echo_read", json!({"reference":hit["reference"]}))]}), "tool_calls");
+    }
+    if last["tool_call_id"] == "exact_echo" {
+        let reply: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+        assert!(reply["echo"].to_string().contains("get_current_time"));
+        return send(json!({"content":"Recovered the Archive and Echo."}), "stop");
+    }
     if last["content"] == CONTEXT_PROBE {
         // Observe at the chat request. Background capture of this turn starts after it commits.
         let has_tool = |name: &str| request["tools"].as_array().unwrap().iter()
@@ -346,11 +401,29 @@ fn context_report(completed: &Value) -> Value {
         .unwrap_or_else(|error| panic!("invalid context probe response: {error}: {completed}"))
 }
 
-async fn embed_memory_fixture(State(memory_requests): State<Arc<AtomicUsize>>, Json(request): Json<Value>) -> Json<Value> {
+fn assert_hermes_inference(headers: &HeaderMap) {
+    let user_agent = headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok());
+    assert!(user_agent.is_some_and(|value| value.starts_with("HermesRust/")),
+        "expected the Hermes provider transport");
+}
+
+fn assert_memory_route(headers: &HeaderMap, request: &Value, route: &str) {
+    assert_eq!(request["model"], format!("fixture-{route}"));
+    let auth = headers.get(header::AUTHORIZATION).unwrap().to_str().unwrap();
+    assert_eq!(auth, format!("Bearer fixture-{route}-key"));
+}
+
+async fn embed_memory_fixture(
+    State(memory_requests): State<Arc<AtomicUsize>>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    assert_hermes_inference(&headers);
+    assert_memory_route(&headers, &request, "embedding");
     memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
     let data = (0..inputs.len()).map(|index| {
-        json!({"index": index, "embedding": [1.0, 0.0]})
+        json!({"index": index, "embedding": [3.0, 4.0]})
     }).collect::<Vec<_>>();
     Json(json!({"model": request["model"], "data": data}))
 }
@@ -444,51 +517,147 @@ async fn approved_memory_query(client: &mut Client, sid: &str) -> String {
 }
 
 #[cfg(feature = "reliquary")]
+async fn approve_fixture_tool(client: &mut Client, sid: &str, name: &str) {
+    let request = client.event("approval.request").await;
+    assert_eq!(request["payload"]["tool_name"], name);
+    client.ok("approval.respond", json!({
+        "session_id":sid, "prompt_id":request["payload"]["prompt_id"],
+        "execution_generation":request["execution_generation"], "choice":"once"
+    })).await;
+}
+
+#[cfg(feature = "reliquary")]
+struct PortableGateway {
+    process: tokio::process::Child,
+    endpoint: Value,
+    home: std::path::PathBuf,
+}
+
+#[cfg(feature = "reliquary")]
+impl PortableGateway {
+    const TOKEN: &str = "stock-plugin-test-token-for-local-gateway";
+
+    async fn start(binary: &std::path::Path, home: &std::path::Path, config: &Config) -> Self {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut process = tokio::process::Command::new(binary)
+            .args(["gateway", "run", "--port", "0", "--data-dir"]).arg(home)
+            .env("HERMES_RUST_BASE_URL", &config.base_url)
+            .env("HERMES_RUST_MODEL", &config.model)
+            .env("HERMES_RUST_API_KEY", &config.api_key)
+            .env("HERMES_RUST_GATEWAY_TOKEN", Self::TOKEN)
+            .env_remove("APPIMAGE")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn().unwrap();
+        let mut line = String::new();
+        timeout(Duration::from_secs(10), BufReader::new(process.stdout.take().unwrap()).read_line(&mut line))
+            .await.unwrap().unwrap();
+        Self { process, endpoint: serde_json::from_str(&line).unwrap(), home: home.to_owned() }
+    }
+
+    async fn client(&self) -> Client {
+        Client::native_at(
+            self.endpoint["http_url"].as_str().unwrap(),
+            self.endpoint["websocket_url"].as_str().unwrap(),
+            Self::TOKEN,
+        ).await
+    }
+
+    async fn private_request(&self, method: &str, params: Value) -> Value {
+        use hermes_gateway::{client::{ClientOptions, GatewayClient}, owner};
+        let control = owner::discover(&self.home).await.unwrap().unwrap();
+        let client = GatewayClient::new(ClientOptions::default());
+        control.connect(&client).await.unwrap();
+        let result = client.request(method, params).await.unwrap();
+        client.close();
+        result
+    }
+
+    async fn reconcile_memory(&self) -> Value {
+        self.private_request("plugins.memory.sync", json!({})).await
+    }
+
+    async fn shutdown(mut self) {
+        hermes_gateway::owner::discover(&self.home).await.unwrap().unwrap().stop().await.unwrap();
+        assert!(self.process.wait().await.unwrap().success());
+    }
+}
+
+#[cfg(feature = "reliquary")]
 #[tokio::test]
-async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval() {
+async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     use hermes_engine::{credentials::EndpointStore, settings::ProfileSettings};
     use hermes_library::Library;
-    use reliquary_memory::{
-        Gateway as MemoryGateway, HostCredentialBinding, NativeImportState, OwnerGrant,
-        Phylactery, Rel, TrustedHostAdmission,
+    use hermes_reliquary_plugin::{
+        EmbeddingNormalization, HostedEmbeddingSettings, HostedModelRoute, ModelSlot,
+        save_switchboard_config, switchboard_config,
     };
-    use std::fs;
+    use std::{fs, path::Path};
 
     let provider = Provider::start().await;
-    let root = TempDir::new().unwrap();
-    let notes = root.path().join("memories");
+    let memory_provider = Provider::start().await;
+    let sandbox = TempDir::new().unwrap();
+    let install = sandbox.path().join("install");
+    fs::create_dir(&install).unwrap();
+    let compiled = Path::new(env!("CARGO_BIN_EXE_hermes-gateway"));
+    let binary = install.join(compiled.file_name().unwrap());
+    fs::copy(compiled, &binary).unwrap();
+
+    let profiles = Library::open(sandbox.path().join("data")).unwrap();
+    let profile = profiles.create_profile("work").unwrap();
+    let library = Library::open(&profile.path).unwrap();
+    let notes = library.root().join("memories");
     fs::create_dir(&notes).unwrap();
     fs::write(notes.join("MEMORY.md"), PROFILE_NOTE).unwrap();
-    let project_dir = TempDir::new().unwrap();
-    let library = Library::open(root.path()).unwrap();
-    let project = library.add_project(project_dir.path()).unwrap();
-    let rel = Rel::create(root.path().join("project.rel")).unwrap();
-    let general = Rel::create(root.path().join("general.rel")).unwrap();
-    let phy = Phylactery::create(root.path().join("private.phy")).unwrap();
-    let state = root.path().join("reliquary");
-    fs::create_dir(&state).unwrap();
-    let topology = json!({
-        "version": 2, "profile_id": "default", "principal_id": "owner",
-        "main_rel": general.owner_id(), "active_phy": phy.owner_id(),
-        "projects": {(project.id.clone()): {"rel_id": rel.owner_id()}},
-        "owners": {
-            (general.owner_id().to_string()): {"kind":"rel", "path":general.path()},
-            (rel.owner_id().to_string()): {"kind":"rel", "path":rel.path()},
-            (phy.owner_id().to_string()): {"kind":"phylactery", "path":phy.path()}
-        }
-    });
+    let workspace = sandbox.path().join("Lantern");
+    fs::create_dir(&workspace).unwrap();
+    let project = library.add_project(&workspace).unwrap();
     let old = library.create_session(Some(&project.id), Some("Before enrollment")).unwrap();
-    fs::write(state.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
-    fs::write(state.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
-    let endpoint = EndpointStore::open(&root.path().join("providers")).unwrap()
-        .save(Some("fixture-embeddings"), "Embeddings", &Config {
-            model: "fixture-embeddings".into(), ..provider.config()
-        }).unwrap();
-    let settings = json!({"memory_embedding":{"endpoint_id":endpoint.id,"dimensions":2}});
-    hermes_engine::settings::ProfileSettings::update(root.path(), settings.as_object().unwrap()).unwrap();
 
-    let gateway = provider.gateway(&root).await;
-    let mut client = Client::native(&gateway).await;
+    let disabled = json!({"memory_provider":"off"});
+    ProfileSettings::update(library.root(), disabled.as_object().unwrap()).unwrap();
+    let gateway = PortableGateway::start(&binary, library.root(), &provider.config()).await;
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], false);
+    let store = profiles.root().join("plugin-data").join("reliquary_store");
+    let state = store.join("work");
+    let select = |provider: &str| {
+        let settings = json!({"memory_provider":provider, "approval_mode":"manual"});
+        ProfileSettings::update(library.root(), settings.as_object().unwrap()).unwrap();
+    };
+    // Automatic keeps an unenrolled profile on its Markdown notes and creates nothing.
+    select("auto");
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], false);
+    assert!(!store.exists());
+    let mut unenrolled = gateway.client().await;
+    let chat = unenrolled.ok("session.create", json!({"title":"Unenrolled"})).await;
+    unenrolled.ok("prompt.submit", json!({"session_id":chat["session_id"],"submission_id":"notes","text":CONTEXT_PROBE})).await;
+    let report = context_report(&unenrolled.event("message.complete").await);
+    assert_eq!(report["notes_visible"], true);
+    assert_eq!(report["query_tool"], false);
+    drop(unenrolled);
+    select("reliquary");
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], true);
+    assert!(!install.join("reliquary").exists());
+    // An existing enrollment stays in use under Automatic.
+    select("auto");
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], true);
+    assert!(state.join("work.phy").is_file());
+    assert!(state.join("general.rel").is_file());
+    assert!(state.join("projects").join("Lantern.rel").is_file());
+    let read_topology = |state: &Path| -> Value {
+        serde_json::from_slice(&fs::read(state.join("topology-v1.json")).unwrap()).unwrap()
+    };
+    let topology = read_topology(&state);
+    let rel_id = topology["projects"][&project.id]["rel_id"].clone();
+    let general_id = topology["main_rel"].clone();
+    let new_workspace = sandbox.path().join("Second project");
+    fs::create_dir(&new_workspace).unwrap();
+    library.add_project(&new_workspace).unwrap();
+    assert_eq!(gateway.reconcile_memory().await["projects_ready"], true);
+    assert!(state.join("projects").join("Second project.rel").is_file());
+
+    let mut client = gateway.client().await;
     client.ok("session.resume", json!({"session_id":old.id})).await;
     client.ok("prompt.submit", json!({"session_id":old.id,"submission_id":"preexisting","text":"A historical chat"})).await;
     assert_eq!(client.event("message.complete").await["payload"]["status"], "complete");
@@ -500,35 +669,108 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
     let submit = json!({"session_id":source_id,"submission_id":"source-fact","text":PROJECT_FACT});
     let admission = client.ok("prompt.submit", submit.clone()).await;
+    approve_fixture_tool(&mut client, source_id, "get_current_time").await;
     assert_eq!(client.event("message.complete").await["payload"]["status"], "complete");
     let committed: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert_eq!(committed["authority"]["receipts"][0]["status"], "terminal");
     assert_eq!(committed["authority"]["receipts"][0]["capture"]["admission_id"], admission["admission_id"]);
-    assert_eq!(committed["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], rel.owner_id().to_string());
+    assert_eq!(committed["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], rel_id);
 
-    // Root may settle semantic processing independently of the conversation.
+    // Capture works before a model route is saved. Processing resumes after configuration.
+    assert_eq!(provider.memory_requests.load(Ordering::Relaxed), 0);
+    let vault = EndpointStore::open(&library.root().join("providers")).unwrap();
+    let route = |name: &str, embedding| {
+        let endpoint = vault
+            .save(Some(name), name, &Config {
+                model: format!("saved-{name}-default"),
+                api_key: format!("fixture-{name}-key"),
+                ..memory_provider.config()
+            })
+            .unwrap();
+        Some(HostedModelRoute {
+            endpoint: format!("endpoint:{}", endpoint.id),
+            model: Some(format!("fixture-{name}")),
+            reasoning_effort: None,
+            embedding,
+        })
+    };
+    let general = route("general", None);
+    save_switchboard_config(
+        library.root(),
+        &[
+            (ModelSlot::General, general.clone()),
+            (ModelSlot::EntityResolution, general),
+            (ModelSlot::Insomnia, route("insomnia", None)),
+            (ModelSlot::InsomniaMetadata, route("metadata", None)),
+            (ModelSlot::MemoryRetrievalDecision, route("recall", None)),
+            (ModelSlot::Embedding, route("embedding", Some(HostedEmbeddingSettings {
+                dimensions: 2,
+                normalization: EmbeddingNormalization::L2,
+            }))),
+        ],
+    ).unwrap();
     let accepted = memory_capture_receipt(&record_path, 0).await;
+    assert_eq!(provider.memory_requests.load(Ordering::Relaxed), 0);
+    assert!(memory_provider.memory_requests.load(Ordering::Relaxed) > 0);
+
+    library.rename_project(&project.id, "Amethyst").unwrap();
+    assert_eq!(gateway.reconcile_memory().await["projects_ready"], true);
+    assert!(!state.join("projects").join("Lantern.rel").exists());
+    assert!(state.join("projects").join("Amethyst.rel").is_file());
+    assert_eq!(read_topology(&state)["projects"][&project.id]["rel_id"], rel_id);
+    assert!(hermes_gateway::stock_plugins::rename_profile(&profiles, "work", "office").is_err());
     drop(client);
-    gateway.shutdown().await.unwrap();
-    {
-        let reader = MemoryGateway::new();
-        let owner = reader.mount_rel(&rel, false).unwrap();
-        let token = "project-fixture-reader-with-a-local-token";
-        let instance = TrustedHostAdmission::new([HostCredentialBinding::new(
-            "reader", token, [OwnerGrant::ViewRel(owner)],
-        )]).install(&reader).unwrap().0.authenticate(token).unwrap();
-        let status = instance.native_import_status(owner, &accepted.import_id).unwrap().unwrap();
-        assert_eq!(status.state, NativeImportState::Completed);
-        assert!(instance.has_active_vectors(owner).unwrap());
-        assert_eq!(status.receipt_digest, Some(accepted.receipt_digest));
+    gateway.shutdown().await;
+
+    assert_eq!(hermes_gateway::stock_plugins::rename_profile(&profiles, "work", "office").unwrap(), None);
+    assert!(!state.exists());
+    let state = store.join("office");
+    assert!(state.join("office.phy").is_file());
+    assert!(!state.join("work.phy").exists());
+    let relocated = read_topology(&state);
+    for field in ["profile_id", "principal_id", "main_rel", "active_phy"] {
+        assert_eq!(relocated[field], topology[field], "{field} changed during rename");
     }
-    let restarted = provider.gateway(&root).await;
-    let mut next = Client::native(&restarted).await;
+    assert_eq!(relocated["projects"][&project.id]["rel_id"], rel_id);
+    assert!(state.join("projects").join("Second project.rel").is_file());
+
+    let library = Library::open(profiles.profile_path("office").unwrap()).unwrap();
+    assert_eq!(
+        switchboard_config(library.root()).unwrap().model(ModelSlot::Insomnia).unwrap().endpoint,
+        "endpoint:insomnia",
+    );
+    let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
+    let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
+    let mut next = restarted.client().await;
     next.ok("session.resume", json!({"session_id":source_id})).await;
     assert_eq!(next.ok("prompt.submit", submit).await["admission_id"], admission["admission_id"]);
     let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert_eq!(record["authority"]["receipts"].as_array().unwrap().len(), 1);
     assert_eq!(record["authority"]["receipts"][0]["capture"]["receipt"]["import_id"], accepted.import_id);
+
+    let public_archive = next.call("plugins.memory.archive_search", json!({
+        "session_id":source_id,"query":"Amethyst Lantern"
+    })).await;
+    assert_eq!(public_archive["error"]["data"]["reason"], "permission_denied");
+    let project_archive = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":source_id,"query":"Amethyst Lantern"
+    })).await;
+    assert!(project_archive["hits"].as_array().unwrap().iter().any(|hit| {
+        hit["rel"] == "Amethyst" && hit["text"].as_str().unwrap().contains("Amethyst Lantern")
+    }), "project Archive results: {project_archive}");
+
+    let investigation = next.ok("session.create", json!({"project_id":project.id,"title":"Archive investigation"})).await;
+    let investigation = investigation["session_id"].as_str().unwrap();
+    next.ok("prompt.submit", json!({
+        "session_id":investigation,"submission_id":"investigate","text":"Inspect the archived clock check."
+    })).await;
+    for tool in ["archive_search", "archive_search", "echo_read"] {
+        approve_fixture_tool(&mut next, investigation, tool).await;
+    }
+    let completed = next.event_with_timeout("message.complete", 65).await;
+    assert_eq!(completed["payload"]["text"], "Recovered the Archive and Echo.");
+    let investigation_record = library.session(investigation).unwrap().directory.join("conversation.json");
+    memory_capture_receipt(&investigation_record, 0).await;
 
     let related = next.ok("session.create", json!({"project_id":project.id,"title":"Same project"})).await;
     let related_id = related["session_id"].as_str().unwrap();
@@ -536,7 +778,7 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     let read_related = || -> Value { serde_json::from_slice(&fs::read(&related_record).unwrap()).unwrap() };
     let set_provider = |name: &str| {
         let settings = json!({"memory_provider": name});
-        ProfileSettings::update(root.path(), settings.as_object().unwrap()).unwrap();
+        ProfileSettings::update(library.root(), settings.as_object().unwrap()).unwrap();
     };
     provider.memory_requests.store(0, Ordering::Relaxed);
     next.ok("prompt.submit", json!({"session_id":related_id,"submission_id":"ordinary","text":CONTEXT_PROBE})).await;
@@ -575,14 +817,23 @@ async fn enrolled_reliquary_captures_across_restart_without_automatic_retrieval(
     assert!(read_related()["authority"]["receipts"][2]["capture"].is_null());
 
     let general_chat = next.ok("session.create", json!({"title":"General chat"})).await;
-    let general_id = general_chat["session_id"].as_str().unwrap();
-    assert_eq!(approved_memory_query(&mut next, general_id).await, "No project memory.");
-    let general_record = library.session(general_id).unwrap().directory.join("conversation.json");
+    let general_chat_id = general_chat["session_id"].as_str().unwrap();
+    let local_archive = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":general_chat_id,"query":"Amethyst Lantern"
+    })).await;
+    assert_eq!(local_archive["hits"], json!([]));
+    let related_archive = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":general_chat_id,"query":"Amethyst Lantern","include_related":true
+    })).await;
+    assert!(related_archive["hits"].as_array().unwrap().iter().any(|hit| hit["rel"] == "Amethyst"),
+        "related Archive results: {related_archive}");
+    assert_eq!(approved_memory_query(&mut next, general_chat_id).await, "No project memory.");
+    let general_record = library.session(general_chat_id).unwrap().directory.join("conversation.json");
     let record: Value = serde_json::from_slice(&fs::read(general_record).unwrap()).unwrap();
     assert!(!record.to_string().contains(PROJECT_FACT));
-    assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general.owner_id().to_string());
+    assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general_id);
     drop(next);
-    restarted.shutdown().await.unwrap();
+    restarted.shutdown().await;
 }
 
 #[tokio::test]

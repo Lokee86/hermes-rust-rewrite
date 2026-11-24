@@ -29,11 +29,11 @@ codesign --force --sign - "$host"
 cp packaging/macos/Info.plist "$destination/Contents/Info.plist"
 cp assets/icon.icns "$destination/Contents/Resources/Hermes.icns"
 mkdir -p "$destination/Contents/Resources/Notices"
-"$destination/Contents/MacOS/hermes-desktop" --licenses > "$destination/Contents/Resources/Notices/Herdr-THIRD-PARTY-NOTICES"
 for notice in crates/desktop/assets/fonts/*NOTICE.txt crates/desktop/assets/fonts/*LICENSE*.txt; do
     if [ -f "$notice" ]; then cp "$notice" "$destination/Contents/Resources/Notices/"; fi
 done
-cp LICENSE-HERMES-AGENT "$destination/Contents/Resources/Notices/Hermes-LICENSE"
+"$PYO3_PYTHON" scripts/reliquary-notices.py stage "$destination/Contents/Resources/Notices" "$destination/Contents/MacOS/hermes-desktop" \
+    --save-runtime-notices "$destination/Contents/Resources/Notices/Herdr-THIRD-PARTY-NOTICES"
 codesign --force --sign - "$destination"
 scripts/verify-native-macos.sh "$destination"
 printf 'Built %s\n' "$destination"

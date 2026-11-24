@@ -20,10 +20,8 @@ pub(super) struct State {
 
 /// The profile this window runs (its data directory is `<root>/profiles/<name>`), else "default".
 pub(super) fn current_name() -> String {
-    hermes_engine::Session::default_dir().ok().and_then(|p| {
-        let parent = p.parent()?.file_name()?.to_str()?.to_owned();
-        (parent == "profiles").then(|| p.file_name()?.to_str().map(str::to_owned)).flatten()
-    }).unwrap_or_else(|| "default".into())
+    hermes_engine::Session::default_dir().map(|home| hermes_library::profiles::name_for_home(&home).to_owned())
+        .unwrap_or_else(|_| "default".into())
 }
 
 pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
@@ -47,7 +45,14 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         Action::Rename => state.renaming = state.selected.clone(),
         Action::RenameValue(v) => state.renaming = Some(v.to_lowercase()),
         Action::RenameSave => if let (Some(from), Some(to)) = (state.selected.clone(), state.renaming.clone()) {
-            match library.rename_profile(&from, to.trim()) { Ok(()) => { select(state, to.trim().to_owned()); state.notice = Some("Renamed.".into()); } Err(e) => state.error = Some(format!("{e:#}")) }
+            match hermes_gateway::stock_plugins::rename_profile(&library, &from, to.trim()) {
+                Ok(warning) => {
+                    select(state, to.trim().to_owned());
+                    state.error = None;
+                    state.notice = Some(warning.unwrap_or_else(|| "Renamed.".into()));
+                }
+                Err(e) => state.error = Some(format!("{e:#}")),
+            }
         },
         Action::Delete => state.deleting = true,
         Action::ConfirmDelete => if let Some(name) = state.selected.clone() {

@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
-reliquary = ["hermes-gateway/reliquary"]
+default = ["reliquary"]
+reliquary = ["hermes-gateway/reliquary", "dep:hermes-reliquary-plugin"]
 embedded-herdr = ["hermes-engine/embedded-herdr"]
 ui-test = []
 
@@ -16,6 +16,7 @@ hermes-engine = { path = "../engine" }
 hermes-library = { path = "../library" }
 hermes-telegram = { path = "../telegram" }
 hermes-gateway = { path = "../gateway", default-features = false }
+hermes-reliquary-plugin = { path = "../plugins/reliquary", features = ["native"], optional = true }
 iced = { version = "0.14", default-features = false, features = ["advanced", "wgpu", "tiny-skia", "tokio", "basic-shaping", "x11", "wayland", "markdown", "image-without-codecs", "svg", "canvas"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 async-channel.workspace = true

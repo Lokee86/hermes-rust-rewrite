@@ -46,7 +46,7 @@ pub struct ProfileSettings {
     pub memory_provider: MemoryProvider,
     /// Reserve this profile's HTTP MCP connector for the External memory setting.
     pub external_memory_connector: bool,
-    /// Saved profile endpoint used for shared-space embeddings by embedded Reliquary.
+    /// Legacy embedding selection used before the profile saves Switchboard routes.
     pub memory_embedding: Option<MemoryEmbedding>,
     pub checkpoints_enabled: bool,
     pub checkpoint_max_snapshots: usize,
@@ -128,7 +128,8 @@ impl ProfileSettings {
         self.validate()?;
         let mut file=tempfile::NamedTempFile::new_in(root)?;
         serde_json::to_writer_pretty(&mut file,self)?; file.write_all(b"\n")?;file.as_file().sync_all()?;
-        file.persist(root.join("agent-settings.json")).context("Could not save profile settings")?;
+        crate::history::persist_with_retry(file, &root.join("agent-settings.json"))
+            .context("Could not save profile settings")?;
         Ok(())
     }
     /// Whether a tool call must wait for the user's answer under the approval mode.
@@ -145,7 +146,7 @@ impl ProfileSettings {
             "terminal"|"process_manage"=>self.terminal_tools,
             "list_directory"|"read_file"|"write_file"|"search_files"=>self.file_tools,
             "skills_list"|"skill_view"=>self.skill_tools,
-            "memory"|"memory_query"|"refine_query"|"traverse_graph"=>self.memory_tool,
+            "memory"|"memory_query"|"refine_query"|"traverse_graph"|"archive_search"|"archive_read"|"echo_read"=>self.memory_tool,
             "delegate_task"=>true,
             _=>self.mcp_tools,
         }
