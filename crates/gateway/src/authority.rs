@@ -29,6 +29,12 @@ pub(super) struct Receipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_turn_hint: Option<usize>,
     pub(super) admitted_ns: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) committed_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) python_selection: Option<python_memory::PythonSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) python_delivery: Option<python_memory::PythonDelivery>,
     #[serde(default)]
     pub(super) unattended: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +168,9 @@ impl Authority {
                 turn_index: None,
                 legacy_turn_hint: turn_index,
                 admitted_ns: 0,
+                committed_ns: None,
+                python_selection: None,
+                python_delivery: None,
                 unattended: false,
                 ordinary_chat: false,
                 capture: None,
@@ -372,6 +381,7 @@ impl Shared {
             model: turn.model.clone(), options: GenerationOptions::default(), sequence: authority.receipts.len() as u64 + 1,
             generation: authority.generation, owner_epoch: Some(self.authority_epoch), status: "terminal".into(), outcome: Some("published".into()),
             result: Some(payload), turn_index: Some(turn_index), admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), unattended: true,
+            committed_ns: None, python_selection: None, python_delivery: None,
             capture: None, ordinary_chat: false, legacy_turn_hint: None, group: None,
         });
         authority.persist(&session.writer, Some(&history))?;
@@ -391,6 +401,16 @@ impl Shared {
         let bound = lock(&session.settings).memory_binding.is_some();
         let ordinary_chat = matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none()
             && bound && self.selected_memory().await.native();
+        let python_selection = if matches!(origin, AdmissionOrigin::Chat)
+            && attachments.is_empty()
+            && hermes_engine::references::parse(&text).is_empty()
+            && !hermes_engine::memory_capture::contains_inline_data(&text)
+            && self.python_source_is_active(&summary, &lock(&session.settings))
+        {
+            self.python_selection_at_admission().await
+        } else {
+            None
+        };
         let mut candidate = Receipt {
             id: new_id(),
             input_id: input,
@@ -407,6 +427,9 @@ impl Shared {
             turn_index: None,
             legacy_turn_hint: None,
             admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            committed_ns: None,
+            python_selection,
+            python_delivery: None,
             unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
             // Freeze consent at submission, including queued turns that run after a switch.
             ordinary_chat,
