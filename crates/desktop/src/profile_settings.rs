@@ -44,7 +44,7 @@ const FIELDS:&[Field]=&[
 #[derive(Clone,Debug)]
 pub(super) enum Action {
     SetMemoryProvider(MemoryProvider),
-    MemorySynced(Result<serde_json::Value, String>),
+    SetMemoryProviderId(String), MemoryProvidersLoaded(Result<serde_json::Value,String>), MemoryProviderSet(Result<serde_json::Value,String>),
     #[cfg(feature = "reliquary")]
     SwitchboardEndpoint(ModelSlot, String),
     #[cfg(feature = "reliquary")]
@@ -76,8 +76,17 @@ pub(super) struct State {
     edits:BTreeMap<&'static str,String>,
     pub archive:Vec<SessionSummary>,
     pub feedback:Option<Result<String,String>>,
+    memory_inventory: Option<serde_json::Value>,
     delete:Option<String>,
     awake:Option<Child>,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct MemoryChoice { id:String, label:String }
+impl std::fmt::Display for MemoryChoice { fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result { f.write_str(&self.label) } }
+
+pub(super) fn load_memory_providers(app:&mut Hermes)->Task<Message>{
+    let Ok(conn)=app.chat_connection() else{return Task::none()};
+    Task::perform(async move{conn.request("memory.providers",serde_json::json!({})).await},|r|Message::ProfileSetting(Action::MemoryProvidersLoaded(r)))
 }
 impl Drop for State{fn drop(&mut self){self.release_awake();}}
 impl State {
@@ -179,35 +188,23 @@ fn nonempty(value: String) -> Option<String> {
     let value=value.trim().to_owned(); (!value.is_empty()).then_some(value)
 }
 pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
+    match action {
+        Action::SetMemoryProvider(provider) => return set_memory_provider(app, provider.as_id().to_string()),
+        Action::SetMemoryProviderId(id) => return set_memory_provider(app,id),
+        action => return update_other(app,action),
+    }
+}
+fn set_memory_provider(app:&mut Hermes,id:String)->Task<Message>{
+    let Ok(conn)=app.chat_connection() else {app.profile_settings.feedback=Some(Err("The profile gateway is unavailable.".into()));return Task::none()};
+    Task::perform(async move{conn.request("memory.provider.set",serde_json::json!({"provider":id})).await},|r|Message::ProfileSetting(Action::MemoryProviderSet(r)))
+}
+fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
     let Some(lib)=app.library.clone() else{return Task::none()};
     let state=&mut app.profile_settings;
     match action {
-        Action::SetMemoryProvider(provider) => {
-            let changes = serde_json::Map::from_iter([("memory_provider".into(), serde_json::json!(provider))]);
-            state.feedback = Some(ProfileSettings::update(lib.root(), &changes)
-                .map(|saved| { state.saved = saved; "Settings saved".into() })
-                .map_err(|e| format!("{e:#}")));
-            if provider == MemoryProvider::Reliquary
-                && hermes_gateway::stock_plugins::has_memory_plugin()
-                && state.feedback.as_ref().is_some_and(Result::is_ok)
-            {
-                let root = lib.root().to_owned();
-                return Task::perform(
-                    super::local_gateway::catalog_request(root, app.config.clone(), "plugins.memory.sync", serde_json::json!({})),
-                    |result| Message::ProfileSetting(Action::MemorySynced(result)),
-                );
-            }
-        }
-        Action::MemorySynced(result) => {
-            if state.saved.memory_provider == MemoryProvider::Reliquary {
-                state.feedback = Some(result.and_then(|result| {
-                    if result["enrolled"] != true {
-                        return Err("This profile's gateway does not have the Reliquary stock plugin.".into());
-                    }
-                    Ok("Reliquary enrolled.".into())
-                }));
-            }
-        }
+        Action::MemoryProvidersLoaded(result) => match result { Ok(value)=>{if let Some(id)=value["selected"].as_str(){if let Ok(provider)=MemoryProvider::from_id(id){state.saved.memory_provider=provider;}}state.memory_inventory=Some(value)},Err(error)=>state.feedback=Some(Err(error)) },
+        Action::MemoryProviderSet(result) => match result { Ok(value)=>{state.memory_inventory=Some(value.clone());if let Some(id)=value["selected"].as_str(){if let Ok(provider)=MemoryProvider::from_id(id){state.saved.memory_provider=provider;}}state.feedback=Some(Ok("Memory provider saved.".into()));},Err(error)=>state.feedback=Some(Err(error)) },
+        Action::SetMemoryProvider(_) | Action::SetMemoryProviderId(_) => unreachable!(),
         #[cfg(feature = "reliquary")]
         Action::SwitchboardEndpoint(slot, endpoint) => {
             let route = if endpoint.is_empty() {
@@ -502,7 +499,7 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
         use MemoryProvider::{Auto, External, Notes, Off, Reliquary};
         let saved = &state.saved;
         let stock = hermes_gateway::stock_plugins::has_memory_plugin();
-        let description = match saved.memory_provider {
+        let description = match &saved.memory_provider {
             Auto if stock => "Automatically enroll this profile in the Reliquary stock plugin. Choose another provider to opt out.",
             Auto => "Use this profile’s Markdown notes.",
             Reliquary if stock => "Enroll this profile with the Reliquary stock plugin. New chats can capture turns and query their assigned memory.",
@@ -514,16 +511,29 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
                 "Enable both MCP tools and Memory tools in Advanced to use the external provider.",
             External => "Use tools from the MCP server designated for memory in Capabilities > Connectors.",
             Off => "Disable built-in memory and the designated external memory connector for this profile.",
+            MemoryProvider::Plugin(id) => state.memory_inventory.as_ref().and_then(|v|v["providers"].as_array()).into_iter().flatten().find(|p|p["id"]==format!("plugin:{id}")).and_then(|p|p["reason"].as_str()).unwrap_or("Use the selected installed Python memory provider."),
         };
-        let options = if stock || saved.memory_provider == Reliquary {
-            vec![Auto, Reliquary, Notes, External, Off]
+        let saved_id=saved.memory_provider.as_id().to_string();
+        let selected_id = state.memory_inventory.as_ref().and_then(|v|v["selected"].as_str()).unwrap_or(&saved_id);
+        let mut options:Vec<MemoryChoice> = if let Some(providers)=state.memory_inventory.as_ref().and_then(|v|v["providers"].as_array()) {
+            providers.iter().filter_map(|provider| {
+                let id=provider["id"].as_str()?;
+                let label=provider["label"].as_str().unwrap_or(id);
+                Some(MemoryChoice{id:id.to_owned(),label:if provider["status"]=="unavailable" {format!("{label} (unavailable)")} else {label.to_owned()}})
+            }).collect()
         } else {
-            vec![Auto, Notes, External, Off]
+            let mut builtins=vec![Auto,Notes,External,Off];if stock||saved.memory_provider==Reliquary{builtins.insert(1,Reliquary)}
+            builtins.into_iter().map(|p|MemoryChoice{id:p.as_id().to_string(),label:p.as_id().to_string()}).collect()
         };
-        let selector = pick_list(options, Some(saved.memory_provider),
-            |choice| Message::ProfileSetting(Action::SetMemoryProvider(choice)))
+        if !options.iter().any(|option|option.id==selected_id) {options.push(MemoryChoice{id:selected_id.to_owned(),label:selected_id.to_owned()});}
+        let selected=options.iter().find(|option|option.id==selected_id).cloned();
+        let selector = pick_list(options, selected,
+            |choice| Message::ProfileSetting(Action::SetMemoryProviderId(choice.id)))
             .width(165).text_size(13).padding([7, 10]);
         rows.push(super::settings::card_row("Memory provider", description, selector.into(), dark));
+        if let Some(reason)=state.memory_inventory.as_ref().and_then(|v|v["providers"].as_array()).into_iter().flatten().find(|provider|provider["id"]==selected_id).and_then(|provider|provider["reason"].as_str()) {
+            rows.push(super::settings::card_row("Provider status", reason, Space::new().into(), dark));
+        }
         if stock && matches!(saved.memory_provider, Reliquary | Auto) {
             #[cfg(feature = "reliquary")]
             rows.extend(switchboard_rows(app));
