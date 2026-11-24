@@ -196,8 +196,11 @@ impl Shared {
             ));
         }
         let settings = lock(&session.settings).clone();
-        let source = settings.source.clone();
-        if !matches!(source.as_str(), "cli" | "tui" | "gui" | "desktop" | "rust") {
+        let source_kind = settings.source.clone();
+        if !matches!(
+            source_kind.as_str(),
+            "cli" | "tui" | "gui" | "desktop" | "rust"
+        ) {
             return Err(RpcError::new(
                 4403,
                 "permission_denied",
@@ -240,8 +243,10 @@ impl Shared {
             .and_then(|path| path.to_str())
             .unwrap_or("");
         let session_id = summary.id;
+        let session_key = local_session_key(&self.profile_name, &session_id);
         let response = handle.request("hermes/command", json!({"name":metadata.name,"arguments":arguments,
-            "context":{"source":source,"session_id":session_id,"session_key":session_id,"platform":"local","cwd":cwd}}))
+            "context":{"source":{"platform":"local","chat_id":session_id,"chat_type":"dm","profile_name":self.profile_name},
+                "session_id":session_id,"session_key":session_key,"platform":"local","cwd":cwd}}))
             .await.map_err(|error| RpcError::new(4004, "command_failed", format!("Plugin command failed: {error}")))?;
         if !self.plugins.is_current(handle).await {
             return Err(RpcError::new(
@@ -263,6 +268,15 @@ impl Shared {
         };
         Ok(json!({"type":"exec","output":output}))
     }
+}
+
+fn local_session_key(profile_name: &str, session_id: &str) -> String {
+    let profile = match profile_name {
+        "default" => "main",
+        "main" => "main~",
+        other => other,
+    };
+    format!("agent:{profile}:local:dm:{session_id}")
 }
 
 #[cfg(test)]
@@ -300,6 +314,18 @@ mod tests {
             .unwrap();
         assert_eq!(name, "tool");
         assert_eq!(arguments, " first arg\twith spacing");
+    }
+
+    #[test]
+    fn local_session_key_uses_stock_default_profile_mapping() {
+        assert_eq!(
+            local_session_key("default", "sid-1"),
+            "agent:main:local:dm:sid-1"
+        );
+        assert_eq!(
+            local_session_key("main", "sid-1"),
+            "agent:main~:local:dm:sid-1"
+        );
     }
 
     #[test]
