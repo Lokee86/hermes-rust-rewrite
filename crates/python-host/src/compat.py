@@ -497,7 +497,10 @@ def install(home):
         resolved = path.resolve(strict=True)
         if _HOME is not None and _ordinary_path(_HOME) != _ordinary_path(resolved):
             raise ValueError("Cannot rebind the plugin host to another Hermes profile")
-        _HOME = resolved
+        _HOME = _ordinary_path(resolved)
+        # The stock package also opens its own SQLite outbox using File URIs.
+        # Bind the ordinary spelling before plugin import and provider initialization.
+        os.environ["HERMES_HOME"] = str(_HOME)
         inferred = _HOME.name if _HOME.parent.name == "profiles" else "default"
         _PROFILE = os.environ.get("HERMES_PROFILE_NAME") or inferred
     _module("hermes_constants", get_hermes_home=get_hermes_home,
