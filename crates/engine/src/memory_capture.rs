@@ -9,6 +9,11 @@ use std::collections::BTreeSet;
 // Reserve space for normalized source and receipt metadata in Core's batch.
 const MAX_EVIDENCE_BYTES: usize = 224 * 1024;
 
+/// Scrub text before it leaves the authoritative transcript for a memory provider.
+pub fn redact_source_text(text: &str, protected: &[&str]) -> String {
+    privacy::redact_capture(text, protected)
+}
+
 /// Frozen by the gateway when an enrolled, ordinary chat is created. These are
 /// owner identities, never paths or request-supplied destinations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
