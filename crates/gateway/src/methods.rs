@@ -72,6 +72,11 @@ fn tokens(bytes: usize) -> usize {
 
 impl Shared {
     pub(super) async fn profile_method(self: &Arc<Self>, method: &str, params: &Value, peer: &Peer) -> RpcResult {
+        let unknown = || RpcError::new(-32601, "method_not_found", format!("Method not implemented by the Rust gateway: {method}"));
+        // Clients on any connection read -32601 as a missing method, so the name is checked before access.
+        if !METHODS.contains(&method) {
+            return Err(unknown());
+        }
         if !peer.canonical {
             return Err(RpcError::unsupported("A native session is required"));
         }
@@ -332,7 +337,7 @@ impl Shared {
             }
             "i18n.languages" => Ok(json!({"languages":LANGUAGES.iter().map(|(id, name)| json!({"id":id,"endonym":name,"rtl":false,"source":"bundled","surfaces":["desktop"]})).collect::<Vec<_>>()})),
             "system.battery" => Ok(blocking(|| Ok(battery())).await?.unwrap_or_else(|| json!({"available":false}))),
-            _ => Err(RpcError::new(-32601, "method_not_found", format!("Method not implemented by the Rust gateway: {method}"))),
+            _ => Err(unknown()),
         }
     }
 

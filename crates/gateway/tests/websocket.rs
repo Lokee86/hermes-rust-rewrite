@@ -961,6 +961,13 @@ async fn ticket_auth_is_single_use_and_boundaries_fail_closed() {
         "unsupported_profile"
     );
     native.socket.close(None).await.unwrap();
+    // Stock clients read -32601 as "this gateway lacks the method", on either connection.
+    let mut legacy = Client::legacy(&gateway).await;
+    assert_eq!(legacy.call("python.exec", json!({})).await["error"]["code"], -32601);
+    let refused = legacy.call("profiles.list", json!({})).await;
+    assert_eq!(refused["error"]["code"], 4001);
+    assert_eq!(refused["error"]["data"]["reason"], "unsupported_control");
+    legacy.socket.close(None).await.unwrap();
     gateway.shutdown().await.unwrap();
     let mut unsafe_config = GatewayConfig::new(root.path(), provider.config());
     unsafe_config.bind = "0.0.0.0:0".parse().unwrap();
