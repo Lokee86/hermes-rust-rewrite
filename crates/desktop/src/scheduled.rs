@@ -37,6 +37,9 @@ pub enum Action {
     EditorClose,
     Save,
     Name(String),
+    Script(String),
+    NoAgent(bool),
+    Monitor(String),
     Prompt(text_editor::Action),
     Schedule(String),
     Timezone(String),
@@ -411,6 +414,22 @@ impl Scheduled {
             Action::Name(value) => {
                 if let Some(editor) = &mut self.editor {
                     editor.draft.name = value;
+                }
+            }
+            Action::Script(value) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.draft.no_agent &= !value.trim().is_empty();
+                    editor.draft.script = value;
+                }
+            }
+            Action::NoAgent(value) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.draft.no_agent = value;
+                }
+            }
+            Action::Monitor(value) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.draft.monitor = value;
                 }
             }
             Action::Prompt(action) => {
@@ -1011,6 +1030,13 @@ impl Scheduled {
                     .size(12)
                     .padding(8),
             )
+            .push(text("Script (optional)").size(12))
+            .push(text_input("collect.py", &editor.draft.script).on_input(Action::Script).size(12).padding(8))
+            .push(text("A .py or .sh file in this profile’s scripts folder. Its output is added to the prompt.").size(11).style(muted))
+            .push(checkbox(editor.draft.no_agent).label("Run only the script, without the agent")
+                .on_toggle_maybe((!editor.draft.script.trim().is_empty()).then_some(Action::NoAgent)).size(14).text_size(12))
+            .push(text("Run only when this changes (optional)").size(12))
+            .push(text_input("https://example.com/status or check.sh", &editor.draft.monitor).on_input(Action::Monitor).size(12).padding(8))
             .push(text("If a run is missed").size(12))
             .push(
                 pick_list(

@@ -11,7 +11,7 @@ use iced::{Alignment, Border, Color, Element, Fill, Task,
 pub(super) enum Action {
     Roster(bool), Open(String), New, Edit(String), Cancel,
     Name(String), Description(String), Emoji(String), Soul(text_editor::Action),
-    Save, Delete(String), ConfirmDelete, Menu, Toasts,
+    Save, Delete(String), ConfirmDelete, Deleted(bool, Result<(), String>), Menu, Toasts,
     // Roster sections (user-sections.ts)
     NewSection(Option<String>), RenameSection(String), SectionName(String), SaveSection, DeleteSection(String),
     MoveSection(String, i32), RowMenu(String), MoveTo(String, Option<String>), SectionMenu(String),
@@ -196,10 +196,17 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             let (Some(library), Some(name)) = (library, state.deleting.take()) else { return Task::none() };
             let open = app.current.as_ref().is_some_and(|c| c.bot.as_deref() == Some(name.as_str()));
             if open && app.running { state.error = Some("Stop the current response before deleting this bot.".into()); return Task::none(); }
-            let result = match name.strip_prefix("group:") { Some(id) => library.delete_group(id), None => library.delete_bot(&name) };
+            // Windows may have to wait for the bot's plugins to stop.
+            return Task::perform(async move {
+                tokio::task::spawn_blocking(move || match name.strip_prefix("group:") { Some(id) => library.delete_group(id), None => library.delete_bot(&name) }
+                    .map_err(|e| format!("{e:#}"))).await.unwrap_or_else(|e| Err(e.to_string()))
+            }, move |result| Message::Bot(Action::Deleted(open, result)));
+        }
+        Action::Deleted(open, result) => {
+            let Some(library) = library else { return Task::none() };
             match result {
                 Ok(()) => { state.refresh(Some(&library)); if open { app.screen = Screen::Bots; let _ = app.update(Message::NewChat); app.screen = Screen::Bots; } }
-                Err(e) => state.error = Some(format!("{e:#}")),
+                Err(e) => { state.refresh(Some(&library)); state.error = Some(e) }
             }
         }
     }

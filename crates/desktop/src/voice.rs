@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::{io::Write, time::Duration};
 #[cfg(not(target_os = "macos"))]
 mod system;
+// Built on every platform so its conversion tests run everywhere.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+mod recorder;
 
 #[derive(Clone)]
 pub(super) enum Action {
@@ -117,6 +120,8 @@ pub(super) struct State {
     output: Option<mac::Output>,
     #[cfg(not(target_os = "macos"))]
     output: Option<system::Output>,
+    #[cfg(not(target_os = "macos"))]
+    input: Option<recorder::Recording>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -140,7 +145,6 @@ impl Default for State {
             speech_epoch: 0,
             sender,
             receiver,
-            #[cfg(target_os = "macos")]
             input: None,
             output: None,
         }
@@ -207,10 +211,7 @@ impl State {
         self.recording = false;
         self.authorizing = false;
         self.finishing = false;
-        #[cfg(target_os = "macos")]
-        {
-            self.input.take();
-        }
+        self.input.take();
         if let Some(output) = &self.output {
             output.stop();
         }
@@ -224,9 +225,8 @@ impl State {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Some(
-                "On-device dictation is available on macOS 14 or later. This platform does not yet have a native dictation integration.",
-            )
+            (!hermes_engine::transcribe::available())
+                .then_some("Dictation needs the Python runtime that the packaged app includes.")
         }
     }
     pub fn speech_unavailable(&self) -> Option<&'static str> {
@@ -318,8 +318,17 @@ impl Hermes {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = epoch;
-                    self.voice.error = Some("Native dictation is available on macOS.".into());
+                    match Session::default_dir() {
+                        Ok(data) => {
+                            if !hermes_engine::transcribe::installed(&data) {
+                                self.note("The first dictation downloads speech recognition (about 400 MB, one time). After that it runs on this computer.");
+                            }
+                            let locale = self.voice.preferences.locale.clone();
+                            self.voice.input = Some(recorder::Recording::start(data, locale, self.voice.conversation, epoch, self.voice.sender.clone()));
+                            self.voice.recording = true;
+                        }
+                        Err(error) => self.voice.error = Some(error.to_string()),
+                    }
                 }
             }
         }
@@ -330,7 +339,7 @@ impl Hermes {
             Action::Wake(on) => {
                 self.voice.preferences.wake_word = on;
                 if let Err(e) = self.voice.save() { self.voice.error = Some(e.to_string()); }
-                if on { self.note("Wake word on · say “hey Hermes”. Listening happens on this Mac."); return self.voice_update(Action::WakeArm); }
+                if on { self.note("Wake word on · say “hey Hermes”. Listening happens on this computer."); return self.voice_update(Action::WakeArm); }
                 self.note("Wake word off.");
                 if let Some(model) = self.voice.wake_model.take() { self.voice.wake_listening = false; return Task::future(async move { model.send("STOP").await }).discard(); }
                 if self.voice.wake_listening { self.voice.wake_listening = false; return self.voice_update(Action::CancelRecord); }
@@ -349,7 +358,8 @@ impl Hermes {
                     let data = self.library.as_ref().map(|l| l.root().to_owned()).unwrap_or_else(std::env::temp_dir);
                     return Task::run(super::wake_model::start(data), |event| Message::Voice(Action::WakeModel(event)));
                 }
-                if self.voice.dictation_unavailable().is_none() {
+                // Only a recognizer that streams can listen for a phrase.
+                if cfg!(target_os = "macos") && self.voice.dictation_unavailable().is_none() {
                     let record = self.voice_update_record();
                     // Set after Record: Record itself treats a set flag as "yield the mic".
                     self.voice.wake_listening = self.voice.recording || self.voice.authorizing;
@@ -429,14 +439,16 @@ impl Hermes {
             Action::StopRecord if self.voice.recording => {
                 self.voice.recording = false;
                 self.voice.finishing = true;
-                #[cfg(target_os = "macos")]
                 if let Some(input) = &mut self.voice.input {
                     input.finish();
                 }
                 let epoch = self.voice.epoch;
+                // A platform recognizer has been listening all along. The other transcribes now,
+                // after a download the first time.
+                let wait = if cfg!(target_os = "macos") { 3 } else { 900 };
                 return Task::perform(
-                    async {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
                     },
                     move |_| Message::Voice(Action::FinishTimeout(epoch)),
                 );
@@ -462,7 +474,6 @@ impl Hermes {
                 self.voice.finishing = false;
                 self.voice.authorizing = false;
                 self.voice.transcript.clear();
-                #[cfg(target_os = "macos")]
                 self.voice.input.take();
             }
             Action::Speak(id, body) => {
@@ -597,7 +608,6 @@ impl Hermes {
         self.voice.recording = false;
         self.voice.authorizing = false;
         self.voice.finishing = false;
-        #[cfg(target_os = "macos")]
         self.voice.input.take();
         if !text.trim().is_empty() {
             let prefix = if self.composer.text().is_empty() {
@@ -637,7 +647,7 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
         .on_input(|value| Message::Voice(Action::Language(value)))
         .size(12)
         .padding(8);
-        body=body.push(text("Use the microphone button to dictate into your message draft. Recognition stays on this Mac and requires an installed on-device language model.").size(12).color(p.muted))
+        body=body.push(text("Use the microphone button to dictate into your message draft. Recognition stays on this computer. macOS needs an installed on-device language model; elsewhere Hermes downloads one (about 400 MB) the first time.").size(12).color(p.muted))
             .push(row![text("Language").size(13).width(110),language].spacing(12).align_y(Alignment::Center))
             .push(button(text("Save").size(12)).on_press(Message::Voice(Action::Save)).padding([6,12]));
     }
