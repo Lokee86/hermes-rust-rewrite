@@ -47,9 +47,64 @@ pub fn installed(root: &Path) -> Result<Vec<Installed>> {
     }
 }
 fn open_install_lock(root: &Path) -> Result<fs::File> {
-    fs::create_dir_all(dir(root))?;
     Ok(fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(dir(root).join(".install.lock"))?)
+}
+
+fn profile_parent(home: &Path) -> Option<&Path> {
+    home.parent().filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+}
+
+fn open_profile_install_fence(home: &Path, parent: &Path) -> Result<fs::File> {
+    let mut name = std::ffi::OsString::from(".plugin-install-");
+    name.push(home.file_name().context("The plugin profile has no name")?);
+    name.push(".lock");
+    Ok(fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(parent.join(name))?)
+}
+
+/// Fence profile deletion against dependency staging and plugin publication.
+/// Keep the guard until deletion finishes. The file is outside the profile.
+pub fn lock_profile_plugin_deletion(home: &Path) -> Result<Option<fs::File>> {
+    let home = match home.canonicalize() {
+        Ok(home) => home,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = profile_parent(home) else {
+                return Ok(None);
+            };
+            let parent = match parent.canonicalize() {
+                Ok(parent) => parent,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            parent.join(home.file_name().context("The plugin profile has no name")?)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(parent) = profile_parent(&home) else {
+        return Ok(None);
+    };
+    let lock = open_profile_install_fence(&home, parent)?;
+    lock.try_lock().context("Wait for the profile's plugin installation before deleting it")?;
+    Ok(Some(lock))
+}
+
+fn lock_profile_plugin_install(home: &Path) -> Result<Vec<fs::File>> {
+    let mut scopes = Vec::new();
+    let mut current = home;
+    while let Some(parent) = profile_parent(current) {
+        scopes.push((current, parent));
+        // A bot can be inside another profile. Its install also fences deletion
+        // of any enclosing profile.
+        current = parent.parent().context("The profile store has no parent")?;
+    }
+    let locks = scopes.into_iter().rev().map(|(home, parent)| {
+        let lock = open_profile_install_fence(home, parent)?;
+        lock.try_lock_shared().context("The profile is being deleted")?;
+        Ok(lock)
+    }).collect::<Result<Vec<_>>>()?;
+    ensure!(home.is_dir(), "The plugin profile no longer exists");
+    Ok(locks)
 }
 
 fn lock_installation(root: &Path) -> Result<fs::File> {
@@ -104,6 +159,9 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
     ensure!(entry.sha.len() == 40 && entry.sha.bytes().all(|b| b.is_ascii_hexdigit()), "The catalog entry has no exact commit pin");
     let repo = reqwest::Url::parse(&entry.repo).context("The catalog entry has no valid repository")?;
     ensure!(repo.scheme() == "https" && repo.username().is_empty() && repo.password().is_none(), "Plugins install only from an https repository");
+    let home = root.canonicalize().context("The plugin profile no longer exists")?;
+    let root = home.as_path();
+    let _profiles = lock_profile_plugin_install(root)?;
     fs::create_dir_all(dir(root))?;
     let staging = tempfile::tempdir_in(dir(root))?;
     let git = |args: &[&str]| -> Result<()> {
@@ -164,6 +222,15 @@ fn install_checkout(
     // Catalog installs run off the UI thread, so wait for any Python startup
     // to finish loading the current checkout before publishing the replacement.
     let _lock = wait_for_installation(root)?;
+    let staged_package = read_package(source).context("The staged plugin checkout is unavailable")?;
+    ensure!(
+        staged_package.python_dependencies == package.python_dependencies
+            && staged_package.servers.contains_key("python") == staged.is_some(),
+        "The staged plugin's dependency requirements changed"
+    );
+    if let Some(generation) = &python_package_generation {
+        python_packages::selected(&data, Some(generation))?;
+    }
     let mut list = installed(root)?;
     let revision = list.iter().find(|plugin| plugin.name == entry.name).map_or(0, |plugin| plugin.revision);
     if list.iter().any(|plugin| plugin.name == entry.name) {
@@ -486,6 +553,39 @@ async fn connect_python_bridge(plugin_root: &Path, data: &Path, packages: &Path,
 mod tests {
     use super::*;
     #[test]
+    fn profile_deletion_and_nested_bot_install_share_canonical_fences() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("profiles/work");
+        let bot = home.join("profiles/bot");
+        fs::create_dir_all(&bot).unwrap();
+        let home = home.canonicalize().unwrap();
+        let bot = bot.canonicalize().unwrap();
+        let alias = bot.join("..").join("bot");
+        let installation = lock_profile_plugin_install(&alias.canonicalize().unwrap()).unwrap();
+        assert!(lock_profile_plugin_deletion(&alias).is_err());
+        assert!(lock_profile_plugin_deletion(&home).is_err());
+        drop(installation);
+
+        let deleting = lock_profile_plugin_deletion(&home).unwrap().unwrap();
+        assert!(lock_profile_plugin_install(&bot).is_err());
+        assert!(!bot.join("plugins").exists());
+
+        // A second installer may have canonicalized this name before deletion
+        // but must not recreate it after the deletion fence is released.
+        let empty_profile = fixture.path().join("profiles/empty");
+        fs::create_dir(&empty_profile).unwrap();
+        let empty_profile = empty_profile.canonicalize().unwrap();
+        fs::remove_dir(&empty_profile).unwrap();
+        assert!(lock_profile_plugin_install(&empty_profile).is_err());
+        assert!(!empty_profile.exists());
+        let retry = lock_profile_plugin_deletion(&empty_profile).unwrap().unwrap();
+        assert!(lock_profile_plugin_deletion(&empty_profile).is_err());
+        drop(retry);
+        assert!(!empty_profile.exists());
+        drop(deleting);
+    }
+
+    #[test]
     fn python_updates_stage_a_new_package_generation_without_touching_loaded_files() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("profile");
@@ -538,6 +638,14 @@ mod tests {
         assert!(result.is_err());
         assert!(!failed_stage.exists());
         assert_eq!(installed(&root).unwrap(), vec![old]);
+        assert_eq!(fs::read_to_string(installed_checkout.join("__init__.py")).unwrap(), "old checkout");
+
+        let missing = install_checkout(&root, &entry, &source, read_package(&source).unwrap(), |stage, _| {
+            fs::remove_dir(stage)?;
+            Ok(())
+        });
+        assert!(missing.is_err());
+        assert_eq!(installed(&root).unwrap()[0].revision, 3);
         assert_eq!(fs::read_to_string(installed_checkout.join("__init__.py")).unwrap(), "old checkout");
 
         let first = std::thread::scope(|threads| {
