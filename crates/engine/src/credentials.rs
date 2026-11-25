@@ -12,6 +12,9 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+/// How long to wait for another holder of the credentials lock.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointProfile {
     pub id: String,
@@ -167,9 +170,23 @@ impl EndpointStore {
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        file.try_lock_exclusive()
-            .context("Provider credentials are busy in another window")?;
-        Ok(file)
+        // Another window holds this for a moment. So does a program being started, which shares the
+        // app's open files until it runs.
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(file),
+                Err(error)
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(error).context("Provider credentials are busy in another window");
+                }
+            }
+        }
     }
     fn read(&self) -> Result<Document> {
         let path = self.dir.join("endpoints.json");
@@ -218,4 +235,22 @@ fn reject_link(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_brief_holder_is_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EndpointStore::open(dir.path()).unwrap();
+        let held = store.lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        store.list().unwrap();
+        release.join().unwrap();
+    }
 }
