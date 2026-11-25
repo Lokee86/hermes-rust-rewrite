@@ -25,3 +25,7 @@ strip = true
 # bring in a QUIC and telemetry stack.
 [patch."https://github.com/Lokee86/Reliquary.git"]
 reliquary-project-environment = { path = "vendor/reliquary-project-environment" }
+
+[patch.crates-io]
+# GTK3 requires glib 0.18. This copy carries the upstream VariantStrIter fix.
+glib = { path = "vendor/glib" }

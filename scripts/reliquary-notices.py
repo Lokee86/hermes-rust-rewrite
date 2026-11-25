@@ -39,6 +39,8 @@ def notices():
         "Reliquary-NOTICE": notice,
         "Reliquary-MPL-2.0": root("reliquary-memory") / "LICENSE",
         "Lodestone-MIT": root("lodestone-core").parents[1] / "LICENSE.md",
+        "glib-MIT": Path("vendor/glib/LICENSE"),
+        "glib-COPYRIGHT": Path("vendor/glib/COPYRIGHT"),
     }
 
 
