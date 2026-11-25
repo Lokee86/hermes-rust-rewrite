@@ -2,6 +2,15 @@
 set -eu
 cd "$(dirname "$0")/.."
 destination=${1:-"$PWD/dist/Hermes.app"}
+# An ad-hoc signature unless CODESIGN_IDENTITY names a Developer ID certificate in the keychain.
+identity=${CODESIGN_IDENTITY:--}
+sign() {
+    if [ "$identity" = - ]; then
+        codesign --force --sign - "$@"
+    else
+        codesign --force --options runtime --timestamp --entitlements packaging/macos/entitlements.plist --sign "$identity" "$@"
+    fi
+}
 # hermes-python-host embeds this exact CPython; it ships in Contents/Resources/python.
 if [ -z "${PYO3_CONFIG_FILE:-}" ]; then
     for setting in $(scripts/python-runtime.sh); do export "$setting"; done
@@ -24,8 +33,8 @@ case "$library" in
     *) install_name_tool -change "$library" "@rpath/libpython$pyver.dylib" "$host" ;;
 esac
 install_name_tool -id "@rpath/libpython$pyver.dylib" "$destination/Contents/Resources/python/lib/libpython$pyver.dylib"
-find "$destination/Contents/Resources/python" -type f \( -name '*.dylib' -o -name '*.so' \) -exec codesign --force --sign - {} +
-codesign --force --sign - "$host"
+find "$destination/Contents/Resources/python" -type f \( -name '*.dylib' -o -name '*.so' \) | while IFS= read -r library; do sign "$library"; done
+sign "$host"
 cp packaging/macos/Info.plist "$destination/Contents/Info.plist"
 cp assets/icon.icns "$destination/Contents/Resources/Hermes.icns"
 mkdir -p "$destination/Contents/Resources/Notices"
@@ -34,6 +43,20 @@ for notice in crates/desktop/assets/fonts/*NOTICE.txt crates/desktop/assets/font
 done
 "$PYO3_PYTHON" scripts/reliquary-notices.py stage "$destination/Contents/Resources/Notices" "$destination/Contents/MacOS/hermes-desktop" \
     --save-runtime-notices "$destination/Contents/Resources/Notices/Herdr-THIRD-PARTY-NOTICES"
-codesign --force --sign - "$destination"
+sign "$destination"
 scripts/verify-native-macos.sh "$destination"
-printf 'Built %s\n' "$destination"
+# Notarization needs a Developer ID signature and an App Store Connect key.
+if [ "$identity" != - ] && [ -n "${NOTARY_KEY:-}" ]; then
+    archive=$(mktemp -d)/Hermes.zip
+    ditto -c -k --sequesterRsrc --keepParent "$destination" "$archive"
+    xcrun notarytool submit "$archive" --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
+    xcrun stapler staple "$destination"
+fi
+# A disk image with a link to Applications: open it, drag Hermes across.
+image="$(dirname "$destination")/Hermes-macOS.dmg"
+layout=$(mktemp -d)
+ditto "$destination" "$layout/Hermes.app"
+ln -s /Applications "$layout/Applications"
+hdiutil create -quiet -ov -volname Hermes -srcfolder "$layout" -format UDZO "$image"
+if [ "$identity" != - ]; then codesign --force --timestamp --sign "$identity" "$image"; fi
+printf 'Built %s and %s\n' "$destination" "$image"
