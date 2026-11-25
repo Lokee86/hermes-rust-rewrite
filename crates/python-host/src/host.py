@@ -149,7 +149,6 @@ class PluginHost:
         self._register = None
         self._commands = {}
         self._tools = {}
-        self._running = {}
         self._hooks = []
         self._unloads = []
         self._unsupported = set()
@@ -423,16 +422,11 @@ class PluginHost:
             return self.close()
         raise ValueError(f"Unsupported method: {method}")
 
-    def call_tool_json(self, request_id, encoded):
-        running = self._running.setdefault(request_id, _Running())
-        try:
-            return json.dumps(self._call_tool(json.loads(encoded), running), default=str, allow_nan=False)
-        finally:
-            self._running.pop(request_id, None)
+    def prepare_tool(self):
+        return _Running()
 
-    def cancel_tool(self, request_id):
-        # The call itself may still be waiting for its thread.
-        self._running.setdefault(request_id, _Running()).cancel()
+    def call_tool_json(self, encoded, running):
+        return json.dumps(self._call_tool(json.loads(encoded), running), default=str, allow_nan=False)
 
     def dispatch_json(self, method, encoded):
         return json.dumps(self._dispatch(method, json.loads(encoded)), default=str, allow_nan=False)
