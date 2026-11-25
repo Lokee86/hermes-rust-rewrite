@@ -393,39 +393,68 @@ mod tests {
 
     #[test]
     #[ignore = "uses the real system credential store with a temporary profile"]
-    fn remembering_a_bot_preserves_the_saved_ciphertext() {
-        let app_dir = hermes_engine::Session::default_dir().unwrap();
-        fs::create_dir_all(&app_dir).unwrap();
-        let profile = tempfile::tempdir_in(app_dir).unwrap();
-        let store = Store::new(profile.path());
+    fn managed_gateway_preserves_saved_ciphertext() {
+        const CHILD: &str = "HERMES_TELEGRAM_CREDENTIAL_TEST_CHILD";
+        let data_dir = hermes_engine::Session::default_dir().unwrap();
         let token = Token::parse("123456:abcdefghijklmnopqrstuvwxyz1234567890").unwrap();
-        let bot = Identity {
-            id: 123456,
-            username: "synthetic_bot".into(),
-            name: "Synthetic".into(),
-        };
+
+        if std::env::var_os(CHILD).is_some() {
+            let store = Store::new(&data_dir);
+            assert_eq!(store.load_settings().unwrap().unwrap().token.as_ref(), Some(&token));
+            let bot = Identity {
+                id: 123456,
+                username: "synthetic_bot".into(),
+                name: "Synthetic".into(),
+            };
+            let before = store.read_saved().unwrap();
+            assert!(before["token"].as_str().is_some_and(secret::is_sealed));
+            for _ in 0..2 {
+                store.remember_bot(&bot, &token).unwrap();
+                let saved = store.read_saved().unwrap();
+                assert_eq!(saved["token"], before["token"]);
+                assert_eq!(saved["allowed"], before["allowed"]);
+                assert_eq!(saved["enabled"], true);
+                assert_eq!(saved["bot"]["id"], bot.id);
+            }
+            return;
+        }
+
+        fs::create_dir_all(&data_dir).unwrap();
+        let profile = tempfile::tempdir_in(data_dir).unwrap();
+        let store = Store::new(profile.path());
         let settings = Settings {
             version: 1,
-            token: Some(token.clone()),
+            token: Some(token),
             allowed: BTreeSet::from([42]),
             bot: None,
             enabled: false,
         };
+        let run_gateway = || {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "store::tests::managed_gateway_preserves_saved_ciphertext"])
+                .env("HERMES_RUST_DATA_DIR", profile.path())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr),
+            );
+        };
+
         store.save_settings(&settings).unwrap();
-        assert!(store.read_saved().unwrap()["token"].as_str().is_some_and(secret::is_sealed));
+        let before = store.read_saved().unwrap();
+        assert!(before["token"].as_str().is_some_and(secret::is_sealed));
+        run_gateway();
+        assert_eq!(store.read_saved().unwrap()["token"], before["token"]);
 
         // Simulate a token left in plaintext by an older gateway.
         atomic_json(&store.root.join("settings.json"), &settings).unwrap();
-        assert_eq!(store.load_settings().unwrap().unwrap().token.as_ref(), Some(&token));
-        let before = store.read_saved().unwrap();
-        assert!(before["token"].as_str().is_some_and(secret::is_sealed));
-        for _ in 0..2 {
-            store.remember_bot(&bot, &token).unwrap();
-            let saved = store.read_saved().unwrap();
-            assert_eq!(saved["token"], before["token"]);
-            assert_eq!(saved["allowed"], before["allowed"]);
-            assert_eq!(saved["enabled"], true);
-            assert_eq!(saved["bot"]["id"], bot.id);
-        }
+        run_gateway();
+        let migrated = store.read_saved().unwrap();
+        assert!(migrated["token"].as_str().is_some_and(secret::is_sealed));
+        assert_eq!(migrated["enabled"], true);
     }
 }
