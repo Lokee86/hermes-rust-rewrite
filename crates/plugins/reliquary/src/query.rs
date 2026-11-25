@@ -63,6 +63,7 @@ impl GatewayMemoryQuery {
                 preview,
                 owner,
                 instance,
+                &self.memory,
                 self.sources.as_ref(),
                 &self.binding.profile_id,
             )?;
@@ -293,8 +294,8 @@ impl GatewayMemoryQuery {
             );
             ensure!(
                 !self
-                    .sources
-                    .copied_source_change_pending(&source.session_id)?,
+                    .memory
+                    .source_change_pending(self.sources.as_ref(), &source.session_id)?,
                 "Archive source removal is still syncing"
             );
             ensure!(
@@ -337,6 +338,7 @@ fn check_provenance(
     preview: &RetrievalPreview,
     owner: OwnerId,
     instance: &Instance,
+    memory: &EmbeddedMemory,
     sources: &dyn MemorySources,
     profile_id: &str,
 ) -> Result<()> {
@@ -398,7 +400,7 @@ fn check_provenance(
                 )?;
                 ensure!(
                     scope.conversation_id() == turn.conversation_id
-                        && !sources.copied_source_change_pending(&imported.conversation_id)?,
+                        && !memory.source_change_pending(sources, &imported.conversation_id)?,
                     "retrieval source is no longer eligible"
                 );
             }

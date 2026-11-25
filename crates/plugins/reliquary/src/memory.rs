@@ -333,6 +333,30 @@ impl EmbeddedMemory {
         Ok(true)
     }
 
+    /// The host fence of a removal that Core has not acknowledged.
+    fn removal_pending(&self, path: &Path, source: &CopiedSource) -> Result<bool> {
+        Ok(!source.tombstoned
+            && (source.terminal || regular_file(&path.with_extension("terminal"))?.is_some()))
+    }
+
+    /// Whether a removal of this source has yet to reach Core. Its copies stay undisclosed until then.
+    pub(super) fn source_change_pending(
+        &self,
+        sources: &dyn MemorySources,
+        session_id: &str,
+    ) -> Result<bool> {
+        {
+            let _guard = self.source_index.lock().expect("memory source index lock");
+            let path = self.source_path(session_id)?;
+            if let Some(file) = regular_file(&path)?
+                && self.removal_pending(&path, &read_state(file)?)?
+            {
+                return Ok(true);
+            }
+        }
+        sources.copied_source_change_pending(session_id)
+    }
+
     fn resume_before_removal(
         &self,
         owner: OwnerId,
@@ -680,6 +704,34 @@ impl MemoryStore for EmbeddedMemory {
         Ok(true)
     }
 
+    fn unfinished_removals(&self) -> Result<Vec<String>> {
+        let _guard = self.source_index.lock().expect("memory source index lock");
+        let entries = match self.source_dir().read_dir() {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut unfinished = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Some(file) = regular_file(&path)? else {
+                continue;
+            };
+            let source: CopiedSource = read_state(file)?;
+            ensure!(
+                path == self.source_path(&source.session_id)?,
+                "invalid copied source record"
+            );
+            if self.removal_pending(&path, &source)? {
+                unfinished.push(source.session_id);
+            }
+        }
+        Ok(unfinished)
+    }
+
     fn rewind_source(
         &self,
         binding: &CaptureBinding,
@@ -793,7 +845,7 @@ impl MemoryStore for EmbeddedMemory {
                 let mut pending = false;
                 for row in &rows {
                     if row.source.profile_id != binding.profile_id
-                        || sources.copied_source_change_pending(&row.source.session_id)?
+                        || self.source_change_pending(sources, &row.source.session_id)?
                     {
                         pending = true;
                         break;
@@ -984,6 +1036,11 @@ mod tests {
         library.set_archived(&summary.id, true).unwrap();
         assert!(library.pending_memory_deletions().unwrap().is_empty());
         assert_eq!(receipt, reopened.stage(&capture, &turn, None).unwrap());
+        fs::write(
+            summary.directory.join("gateway.json"),
+            serde_json::to_vec(&serde_json::json!({"memory_binding": binding})).unwrap(),
+        )
+        .unwrap();
         library.delete_archived(&summary.id).unwrap();
         drop(reopened);
         let reopened = legacy(tmp.path(), "default").unwrap().unwrap();
@@ -1000,6 +1057,30 @@ mod tests {
         reopened.terminal_source(&summary.id, &config).unwrap();
         assert!(reopened.stage(&capture, &turn, None).is_err());
         assert!(library.session(&summary.id).is_err());
+
+        // A deletion made before the journal existed left a fence and no acknowledgment. It is
+        // still withheld and still retried.
+        struct NoJournal;
+        impl MemorySources for NoJournal {
+            fn check_session(&self, _: &str, _: &CaptureBinding) -> Result<()> {
+                Ok(())
+            }
+            fn copied_source_change_pending(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+        }
+        let path = reopened.source_path(&summary.id).unwrap();
+        let mut source: CopiedSource = read_state(File::open(&path).unwrap()).unwrap();
+        source.terminal = true;
+        source.tombstoned = false;
+        save_state(&path, &source, true).unwrap();
+        save_state(&path.with_extension("terminal"), &summary.id, true).unwrap();
+        assert!(reopened.source_change_pending(&NoJournal, &summary.id).unwrap());
+        assert_eq!(reopened.unfinished_removals().unwrap(), [summary.id.clone()]);
+        source.tombstoned = true;
+        save_state(&path, &source, true).unwrap();
+        assert!(!reopened.source_change_pending(&NoJournal, &summary.id).unwrap());
+        assert!(reopened.unfinished_removals().unwrap().is_empty());
 
         let retired = library
             .create_session(None, Some("archive before capture"))

@@ -54,6 +54,14 @@ fn has_unacknowledged_stage(directory: &Path) -> Result<bool> {
     }))
 }
 
+/// Whether the chat was ever bound to profile memory. One that cannot be read counts as bound.
+fn has_memory_binding(directory: &Path) -> bool {
+    match std::fs::read(directory.join("gateway.json")) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).map_or(true, |saved| !saved["memory_binding"].is_null()),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 impl Library {
     /// Archive by last activity, excluding the foreground conversation and pins.
     pub fn archive_inactive(&self,days:u32,current:Option<&str>)->Result<()>{
@@ -93,13 +101,16 @@ impl Library {
             !has_unacknowledged_stage(&directory)?,
             "Memory is staging a copied turn. Retry the deletion after it is recorded."
         );
+        let bound = has_memory_binding(&directory);
         self.with_catalog(true,|catalog|{
             let record=find_session(catalog,id)?;
             ensure!(record.archived && catalog.active_session.as_deref()!=Some(id),"Only archived, inactive conversations can be deleted here");
             catalog.sessions.retain(|s|s.id!=id);
             catalog.pinned_order.retain(|p|p!=id);
             catalog.pending_deletion.push(id.to_owned());
-            catalog.pending_memory_deletions.push(id.to_owned());
+            if bound {
+                catalog.pending_memory_deletions.push(id.to_owned());
+            }
             Ok(())
         })?;
         self.finish_deletions()

@@ -123,6 +123,10 @@ impl Shared {
                     &view,
                 ));
             }
+            // The open conversation has its own copy of the transcript.
+            let mut engine = session.engine.try_lock().map_err(|_| {
+                RpcError::fenced("session_busy", "Owner is still using the engine", &view)
+            })?;
             if kept >= view.history.turns.len() {
                 return Err(RpcError::invalid(
                     "Rewind must remove at least one committed turn",
@@ -182,6 +186,10 @@ impl Shared {
                     // Retain submission identity so an old delivery cannot regenerate a removed turn.
                     admission.turn_index = None;
                     admission.capture = None;
+                    // There is no turn left to deliver.
+                    if admission.python_delivery == Some(python_memory::PythonDelivery::Pending) {
+                        admission.python_delivery = Some(python_memory::PythonDelivery::Ineligible);
+                    }
                     admission.text.clear();
                     admission.attachments.clear();
                     admission.outcome = Some("rewound".into());
@@ -192,10 +200,11 @@ impl Shared {
             let response = describe(&change);
             authority.source_rewinds.push(change);
             let mut history = view.history.clone();
-            history.turns.truncate(kept);
+            history.rewind(kept);
             authority
                 .persist(&session.writer, Some(&history))
                 .map_err(RpcError::internal)?;
+            engine.accept_committed_history(history.clone());
             view.history = history;
             view.authority = authority;
             view.generation = generation;
@@ -288,20 +297,34 @@ impl Shared {
                 if !owner.memory.active() {
                     return Ok(Vec::new());
                 }
-                for id in owner.library.pending_memory_deletions()? {
+                let pending = owner.library.pending_memory_deletions()?;
+                for id in &pending {
                     if matches!(
                         owner
                             .memory
-                            .with_selected(|memory| memory.terminal_source(&id, &owner.provider)),
+                            .with_selected(|memory| memory.terminal_source(id, &owner.provider)),
                         Some(Ok(true))
                     ) {
-                        owner.library.acknowledge_memory_deletion(&id)?;
+                        owner.library.acknowledge_memory_deletion(id)?;
                     }
                 }
-                owner.library.list_sessions(&hermes_library::SessionQuery {
+                let summaries = owner.library.list_sessions(&hermes_library::SessionQuery {
                     archive: hermes_library::ArchiveFilter::All,
                     ..Default::default()
-                })
+                })?;
+                // Chats deleted before deletions were journaled have only their fence.
+                let unfinished = owner.memory.with_selected(|memory| memory.unfinished_removals());
+                for id in unfinished.transpose()?.unwrap_or_default() {
+                    if !pending.contains(&id)
+                        && !summaries.iter().any(|summary| summary.id == id)
+                        && owner.library.session(&id).is_err()
+                    {
+                        let _ = owner
+                            .memory
+                            .with_selected(|memory| memory.terminal_source(&id, &owner.provider));
+                    }
+                }
+                Ok(summaries)
             })
             .await
             {
@@ -417,10 +440,14 @@ fn stage_next(
     let Some(binding) = Settings::read(&summary.directory)?.memory_binding else {
         return Ok(None);
     };
-    if source_ended(&summary.directory) {
-        if !release_legacy_archive_fence(memory, &binding, summary, history, authority)? {
-            return Ok(None);
-        }
+    // An archive made directly by the desktop app left a fence without the marker.
+    let ended = source_ended(&summary.directory);
+    if (ended || authority.receipts.iter().any(|row| row.capture.is_some()))
+        && !release_legacy_archive_fence(memory, &binding, summary, history, authority)?
+    {
+        return Ok(None);
+    }
+    if ended {
         match fs::remove_file(summary.directory.join(ENDED)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -463,7 +490,11 @@ fn stage_next(
         let Some(marker) = &admission.capture else {
             continue;
         };
-        if latest_rewind.is_some() && admission.generation <= surviving_capture_generation {
+        // A surviving copy that was not processed yet still has to be.
+        if latest_rewind.is_some()
+            && admission.generation <= surviving_capture_generation
+            && marker.settled
+        {
             continue;
         }
         ensure!(
@@ -683,5 +714,67 @@ impl MemorySources for CaptureSources {
                     .iter()
                     .any(|change| !change.acknowledged)
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rewind applies to the open conversation, not only to its saved copy.
+    #[tokio::test]
+    async fn the_next_turn_after_a_rewind_neither_sends_nor_restores_removed_turns() {
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let captured = requests.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/chat/completions", post(move |body: String| {
+                lock(&captured).push(body);
+                async {
+                    ([(header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                }
+            }))).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::start(GatewayConfig::new(directory.path(), Config {
+            base_url: format!("http://{address}/v1"), model: "fixture".into(), api_key: String::new(),
+        })).await.unwrap();
+        let shared = &gateway.shared;
+        let (tx, _rx) = mpsc::channel(256);
+        let peer = Peer { id: "rewinder".into(), tx, stop: CancellationToken::new(), canonical: true, local_native: true };
+        let created = shared.create(&json!({"source":"gui"}), &peer).await.unwrap_or_else(|e| panic!("{}", e.message));
+        let sid = created["session_id"].as_str().unwrap().to_owned();
+        let session = shared.session(&sid).await.unwrap_or_else(|e| panic!("{}", e.message));
+        lock(&session.peers).insert(peer.id.clone(), peer.clone());
+        let say = async |text: &str| {
+            shared.submit(&json!({"session_id":sid,"text":text,"submission_id":text}), &peer).await.unwrap_or_else(|e| panic!("{}", e.message));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while lock(&session.view).running { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.unwrap();
+        };
+        for text in ["kept-turn", "removed-turn-one", "removed-turn-two"] { say(text).await; }
+        // A Python memory provider had not received the last turn yet.
+        {
+            let mut view = lock(&session.view);
+            let mut next = view.authority.clone();
+            next.receipts.back_mut().unwrap().python_delivery = Some(python_memory::PythonDelivery::Pending);
+            next.persist(&session.writer, None).unwrap();
+            view.authority = next;
+        }
+        let before = shared.snapshot(&session, &peer, false);
+        shared.mutate(&json!({"session_id":sid,"operation":"rewind","request_id":"once","payload":{"keep_turns":1},
+            "expected_revision":before["revision"],"expected_generation":before["execution_generation"]}), &peer, true)
+            .await.unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(lock(&session.view).authority.receipts.back().unwrap().python_delivery, Some(python_memory::PythonDelivery::Ineligible));
+        lock(&requests).clear();
+        say("after-rewind").await;
+        assert!(!lock(&requests).iter().any(|body| body.contains("removed-turn")), "{requests:?}");
+        let saved: Value = serde_json::from_slice(&fs::read(session.dir.join("conversation.json")).unwrap()).unwrap();
+        let prompts: Vec<_> = saved["turns"].as_array().unwrap().iter().map(|turn| turn["prompt"].as_str().unwrap()).collect();
+        assert_eq!(prompts, ["kept-turn", "after-rewind"]);
+        gateway.shutdown().await.unwrap();
+        server.abort();
     }
 }

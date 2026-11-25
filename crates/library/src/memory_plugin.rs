@@ -59,6 +59,8 @@ pub trait MemoryStore: Send + Sync {
     ) -> Result<bool>;
     /// True after Core has acknowledged the deletion, or if no copy exists.
     fn terminal_source(&self, session_id: &str, config: &Config) -> Result<bool>;
+    /// Chats whose copy is fenced and whose removal Core has not acknowledged.
+    fn unfinished_removals(&self) -> Result<Vec<String>>;
     fn rewind_source(
         &self,
         binding: &CaptureBinding,
