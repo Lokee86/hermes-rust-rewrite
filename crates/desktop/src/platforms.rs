@@ -3,11 +3,11 @@
 //! fields. Settings are kept per library; secret fields go to a 0600 file and
 //! are never shown again. Telegram has its own live native adapter
 //! (messaging.rs); the other adapters run in the Hermes backend.
-use super::messaging::Message;
+use super::{credential_files, messaging::Message};
 use crate::appearance::text;
 use iced::{Alignment, Border, Color, Element, Fill, Padding, widget::{Space, button, column, container, row, rule, scrollable, text_input}};
 use hermes_engine::secret;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::LazyLock};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -37,26 +37,49 @@ pub(super) struct State {
 fn values_path(root: &Path) -> PathBuf { root.join("messaging-platforms.json") }
 fn secrets_path(root: &Path) -> PathBuf { root.join("messaging-secrets.json") }
 
-/// Encrypts the values that are not yet, and saves them.
-fn save_secrets(root: &Path, secrets: &mut BTreeMap<String, BTreeMap<String, String>>) -> Result<(), String> {
-    for value in secrets.values_mut().flat_map(BTreeMap::values_mut).filter(|value| !secret::is_sealed(value)) {
-        *value = secret::seal(root, value).map_err(|e| format!("{e:#}"))?;
+type Secrets = BTreeMap<String, BTreeMap<String, String>>;
+
+fn read_json<T: Default + DeserializeOwned>(path: &Path) -> Result<T, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error.to_string()),
     }
-    let temp = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
-    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?; }
-    serde_json::to_writer(temp.as_file(), secrets).map_err(|e| e.to_string())?;
-    temp.persist(secrets_path(root)).map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn write_json(path: &Path, data: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(data).map_err(|error| error.to_string())?;
+    credential_files::replace(path, &bytes)
+}
+
+/// Protect legacy plaintext values while preserving ciphertext even when its key is unavailable.
+fn seal_secrets(root: &Path, secrets: &mut Secrets) -> Result<bool, String> {
+    let mut changed = false;
+    for value in secrets.values_mut().flat_map(BTreeMap::values_mut).filter(|value| !secret::is_sealed(value)) {
+        let sealed = secret::seal(root, value).map_err(|error| format!("{error:#}"))?;
+        if secret::is_sealed(&sealed) {
+            *value = sealed;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn migrate_secrets(root: &Path) -> Result<Secrets, String> {
+    let path = secrets_path(root);
+    let _lock = credential_files::lock(&path)?;
+    let mut secrets = read_json(&path)?;
+    if seal_secrets(root, &mut secrets)? {
+        write_json(&path, &secrets)?;
+    }
+    Ok(secrets)
 }
 
 impl State {
     pub fn load(&mut self, root: &Path) {
         self.root = Some(root.to_owned());
-        self.saved = std::fs::read(values_path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let mut secrets: BTreeMap<String, BTreeMap<String, String>> = std::fs::read(secrets_path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        // Protect values saved by a version that stored them as text.
-        if secrets.values().flat_map(BTreeMap::values).any(|value| !secret::is_sealed(value)) {
-            let _ = save_secrets(root, &mut secrets);
-        }
+        self.saved = read_json(&values_path(root)).unwrap_or_default();
+        let secrets = migrate_secrets(root).or_else(|_| read_json(&secrets_path(root))).unwrap_or_default();
         self.secrets = secrets.into_iter().map(|(p, m)| (p, m.into_keys().collect())).collect();
     }
     fn platform(&self) -> Option<&'static Platform> { let id = self.selected.as_deref()?; CATALOG.iter().find(|p| p.id == id) }
@@ -69,20 +92,33 @@ impl State {
         else { self.saved.values.get(platform).and_then(|m| m.get(&field.name)).is_some_and(|v| !v.trim().is_empty()) }
     }
     pub fn enabled(&self, id: &str) -> bool { self.saved.enabled.contains(id) }
-    fn persist(&mut self) -> Result<(), String> {
-        let Some(root) = self.root.clone() else { return Err("The chat library is unavailable.".into()) };
+    fn persist(&mut self, enabled: Option<bool>) -> Result<(), String> {
+        let Some(root) = self.root.as_deref() else { return Err("The chat library is unavailable.".into()) };
         let Some(platform) = self.platform() else { return Ok(()) };
-        let mut secrets: BTreeMap<String, BTreeMap<String, String>> = std::fs::read(secrets_path(&root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let path = secrets_path(root);
+        let _lock = credential_files::lock(&path)?;
+        let mut secrets: Secrets = read_json(&path)?;
+        let mut saved: Saved = read_json(&values_path(root))?;
+        let mut added_secret = false;
         for field in &platform.fields {
             let Some(value) = self.draft.get(&field.name) else { continue };
             if field.secret {
-                if !value.trim().is_empty() { secrets.entry(platform.id.clone()).or_default().insert(field.name.clone(), value.trim().to_owned()); }
+                if !value.trim().is_empty() {
+                    secrets.entry(platform.id.clone()).or_default().insert(field.name.clone(), value.trim().to_owned());
+                    added_secret = true;
+                }
             } else {
-                self.saved.values.entry(platform.id.clone()).or_default().insert(field.name.clone(), value.trim().to_owned());
+                saved.values.entry(platform.id.clone()).or_default().insert(field.name.clone(), value.trim().to_owned());
             }
         }
-        std::fs::write(values_path(&root), serde_json::to_vec_pretty(&self.saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        save_secrets(&root, &mut secrets)?;
+        if let Some(on) = enabled {
+            if on { saved.enabled.insert(platform.id.clone()); } else { saved.enabled.remove(&platform.id); }
+        }
+        if seal_secrets(root, &mut secrets)? || added_secret {
+            write_json(&path, &secrets)?;
+        }
+        write_json(&values_path(root), &saved)?;
+        self.saved = saved;
         self.secrets = secrets.into_iter().map(|(p, m)| (p, m.into_keys().collect())).collect();
         self.draft.clear(); self.dirty = false;
         Ok(())
@@ -91,15 +127,13 @@ impl State {
         match action {
             Action::Select(id) => { self.selected = Some(id); self.draft.clear(); self.dirty = false; self.note = None; }
             Action::Field(name, value) => { self.draft.insert(name, value); self.dirty = true; self.note = None; }
-            Action::Save => self.note = Some(self.persist().map(|_| "Saved.".into())),
+            Action::Save => self.note = Some(self.persist(None).map(|_| "Saved.".into())),
             Action::Toggle => {
                 let Some(platform) = self.platform() else { return };
-                if self.dirty && let Err(e) = self.persist() { self.note = Some(Err(e)); return; }
+                if self.dirty && let Err(e) = self.persist(None) { self.note = Some(Err(e)); return; }
                 if !self.configured(platform) { self.note = Some(Err("Fill in the required fields first.".into())); return; }
-                let id = platform.id.clone();
-                let on = !self.saved.enabled.contains(&id);
-                if on { self.saved.enabled.insert(id); } else { self.saved.enabled.remove(&id); }
-                self.note = Some(self.persist().map(|_| if on { "Enabled. The Hermes backend starts this channel on its next run.".into() } else { "Disabled.".into() }));
+                let on = !self.saved.enabled.contains(&platform.id);
+                self.note = Some(self.persist(Some(on)).map(|_| if on { "Enabled. The Hermes backend starts this channel on its next run.".into() } else { "Disabled.".into() }));
             }
         }
     }
@@ -173,6 +207,35 @@ pub(super) fn detail<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_reads_secrets_after_a_concurrent_replacement() {
+        use std::{sync::mpsc, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = secrets_path(dir.path());
+        write_json(&path, &serde_json::json!({"discord": {"DISCORD_BOT_TOKEN": "legacy"}})).unwrap();
+        let guard = credential_files::lock(&path).unwrap();
+
+        let (started, starting) = mpsc::channel();
+        let (finished, loaded) = mpsc::channel();
+        let root = dir.path().to_owned();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let mut state = State::default();
+            state.load(&root);
+            let _ = finished.send(state.secrets);
+        });
+        starting.recv().unwrap();
+        assert_eq!(loaded.recv_timeout(Duration::from_millis(75)), Err(mpsc::RecvTimeoutError::Timeout));
+        write_json(&path, &serde_json::json!({"slack": {"SLACK_BOT_TOKEN": "replacement"}})).unwrap();
+        drop(guard);
+
+        let secrets = loaded.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+        assert!(!secrets.contains_key("discord"));
+        assert!(secrets["slack"].contains("SLACK_BOT_TOKEN"));
+    }
+
     #[test]
     fn catalog_lists_the_hermes_platforms_and_saves_privately() {
         assert!(CATALOG.len() >= 25 && CATALOG.iter().any(|p| p.id == "discord") && CATALOG.iter().any(|p| p.id == "slack"));
