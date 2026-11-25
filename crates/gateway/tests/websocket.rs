@@ -174,6 +174,7 @@ struct Provider {
 #[derive(Default)]
 struct ObservationReview {
     challenged: AtomicBool,
+    held: AtomicBool,
     started: Notify,
     finish: Notify,
 }
@@ -508,8 +509,11 @@ async fn native_decision_fixture(
         }) {
             // The worker schedules review before auditing again once it commits the challenge.
             assert!(review.challenged.load(Ordering::Acquire));
-            review.started.notify_one();
-            review.finish.notified().await;
+            // Core verifies again when evidence arrives during the review. Only the first one waits.
+            if !review.held.swap(true, Ordering::AcqRel) {
+                review.started.notify_one();
+                review.finish.notified().await;
+            }
         }
         verified.fetch_add(1, Ordering::Relaxed);
     }
@@ -667,7 +671,8 @@ async fn query_observation(client: &mut Client, sid: &str, submission: &str, pro
 #[cfg(feature = "reliquary")]
 async fn wait_for_observation(client: &mut Client, sid: &str, prompt: &str) -> Value {
     let mut last_reply = Value::Null;
-    timeout(Duration::from_secs(25), async {
+    // Core waits up to 60 seconds before it retries.
+    timeout(Duration::from_secs(90), async {
         let mut attempt = 0;
         loop {
             last_reply = query_observation(client, sid, &format!("observation-{prompt}-{attempt}"), prompt).await;
