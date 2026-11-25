@@ -19,6 +19,7 @@ required-git-spec = "rev"
 allow-git = [
     "https://github.com/EpicGames/lore.git",
     "https://github.com/Lokee86/Reliquary.git",
+    "https://github.com/Lokee86/hermes-rust-rewrite.git", # Pinned glib 0.18 security backport
     "https://github.com/Lokee86/lodestone.git",
     "https://github.com/herdrdev/herdr-core",
 ]

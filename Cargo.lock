@@ -2147,8 +2147,7 @@ checksum = "151665d9be52f9bb40fc7966565d39666f2d1e69233571b71b87791c7e0528b3"
 [[package]]
 name = "glib"
 version = "0.18.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5"
+source = "git+https://github.com/Lokee86/hermes-rust-rewrite.git?rev=036f8720136dac1200992639b648b968623e6583#036f8720136dac1200992639b648b968623e6583"
 dependencies = [
  "bitflags 2.13.2",
  "futures-channel",

@@ -16,4 +16,6 @@ Only the latest release and `main` receive fixes.
 | CodeQL | the analysis of Rust, Python, JavaScript or a workflow cannot run; its findings are under **Security › Code scanning** |
 | Lint (`build.yml`) | clippy finds a likely mistake, or `cargo audit` a vulnerability |
 
+The lint job also audits Git-sourced `glib` against its crates.io advisories. It skips `RUSTSEC-2024-0429` only for the pinned `glib` 0.18.5 backport.
+
 Pull requests from forks run with a read-only token and without secrets.
