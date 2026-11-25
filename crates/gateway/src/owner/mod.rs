@@ -157,17 +157,19 @@ impl OwnerConnection {
             self.native,
             "Manage the stock gateway with its own service controls"
         );
-        self.request("rust.stop", self.identity()).await?;
-        let deadline = Instant::now() + Duration::from_secs(8);
+        // An owner that is already on its way out can close the connection instead of answering.
+        // Whether it is gone decides the outcome.
+        let refused = self.request("rust.stop", self.identity()).await.err();
+        let deadline = Instant::now() + Duration::from_secs(if refused.is_some() { 2 } else { 8 });
         loop {
             // A draining owner can close a control connection without answering it (on Unix
             // the listener's backlog is dropped), which means it is not gone yet.
             match discover(Path::new(&self.profile)).await {
                 Ok(owner) if owner.as_ref().is_none_or(|o| o.instance != self.instance) => return Ok(()),
-                Err(e) if Instant::now() >= deadline => return Err(e.context("Gateway is still shutting down")),
+                Err(e) if Instant::now() >= deadline => return Err(refused.unwrap_or(e).context("Gateway is still shutting down")),
+                Ok(_) if Instant::now() >= deadline => return Err(refused.unwrap_or_else(|| anyhow::anyhow!("Gateway is still shutting down"))),
                 _ => {}
             }
-            ensure!(Instant::now() < deadline, "Gateway is still shutting down");
             sleep(Duration::from_millis(80)).await;
         }
     }
