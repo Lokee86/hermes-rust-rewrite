@@ -418,20 +418,19 @@ mod tests {
         for worker in std::mem::take(&mut *gateway.shared.turns.lock().await) { worker.await.unwrap(); }
         let id = lock(&session.summary).id.clone();
         let workspace = lock(&session.settings).cwd.clone().unwrap();
-        let path = session.dir.join("conversation.json");
+        let path = session.dir.clone();
         gateway.shared.sessions.lock().await.remove(&id);
         drop(session);
-        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut record = hermes_engine::conversation_json(&path).unwrap().unwrap();
         record["authority"]["receipts"][0]["status"] = json!("started");
         record["authority"]["receipts"][0]["outcome"] = Value::Null;
         record["authority"]["receipts"][0]["result"] = Value::Null;
         record["turns"][0]["status"] = json!({"state":"running"});
-        let before = serde_json::to_vec(&record).unwrap();
-        fs::write(&path, &before).unwrap();
+        hermes_engine::restore_conversation(&path, record.clone()).unwrap();
         fs::remove_dir(&workspace).unwrap();
 
         assert!(run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone()).await.is_err());
-        assert_eq!(fs::read(&path).unwrap(), before, "an uncertain admission must retain its original identity and disposition");
+        assert_eq!(hermes_engine::conversation_json(&path).unwrap().unwrap(), record, "an uncertain admission must retain its original identity and disposition");
         assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Running);
         gateway.shared.scheduler.finish(&claim, Outcome::Cancelled { reason: "test complete".into() }, chrono::Utc::now()).unwrap();
         gateway.shutdown().await.unwrap();

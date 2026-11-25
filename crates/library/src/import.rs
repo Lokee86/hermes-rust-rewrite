@@ -362,12 +362,12 @@ impl Library {
             let archive_path = directory.join("hermes-source.json");
             let save = (|| -> Result<()> {
                 atomic_json(&archive_path, &archive)?;
-                atomic_json(&directory.join("conversation.json"), &history)
+                hermes_engine::create_conversation(&directory, &history)
             })();
             if let Err(error) = save {
                 // Only this freshly-created private directory is removed.
                 let _ = fs::remove_file(&archive_path);
-                let _ = fs::remove_file(directory.join("conversation.json"));
+                let _ = hermes_engine::delete_conversation(&directory);
                 let _ = fs::remove_dir(&directory);
                 return Err(error).context("Could not save the imported conversation");
             }

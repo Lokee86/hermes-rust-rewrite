@@ -25,10 +25,12 @@ pub fn name_for_home(home: &Path) -> &str {
 fn describe(name: &str, path: &Path, is_default: bool, is_bot: bool) -> Profile {
     let prefs: serde_json::Value = fs::read(path.join("desktop-preferences.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let skill_count = hermes_engine::skill_catalog::status(path).map(|s| s.installed.difference(&s.disabled).count()).unwrap_or(0);
-    let sessions = fs::read(path.join("library.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v["sessions"].as_array().map(Vec::len)).unwrap_or(0);
+    let sessions = crate::session_count(path);
     Profile { name: name.into(), path: path.into(), is_default, is_bot, model: prefs["model"].as_str().unwrap_or_default().into(), skill_count, sessions }
 }
+
+/// A profile's chat database inside its archive.
+const EXPORTED_DATABASE: &str = "mercury-export.db";
 
 impl Library {
     fn profiles_dir(&self) -> PathBuf { self.root().join("profiles") }
@@ -116,8 +118,15 @@ impl Library {
     /// A `.tar.gz` of one named profile (its sessions, memory, settings, keys).
     pub fn export_profile(&self, name: &str, dest: &Path) -> Result<()> {
         ensure!(name != "default", "Back up the default profile from Settings › Backup");
-        ensure!(self.profile_path(name)?.is_dir(), "No such profile");
-        let status = Command::new("tar").arg("-czf").arg(dest).arg("-C").arg(self.profiles_dir()).arg(name).status().context("tar is not available")?;
+        let profile = self.profile_path(name)?;
+        ensure!(profile.is_dir(), "No such profile");
+        // The database and its companions may change while tar reads them, so a copy goes instead.
+        let copy = profile.join(EXPORTED_DATABASE);
+        let _ = fs::remove_file(&copy);
+        hermes_engine::db::snapshot(&profile, &copy)?;
+        let status = Command::new("tar").arg("--exclude=mercury.db*").arg("-czf").arg(dest).arg("-C").arg(self.profiles_dir()).arg(name).status();
+        let _ = fs::remove_file(&copy);
+        let status = status.context("tar is not available")?;
         ensure!(status.success(), "Could not write the profile archive");
         Ok(())
     }
@@ -137,6 +146,11 @@ impl Library {
         self.ensure_profiles_dir()?;
         let status = Command::new("tar").arg("-xzf").arg(archive).arg("-C").arg(self.profiles_dir()).status()?;
         ensure!(status.success(), "Could not unpack the profile archive");
+        let profile = self.profiles_dir().join(name);
+        let copy = profile.join(EXPORTED_DATABASE);
+        if copy.is_file() {
+            fs::rename(copy, profile.join(hermes_engine::db::FILE))?;
+        }
         Ok(name.to_string())
     }
 }
@@ -154,10 +168,16 @@ mod tests {
         library.set_profile_soul("work", "You are focused.").unwrap();
         library.rename_profile("work", "office").unwrap();
         assert_eq!(library.profile_soul("office").unwrap(), "You are focused.");
+        let chat = Library::open(library.profile_path("office").unwrap()).unwrap().create_session(None, Some("Exported chat")).unwrap();
+        let (_open, _) = hermes_engine::ConversationWriter::open(&chat.directory).unwrap();
         let archive = dir.path().join("office.tar.gz");
         library.export_profile("office", &archive).unwrap();
+        drop(_open);
         library.delete_profile("office").unwrap();
         assert_eq!(library.import_profile(&archive).unwrap(), "office");
+        let imported = Library::open(library.profile_path("office").unwrap()).unwrap();
+        assert_eq!(imported.session(&chat.id).unwrap().title, "Exported chat");
+        assert!(!imported.root().join(EXPORTED_DATABASE).exists());
         assert!(library.import_profile(&archive).is_err(), "no overwrite");
         let names: Vec<_> = library.profiles().unwrap().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["default", "office"]);

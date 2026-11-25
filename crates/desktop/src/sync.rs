@@ -2,16 +2,12 @@
 //! "Open in new window" windows, scheduled runs, webhooks, the quick-entry
 //! window, a second launch) writes through the same catalog, so a chat made,
 //! renamed, archived or advanced elsewhere shows up here. A 2-second tick
-//! compares library.json's modification time and reloads the chat list when it
-//! moved. An open chat's transcript needs no polling: each conversation is
+//! compares the catalog's revision and reloads the chat list when it moved. An open chat's transcript needs no polling: each conversation is
 //! locked to the one window that has it open, so nobody else writes it.
 use super::Hermes;
-use std::{path::Path, time::SystemTime};
 
 #[derive(Default)]
-pub(super) struct State { catalog: Option<SystemTime> }
-
-fn modified(path: &Path) -> Option<SystemTime> { std::fs::metadata(path).and_then(|m| m.modified()).ok() }
+pub(super) struct State { catalog: Option<i64> }
 
 pub(super) fn subscription() -> iced::Subscription<super::Message> {
     iced::time::every(std::time::Duration::from_secs(2)).map(|_| super::Message::SyncTick)
@@ -19,7 +15,7 @@ pub(super) fn subscription() -> iced::Subscription<super::Message> {
 
 pub(super) fn tick(app: &mut Hermes) {
     let Some(library) = app.library.clone() else { return };
-    let catalog = modified(&library.root().join("library.json"));
+    let catalog = library.catalog_revision();
     if catalog == app.sync.catalog { return }
     let first = app.sync.catalog.is_none();
     app.sync.catalog = catalog;

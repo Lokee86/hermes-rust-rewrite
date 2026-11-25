@@ -105,9 +105,13 @@ impl Library {
                 let directory = self.checked_directory(&record.id)?;
                 let mut files = Vec::new();
                 for path in SESSION_FILES {
-                    if let Some(blob) = capture(&directory, path, &mut content)? {
-                        files.push(blob);
-                    }
+                    let blob = if *path == "conversation.json" {
+                        hermes_engine::conversation_json(&directory)?
+                            .map(|saved| blob(path, &serde_json::to_vec(&saved)?, &mut content)).transpose()?
+                    } else {
+                        capture(&directory, path, &mut content)?
+                    };
+                    files.extend(blob);
                 }
                 ensure!(
                     files.iter().any(|blob| blob.path == "conversation.json"),
@@ -153,9 +157,13 @@ impl Library {
             }
             let mut profile = Vec::new();
             for path in PROFILE_FILES {
-                if let Some(blob) = capture(&self.root, path, &mut content)? {
-                    profile.push(blob);
-                }
+                let blob = if *path == "cron/jobs.json" {
+                    hermes_engine::cron::export(&self.root)?
+                        .map(|saved| blob(path, &saved, &mut content)).transpose()?
+                } else {
+                    capture(&self.root, path, &mut content)?
+                };
+                profile.extend(blob);
             }
             Ok(Archive {
                 format: FORMAT.into(),
@@ -236,6 +244,8 @@ impl Library {
                         let queue = recovery.join("sessions").join(&record.id);
                         private_directory(&queue)?;
                         write_blob(&queue, blob, &blob.path)?;
+                    } else if blob.path == "conversation.json" {
+                        hermes_engine::restore_conversation(&directory, serde_json::from_slice(&decode(blob)?)?)?;
                     } else {
                         write_blob(&directory, blob, &blob.path)?;
                     }
@@ -299,6 +309,13 @@ fn capture(root: &Path, path: &str, total: &mut u64) -> Result<Option<Blob>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    blob(path, &bytes, total).map(Some)
+}
+fn blob(path: &str, bytes: &[u8], total: &mut u64) -> Result<Blob> {
+    ensure!(
+        bytes.len() as u64 <= MAX_FILE,
+        "{path} exceeds the native backup size limit"
+    );
     *total = total
         .checked_add(bytes.len() as u64)
         .context("Backup size overflow")?;
@@ -306,12 +323,12 @@ fn capture(root: &Path, path: &str, total: &mut u64) -> Result<Option<Blob>> {
         *total <= MAX_CONTENT,
         "Native backup exceeds the 128 MiB content limit"
     );
-    Ok(Some(Blob {
+    Ok(Blob {
         path: path.into(),
         bytes: bytes.len() as u64,
-        sha256: sha256(&bytes),
+        sha256: sha256(bytes),
         base64: STANDARD.encode(bytes),
-    }))
+    })
 }
 fn bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).context("Could not inspect backup input")?;
@@ -564,7 +581,7 @@ mod tests {
                 prompt: format!("Saved conversation {index}"), context: String::new(), attachments: vec![],
                 model: "fixture".into(), entries: vec![], status: hermes_engine::Status::Complete,
             });
-            atomic_json(&chat.directory.join("conversation.json"), &history).unwrap();
+            crate::tests::save_history(&chat.directory, &history);
             source.touch_session(&chat.id).unwrap();
         }
         let archive = dir.path().join("backup.hermes-native.json");

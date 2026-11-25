@@ -39,7 +39,7 @@ async fn capture_screens() {
             let session = library.create_session(None, None).unwrap();
             let mut history = History::default();
             history.turns.push(hermes_engine::Turn { context: String::new(), attachments: vec![], prompt: prompt.into(), model: "m".into(), entries: vec![], status: hermes_engine::Status::Complete });
-            std::fs::write(session.directory.join("conversation.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+            hermes_engine::restore_conversation(&session.directory, serde_json::to_value(&history).unwrap()).unwrap();
             library.touch_session(&session.id).unwrap();
         }
         let first = library.sessions(None).unwrap().into_iter().find(|s| s.title == "hi").unwrap();
@@ -209,7 +209,7 @@ setTimeout(()=>{ try { window.open('https://popup.example/'); } catch(e) {} }, 3
     let mut history = History::default();
     history.turns.push(hermes_engine::Turn { context: String::new(), attachments: vec![], prompt: "make a report".into(), model: "m".into(),
         entries: vec![Entry::Assistant { text: format!("Here it is: [report.html]({})", site.join("report.html").display()), calls: vec![] }], status: hermes_engine::Status::Complete });
-    std::fs::write(session.directory.join("conversation.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    hermes_engine::restore_conversation(&session.directory, serde_json::to_value(&history).unwrap()).unwrap();
     library.touch_session(&session.id).unwrap();
 }
 

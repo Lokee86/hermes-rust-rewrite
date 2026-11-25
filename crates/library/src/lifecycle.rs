@@ -102,6 +102,7 @@ impl Library {
             for id in &catalog.pending_deletion {
                 ensure!(safe_id(id) && !catalog.sessions.iter().any(|r|&r.id==id),"Invalid pending session removal");
                 let dir=self.root.join("sessions").join(id);
+                hermes_engine::delete_conversation(&dir)?;
                 match fs::symlink_metadata(&dir){
                     Ok(meta)=>ensure!(meta.file_type().is_dir(),"Invalid archived session directory"),
                     Err(e) if e.kind()==std::io::ErrorKind::NotFound=>continue,
@@ -198,9 +199,9 @@ mod tests {
             entries: vec![],
             status: Status::Complete,
         });
-        atomic_json(&summary.directory.join("conversation.json"), &history).unwrap();
+        crate::tests::save_history(&summary.directory, &history);
         let owned = Session::open(&summary.directory).unwrap();
-        let before = fs::read(summary.directory.join("conversation.json")).unwrap();
+        let before = hermes_engine::conversation_json(&summary.directory).unwrap();
         library.set_pinned(&summary.id, true).unwrap();
         library.set_archived(&summary.id, true).unwrap();
         assert!(library.active_session().unwrap().is_none());
@@ -215,7 +216,7 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert!(archived[0].archived && archived[0].pinned);
         assert_eq!(
-            fs::read(summary.directory.join("conversation.json")).unwrap(),
+            hermes_engine::conversation_json(&summary.directory).unwrap(),
             before
         );
         assert_eq!(owned.history(), &history);
@@ -239,7 +240,7 @@ mod tests {
             summary.updated_at
         );
         assert_eq!(
-            fs::read(summary.directory.join("conversation.json")).unwrap(),
+            hermes_engine::conversation_json(&summary.directory).unwrap(),
             before
         );
     }
@@ -349,7 +350,7 @@ mod tests {
         let bound = library.create_session(None, Some("Copied")).unwrap();
         let plain = library.create_session(None, Some("Not copied")).unwrap();
         let saved = serde_json::json!({"version":1,"turns":[],"authority":{"receipts":[{"capture":{"staging":true}}]}});
-        fs::write(bound.directory.join("conversation.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        hermes_engine::restore_conversation(&bound.directory, saved).unwrap();
         fs::write(bound.directory.join("gateway.json"), br#"{"memory_binding":{"rel_id":"r"}}"#).unwrap();
         library.create_session(None, Some("Open")).unwrap();
         for chat in [&bound, &plain] {
@@ -372,8 +373,7 @@ mod tests {
             .unwrap();
         let b = library.create_session(None, Some("Archive me")).unwrap();
         let path = temp.path().join("library.json");
-        let mut json: serde_json::Value =
-            serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+        let mut json = crate::tests::catalog_as_file(temp.path());
         json.as_object_mut().unwrap().remove("pinned_order");
         for row in json["sessions"].as_array_mut().unwrap() {
             row.as_object_mut().unwrap().remove("archived");

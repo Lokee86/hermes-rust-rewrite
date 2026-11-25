@@ -11,7 +11,7 @@ pub use script::{Preflight, has_preflight, preflight, preflight_with_cancel};
 pub use schedule::{Schedule, instant, stamp};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
-pub use store::Store;
+pub use store::{Store, export};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Repeat {

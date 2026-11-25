@@ -419,11 +419,14 @@ pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<Committe
     if Settings::read(&summary.directory)?.memory_binding.is_none() {
         return Ok(None);
     }
-    let path = summary.directory.join("conversation.json");
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    CommittedRecord::read(&summary.directory)
+}
+
+impl CommittedRecord {
+    pub(super) fn read(directory: &Path) -> Result<Option<Self>> {
+        hermes_engine::saved_conversation(directory)?.map(|(history, authority)| {
+            Ok(Self { history, authority: authority.map(serde_json::from_value).transpose()? })
+        }).transpose()
     }
 }
 
@@ -771,7 +774,7 @@ mod tests {
         lock(&requests).clear();
         say("after-rewind").await;
         assert!(!lock(&requests).iter().any(|body| body.contains("removed-turn")), "{requests:?}");
-        let saved: Value = serde_json::from_slice(&fs::read(session.dir.join("conversation.json")).unwrap()).unwrap();
+        let saved = hermes_engine::conversation_json(&session.dir).unwrap().unwrap();
         let prompts: Vec<_> = saved["turns"].as_array().unwrap().iter().map(|turn| turn["prompt"].as_str().unwrap()).collect();
         assert_eq!(prompts, ["kept-turn", "after-rewind"]);
         gateway.shutdown().await.unwrap();

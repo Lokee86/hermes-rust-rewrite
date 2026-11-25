@@ -333,9 +333,8 @@ async fn stock_history_pages_are_read_only_and_use_canonical_rows() {
             },
         ],
     });
-    let file = summary.directory.join("conversation.json");
-    let original = serde_json::to_vec(&history).unwrap();
-    fs::write(&file, &original).unwrap();
+    hermes_engine::restore_conversation(&summary.directory, serde_json::to_value(&history).unwrap()).unwrap();
+    let original = hermes_engine::conversation_json(&summary.directory).unwrap();
     let gateway = Gateway::start(GatewayConfig::new(home.path(), Config::from_env()))
         .await
         .unwrap();
@@ -423,7 +422,7 @@ async fn stock_history_pages_are_read_only_and_use_canonical_rows() {
             .status(),
         StatusCode::NOT_FOUND
     );
-    assert_eq!(fs::read(file).unwrap(), original);
+    assert_eq!(hermes_engine::conversation_json(&summary.directory).unwrap(), original);
 
     let ticket = value(
         client

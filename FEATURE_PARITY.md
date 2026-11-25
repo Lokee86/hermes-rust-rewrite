@@ -40,9 +40,9 @@ Evidence levels below: **verified live** means driven against real services or t
 
 ## Gateway contract inventory
 
-_Counted on 25 November 2026 from the method tables in `crates/gateway/src`._
+_Counted on 25 November 2026 against Mercury `1ac307f` and stock Hermes v0.23.3, from the method tables in `crates/gateway/src`._
 
-The published OpenRPC file declares **264 unique method names**. The Rust gateway advertises **82** methods, **60** of which appear in that file. **204** published names are absent from the Rust method table. A matching name establishes dispatch coverage only. It does not certify complete request schemas or behavior, and the count is not a desktop feature percentage. [Published OpenRPC registry](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/apps/shared/src/gateway-contract.openrpc.json) · [Native handlers](crates/gateway/src/lib.rs) · [Gateway wire and tests](crates/gateway/README.md)
+The published OpenRPC file declares **263** names under `methods` and **54** under `x-canonical-methods`, the native session wire. **25** names are in both lists, so it declares **292 unique method names**. The Rust gateway advertises **84** methods, **67** of which appear in that file: **61** of the 263 and **15** of the 54, with nine in both. The table below covers the 263, of which **202** are absent from the Rust method table. The [API parity report](API_PARITY_REPORT.md#advertised-methods) lists the native ones. A matching name establishes dispatch coverage only. It does not certify complete request schemas or behavior, and the count is not a desktop feature percentage. [Published OpenRPC registry](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/apps/shared/src/gateway-contract.openrpc.json) · [Native handlers](crates/gateway/src/lib.rs) · [Gateway wire and tests](crates/gateway/README.md)
 
 | Published namespace | Advertised names in the Rust gateway | Outstanding published names |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ The published OpenRPC file declares **264 unique method names**. The Rust gatewa
 | gateway | `gateway.capabilities` | — |
 | groups | — | `groups.approve`, `groups.attachment.download`, `groups.attachment.upload`, `groups.capabilities`, `groups.context`, `groups.continue`, `groups.create`, `groups.demote`, `groups.disband`, `groups.discard`, `groups.list`, `groups.log`, `groups.peer.invite`, `groups.peer.register`, `groups.peer.revoke`, `groups.promote`, `groups.rename`, `groups.replica_state`, `groups.replicate`, `groups.retry`, `groups.send`, `groups.state`, `groups.stop` |
 | handoff | — | `handoff.fail`, `handoff.request`, `handoff.state` |
-| i18n | — | `i18n.catalog`, `i18n.languages` |
+| i18n | `i18n.languages` | `i18n.catalog` |
 | image | — | `image.attach`, `image.attach_bytes`, `image.detach`, `image.generate`, `image.render` |
 | input | — | `input.detect_drop` |
 | insights | `insights.get` | — |
@@ -98,7 +98,7 @@ The published OpenRPC file declares **264 unique method names**. The Rust gatewa
 | rollback | `rollback.diff`, `rollback.list`, `rollback.restore` | — |
 | session | `session.activate`, `session.active_list`, `session.archive`, `session.close`, `session.compress`, `session.context_breakdown`, `session.create`, `session.delete`, `session.events.since`, `session.history`, `session.interrupt`, `session.list`, `session.most_recent`, `session.resume`, `session.status`, `session.title`, `session.usage` | `session.branch`, `session.branch_stored`, `session.branch_whole`, `session.control`, `session.control.read`, `session.cwd.set`, `session.events.stats`, `session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.redirect`, `session.save`, `session.set_hidden`, `session.steer`, `session.undo`, `session.workspace.move` |
 | setup | `setup.runtime_check`, `setup.status` | — |
-| shared_metrics | — | `shared_metrics.desktop_daily`, `shared_metrics.desktop_dislike`, `shared_metrics.desktop_feature_use`, `shared_metrics.desktop_friction`, `shared_metrics.desktop_long_frames`, `shared_metrics.desktop_onboarding`, `shared_metrics.set`, `shared_metrics.slash_command`, `shared_metrics.startup_latency`, `shared_metrics.status`, `shared_metrics.update_run` |
+| shared_metrics | — | `shared_metrics.desktop_daily`, `shared_metrics.desktop_dislike`, `shared_metrics.desktop_feature_use`, `shared_metrics.desktop_friction`, `shared_metrics.desktop_onboarding`, `shared_metrics.set`, `shared_metrics.slash_command`, `shared_metrics.startup_latency`, `shared_metrics.status`, `shared_metrics.update_run` |
 | shell | `shell.exec` | — |
 | skills | `skills.reload` | `skills.manage` |
 | slash | `slash.exec` | — |
@@ -115,6 +115,8 @@ The published OpenRPC file declares **264 unique method names**. The Rust gatewa
 | voice | — | `voice.record`, `voice.toggle`, `voice.tts` |
 | wake | — | `wake.feed`, `wake.pause`, `wake.resume`, `wake.start`, `wake.status`, `wake.stop` |
 
-Rust also advertises `catalog.archive_inactive`, `catalog.session.delete`, `catalog.session.set`, `cron.chat`, `cron.trigger`, `gateway.ping`, `memory.provider.set`, `memory.providers`, `plugins.memory.archive_search`, `plugins.memory.sync`, `prompt.cancel`, `prompt.receipt`, `prompt.resolve_unknown`, `prompt.resume_parked`, `rpc.discover`, `runtime.describe`, `session.info`, `session.mutate`, `telegram.connect`, `telegram.disconnect`, `telegram.send`, `telegram.status`. These are outside this generated registry.
+Six more advertised names are declared only under `x-canonical-methods`: `prompt.cancel`, `prompt.receipt`, `prompt.resolve_unknown`, `runtime.describe`, `session.info`, `session.mutate`.
+
+Rust also advertises `catalog.archive_inactive`, `catalog.bot.delete`, `catalog.session.delete`, `catalog.session.set`, `cron.chat`, `cron.trigger`, `gateway.ping`, `memory.provider.set`, `memory.providers`, `plugins.memory.archive_search`, `plugins.memory.sync`, `prompt.resume_parked`, `rpc.discover`, `telegram.connect`, `telegram.disconnect`, `telegram.send`, `telegram.status`. These 17 are outside the published file.
 
 `commands.catalog`, `command.resolve` and `slash.exec` cover commands that plugins register, not the stock built-ins. Usage and context figures are estimates. `i18n.languages` reports English, the app's only language.

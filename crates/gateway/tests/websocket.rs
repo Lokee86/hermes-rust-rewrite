@@ -612,6 +612,10 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
     json!({"choices":[{"message":{"content":value.to_string()}}]})
 }
 
+fn saved_json(directory: &std::path::Path) -> Value {
+    hermes_engine::conversation_json(directory).unwrap().expect("a saved conversation")
+}
+
 #[cfg(feature = "reliquary")]
 async fn memory_capture_receipt(
     record_path: &std::path::Path,
@@ -619,7 +623,7 @@ async fn memory_capture_receipt(
 ) -> hermes_engine::memory_capture::CaptureReceipt {
     timeout(Duration::from_secs(40), async {
         loop {
-            let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+            let record: Value = saved_json(record_path);
             let marker = &record["authority"]["receipts"][index]["capture"];
             if marker["settled"] == true {
                 break serde_json::from_value(marker["receipt"].clone()).unwrap();
@@ -627,7 +631,7 @@ async fn memory_capture_receipt(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }).await.unwrap_or_else(|_| {
-        let record: Value = serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+        let record: Value = saved_json(record_path);
         panic!("{} receipt {index} did not settle: {}", record_path.display(), record["authority"]["receipts"][index]["capture"]);
     })
 }
@@ -838,17 +842,17 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     client.ok("session.resume", json!({"session_id":old.id})).await;
     client.ok("prompt.submit", json!({"session_id":old.id,"submission_id":"preexisting","text":"A historical chat"})).await;
     assert_eq!(client.event("message.complete").await["payload"]["status"], "complete");
-    let old_record: Value = serde_json::from_slice(&fs::read(old.directory.join("conversation.json")).unwrap()).unwrap();
+    let old_record: Value = serde_json::from_value(saved_json(&old.directory)).unwrap();
     assert!(old_record["authority"]["receipts"][0]["capture"].is_null());
 
     let source = client.ok("session.create", json!({"project_id":project.id,"title":"Memory source"})).await;
     let source_id = source["session_id"].as_str().unwrap();
-    let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
+    let record_path = library.session(source_id).unwrap().directory.clone();
     let submit = json!({"session_id":source_id,"submission_id":"source-fact","text":PROJECT_FACT});
     let admission = client.ok("prompt.submit", submit.clone()).await;
     approve_fixture_tool(&mut client, source_id, "get_current_time").await;
     assert_eq!(client.event("message.complete").await["payload"]["status"], "complete");
-    let committed: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let committed: Value = saved_json(&record_path);
     assert_eq!(committed["authority"]["receipts"][0]["status"], "terminal");
     assert_eq!(committed["authority"]["receipts"][0]["capture"]["admission_id"], admission["admission_id"]);
     assert_eq!(committed["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], rel_id);
@@ -901,7 +905,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
 
     // Reproduce an older archive intent that reached the adapter but never
     // committed a Core tombstone. Recovery must prove the accepted source is live.
-    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    let old_fence = record_path.join("gateway-memory-ended");
     fs::write(&old_fence, b"").unwrap();
     let (sidecar, mut saved) = fs::read_dir(state.join("native-capture-sources-v1")).unwrap()
         .filter_map(|item| {
@@ -931,10 +935,10 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
         switchboard_config(library.root()).unwrap().model(ModelSlot::Insomnia).unwrap().endpoint,
         "endpoint:insomnia",
     );
-    let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
+    let record_path = library.session(source_id).unwrap().directory.clone();
     let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
     let mut next = restarted.client().await;
-    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    let old_fence = record_path.join("gateway-memory-ended");
     timeout(Duration::from_secs(15), async {
         while old_fence.exists() {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -942,7 +946,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     }).await.expect("an old archive-only fence did not release after Core proved the source live");
     next.ok("session.resume", json!({"session_id":source_id})).await;
     assert_eq!(next.ok("prompt.submit", submit).await["admission_id"], admission["admission_id"]);
-    let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let record: Value = saved_json(&record_path);
     assert_eq!(record["authority"]["receipts"].as_array().unwrap().len(), 1);
     assert_eq!(record["authority"]["receipts"][0]["capture"]["receipt"]["import_id"], accepted.import_id);
 
@@ -967,13 +971,13 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     }
     let completed = next.event_with_timeout("message.complete", 65).await;
     assert_eq!(completed["payload"]["text"], "Recovered the Archive and Echo.");
-    let investigation_record = library.session(investigation).unwrap().directory.join("conversation.json");
+    let investigation_record = library.session(investigation).unwrap().directory.clone();
     memory_capture_receipt(&investigation_record, 0).await;
 
     let related = next.ok("session.create", json!({"project_id":project.id,"title":"Same project"})).await;
     let related_id = related["session_id"].as_str().unwrap();
-    let related_record = library.session(related_id).unwrap().directory.join("conversation.json");
-    let read_related = || -> Value { serde_json::from_slice(&fs::read(&related_record).unwrap()).unwrap() };
+    let related_record = library.session(related_id).unwrap().directory.clone();
+    let read_related = || -> Value { saved_json(&related_record) };
     let set_provider = |name: &str| {
         let settings = json!({"memory_provider": name});
         ProfileSettings::update(library.root(), settings.as_object().unwrap()).unwrap();
@@ -1026,8 +1030,8 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     assert!(related_archive["hits"].as_array().unwrap().iter().any(|hit| hit["rel"] == "Amethyst"),
         "related Archive results: {related_archive}");
     assert_eq!(approved_memory_query(&mut next, general_chat_id).await, "No project memory.");
-    let general_record = library.session(general_chat_id).unwrap().directory.join("conversation.json");
-    let record: Value = serde_json::from_slice(&fs::read(general_record).unwrap()).unwrap();
+    let general_record = library.session(general_chat_id).unwrap().directory.clone();
+    let record: Value = saved_json(&general_record);
     assert!(!record.to_string().contains(PROJECT_FACT));
     assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general_id);
 
@@ -1112,7 +1116,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let restored = wait_for_observation(&mut next, pending_id, REQUEST_OBSERVATION).await;
     assert_eq!(restored["observations"], lexical["observations"]);
 
-    let challenge_record = library.session(challenge_id).unwrap().directory.join("conversation.json");
+    let challenge_record = library.session(challenge_id).unwrap().directory.clone();
     memory_capture_receipt(&challenge_record, 0).await;
     let before_rewind = restarted.private_request("plugins.memory.archive_search", json!({
         "session_id":pending_id, "query":"Copper Finch 862"
@@ -1124,7 +1128,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let rewound = restarted.rewind(challenge_id, 0).await;
     assert_eq!(rewound["kept_turns"], 0);
     assert_eq!(rewound["memory_synced"], false);
-    let stopped: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+    let stopped: Value = saved_json(&challenge_record);
     assert_eq!(stopped["turns"], json!([]));
     assert_eq!(stopped["authority"]["source_rewinds"][0]["acknowledged"], false);
 
@@ -1137,7 +1141,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     next.ok("session.resume", json!({"session_id":pending_id})).await;
     timeout(Duration::from_secs(25), async {
         loop {
-            let row: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+            let row: Value = saved_json(&challenge_record);
             if row["authority"]["source_rewinds"][0]["acknowledged"] == true {
                 assert!(row["authority"]["source_rewinds"][0]["resulting_head"].is_array());
                 assert!(row["authority"]["source_rewinds"][0]["removed_message_uids"].is_array());
@@ -1231,7 +1235,7 @@ async fn disabled_memory_ignores_broken_enrollment_and_profile_notes() {
     assert_eq!(report, json!({"memory_requests":0,"included_fact":false,
         "notes_visible":false,"notes_tool":false,"query_tool":false}));
     let directory = Library::open(root.path()).unwrap().session(id).unwrap().directory;
-    let record: Value = serde_json::from_slice(&fs::read(directory.join("conversation.json")).unwrap()).unwrap();
+    let record: Value = serde_json::from_value(saved_json(&directory)).unwrap();
     assert!(record["authority"]["receipts"][0]["capture"].is_null());
     drop(client);
     gateway.shutdown().await.unwrap();
@@ -1544,10 +1548,7 @@ async fn legacy_stream_offsets_busy_and_native_interrupt_are_real_transport_oper
         .unwrap()
         .sessions(None)
         .unwrap();
-    let history: Value = serde_json::from_reader(
-        std::fs::File::open(summaries[0].directory.join("conversation.json")).unwrap(),
-    )
-    .unwrap();
+    let history: Value = saved_json(&summaries[0].directory);
     assert_eq!(history["turns"][1]["status"]["state"], "interrupted");
 }
 
@@ -1610,10 +1611,7 @@ async fn denial_provider_errors_and_shutdown_persist_their_real_outcomes() {
     client.event("message.delta").await;
     gateway.shutdown().await.unwrap();
     let library = hermes_library::Library::open(root.path()).unwrap();
-    let history: Value = serde_json::from_reader(
-        std::fs::File::open(library.session_dir(&sid).unwrap().join("conversation.json")).unwrap(),
-    )
-    .unwrap();
+    let history: Value = saved_json(&library.session_dir(&sid).unwrap());
     assert_eq!(history["turns"][1]["status"]["state"], "failed");
     assert_eq!(history["turns"][2]["status"]["state"], "interrupted");
 }
@@ -1928,8 +1926,7 @@ async fn signed_webhook_runs_the_agent_into_its_own_chat() {
     assert_eq!(chat.title, "Webhook · deploys");
     let history: hermes_engine::History = timeout(Duration::from_secs(20), async {
         loop {
-            if let Ok(bytes) = std::fs::read(chat.directory.join("conversation.json"))
-                && let Ok(history) = serde_json::from_slice::<hermes_engine::History>(&bytes)
+            if let Ok(history) = hermes_engine::read_history(&chat.directory)
                 && history.turns.len() == 3 && history.turns.last().is_some_and(|turn| matches!(turn.status, hermes_engine::Status::Complete)) { break history; }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1959,7 +1956,7 @@ async fn signed_webhook_runs_the_agent_into_its_own_chat() {
     let retry: Value = response.json().await.unwrap();
     assert_eq!(retry["receipt"]["admission_id"], first["receipt"]["admission_id"]);
     assert_eq!(retry["receipt"]["status"], "terminal");
-    let history: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    let history: hermes_engine::History = serde_json::from_value(saved_json(&chat.directory)).unwrap();
     assert_eq!(history.turns.len(), 3);
     library.record_delivery("deploys", hermes_library::webhooks::Delivery { at: "now".into(), event: "push".into(), status: "test".into(), id: None }, Some("missing-session".into())).unwrap();
     let unavailable = http.post(format!("{}/webhooks/deploys", gateway.http_url()))
@@ -1982,7 +1979,7 @@ async fn legacy_flight_hint_does_not_claim_a_matching_historical_row() {
     let file = hermes_engine::Attachment::capture_data_url(dir, "note.txt".into(), "data:text/plain;base64,aGVsbG8=").unwrap();
     let history = json!({"version":1,"turns":[{"prompt":"same text","model":"old-model","attachments":[file],
         "entries":[{"role":"assistant","text":"old answer","calls":[]}],"status":{"state":"complete"}}]});
-    std::fs::write(dir.join("conversation.json"),serde_json::to_vec(&history).unwrap()).unwrap();
+    hermes_engine::restore_conversation(dir, history.clone()).unwrap();
     std::fs::write(dir.join("gateway.json"),br#"{"model":"old-model"}"#).unwrap();
     let queue = json!({"parked":true,"next_id":10,
         "in_flight":{"entry":{"id":9,"text":"same text","attachments":[file]},"turn_index":0},
@@ -1993,7 +1990,7 @@ async fn legacy_flight_hint_does_not_claim_a_matching_historical_row() {
     let mut client = Client::native(&gateway).await;
     let params = json!({"session_id":chat.id});
     assert!(client.call("session.resume",params.clone()).await.get("error").is_some());
-    let preserved: Value = serde_json::from_slice(&std::fs::read(dir.join("conversation.json")).unwrap()).unwrap();
+    let preserved: Value = serde_json::from_value(saved_json(&dir)).unwrap();
     assert_eq!(preserved,history);
     std::fs::write(&path,serde_json::to_vec(&queue).unwrap()).unwrap();
     let first = client.ok("session.resume",params.clone()).await;
@@ -2047,10 +2044,10 @@ async fn crash_checkpoint_holds_follower_until_fenced_resolution_and_preserves_a
     let source = root.path().join("sessions").join(&sid);
     let copied = recovery.path().join("sessions").join(&sid);
     std::fs::create_dir_all(copied.join("attachments")).unwrap();
-    std::fs::copy(root.path().join("library.json"),recovery.path().join("library.json")).unwrap();
-    for file in ["gateway.json","conversation.json"] {
-        std::fs::copy(source.join(file),copied.join(file)).unwrap();
+    for file in ["mercury.db","mercury.db-wal"] {
+        std::fs::copy(root.path().join(file),recovery.path().join(file)).unwrap();
     }
+    std::fs::copy(source.join("gateway.json"),copied.join("gateway.json")).unwrap();
     let blob = attached["attachment"]["digest"].as_str().unwrap();
     std::fs::copy(source.join("attachments").join(blob),copied.join("attachments").join(blob)).unwrap();
     client.socket.close(None).await.unwrap();
@@ -2100,14 +2097,14 @@ async fn due_routine_runs_and_publishes_with_no_desktop() {
     let chat_id = index[&job.id].as_str().unwrap();
     let library = hermes_library::Library::open(root.path()).unwrap();
     let chat = library.session(chat_id).unwrap();
-    let history: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    let history: hermes_engine::History = serde_json::from_value(saved_json(&chat.directory)).unwrap();
     assert_eq!(history.turns.len(), 1);
     assert_eq!(history.turns[0].prompt, "Read the clock");
     assert!(run.output.contains("Tool denied."), "scheduled approval requests are denied unattended");
     gateway.shutdown().await.unwrap();
     let gateway = provider.gateway(&root).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let history: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    let history: hermes_engine::History = serde_json::from_value(saved_json(&chat.directory)).unwrap();
     assert_eq!(history.turns.len(), 1);
     assert_eq!(store.runs(&job.id).unwrap().len(), 1);
     gateway.shutdown().await.unwrap();
@@ -2165,8 +2162,7 @@ async fn group_round_runs_each_profile_without_desktop_and_deduplicates_retry() 
     let receipt = client.ok("prompt.submit", request.clone()).await;
     client.socket.close(None).await.unwrap();
     let history: hermes_engine::History = timeout(Duration::from_secs(20), async { loop {
-        if let Ok(bytes) = std::fs::read(chat.directory.join("conversation.json"))
-            && let Ok(history) = serde_json::from_slice::<hermes_engine::History>(&bytes)
+        if let Ok(history) = hermes_engine::read_history(&chat.directory)
             && history.turns.len() == 2 && history.turns.last().is_some_and(|turn| matches!(turn.status, hermes_engine::Status::Complete)) { break history; }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }}).await.unwrap();
@@ -2175,18 +2171,18 @@ async fn group_round_runs_each_profile_without_desktop_and_deduplicates_retry() 
     gateway.shutdown().await.unwrap();
     // Reconstruct the durable checkpoint after Ada committed and before Grace
     // was claimed, then restart with every Desktop client closed.
-    let path = chat.directory.join("conversation.json");
-    let mut checkpoint: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let path = chat.directory.clone();
+    let mut checkpoint: Value = saved_json(&path);
     checkpoint["turns"].as_array_mut().unwrap().pop();
     let child = checkpoint["authority"]["receipts"].as_array_mut().unwrap().iter_mut()
         .find(|receipt| receipt["group"]["first"] == false).unwrap();
     let child_id = child["id"].clone();
     child["status"] = json!("queued"); child["generation"] = json!(0);
     child["outcome"] = Value::Null; child["result"] = Value::Null; child["turn_index"] = Value::Null;
-    std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    hermes_engine::restore_conversation(&path, checkpoint).unwrap();
     let gateway = provider.gateway(&root).await;
     timeout(Duration::from_secs(20), async { loop {
-        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let record: Value = saved_json(&path);
         if record["turns"].as_array().unwrap().len() == 2 && record["authority"]["receipts"].as_array().unwrap().iter()
             .any(|receipt| receipt["id"] == child_id && receipt["status"] == "terminal") { break; }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2195,11 +2191,11 @@ async fn group_round_runs_each_profile_without_desktop_and_deduplicates_retry() 
     client.ok("session.resume", json!({"session_id":chat.id})).await;
     let retry = client.ok("prompt.submit", request).await;
     assert_eq!(receipt["admission_id"], retry["admission_id"]);
-    let saved: hermes_engine::History = serde_json::from_slice(&std::fs::read(chat.directory.join("conversation.json")).unwrap()).unwrap();
+    let saved: hermes_engine::History = serde_json::from_value(saved_json(&chat.directory)).unwrap();
     assert_eq!(saved.turns.len(), 2);
     let failed = client.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"fail-once","text":"fail-group"})).await;
     timeout(Duration::from_secs(20), async { loop {
-        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let record: Value = saved_json(&path);
         let round: Vec<_> = record["authority"]["receipts"].as_array().unwrap().iter()
             .filter(|row| row["group"]["round"] == failed["admission_id"]).collect();
         if round.len() == 2 && round.iter().all(|row| row["status"] == "terminal") {
@@ -2210,7 +2206,7 @@ async fn group_round_runs_each_profile_without_desktop_and_deduplicates_retry() 
     let active = client.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"hold","text":"hold-group"})).await;
     let queued = client.ok("prompt.submit", json!({"session_id":chat.id,"submission_id":"queued-round","text":"next","queued":true})).await;
     client.ok("prompt.cancel", json!({"session_id":chat.id,"admission_id":queued["admission_id"]})).await;
-    let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let record: Value = saved_json(&path);
     let round: Vec<_> = record["authority"]["receipts"].as_array().unwrap().iter()
         .filter(|row| row["group"]["round"] == queued["admission_id"]).collect();
     assert_eq!(round.len(), 2);

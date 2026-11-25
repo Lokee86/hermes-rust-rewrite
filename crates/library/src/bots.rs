@@ -317,7 +317,7 @@ impl Library {
             let mut record = self.new_record(None, Some(BOT_CHAT_TITLE), SessionSource::Native);
             record.bot = Some(name.to_owned());
             let directory = self.create_directory(&record.id)?;
-            if let Err(error) = atomic_json(&directory.join("conversation.json"), &History::default()) {
+            if let Err(error) = hermes_engine::create_conversation(&directory, &History::default()) {
                 let _ = fs::remove_dir(&directory);
                 return Err(error);
             }
@@ -571,7 +571,7 @@ impl Library {
             let mut record = self.new_record(None, Some(&group.name), SessionSource::Native);
             record.bot = Some(owner.clone());
             let directory = self.create_directory(&record.id)?;
-            if let Err(error) = atomic_json(&directory.join("conversation.json"), &History::default()) { let _ = fs::remove_dir(&directory); return Err(error); }
+            if let Err(error) = hermes_engine::create_conversation(&directory, &History::default()) { let _ = fs::remove_dir(&directory); return Err(error); }
             catalog.active_session = Some(record.id.clone());
             let summary = self.summary(&record);
             catalog.sessions.push(record);

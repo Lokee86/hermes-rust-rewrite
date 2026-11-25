@@ -386,11 +386,7 @@ fn imported_lineage_retains_original_timestamp_and_cwd_then_adds_native_continua
             calls: vec![],
         },
     ]);
-    std::fs::write(
-        summary.directory.join("conversation.json"),
-        serde_json::to_vec(&native).unwrap(),
-    )
-    .unwrap();
+    hermes_engine::restore_conversation(&summary.directory, serde_json::to_value(&native).unwrap()).unwrap();
     let index = load(&library, None).unwrap();
     assert!(index.failures.is_empty());
     assert_eq!(index.artifacts.len(), 2);
@@ -434,11 +430,7 @@ fn native_written_files_use_owner_workspace_and_global_index_ignores_selected_pr
             result: json!({"path":"report.md","bytes_written":3,"created":true,"verified":true})
                 .to_string(),
         }]);
-        std::fs::write(
-            summary.directory.join("conversation.json"),
-            serde_json::to_vec(&native).unwrap(),
-        )
-        .unwrap();
+        hermes_engine::restore_conversation(&summary.directory, serde_json::to_value(&native).unwrap()).unwrap();
         ids.push((project.id, summary.id));
     }
     library.select_project(Some(&ids[0].0)).unwrap();
@@ -465,11 +457,7 @@ fn corrupt_session_is_discarded_and_other_sessions_continue_indexing() {
         calls: vec![],
     }]);
     for summary in [&good, &bad] {
-        std::fs::write(
-            summary.directory.join("conversation.json"),
-            serde_json::to_vec(&native).unwrap(),
-        )
-        .unwrap();
+        hermes_engine::restore_conversation(&summary.directory, serde_json::to_value(&native).unwrap()).unwrap();
     }
     std::fs::write(
         bad.directory.join("hermes-source.json"),

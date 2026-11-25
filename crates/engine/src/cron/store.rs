@@ -1,18 +1,18 @@
 use super::*;
+use crate::db;
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
-use tempfile::NamedTempFile;
 
 const MAX_JOBS: usize = 1000;
 const MAX_RUNS: usize = 5000;
@@ -45,6 +45,68 @@ struct Document {
     runs: Vec<Run>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
+}
+const DOCUMENT: &str = "routines";
+/// Where routines and their runs were kept before the profile's database.
+const LEGACY: &str = "jobs.json";
+impl Document {
+    fn from_saved(saved: &db::Document) -> Result<Self> {
+        const DAMAGED: &str = "Could not read scheduled jobs; the saved jobs were left untouched";
+        fn rows<T: serde::de::DeserializeOwned>(saved: &db::Document, wanted: &str) -> Result<Vec<T>> {
+            saved.records.iter().filter(|(kind, ..)| kind == wanted)
+                .map(|(.., body)| serde_json::from_str(body)).collect::<serde_json::Result<_>>().context(DAMAGED)
+        }
+        Ok(Self { jobs: rows(saved, "job")?, runs: rows(saved, "run")?, extra: serde_json::from_str(&saved.body).context(DAMAGED)? })
+    }
+    fn to_saved(&self) -> Result<db::Document> {
+        let mut records = Vec::with_capacity(self.jobs.len() + self.runs.len());
+        for job in &self.jobs {
+            records.push(("job".to_owned(), job.id.clone(), serde_json::to_string(job)?));
+        }
+        for run in &self.runs {
+            records.push(("run".to_owned(), run.id.clone(), serde_json::to_string(run)?));
+        }
+        Ok(db::Document { body: serde_json::to_string(&self.extra)?, records })
+    }
+}
+fn read(profile: &Path) -> Result<Option<Document>> {
+    let load = || -> Result<Option<Document>> {
+        let Some(mut db) = db::open_existing(profile)? else { return Ok(None) };
+        db::read_document(&mut db, DOCUMENT)?.as_ref().map(Document::from_saved).transpose()
+    };
+    if let Some(document) = load()? {
+        return Ok(Some(document));
+    }
+    match read_legacy(&profile.join("cron"))? {
+        Some(document) => Ok(Some(document)),
+        // It may have moved into the database in between.
+        None => load(),
+    }
+}
+fn read_legacy(root: &Path) -> Result<Option<Document>> {
+    let path = root.join(LEGACY);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        !fs::symlink_metadata(&path)?.file_type().is_symlink() && file.metadata()?.is_file(),
+        "Scheduled jobs file must not be a symbolic link"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "Scheduled jobs file is too large"
+    );
+    serde_json::from_slice(&bytes)
+        .context("Could not read scheduled jobs; the existing file was left untouched")
+        .map(Some)
+}
+/// Routines and their runs as a backup keeps them.
+pub fn export(profile: &Path) -> Result<Option<Vec<u8>>> {
+    Ok(read(profile)?.map(|document| serde_json::to_vec_pretty(&document)).transpose()?)
 }
 static NEXT: AtomicU64 = AtomicU64::new(1);
 fn id() -> String {
@@ -154,50 +216,31 @@ impl Store {
     fn transaction<T>(&self, operation: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
         let lock = lock_file(&self.root.join(".jobs.lock"))?;
         lock.lock_exclusive()?;
-        let mut document = self.read()?;
+        let mut db = db::open(&self.profile)?;
+        let saved = db::read_document(&mut db, DOCUMENT)?;
+        let mut document = match &saved {
+            Some(saved) => Document::from_saved(saved)?,
+            None => read_legacy(&self.root)?.unwrap_or_default(),
+        };
         let value = operation(&mut document)?;
         ensure!(
             document.jobs.len() <= MAX_JOBS && document.runs.len() <= MAX_RUNS + 32,
             "Scheduler store exceeds its limit"
         );
-        let bytes = serde_json::to_vec_pretty(&document)?;
+        let next = document.to_saved()?;
+        let bytes = next.body.len() + next.records.iter().map(|(.., body)| body.len()).sum::<usize>();
         ensure!(
-            bytes.len() as u64 <= MAX_BYTES,
+            bytes as u64 <= MAX_BYTES,
             "Scheduled jobs store is full; remove older run records first"
         );
-        let mut temp = NamedTempFile::new_in(&self.root)?;
-        temp.write_all(&bytes)?;
-        temp.write_all(b"\n")?;
-        temp.as_file().sync_all()?;
-        temp.persist(self.root.join("jobs.json"))
-            .context("Could not save scheduled jobs")?;
+        db::write_document(&mut db, DOCUMENT, saved.as_ref(), &next).context("Could not save scheduled jobs")?;
+        if saved.is_none() {
+            db::retire(&self.root.join(LEGACY));
+        }
         Ok(value)
     }
     fn read(&self) -> Result<Document> {
-        let path = self.root.join("jobs.json");
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Document::default());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        ensure!(
-            !fs::symlink_metadata(&path)?.file_type().is_symlink() && file.metadata()?.is_file(),
-            "Scheduled jobs file must not be a symbolic link"
-        );
-        ensure!(
-            file.metadata()?.len() <= MAX_BYTES,
-            "Scheduled jobs file is too large"
-        );
-        let mut bytes = Vec::new();
-        file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_BYTES,
-            "Scheduled jobs file is too large"
-        );
-        serde_json::from_slice(&bytes)
-            .context("Could not read scheduled jobs; the existing file was left untouched")
+        Ok(read(&self.profile)?.unwrap_or_default())
     }
     pub fn jobs(&self) -> Result<Vec<Job>> {
         let document = self.read()?;
@@ -757,6 +800,39 @@ fn prune(document: &mut Document) {
 #[cfg(test)]
 mod gateway_recovery_tests {
     use super::*;
+    #[test]
+    fn routines_move_from_their_file_once_with_their_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let job = store.create(Draft { name: "Fixture".into(), prompt: "hello".into(), schedule: "every 1h".into(), ..Default::default() }, Utc::now()).unwrap();
+        store.claim_now(&job.id, Utc::now()).unwrap();
+        drop(store);
+        // As an earlier version left it, with a field this one does not know.
+        let mut saved: serde_json::Value = serde_json::from_slice(&export(dir.path()).unwrap().unwrap()).unwrap();
+        saved["future"] = serde_json::json!({"kept": true});
+        db::open(dir.path()).unwrap().execute("DELETE FROM documents", []).unwrap();
+        let file = dir.path().join("cron").join(LEGACY);
+        let bytes = serde_json::to_vec_pretty(&saved).unwrap();
+        fs::write(&file, &bytes).unwrap();
+
+        // Looking does not move it.
+        assert_eq!(Store::open_view(dir.path()).unwrap().jobs().unwrap()[0].id, job.id);
+        assert!(file.is_file());
+        let store = Store::open(dir.path()).unwrap();
+        store.pause(&job.id, Utc::now()).unwrap();
+        assert!(!file.exists());
+        assert_eq!(fs::read(dir.path().join("cron/jobs.json.before-sqlite")).unwrap(), bytes);
+        assert_eq!(store.runs(&job.id).unwrap().len(), 1);
+        let now: serde_json::Value = serde_json::from_slice(&export(dir.path()).unwrap().unwrap()).unwrap();
+        assert_eq!(now["future"], saved["future"]);
+        // A damaged file is reported and kept.
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir(other.path().join("cron")).unwrap();
+        fs::write(other.path().join("cron").join(LEGACY), b"{").unwrap();
+        assert!(Store::open(other.path()).is_err());
+        assert_eq!(fs::read(other.path().join("cron").join(LEGACY)).unwrap(), b"{");
+    }
+
     #[test]
     fn gateway_adopts_claim_with_frozen_definition_and_bound_session() {
         let dir = tempfile::tempdir().unwrap();
