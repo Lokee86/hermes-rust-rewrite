@@ -45,7 +45,7 @@ Package: hermes-rust
 Version: $version
 Architecture: $(dpkg --print-architecture)
 Maintainer: itsflownium <157689911+itsflownium@users.noreply.github.com>
-Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libasound2t64 | libasound2, libxdo3, libdbus-1-3
+Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libasound2t64 | libasound2, libxdo3, libdbus-1-3, libxkbcommon-x11-0
 Section: utils
 Priority: optional
 Description: Hermes desktop, the community Rust rewrite
