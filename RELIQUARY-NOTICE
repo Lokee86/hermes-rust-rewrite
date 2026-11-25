@@ -13,6 +13,12 @@ A downloadable archive of that source is available at:
 
 https://github.com/Lokee86/Reliquary/archive/91b6ea7081d4b5c2e7bf1eaab1145da345235abd.tar.gz
 
+One of its crates, reliquary-project-environment, is modified to leave out
+Lore. The Source Code Form of the modified crate is in
+vendor/reliquary-project-environment of the Hermes source, under the MPL-2.0:
+
+https://github.com/itsflownium/mercury-hermes-rust-rewrite/tree/main/vendor/reliquary-project-environment
+
 The MPL-2.0 license text is available at:
 
 https://github.com/Lokee86/Reliquary/blob/91b6ea7081d4b5c2e7bf1eaab1145da345235abd/LICENSE

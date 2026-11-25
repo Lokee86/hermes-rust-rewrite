@@ -1,0 +1,12 @@
+# Reliquary's crate of this name at the revision in crates/plugins/reliquary/Cargo.toml, without Lore.
+# Update the sources with that revision.
+[package]
+name = "reliquary-project-environment"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+reliquary-archive = { git = "https://github.com/Lokee86/Reliquary.git", rev = "91b6ea7081d4b5c2e7bf1eaab1145da345235abd" }
+sha2 = "0.10"

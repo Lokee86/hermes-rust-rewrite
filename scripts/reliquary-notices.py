@@ -33,18 +33,12 @@ def notices():
     def root(name):
         return Path(package(name)["manifest_path"]).parent
 
-    lore = root("lore").parent
-    quinn = root("quinn-proto")
     return source_url, {
         "Hermes-Rust-LICENSE": Path("LICENSE"),
         "Hermes-LICENSE": Path("LICENSE-HERMES-AGENT"),
         "Reliquary-NOTICE": notice,
         "Reliquary-MPL-2.0": root("reliquary-memory") / "LICENSE",
-        "Lore-MIT": lore / "LICENSE",
-        "Lore-rpmalloc-MIT": lore / "lore-base/native/thirdparty/rpmalloc/LICENSE",
         "Lodestone-MIT": root("lodestone-core").parents[1] / "LICENSE.md",
-        "Reliquary-vendored-Quinn-MIT": quinn / "LICENSE-MIT",
-        "Reliquary-vendored-Quinn-Apache-2.0": quinn / "LICENSE-APACHE",
     }
 
 
