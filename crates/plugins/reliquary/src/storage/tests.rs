@@ -306,3 +306,92 @@ fn resumes_renames_between_the_file_move_and_registry_commit() {
     .unwrap();
     assert!(resumed.owners[&id].pending_path.is_none());
 }
+
+#[test]
+fn profile_deletion_resumes_after_detach_and_partial_purge() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = Library::open(temp.path()).unwrap();
+
+    for (name, progress) in [
+        ("detaching", deletion::Progress::Detach),
+        ("purging", deletion::Progress::Purge),
+    ] {
+        let profile = Library::open(catalog.create_profile(name).unwrap().path).unwrap();
+        drop(open(&profile, name, true).unwrap().unwrap());
+        let home = profile.root();
+        let mut location = Location::load(home).unwrap().unwrap();
+        let detached = location
+            .root
+            .join(format!(".delete-{}", location.profile_id()));
+        fs::rename(location.profile_directory(), &detached).unwrap();
+        location.deletion = Some(progress);
+        save_state(&location_path(home), &location, true).unwrap();
+        if progress == deletion::Progress::Purge {
+            fs::remove_file(detached.join(TOPOLOGY)).unwrap();
+        }
+
+        assert!(open(&profile, name, true).is_err());
+        purge_profile_data(home, name).unwrap();
+        purge_profile_data(home, name).unwrap();
+        assert!(!detached.exists());
+        assert!(location_path(home).is_file());
+    }
+}
+
+#[test]
+fn profile_deletion_recovers_a_move_lost_after_purge_was_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = Library::open(temp.path()).unwrap();
+    let profile = Library::open(catalog.create_profile("work").unwrap().path).unwrap();
+    drop(open(&profile, "work", true).unwrap().unwrap());
+    let home = profile.root();
+    let mut location = Location::load(home).unwrap().unwrap();
+    let directory = location.profile_directory();
+    location.deletion = Some(deletion::Progress::Purge);
+    save_state(&location_path(home), &location, true).unwrap();
+
+    purge_profile_data(home, "work").unwrap();
+    assert!(!directory.exists());
+
+    let replacement = Library::open(catalog.create_profile("replacement").unwrap().path).unwrap();
+    drop(open(&replacement, "work", true).unwrap().unwrap());
+    let replacement_location = Location::load(replacement.root()).unwrap().unwrap();
+    assert_eq!(replacement_location.profile_directory(), directory);
+    purge_profile_data(home, "work").unwrap();
+    assert!(directory.join("general.rel").is_file());
+}
+
+#[test]
+fn profile_deletion_requires_the_registered_identity_and_respects_a_mount() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = Library::open(temp.path()).unwrap();
+    let original = Library::open(catalog.create_profile("original").unwrap().path).unwrap();
+    let mounted = open(&original, "original", true).unwrap().unwrap();
+    let mut location = Location::load(original.root()).unwrap().unwrap();
+    let directory = location.profile_directory();
+
+    assert!(purge_profile_data(original.root(), "original").is_err());
+    assert!(directory.join("general.rel").is_file());
+    drop(mounted);
+
+    let imported = Library::open(catalog.create_profile("imported").unwrap().path).unwrap();
+    ensure_directory(&imported.root().join("plugin-data")).unwrap();
+    fs::copy(
+        location_path(original.root()),
+        location_path(imported.root()),
+    )
+    .unwrap();
+    purge_profile_data(imported.root(), "imported").unwrap();
+    assert!(directory.join("general.rel").is_file());
+
+    let original_id = location.id;
+    location.id = Uuid::new_v4();
+    save_state(&location_path(original.root()), &location, true).unwrap();
+    assert!(purge_profile_data(original.root(), "original").is_err());
+    assert!(directory.join("general.rel").is_file());
+
+    location.id = original_id;
+    save_state(&location_path(original.root()), &location, true).unwrap();
+    purge_profile_data(original.root(), "original").unwrap();
+    assert!(!directory.exists());
+}

@@ -39,4 +39,8 @@ impl MemoryPlugin for Reliquary {
     fn rename_profile(&self, library: &Library, from: &str, to: &str) -> Result<Option<String>> {
         storage::rename_profile(library, from, to)
     }
+
+    fn purge_profile_data(&self, home: &std::path::Path, name: &str) -> Result<()> {
+        storage::purge_profile_data(home, name)
+    }
 }
