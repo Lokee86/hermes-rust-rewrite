@@ -117,6 +117,8 @@ struct Catalog {
     pinned_order: Vec<String>,
     #[serde(default)]
     pending_deletion: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_memory_deletions: Vec<String>,
     /// Set once `last_active` has been backfilled for pre-existing sessions.
     #[serde(default)]
     activity_migrated: bool,
@@ -130,7 +132,7 @@ impl Default for Catalog {
             sessions: vec![],
             selected_project: None,
             active_session: None,
-            pinned_order: vec![], pending_deletion:vec![], activity_migrated: true,
+            pinned_order: vec![], pending_deletion:vec![], pending_memory_deletions: vec![], activity_migrated: true,
         }
     }
 }

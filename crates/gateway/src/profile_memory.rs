@@ -6,16 +6,18 @@ use hermes_library::memory_plugin::{MemoryStore, MemoryTurn};
 pub(super) struct NativeSlot {
     library: Library,
     profile_name: String,
+    provider: Config,
     mounted: StdMutex<Option<Arc<dyn MemoryStore>>>,
     active: std::sync::atomic::AtomicBool,
     pub(super) wake: tokio::sync::Notify,
 }
 
 impl NativeSlot {
-    pub(super) fn new(library: Library, profile: &str) -> Arc<Self> {
+    pub(super) fn new(library: Library, profile: &str, provider: Config) -> Arc<Self> {
         Arc::new(Self {
             library,
             profile_name: profile.to_owned(),
+            provider,
             mounted: StdMutex::new(None),
             active: false.into(),
             wake: tokio::sync::Notify::new(),
@@ -26,11 +28,16 @@ impl NativeSlot {
         self.active.load(Ordering::Acquire)
     }
 
-    fn open_selected(&self, mounted: &mut Option<Arc<dyn MemoryStore>>) -> Result<()> {
+    fn open_selected(
+        &self,
+        mounted: &mut Option<Arc<dyn MemoryStore>>,
+        refresh_runtime: bool,
+    ) -> Result<()> {
         let Some(plugin) = stock_plugins::memory_plugin() else {
             return Ok(());
         };
         let configured = ProfileSettings::load(self.library.root())?.memory_provider;
+        let opening = mounted.is_none();
         if !matches!(configured, MemoryProvider::Auto | MemoryProvider::Reliquary) {
             self.unmount(mounted);
         } else if mounted.is_none() {
@@ -43,6 +50,15 @@ impl NativeSlot {
                 self.wake.notify_one();
             }
         }
+        if (opening || refresh_runtime)
+            && let Some(store) = mounted.as_ref()
+            && let Err(error) = store.configure_profile_runtime(&self.provider)
+        {
+            if refresh_runtime {
+                return Err(error);
+            }
+            eprintln!("Could not configure the profile's managed memory runtime: {error:#}");
+        }
         Ok(())
     }
 
@@ -52,7 +68,7 @@ impl NativeSlot {
         operation: impl FnOnce(&Arc<dyn MemoryStore>) -> T,
     ) -> Option<T> {
         let mut mounted = lock(&self.mounted);
-        if let Err(error) = self.open_selected(&mut mounted) {
+        if let Err(error) = self.open_selected(&mut mounted, false) {
             eprintln!("Could not open profile memory: {error:#}");
             return None;
         }
@@ -62,7 +78,7 @@ impl NativeSlot {
     /// Refresh assignments once outstanding tool queries release their store.
     pub(super) fn refresh_projects(&self, sync_inactive: bool) -> Result<bool> {
         let mut mounted = lock(&self.mounted);
-        self.open_selected(&mut mounted)?;
+        self.open_selected(&mut mounted, sync_inactive)?;
         if let Some(store) = mounted.as_ref()
             && store.projects_changed(&self.library.projects()?)
         {
@@ -70,7 +86,7 @@ impl NativeSlot {
                 return Ok(false);
             }
             self.unmount(&mut mounted);
-            self.open_selected(&mut mounted)?;
+            self.open_selected(&mut mounted, false)?;
         }
         if sync_inactive
             && mounted.is_none()

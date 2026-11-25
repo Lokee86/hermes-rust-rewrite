@@ -290,6 +290,18 @@ impl Hermes {
             move |result| Message::Models(Action::Loaded(generation, key.clone(), result)),
         )
     }
+    fn refresh_perception_runtime(&self) -> Task<Message> {
+        let Some(library) = self.library.as_ref() else {
+            return Task::none();
+        };
+        if hermes_engine::settings::ProfileSettings::load(library.root())
+            .is_ok_and(|settings| settings.memory_perception_endpoint.is_some())
+        {
+            return self.sync_workspace_memory(library.root().to_owned());
+        }
+        Task::none()
+    }
+
     pub(super) fn models_update(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Open => {
@@ -422,6 +434,7 @@ impl Hermes {
                         }
                         self.models.reload_endpoints();
                         self.note("Endpoint disconnected");
+                        return self.refresh_perception_runtime();
                     }
                     Err(error) => self.models.error = Some(error),
                 }
@@ -431,9 +444,11 @@ impl Hermes {
                 match self.persist_provider(close) {
                     Ok(()) => {
                         self.note("Provider settings saved");
+                        let refresh = self.refresh_perception_runtime();
                         if !close {
-                            return self.discover_models();
+                            return Task::batch([self.discover_models(), refresh]);
                         }
+                        return refresh;
                     }
                     Err(error) => self.models.error = Some(error),
                 }

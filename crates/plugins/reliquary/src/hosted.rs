@@ -4,18 +4,20 @@ use super::switchboard::switchboard_config;
 use anyhow::{Context, Result};
 use hermes_engine::{
     Config,
+    credentials::EndpointStore,
     inference::{CompletionInference, EmbeddingInference, InferenceTarget},
+    settings::ProfileSettings,
 };
 use reliquary_memory::{
-    ConfiguredRuntime, ConfiguredRuntimeError, EmbeddingEndpoint, EmbeddingEndpointError,
-    EmbeddingNormalization, GeneralEndpoint, GeneralEndpointError, ModelSlot,
-    SwitchboardEmbeddingMode,
+    ConfiguredDecisionEndpoint, ConfiguredRuntime, ConfiguredRuntimeError, DecisionEndpoint,
+    DecisionEndpointError, EmbeddingEndpoint, EmbeddingEndpointError, EmbeddingNormalization,
+    GeneralEndpoint, GeneralEndpointError, ModelSlot, SwitchboardEmbeddingMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::runtime::Handle;
@@ -206,4 +208,86 @@ pub(super) fn from_profile(
         |_, _| Ok((metadata.provider.clone(), embedding.clone())),
     )?;
     Ok(Some((runtime, metadata)))
+}
+
+pub(super) fn with_native_perception(
+    home: &Path,
+    endpoint_id: &str,
+    runtime: ConfiguredRuntime,
+) -> Result<ConfiguredRuntime> {
+    let config = EndpointStore::open(&home.join("providers"))?
+        .config(endpoint_id)
+        .context("The saved Perception endpoint is unavailable")?;
+    config.validate()?;
+    let endpoint =
+        ConfiguredDecisionEndpoint::native(&config.base_url, &config.model, &config.api_key)?;
+    let route = format!("mercury-native-jev-v1\0{endpoint_id}\0{}", config.base_url);
+    let identity = blake3::hash(route.as_bytes()).to_hex();
+    let decision = ProfileDecision {
+        home: home.to_owned(),
+        endpoint_id: endpoint_id.to_owned(),
+        binding: endpoint_binding(&config),
+        endpoint,
+    };
+    Ok(runtime.with_native_perception_decision(Arc::new(decision), identity.as_str())?)
+}
+
+struct ProfileDecision {
+    home: PathBuf,
+    endpoint_id: String,
+    binding: blake3::Hash,
+    endpoint: ConfiguredDecisionEndpoint,
+}
+
+fn endpoint_binding(config: &Config) -> blake3::Hash {
+    let mut digest = blake3::Hasher::new();
+    for part in [&config.base_url, &config.model, &config.api_key] {
+        digest.update(&(part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.finalize()
+}
+
+impl ProfileDecision {
+    fn check_current(&self) -> Result<(), DecisionEndpointError> {
+        let changed = || DecisionEndpointError::InvalidConfiguration("Perception endpoint changed");
+        let settings = ProfileSettings::load(&self.home).map_err(|_| changed())?;
+        if settings.memory_perception_endpoint.as_deref() != Some(self.endpoint_id.as_str()) {
+            return Err(changed());
+        }
+        let current = EndpointStore::open(&self.home.join("providers"))
+            .and_then(|store| store.config(&self.endpoint_id))
+            .map_err(|_| changed())?;
+        if endpoint_binding(&current) != self.binding {
+            return Err(changed());
+        }
+        Ok(())
+    }
+}
+
+impl DecisionEndpoint for ProfileDecision {
+    fn model(&self) -> &str {
+        self.endpoint.model()
+    }
+
+    fn evaluate(&self, state: &Value, questions: &Value) -> Result<Value, DecisionEndpointError> {
+        self.check_current()?;
+        let reply = self.endpoint.evaluate(state, questions)?;
+        self.check_current()?;
+        Ok(reply)
+    }
+
+    fn evaluate_bounded(
+        &self,
+        state: &Value,
+        questions: &Value,
+        max_response_bytes: usize,
+    ) -> Result<Value, DecisionEndpointError> {
+        self.check_current()?;
+        let reply = self
+            .endpoint
+            .evaluate_bounded(state, questions, max_response_bytes)?;
+        self.check_current()?;
+        Ok(reply)
+    }
 }

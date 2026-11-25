@@ -15,13 +15,14 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Notify,
     task::JoinHandle,
     time::timeout,
 };
@@ -165,7 +166,17 @@ impl Client {
 struct Provider {
     address: SocketAddr,
     memory_requests: Arc<AtomicUsize>,
+    observation_verifications: Arc<AtomicUsize>,
+    observation_review: Arc<ObservationReview>,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ObservationReview {
+    challenged: AtomicBool,
+    held: AtomicBool,
+    started: Notify,
+    finish: Notify,
 }
 impl Drop for Provider {
     fn drop(&mut self) {
@@ -178,18 +189,25 @@ impl Provider {
         let address = listener.local_addr().unwrap();
         let memory_requests = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&memory_requests);
+        let observation_verifications = Arc::new(AtomicUsize::new(0));
+        let verified = Arc::clone(&observation_verifications);
+        let observation_review = Arc::new(ObservationReview::default());
+        let review = Arc::clone(&observation_review);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
                 Router::new()
                     .route("/v1/chat/completions", post(model))
                     .route("/v1/embeddings", post(embed_memory_fixture))
+                    .route("/v1/decisions", post(move |headers, request| {
+                        native_decision_fixture(verified.clone(), review.clone(), headers, request)
+                    }))
                     .with_state(observed),
             )
             .await
             .unwrap();
         });
-        Self { address, memory_requests, task }
+        Self { address, memory_requests, observation_verifications, observation_review, task }
     }
     fn config(&self) -> Config {
         Config {
@@ -304,6 +322,21 @@ async fn model(
         return ([(header::CONTENT_TYPE, "text/event-stream")],
                 format!("{body}data: [DONE]\n\n")).into_response();
     }
+    if last["role"] == "user" {
+        let query = match last["content"].as_str() {
+            Some(REQUEST_OBSERVATION) => Some("Amethyst Lantern"),
+            Some(REQUEST_PARAPHRASE) => Some(OBSERVATION_PARAPHRASE),
+            _ => None,
+        };
+        if let Some(query) = query {
+            return send(json!({"tool_calls":[tool("observation_query", "memory_query",
+                json!({"query":query}))]}), "tool_calls");
+        }
+    }
+    if last["role"] == "tool" && last["tool_call_id"] == "observation_query" {
+        // The Gateway persists only the result count. Echo what the model actually received.
+        return send(json!({"content":last["content"]}), "stop");
+    }
     if last["content"] == "provider-error" {
         return (
             [(header::CONTENT_TYPE, "text/event-stream")],
@@ -392,6 +425,13 @@ async fn model(
 
 const PROJECT_FACT: &str = "The workspace project is Amethyst Lantern 741.";
 const REQUEST_QUERY: &str = "Look up the project name in memory.";
+const REQUEST_OBSERVATION: &str = "Look up the verified Observation about the lantern.";
+const OBSERVATION_FACT: &str = "Amethyst Lantern 741 is the workspace project name.";
+const OBSERVATION_PARAPHRASE: &str = "Initiative designation";
+const REQUEST_PARAPHRASE: &str = "Recall the initiative designation.";
+const PROJECT_CONTROL: &str = "The project deploys with a weekly smoke test checklist.";
+const PROJECT_CHALLENGE: &str = "Correction: our workspace project has always been called Copper Finch 862.";
+const CHALLENGE_RECEPTOR: &str = "a different project name";
 const PROFILE_NOTE: &str = "The notes canary is violet.";
 const CONTEXT_PROBE: &str = "How is the Amethyst Lantern project going?";
 
@@ -422,10 +462,67 @@ async fn embed_memory_fixture(
     assert_memory_route(&headers, &request, "embedding");
     memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
-    let data = (0..inputs.len()).map(|index| {
-        json!({"index": index, "embedding": [3.0, 4.0]})
+    let data = inputs.iter().enumerate().map(|(index, input)| {
+        let text = input.as_str().unwrap();
+        let (_, body) = text.split_once('\n').unwrap_or(("", text));
+        let embedding = match body {
+            OBSERVATION_PARAPHRASE | OBSERVATION_FACT | PROJECT_FACT | PROJECT_CONTROL | "Amethyst Lantern" => [1.0, 0.0],
+            CHALLENGE_RECEPTOR => [0.0, 1.0],
+            text if text.to_ascii_lowercase().contains("copper finch 862") => [0.0, 1.0],
+            _ => [-1.0, 0.0],
+        };
+        json!({"index": index, "embedding": embedding})
     }).collect::<Vec<_>>();
     Json(json!({"model": request["model"], "data": data}))
+}
+
+async fn native_decision_fixture(
+    verified: Arc<AtomicUsize>,
+    review: Arc<ObservationReview>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture-jev-key");
+    assert_eq!(request["model"], "typesafe/jev-1.13");
+    assert_eq!(request.as_object().unwrap().len(), 3);
+    let questions = request["questions"].as_object().unwrap();
+    let state = &request["state"];
+    let mut answers = serde_json::Map::new();
+    for id in questions.keys() {
+        let answer = match id.as_str() {
+            "verify" => "stands_as_written",
+            key if key.ends_with("-time") => "change_to_ongoing_claim",
+            key if key.ends_with("-scope") => "overlapping_scope",
+            key if state["evidence_hits"][key] == PROJECT_CHALLENGE => {
+                assert_eq!(state["existing_observation"], OBSERVATION_FACT);
+                review.challenged.store(true, Ordering::Release);
+                "material_challenge"
+            }
+            _ => "no_material_effect",
+        };
+        answers.insert(id.clone(), json!({"type":"choice", "choice":answer}));
+    }
+    if answers.contains_key("verify") {
+        assert_eq!(state["claim"], OBSERVATION_FACT);
+        if state["backcheck_hits"].as_array().unwrap().iter().any(|hit| {
+            hit["text"] == PROJECT_CHALLENGE
+        }) {
+            // The worker schedules review before auditing again once it commits the challenge.
+            assert!(review.challenged.load(Ordering::Acquire));
+            // Core verifies again when evidence arrives during the review. Only the first one waits.
+            if !review.held.swap(true, Ordering::AcqRel) {
+                review.started.notify_one();
+                review.finish.notified().await;
+            }
+        }
+        verified.fetch_add(1, Ordering::Relaxed);
+    }
+    Json(json!({"answers":answers}))
+}
+
+fn perception_draft(proposition: &str, slots: Value) -> Value {
+    json!({"proposition":proposition,"status":"observed","time_scope":"current",
+           "source_slots":slots,"participants":[]})
 }
 
 fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
@@ -437,9 +534,11 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             for id in shape["turns"]["required"].as_array().unwrap() {
                 let id = id.as_str().unwrap();
                 let source = episode["turns"].as_array().unwrap().iter().find(|turn| turn["id"] == id).unwrap();
-                let clauses = if source["role"] == "user" && source["content"] == PROJECT_FACT {
+                let clauses = if source["role"] == "user"
+                    && matches!(source["content"].as_str(), Some(PROJECT_FACT | PROJECT_CHALLENGE | PROJECT_CONTROL))
+                {
                     json!([{"disposition":"retain", "authority_kind":"direct", "category":"fact",
-                        "type":"project", "lifecycle":"current", "proposition":PROJECT_FACT,
+                        "type":"project", "lifecycle":"current", "proposition":source["content"],
                         "authority_source_node_id":"", "grounding_source_node_id":"",
                         "reason":"The user gave the project name."}])
                 } else {
@@ -459,24 +558,55 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             json!({"ownership": ownership})
         }
         "insomnia_memory_wording" => {
-            let candidates = shape["candidates"]["items"]["properties"]["source_node_id"]["enum"]
-                .as_array().unwrap().iter().filter(|id| id.as_str().unwrap().ends_with("-user"))
-                .map(|id| json!({
-                    "authority_kind":"direct", "category":"fact", "memory_type":"project",
-                    "temporal_status":"current", "ownership":"project", "title":"Amethyst Lantern",
-                    "content":PROJECT_FACT, "source_node_id":id, "source_quote":PROJECT_FACT,
-                    "authority_source":null, "grounding_source":null, "routing_mentions":[]
-                })).collect::<Vec<_>>();
+            let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let candidates = input["synthesis_groups"].as_array().unwrap().iter()
+                .map(|group| {
+                    let text = group["propositions"][0].as_str().unwrap();
+                    let title = match text {
+                        PROJECT_FACT => "Amethyst Lantern",
+                        PROJECT_CHALLENGE => "Copper Finch",
+                        PROJECT_CONTROL => "Weekly smoke test",
+                        _ => panic!("unexpected retained proposition: {text}"),
+                    };
+                    json!({
+                        "authority_kind":"direct", "category":"fact", "memory_type":"project",
+                        "temporal_status":"current", "ownership":"project", "title":title,
+                        "content":text, "source_node_id":group["source_node_id"], "source_quote":text,
+                        "authority_source":null, "grounding_source":null, "routing_mentions":[]
+                    })
+                }).collect::<Vec<_>>();
             json!({"candidates":candidates})
         }
         "decision_response" => {
             let payload: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let approved = payload["state"]["candidates"].as_array().into_iter().flatten()
-                .filter(|candidate| candidate["content"].as_str().is_some_and(|text| text.contains(PROJECT_FACT)))
+                .filter(|candidate| candidate["content"].as_str().is_some_and(|text| {
+                    text.contains(PROJECT_FACT) || text == OBSERVATION_FACT || text == PROJECT_CONTROL
+                }))
                 .map(|candidate| candidate["memory"].clone()).collect::<Vec<_>>();
             json!({"version":1,"approved":approved})
         }
         "dream_pair_classification" => json!({"relation":"none","direction":"none","evidence":[]}),
+        "memory_web_audit_v1" => {
+            let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let candidates = input["sources"].as_array().into_iter().flatten()
+                .find(|row| row["kind"] == "memory" && row["text"] == PROJECT_FACT)
+                .map(|row| perception_draft(OBSERVATION_FACT, json!([row["slot"]])))
+                .into_iter().collect::<Vec<_>>();
+            json!({"ego":{"candidates":[],"lookups":[]},
+                   "perception":{"candidates":candidates,"lookups":[]}})
+        }
+        "observation_synthesis_v1" => {
+            let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            json!({"draft":perception_draft(OBSERVATION_FACT,input["proposal_sources"].clone()),
+                   "duplicate_slot":null})
+        }
+        "observation_receptors_v1" => json!({
+            "support":["project named Amethyst Lantern"],
+            "challenge":[CHALLENGE_RECEPTOR],
+            "qualification":["Amethyst Lantern project naming exceptions"],
+            "other":["changes to project name"],
+        }),
         _ => serde_json::Value::Object(serde_json::Map::new()),
     };
     json!({"choices":[{"message":{"content":value.to_string()}}]})
@@ -527,6 +657,35 @@ async fn approve_fixture_tool(client: &mut Client, sid: &str, name: &str) {
 }
 
 #[cfg(feature = "reliquary")]
+async fn query_observation(client: &mut Client, sid: &str, submission: &str, prompt: &str) -> Value {
+    client.ok("prompt.submit", json!({
+        "session_id":sid, "submission_id":submission, "text":prompt
+    })).await;
+    approve_fixture_tool(client, sid, "memory_query").await;
+    let completed = client.event_with_timeout("message.complete", 65).await;
+    assert_eq!(completed["payload"]["status"], "complete", "{completed}");
+    serde_json::from_str(completed["payload"]["text"].as_str().unwrap())
+        .unwrap_or_else(|error| panic!("invalid memory_query reply for {submission}: {error}: {completed}"))
+}
+
+#[cfg(feature = "reliquary")]
+async fn wait_for_observation(client: &mut Client, sid: &str, prompt: &str) -> Value {
+    let mut last_reply = Value::Null;
+    // Core waits up to 60 seconds before it retries.
+    timeout(Duration::from_secs(90), async {
+        let mut attempt = 0;
+        loop {
+            last_reply = query_observation(client, sid, &format!("observation-{prompt}-{attempt}"), prompt).await;
+            if last_reply["observations"].as_array().is_some_and(|rows| !rows.is_empty()) {
+                return last_reply.clone();
+            }
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }).await.unwrap_or_else(|_| panic!("missing verified Observation for {prompt}: {last_reply}"))
+}
+
+#[cfg(feature = "reliquary")]
 struct PortableGateway {
     process: tokio::process::Child,
     endpoint: Value,
@@ -572,6 +731,24 @@ impl PortableGateway {
         let result = client.request(method, params).await.unwrap();
         client.close();
         result
+    }
+
+    async fn rewind(&self, session_id: &str, keep_turns: usize) -> Value {
+        use hermes_gateway::{client::{ClientOptions, GatewayClient}, owner};
+        let control = owner::discover(&self.home).await.unwrap().unwrap();
+        let client = GatewayClient::new(ClientOptions::default());
+        control.connect(&client).await.unwrap();
+        let session = client.request("session.resume", json!({"session_id":session_id})).await.unwrap();
+        let request = json!({
+            "session_id":session_id, "request_id":"source-cascade-rewind", "operation":"rewind",
+            "expected_revision":session["revision"], "expected_generation":session["execution_generation"],
+            "payload":{"keep_turns":keep_turns}
+        });
+        let changed = client.request("session.mutate", request.clone()).await.unwrap();
+        let retry = client.request("session.mutate", request).await.unwrap();
+        assert_eq!(retry["execution_generation"], changed["execution_generation"]);
+        client.close();
+        changed
     }
 
     async fn reconcile_memory(&self) -> Value {
@@ -722,6 +899,21 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     drop(client);
     gateway.shutdown().await;
 
+    // Reproduce an older archive intent that reached the adapter but never
+    // committed a Core tombstone. Recovery must prove the accepted source is live.
+    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    fs::write(&old_fence, b"").unwrap();
+    let (sidecar, mut saved) = fs::read_dir(state.join("native-capture-sources-v1")).unwrap()
+        .filter_map(|item| {
+            let path = item.ok()?.path();
+            let data: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            (data["session_id"] == source_id).then_some((path, data))
+        })
+        .next().expect("source receipt sidecar is missing");
+    saved["terminal"] = json!(true);
+    fs::write(&sidecar, serde_json::to_vec(&saved).unwrap()).unwrap();
+    fs::write(sidecar.with_extension("terminal"), serde_json::to_vec(source_id).unwrap()).unwrap();
+
     assert_eq!(hermes_gateway::stock_plugins::rename_profile(&profiles, "work", "office").unwrap(), None);
     assert!(!state.exists());
     let state = store.join("office");
@@ -742,6 +934,12 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
     let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
     let mut next = restarted.client().await;
+    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    timeout(Duration::from_secs(15), async {
+        while old_fence.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.expect("an old archive-only fence did not release after Core proved the source live");
     next.ok("session.resume", json!({"session_id":source_id})).await;
     assert_eq!(next.ok("prompt.submit", submit).await["admission_id"], admission["admission_id"]);
     let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
@@ -832,6 +1030,170 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let record: Value = serde_json::from_slice(&fs::read(general_record).unwrap()).unwrap();
     assert!(!record.to_string().contains(PROJECT_FACT));
     assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general_id);
+
+    let jev = EndpointStore::open(&library.root().join("providers")).unwrap()
+        .save(Some("jev"), "Native Jev", &Config {
+            base_url: format!("http://{}/v1/decisions", memory_provider.address),
+            model: "typesafe/jev-1.13".into(),
+            api_key: "fixture-jev-key".into(),
+        }).unwrap();
+    let selection = json!({"memory_perception_endpoint":jev.id});
+    ProfileSettings::update(library.root(), selection.as_object().unwrap()).unwrap();
+    assert_eq!(restarted.reconcile_memory().await["enrolled"], true);
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while memory_provider.observation_verifications.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }).await.expect("Perception did not verify the project Observation through native Jev");
+    let recall = next.ok("session.create",
+        json!({"project_id":project.id,"title":"Observation recall"})).await;
+    let recall_id = recall["session_id"].as_str().unwrap();
+    let lexical = wait_for_observation(&mut next, recall_id, REQUEST_OBSERVATION).await;
+    let lexical_observations = lexical["observations"].as_array().unwrap();
+    let [expected] = lexical_observations.as_slice() else {
+        panic!("expected a single verified Observation: {lexical}");
+    };
+    assert_eq!(expected["content"], OBSERVATION_FACT);
+    let citation = &expected["citation"];
+    assert_eq!(citation["revision"], 1);
+    assert!(citation["source"]["Observation"].is_array(), "{citation}");
+    assert_eq!(citation["field"], "Content");
+    assert_eq!(citation["start_byte"], 0);
+    assert_eq!(citation["end_byte"], OBSERVATION_FACT.len());
+    let [support] = expected["evidence"].as_array().unwrap().as_slice() else {
+        panic!("expected one exact supporting Memory citation: {expected}");
+    };
+    let support_memory_id: String = support["source"]["Memory"].as_array().unwrap().iter()
+        .map(|byte| format!("{:02x}", byte.as_u64().unwrap())).collect();
+    let control = lexical["memories"].as_array().unwrap().iter()
+        .find(|row| row["id"] == support_memory_id).unwrap();
+    assert_eq!(control["content"], PROJECT_FACT);
+    assert_eq!(support["owner_id"], citation["owner_id"]);
+    assert_eq!(support["history_generation"], citation["history_generation"]);
+    assert_eq!(support["revision"], control["revision"]);
+    assert_eq!(support["field"], "Content");
+    assert_eq!(support["start_byte"], 0);
+    assert_eq!(support["end_byte"], PROJECT_FACT.len());
+
+    let claim_tokens: std::collections::BTreeSet<_> = OBSERVATION_FACT.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_owned).collect();
+    assert!(OBSERVATION_PARAPHRASE.to_ascii_lowercase().split_whitespace()
+        .all(|word| !claim_tokens.contains(word)));
+    let semantic_recall = next.ok("session.create",
+        json!({"project_id":project.id,"title":"Paraphrase recall"})).await;
+    let semantic_recall_id = semantic_recall["session_id"].as_str().unwrap();
+    let paraphrase = wait_for_observation(&mut next, semantic_recall_id, REQUEST_PARAPHRASE).await;
+    assert_eq!(paraphrase["observations"], lexical["observations"]);
+    assert!(paraphrase["memories"].as_array().unwrap().contains(control), "{paraphrase}");
+
+    let challenge = next.ok("session.create",
+        json!({"project_id":project.id,"title":"New evidence"})).await;
+    let challenge_id = challenge["session_id"].as_str().unwrap();
+    next.ok("prompt.submit", json!({
+        "session_id":challenge_id, "submission_id":"challenge", "text":PROJECT_CHALLENGE
+    })).await;
+    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    timeout(Duration::from_secs(40), memory_provider.observation_review.started.notified())
+        .await.expect("material challenge never reached native Verify for the pending claim");
+
+    let pending = next.ok("session.create",
+        json!({"project_id":project.id,"title":"Observation pending review"})).await;
+    let pending_id = pending["session_id"].as_str().unwrap();
+    let withheld = timeout(Duration::from_secs(15),
+        query_observation(&mut next, pending_id, "pending-review", REQUEST_PARAPHRASE))
+        .await.expect("recall did not finish while Verify was held");
+    assert!(withheld["search_id"].is_string() && withheld["result_id"].is_string(), "{withheld}");
+    assert_ne!(withheld["search_id"], paraphrase["search_id"]);
+    assert_eq!(withheld.get("observations"), None, "{withheld}");
+    assert!(withheld["memories"].as_array().unwrap().contains(control), "{withheld}");
+    memory_provider.observation_review.finish.notify_one();
+
+    let restored = wait_for_observation(&mut next, pending_id, REQUEST_OBSERVATION).await;
+    assert_eq!(restored["observations"], lexical["observations"]);
+
+    let challenge_record = library.session(challenge_id).unwrap().directory.join("conversation.json");
+    memory_capture_receipt(&challenge_record, 0).await;
+    let before_rewind = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":pending_id, "query":"Copper Finch 862"
+    })).await;
+    assert!(before_rewind["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+        hit["text"].as_str().is_some_and(|text| text.contains(PROJECT_CHALLENGE))
+    })), "{before_rewind}");
+    set_provider("off");
+    let rewound = restarted.rewind(challenge_id, 0).await;
+    assert_eq!(rewound["kept_turns"], 0);
+    assert_eq!(rewound["memory_synced"], false);
+    let stopped: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+    assert_eq!(stopped["turns"], json!([]));
+    assert_eq!(stopped["authority"]["source_rewinds"][0]["acknowledged"], false);
+
+    drop(next);
+    restarted.shutdown().await;
+    set_provider("reliquary");
+    let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
+    let mut next = restarted.client().await;
+    next.ok("session.resume", json!({"session_id":challenge_id})).await;
+    next.ok("session.resume", json!({"session_id":pending_id})).await;
+    timeout(Duration::from_secs(25), async {
+        loop {
+            let row: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+            if row["authority"]["source_rewinds"][0]["acknowledged"] == true {
+                assert!(row["authority"]["source_rewinds"][0]["resulting_head"].is_array());
+                assert!(row["authority"]["source_rewinds"][0]["removed_message_uids"].is_array());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }).await.expect("committed rewind never reached REL");
+    let removed = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":pending_id, "query":"Copper Finch 862"
+    })).await;
+    assert!(!removed.to_string().contains(PROJECT_CHALLENGE));
+
+    next.ok("prompt.submit", json!({
+        "session_id":challenge_id, "submission_id":"after-rewind", "text":PROJECT_CONTROL
+    })).await;
+    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    memory_capture_receipt(&challenge_record, 1).await;
+
+    restarted.private_request("catalog.session.set", json!({
+        "session_id":source_id, "archived":true
+    })).await;
+    let archived = wait_for_observation(&mut next, pending_id, REQUEST_PARAPHRASE).await;
+    assert_eq!(archived["observations"], lexical["observations"]);
+
+    set_provider("off");
+    let deleted = restarted.private_request("catalog.session.delete", json!({"session_id":source_id})).await;
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["memory_synced"], false);
+    assert!(library.session(source_id).is_err());
+    assert!(library.pending_memory_deletions().unwrap().iter().any(|id| id == source_id));
+    drop(next);
+    restarted.shutdown().await;
+
+    set_provider("reliquary");
+    let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
+    let mut next = restarted.client().await;
+    next.ok("session.resume", json!({"session_id":pending_id})).await;
+    timeout(Duration::from_secs(25), async {
+        while library.pending_memory_deletions().unwrap().contains(&source_id.to_owned()) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }).await.expect("committed deletion never reached REL");
+    // A result is withheld while the memory it came from is changing, as it is just after a removal.
+    timeout(Duration::from_secs(60), async {
+        for attempt in 0.. {
+            let terminal = query_observation(&mut next, pending_id, &format!("terminal-source-{attempt}"), REQUEST_OBSERVATION).await;
+            assert!(!terminal.to_string().contains(PROJECT_FACT), "{terminal}");
+            assert_eq!(terminal.get("observations"), None, "{terminal}");
+            if let Some(memories) = terminal["memories"].as_array() {
+                assert!(memories.iter().any(|row| row["content"] == PROJECT_CONTROL), "{terminal}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }).await.expect("the independent Memory was withheld after the removal settled");
     drop(next);
     assert!(hermes_gateway::stock_plugins::delete_profile(&profiles, "office").is_err());
     assert!(state.is_dir());
