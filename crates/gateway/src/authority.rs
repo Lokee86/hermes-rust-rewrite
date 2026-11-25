@@ -884,12 +884,13 @@ mod publication_tests {
         let retry = gateway.shared.submit(&prompt, &peer).await.unwrap_or_else(|e| panic!("{}", e.message));
         assert_eq!(retry["admission_id"], receipt["admission_id"]);
         assert_eq!(lock(&session.view).history.turns.len(), 1);
-        let sent = lock(&requests);
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["model"], "second");
-        assert_eq!(sent[0]["temperature"], 0.4);
-        assert_eq!(sent[0]["reasoning_effort"], "high");
-        drop(sent);
+        {
+            let sent = lock(&requests);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["model"], "second");
+            assert_eq!(sent[0]["temperature"], 0.4);
+            assert_eq!(sent[0]["reasoning_effort"], "high");
+        }
         gateway.shutdown().await.unwrap(); server.abort();
     }
     #[tokio::test]

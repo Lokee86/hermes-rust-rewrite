@@ -375,10 +375,11 @@ mod tests {
         gateway.shared.scheduler.cancel(&claim.run.id).unwrap();
         timeout(Duration::from_secs(5), run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone())).await.unwrap().unwrap();
         wait_for_receipt(&gateway.shared, &session, "followup", "started").await;
-        let view = lock(&session.view);
-        assert!(!view.cancel.as_ref().unwrap().is_cancelled(), "a later admission owns this cancellation token");
-        assert_eq!(view.authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some("followup")).unwrap().status, "started");
-        drop(view);
+        {
+            let view = lock(&session.view);
+            assert!(!view.cancel.as_ref().unwrap().is_cancelled(), "a later admission owns this cancellation token");
+            assert_eq!(view.authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some("followup")).unwrap().status, "started");
+        }
         assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Cancelled);
         drop(session);
         gateway.shutdown().await.unwrap();
@@ -395,10 +396,11 @@ mod tests {
         gateway.shared.submit_background(session.clone(), "scheduled".into(), submission.clone(), false).await.unwrap();
         gateway.shared.scheduler.cancel(&claim.run.id).unwrap();
         timeout(Duration::from_secs(5), run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone())).await.unwrap().unwrap();
-        let view = lock(&session.view);
-        assert!(!view.cancel.as_ref().unwrap().is_cancelled());
-        assert_eq!(view.authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some(&submission)).unwrap().outcome.as_deref(), Some("cancelled"));
-        drop(view);
+        {
+            let view = lock(&session.view);
+            assert!(!view.cancel.as_ref().unwrap().is_cancelled());
+            assert_eq!(view.authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some(&submission)).unwrap().outcome.as_deref(), Some("cancelled"));
+        }
         assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Cancelled);
         drop(session);
         gateway.shutdown().await.unwrap();
