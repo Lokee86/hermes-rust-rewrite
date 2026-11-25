@@ -5,8 +5,10 @@ use iced::Task;
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::PathBuf, time::Duration};
 
-const LATEST: &str = "https://api.github.com/repos/itsflownium/hermes-rust-rewrite/releases/latest";
-const DOWNLOADS: &str = "https://github.com/itsflownium/hermes-rust-rewrite/releases/download/";
+/// By repository ID, which a rename does not change. Download addresses carry the current name.
+const LATEST: &str = "https://api.github.com/repositories/1468454330/releases/latest";
+const OWNER: &str = "https://github.com/itsflownium/";
+pub(super) const RELEASES: &str = "https://github.com/itsflownium/mercury-hermes-rust-rewrite/releases";
 const MAX_DOWNLOAD: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -89,6 +91,14 @@ struct Asset {
     digest: Option<String>,
 }
 
+/// `https://github.com/itsflownium/<repository>/releases/download/…`
+fn is_download(url: &str) -> bool {
+    url.strip_prefix(OWNER).and_then(|rest| rest.split_once('/')).is_some_and(|(repository, rest)| {
+        !repository.is_empty() && repository.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            && rest.starts_with("releases/download/") && !rest.contains("..")
+    })
+}
+
 fn newer(release: Release, current: &str, wanted: &str) -> Option<Update> {
     if version(&release.tag_name)? <= version(current)? {
         return None;
@@ -96,7 +106,7 @@ fn newer(release: Release, current: &str, wanted: &str) -> Option<Update> {
     let asset = release.assets.into_iter().find(|asset| asset.name == wanted);
     let (name, url, sha256) = asset.and_then(|asset| {
         let sha256 = asset.digest?.strip_prefix("sha256:")?.to_ascii_lowercase();
-        let valid = sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()) && asset.browser_download_url.starts_with(DOWNLOADS);
+        let valid = sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()) && is_download(&asset.browser_download_url);
         valid.then_some((asset.name, asset.browser_download_url, sha256))
     }).unwrap_or_default();
     Some(Update { version: release.tag_name.trim_start_matches('v').to_owned(), page: release.html_url, name, url, sha256 })
@@ -247,7 +257,7 @@ mod tests {
     #[test]
     fn only_newer_verifiable_releases_are_offered() {
         let digest = format!("sha256:{}", "a".repeat(64));
-        let url = format!("{DOWNLOADS}v0.2.0/Hermes-macOS.dmg");
+        let url = format!("{RELEASES}/download/v0.2.0/Hermes-macOS.dmg");
         let found = newer(release("v0.2.0", &digest, &url), "0.1.0", "Hermes-macOS.dmg").unwrap();
         assert_eq!((found.version.as_str(), found.sha256.len()), ("0.2.0", 64));
         assert!(newer(release("v0.1.0", &digest, &url), "0.1.0", "Hermes-macOS.dmg").is_none());
@@ -256,6 +266,12 @@ mod tests {
         // Without a checksum, or from another address, only the release page is offered.
         for (digest, url) in [("", url.as_str()), ("sha256:zz", &url), (&digest, "https://example.com/Hermes-macOS.dmg")] {
             assert!(newer(release("v0.2.0", digest, url), "0.1.0", "Hermes-macOS.dmg").unwrap().url.is_empty());
+        }
+        // A renamed repository keeps working; another owner or path does not.
+        assert!(is_download("https://github.com/itsflownium/renamed-again/releases/download/v1.0.0/Hermes-macOS.dmg"));
+        for url in ["https://github.com/someone/mercury-hermes-rust-rewrite/releases/download/v1.0.0/x", "https://github.com/itsflownium/x/raw/main/x",
+            "https://github.com/itsflownium/../other/x/releases/download/x", "https://github.com/itsflownium/x/releases/download/../../x"] {
+            assert!(!is_download(url), "{url}");
         }
         assert!(version("0.10.0") > version("0.9.9"));
         assert_eq!(version("1.2"), None);

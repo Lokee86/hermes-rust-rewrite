@@ -3,17 +3,27 @@
 //! with a loopback redirect to the gateway's `/auth/native/authorize`, the code
 //! exchanged at `/auth/native/token`, refreshed at `/auth/native/refresh`. The
 //! access token is the bearer for `/api/auth/ws-ticket`.
-use hermes_engine::mcp_oauth::{random, s256, wait_for_code};
+use hermes_engine::{mcp_oauth::{random, s256, wait_for_code}, secret};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 const SKEW: i64 = 60;
 fn store(root: &Path) -> std::path::PathBuf { root.join("gateway-oauth.json") }
-fn read(root: &Path) -> BTreeMap<String, Value> { std::fs::read(store(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default() }
+fn read(root: &Path) -> BTreeMap<String, Value> { try_read(root).unwrap_or_default() }
+/// Sign-ins that cannot be opened right now must not be replaced by fewer.
+fn try_read(root: &Path) -> Result<BTreeMap<String, Value>, String> {
+    match std::fs::read_to_string(store(root)) {
+        Ok(text) => Ok(serde_json::from_str(&secret::unseal(text.trim()).map_err(|e| format!("{e:#}"))?).unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
 fn write(root: &Path, all: &BTreeMap<String, Value>) -> Result<(), String> {
     let temp = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600)); }
-    serde_json::to_writer(temp.as_file(), all).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string(all).map_err(|e| e.to_string())?;
+    let sealed = secret::seal(root, &text).map_err(|e| format!("{e:#}"))?;
+    std::io::Write::write_all(&mut temp.as_file(), sealed.as_bytes()).map_err(|e| e.to_string())?;
     temp.persist(store(root)).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -24,7 +34,7 @@ fn client() -> Result<reqwest::Client, String> {
 fn now() -> i64 { chrono::Utc::now().timestamp() }
 
 pub(super) fn signed_in(root: &Path, base: &str) -> bool { read(root).get(&key(base)).is_some_and(|t| t["access_token"].as_str().is_some_and(|a| !a.is_empty())) }
-pub(super) fn sign_out(root: &Path, base: &str) -> Result<(), String> { let mut all = read(root); all.remove(&key(base)); write(root, &all) }
+pub(super) fn sign_out(root: &Path, base: &str) -> Result<(), String> { let mut all = try_read(root)?; all.remove(&key(base)); write(root, &all) }
 
 /// Whether the gateway offers the native PKCE flow (`/api/status` → auth_flows).
 pub(super) async fn supports_native(base: &str) -> Result<bool, String> {
@@ -51,7 +61,7 @@ async fn sign_in_with(root: std::path::PathBuf, base: String, open: impl Fn(&str
     if !response.status().is_success() { return Err(format!("{base} refused the sign-in code ({}).", response.status())); }
     let body: Value = response.json().await.map_err(|e| e.to_string())?;
     let tokens = parse(&body)?;
-    let mut all = read(&root); all.insert(base, tokens); write(&root, &all)
+    let mut all = try_read(&root)?; all.insert(base, tokens); write(&root, &all)
 }
 fn parse(body: &Value) -> Result<Value, String> {
     let access = body["access_token"].as_str().filter(|a| !a.is_empty()).ok_or("The gateway's token response has no access token.")?;
@@ -62,7 +72,7 @@ fn parse(body: &Value) -> Result<Value, String> {
 /// A current access token, refreshed through `/auth/native/refresh` when near expiry.
 pub(super) async fn access_token(root: &Path, base: &str) -> Result<String, String> {
     let base = key(base);
-    let mut all = read(root);
+    let mut all = try_read(root)?;
     let tokens = all.get(&base).cloned().ok_or("Sign in to this gateway in Settings › Gateways.")?;
     let expires = tokens["expires_at"].as_i64().unwrap_or(0);
     if expires > now() + SKEW { return tokens["access_token"].as_str().map(str::to_owned).ok_or_else(|| "No access token".into()); }

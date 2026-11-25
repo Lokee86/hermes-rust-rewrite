@@ -33,10 +33,7 @@ impl Route {
                 if origin.is_empty() {
                     return Err("Select a gateway URL before opening a chat.".into());
                 }
-                let token = std::fs::read_to_string(root.join("connection-token"))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_owned();
+                let token = connections::saved_token(root)?;
                 Ok(Self::Remote { origin, token })
             }
         }

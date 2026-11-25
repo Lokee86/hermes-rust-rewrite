@@ -137,6 +137,14 @@ fn dispatch(host: &Py<PyAny>, method: &str, request: &Value) -> Result<Value, St
     }).map_err(|error: PyErr| error.to_string())
 }
 
+fn call_tool(host: &Py<PyAny>, request: &Value) -> Result<Value, String> {
+    let params = request.get("params").map(Value::to_string).unwrap_or_else(|| "{}".into());
+    Python::attach(|py| {
+        let encoded: String = host.call_method1(py, "call_tool_json", (request["id"].to_string(), params))?.extract(py)?;
+        serde_json::from_str::<Value>(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
+    }).map_err(|error: PyErr| error.to_string())
+}
+
 fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
     start();
     let Ok(plugin_dir) = plugin_dir.canonicalize() else {
@@ -146,7 +154,7 @@ fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
     let name = plugin_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     let home = std::env::var("HERMES_HOME").ok().filter(|value| !value.is_empty());
     let wire = Arc::new(wire::Wire::default());
-    let incoming = wire.read_requests();
+    let (incoming, cancelled) = wire.read_requests();
     let host = Python::attach(|py| -> PyResult<Py<PyAny>> {
         let helper = helper(py)?;
         let compat = if home.is_some() {
@@ -174,6 +182,10 @@ fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
         }
     };
     let host = Arc::new(host);
+    let canceller = host.clone();
+    std::thread::spawn(move || for id in cancelled {
+        let _ = Python::attach(|py| canceller.call_method1(py, "cancel_tool", (id.to_string(),)).map(|_| ()));
+    });
     for request in incoming {
         let Some(id) = request.get("id") else { continue };
         let method = request["method"].as_str().unwrap_or_default();
@@ -182,7 +194,7 @@ fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
         if method == "tools/call" {
             let (host, wire, request) = (host.clone(), wire.clone(), request.clone());
             std::thread::spawn(move || {
-                let result = dispatch(&host, "tools/call", &request);
+                let result = call_tool(&host, &request);
                 let _ = wire.reply(&request["id"], result);
             });
             continue;

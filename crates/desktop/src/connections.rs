@@ -6,6 +6,7 @@
 use super::{Hermes, Message, settings, ui};
 use crate::appearance::text;
 use iced::{Alignment, Color, Element, Fill, Length, Task, widget::{Space, button, column, container, pick_list, row, text_input}};
+use hermes_engine::secret;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -46,8 +47,30 @@ pub(super) struct State {
 fn path(root: &Path) -> PathBuf { root.join("connection.json") }
 fn token_path(root: &Path) -> PathBuf { root.join("connection-token") }
 
+/// The pasted session token; empty when there is none.
+pub(super) fn saved_token(root: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(token_path(root)) {
+        Ok(text) => secret::unseal(text.trim()).map_err(|e| format!("{e:#}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+fn save_token(root: &Path, token: &str) -> Result<(), String> {
+    let sealed = secret::seal(root, token).map_err(|e| format!("{e:#}"))?;
+    let temp = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?; }
+    std::io::Write::write_all(&mut temp.as_file(), sealed.as_bytes()).map_err(|e| e.to_string())?;
+    temp.persist(token_path(root)).map(|_| ()).map_err(|e| e.to_string())
+}
+
 impl State {
     pub fn load(root: &Path) -> Self {
+        // Protect a token saved by a version that stored it as text.
+        if let Ok(text) = std::fs::read_to_string(token_path(root)) && !text.trim().is_empty() && !secret::is_sealed(text.trim())
+            && secret::seal(root, text.trim()).is_ok_and(|sealed| secret::is_sealed(&sealed))
+        {
+            let _ = save_token(root, text.trim());
+        }
         let config = std::fs::read(path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Self { config, has_token: token_path(root).is_file(), aliases: ssh_aliases(), ..Default::default() }
     }
@@ -55,9 +78,7 @@ impl State {
         let bytes = serde_json::to_vec_pretty(&self.config).map_err(|e| e.to_string())?;
         std::fs::write(path(root), bytes).map_err(|e| e.to_string())?;
         if !self.token.trim().is_empty() {
-            let file = token_path(root);
-            std::fs::write(&file, self.token.trim()).map_err(|e| e.to_string())?;
-            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)); }
+            save_token(root, self.token.trim())?;
             self.token.clear(); self.has_token = true;
         }
         self.dirty = false;
