@@ -66,8 +66,7 @@ impl Library {
         ensure!(!self.bots()?.iter().any(|b| b.name == name), "Delete bots from the Bots page");
         let path = self.profile_path(name)?;
         ensure!(path.is_dir(), "No such profile");
-        fs::remove_dir_all(path)?;
-        Ok(())
+        hermes_engine::plugins::remove_dir(&path)
     }
     pub fn profile_soul(&self, name: &str) -> Result<String> { Ok(fs::read_to_string(self.profile_path(name)?.join("SOUL.md")).unwrap_or_default()) }
     pub fn set_profile_soul(&self, name: &str, text: &str) -> Result<()> {

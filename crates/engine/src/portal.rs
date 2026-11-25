@@ -44,8 +44,8 @@ impl Tokens {
 
 fn store_path() -> Result<PathBuf> { Ok(Session::default_dir()?.join("portal-oauth.json")) }
 fn read_own(path: &Path) -> Result<Option<Tokens>> {
-    match File::open(path) {
-        Ok(file) => Ok(Some(serde_json::from_reader(file).context("Could not read the desktop Portal session")?)),
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(serde_json::from_str(&crate::secret::unseal(text.trim())?).context("Could not read the desktop Portal session")?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into())
     }
@@ -87,8 +87,9 @@ async fn lock(path: &Path) -> Result<File> {
     }
 }
 fn save(path: &Path, tokens: &Tokens) -> Result<()> {
-    let mut out = NamedTempFile::new_in(path.parent().context("Missing OAuth store directory")?)?;
-    serde_json::to_writer(&mut out,tokens)?;
+    let dir = path.parent().context("Missing OAuth store directory")?;
+    let mut out = NamedTempFile::new_in(dir)?;
+    out.write_all(crate::secret::seal(dir,&serde_json::to_string(tokens)?)?.as_bytes())?;
     out.flush()?;
     out.as_file().sync_all()?;
     out.persist(path).context("Could not save the Portal session")?;

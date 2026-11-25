@@ -84,20 +84,35 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
     }
     let data = root.join("plugin-data").join(&entry.name);
     fs::create_dir_all(&data)?;
+    // Packages are prepared beside the ones in use, so a failed install changes nothing.
+    let staged = tempfile::Builder::new().prefix("python-packages-").tempdir_in(&data)?;
     if !package.python_dependencies.is_empty() {
         let host = python_host().context("This plugin needs Python packages, and this build of Hermes has no Python runtime")?;
-        let out = Command::new(host).arg("install").arg(data.join(PACKAGES)).args(&package.python_dependencies).output().context("Could not start hermes-python-host")?;
+        let out = Command::new(host).arg("install").arg(staged.path()).args(&package.python_dependencies).output().context("Could not start hermes-python-host")?;
         ensure!(out.status.success(), "Could not install the plugin's Python packages ({}): {}", package.python_dependencies.join(", "),
             String::from_utf8_lossy(&out.stderr).lines().chain(String::from_utf8_lossy(&out.stdout).lines()).filter(|l| l.contains("ERROR") || l.contains("rror:")).collect::<Vec<_>>().join(" ").trim());
     }
     let mut list = installed(root)?;
+    // A running copy holds its files open on Windows. The gateway ends a disabled plugin.
+    let was_enabled = list.iter().any(|plugin| plugin.name == entry.name && plugin.enabled);
+    if was_enabled {
+        for plugin in list.iter_mut().filter(|plugin| plugin.name == entry.name) { plugin.enabled = false; plugin.revision = plugin.revision.saturating_add(1); }
+        save(root, &list)?;
+    }
+    let packages = data.join(PACKAGES);
+    if let Err(error) = remove_dir(&packages).and_then(|()| remove_dir(&dir(root).join(&entry.name))) {
+        if was_enabled {
+            for plugin in list.iter_mut().filter(|plugin| plugin.name == entry.name) { plugin.enabled = true; }
+            save(root, &list)?;
+        }
+        return Err(error);
+    }
+    if !package.python_dependencies.is_empty() { fs::rename(staged.keep(), &packages)?; }
     let revision = list.iter().find(|plugin| plugin.name == entry.name).map_or(0, |plugin| plugin.revision);
     if list.iter().any(|plugin| plugin.name == entry.name) {
         crate::settings::ProfileSettings::invalidate_plugin_memory(root, &entry.name)?;
     }
-    let target = dir(root).join(&entry.name);
-    if target.exists() { fs::remove_dir_all(&target)?; }
-    copy_tree(&source, &target)?;
+    copy_tree(&source, &dir(root).join(&entry.name))?;
     let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
     crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
     let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
@@ -180,14 +195,29 @@ pub fn update_available(installed: &Installed, catalog_sha: &str) -> bool { !cat
 pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     ensure!(valid_name(name), "That plugin name is not valid");
     let mut list = installed(root)?;
-    let before = list.len();
-    list.retain(|p| p.name != name);
-    ensure!(list.len() < before, "That plugin is not installed");
+    let plugin = list.iter_mut().find(|p| p.name == name).context("That plugin is not installed")?;
+    plugin.enabled = false;
+    plugin.revision = plugin.revision.saturating_add(1);
     crate::settings::ProfileSettings::invalidate_plugin_memory(root, name)?;
+    save(root, &list)?;
     crate::skill_catalog::put_documents(root, &format!("plugin/{name}/"), vec![])?;
-    let target = dir(root).join(name);
-    if target.exists() { fs::remove_dir_all(target)?; }
+    remove_dir(&dir(root).join(name))?;
+    list.retain(|p| p.name != name);
     save(root, &list)
+}
+
+/// Remove a folder. Windows refuses while a program works in it or has a library from it loaded,
+/// so there this waits for the gateway to end the plugins it runs from the folder.
+pub fn remove_dir(path: &Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if cfg!(windows) { 20 } else { 0 });
+    loop {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(error) => return Err(error).with_context(|| format!("Could not remove {}. Close anything that uses it and try again", path.display())),
+        }
+    }
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -516,6 +546,51 @@ def register(ctx):
         assert_eq!(crate::plugin_hooks::pre_tool_call(&mut live, &call(r#"{"command":"ls"}"#)).await, None);
         assert_eq!(crate::plugin_hooks::after_tool_call(&mut live, &call("{}"), "ok".into()).await, "ok [seen]");
         live[0].close().await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removing_a_folder_waits_for_a_program_that_still_uses_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("in-use");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("native.pyd"), "x").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("native.pyd")).unwrap();
+        let release = std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_secs(1)); drop(held); });
+        remove_dir(&folder).unwrap();
+        release.join().unwrap();
+        assert!(!folder.exists());
+    }
+
+    #[tokio::test]
+    async fn one_slow_tool_does_not_hold_up_the_plugin() {
+        let root = tempfile::tempdir().unwrap();
+        shout_plugin(root.path(), "");
+        fs::write(root.path().join("plugins/shout/__init__.py"), r#"
+import threading
+gate = threading.Event()
+def _slow(args, **_):
+    return "released" if gate.wait(20) else "timed out"
+def _open(args, **_):
+    gate.set()
+    return "opened"
+def register(ctx):
+    schema = lambda name: {"name": name, "description": name, "parameters": {"type": "object"}}
+    ctx.register_tool("slow", "shout", schema("slow"), _slow)
+    ctx.register_tool("open", "shout", schema("open"), _open)
+    ctx.register_hook("pre_tool_call", lambda **_: None)
+"#).unwrap();
+        let runtime = PluginRuntime::new(root.path().to_path_buf(), None);
+        let (mut first, _) = runtime.tool_connections().await;
+        let (mut second, _) = runtime.tool_connections().await;
+        let slow = tokio::spawn(async move { first[0].call("mcp_shout__slow", &serde_json::json!({})).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let call = crate::history::ToolCall { id: "c".into(), name: "terminal".into(), arguments: "{}".into() };
+        assert_eq!(crate::plugin_hooks::pre_tool_call(&mut second, &call).await, None);
+        second[0].call("mcp_shout__open", &serde_json::json!({})).await.unwrap();
+        assert_eq!(slow.await.unwrap().unwrap()["content"][0]["text"], "released");
+        runtime.unload().await;
     }
 
     #[tokio::test]

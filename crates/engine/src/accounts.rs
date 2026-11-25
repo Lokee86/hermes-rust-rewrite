@@ -82,8 +82,13 @@ fn now() -> i64 { chrono::Utc::now().timestamp() }
 
 // ---------------------------------------------------------------- store
 fn store_path() -> Result<PathBuf> { Ok(Session::default_dir()?.join("accounts-oauth.json")) }
-fn read_store() -> BTreeMap<String, Value> {
-    store_path().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+fn read_store() -> BTreeMap<String, Value> { try_read_store().unwrap_or_default() }
+fn try_read_store() -> Result<BTreeMap<String, Value>> {
+    match std::fs::read_to_string(store_path()?) {
+        Ok(text) => Ok(serde_json::from_str(&crate::secret::unseal(text.trim())?).unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.into()),
+    }
 }
 fn write_store(store: &BTreeMap<String, Value>) -> Result<()> {
     let path = store_path()?;
@@ -91,12 +96,13 @@ fn write_store(store: &BTreeMap<String, Value>) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let temp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600))?; }
-    serde_json::to_writer(temp.as_file(), store)?;
+    std::io::Write::write_all(&mut temp.as_file(), crate::secret::seal(dir, &serde_json::to_string(store)?)?.as_bytes())?;
     temp.as_file().sync_all()?;
     temp.persist(path)?;
     Ok(())
 }
-fn save(id: &str, state: Value) -> Result<()> { let mut s = read_store(); s.insert(id.into(), state); write_store(&s) }
+// A store that cannot be opened right now must not be replaced by one with a single account.
+fn save(id: &str, state: Value) -> Result<()> { let mut s = try_read_store().context("Could not open your saved accounts")?; s.insert(id.into(), state); write_store(&s) }
 
 fn hermes_home() -> Option<PathBuf> {
     std::env::var_os("HERMES_HOME").map(PathBuf::from).or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".hermes")))
@@ -125,7 +131,7 @@ pub fn status(id: &str) -> Status {
     Status::default()
 }
 pub fn disconnect(id: &str) -> Result<bool> {
-    let mut s = read_store();
+    let mut s = try_read_store().context("Could not open your saved accounts")?;
     let removed = s.remove(id).is_some();
     write_store(&s)?;
     Ok(removed)

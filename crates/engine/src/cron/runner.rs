@@ -29,21 +29,6 @@ pub fn prepare_job(store: &Store, claim: &Claim, config: &mut Config) -> Result<
         job.deliver == "local",
         "This native scheduler delivers to This desktop only"
     );
-    for field in ["script", "monitor_script", "monitor_url"] {
-        ensure!(
-            !job.extra
-                .get(field)
-                .is_some_and(|value| value.as_str().is_some_and(|text| !text.trim().is_empty())),
-            "This native scheduler does not execute scripts or monitors"
-        );
-    }
-    ensure!(
-        !job.extra
-            .get("no_agent")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        "Script-only execution is not available in this native scheduler"
-    );
     if let Some(provider) = job
         .provider
         .as_deref()
@@ -95,14 +80,17 @@ async fn execute_inner(
     cancel: &CancellationToken,
 ) -> Result<Outcome> {
     store.begin(claim, Utc::now())?;
-    let job = &claim.job;
+    let prompt = match super::preflight(store, claim).await? {
+        super::Preflight::Agent(prompt) => prompt,
+        super::Preflight::Done(output) => return Ok(Outcome::Completed { output }),
+    };
     let workspace = prepare_job(store, claim, config)?;
     let mut session =
         Session::open_scheduled(&claim.run.session_dir, &workspace, store.profile_root())?;
     let (send, receive) = async_channel::unbounded();
     let mut inactivity = false;
     let turn_result = {
-        let turn = session.turn(config.clone(), job.prompt.clone(), send, cancel.clone());
+        let turn = session.turn(config.clone(), prompt, send, cancel.clone());
         tokio::pin!(turn);
         let mut last_activity = Instant::now();
         let mut heartbeat = tokio::time::interval(Duration::from_secs(2));

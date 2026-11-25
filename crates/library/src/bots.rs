@@ -109,8 +109,8 @@ impl Library {
             Ok(())
         })?;
         let profile = self.bot_profile(name)?;
-        if profile.is_dir() { fs::remove_dir_all(profile)?; }
-        Ok(())
+        // Its plugins stop once the gateway sees that the bot is gone.
+        hermes_engine::plugins::remove_dir(&profile)
     }
 
     /// Resolve the registry every time: the session titled "Bot Chat" owned by
