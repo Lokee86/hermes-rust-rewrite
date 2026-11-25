@@ -55,7 +55,16 @@ impl Shared {
             .and_then(|count| usize::try_from(count).ok())
             .ok_or_else(|| RpcError::invalid("keep_turns is required"))?;
         let _order = self.catalog_edits.lock().await;
-        let id = lock(&session.summary).id.clone();
+        let id = {
+            let summary = lock(&session.summary);
+            if !matches!(summary.source, SessionSource::Native) {
+                return Err(RpcError::unsupported(
+                    "Rewind requires a native conversation",
+                ));
+            }
+            summary.id.clone()
+        };
+        let bound_source = lock(&session.settings).memory_binding.is_some();
         let response = {
             let mut view = lock(&session.view);
             let describe = |change: &CommittedRewind| {
@@ -142,7 +151,7 @@ impl Shared {
                 last_surviving_message_uid: None,
                 surviving_capture_generation: 0,
                 removed_message_uids: Vec::new(),
-                acknowledged: false,
+                acknowledged: !bound_source,
                 resulting_head: None,
             };
             for admission in &mut authority.receipts {
