@@ -10,7 +10,12 @@ build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 # hermes-python-host embeds this exact CPython; it ships in lib/hermes/python.
 if [ -z "${PYO3_CONFIG_FILE:-}" ]; then
-    for setting in $(scripts/python-runtime.sh); do export "$setting"; done
+    python_settings=$(scripts/python-runtime.sh)
+    while IFS= read -r setting; do
+        export "$setting"
+    done <<EOF
+$python_settings
+EOF
 fi
 cargo build --locked --release --features embedded-herdr -p hermes-desktop
 cargo build --locked --release -p hermes-python-host

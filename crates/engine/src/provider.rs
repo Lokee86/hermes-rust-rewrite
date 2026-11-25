@@ -773,18 +773,55 @@ impl Provider {
             Protocol::Anthropic => anthropic_body(self.config.model.trim(), messages, tools)?,
             Protocol::Responses => responses_body(self.config.model.trim(), messages, tools),
         };
-        if self.protocol != Protocol::Responses { self.options.apply(&mut body,self.protocol==Protocol::Anthropic)?; }
+        if self.protocol == Protocol::Responses {
+            self.options.apply_responses_reasoning(&mut body)?;
+        } else {
+            self.options.apply(&mut body, self.protocol == Protocol::Anthropic)?;
+        }
         let request = self.post(&self.endpoint, &body, "text/event-stream");
         let response = Self::send_request(request).await?;
         self.read_stream(response, emit).await
     }
 
     fn post(&self, endpoint: &Url, body: &Value, accept: &str) -> RequestBuilder {
-        let mut request = self
+        let request = self
             .client
             .post(endpoint.clone())
             .header("accept", accept)
             .json(body);
+        self.authenticate(request, endpoint)
+    }
+
+    pub(crate) fn catalog_requests(&self) -> Result<Vec<RequestBuilder>> {
+        let suffix = match self.protocol {
+            Protocol::OpenAi => "/chat/completions",
+            Protocol::Anthropic => "/messages",
+            Protocol::Responses => "/responses",
+        };
+        let base = self.endpoint.path().strip_suffix(suffix)
+            .ok_or_else(|| anyhow!("Invalid model catalog endpoint"))?;
+        let mut endpoint = self.endpoint.clone();
+        endpoint.set_path(&format!("{base}/models"));
+        // The subscription catalog gates models on CLI compatibility, independently of
+        // this desktop's release. An empty catalog can try the legacy sentinel.
+        let versions: &[Option<&str>] = if self.protocol == Protocol::Responses {
+            &[Some("99.0.0"), Some("0.0.0")]
+        } else {
+            &[None]
+        };
+        Ok(versions.iter().map(|version| {
+            let mut endpoint = endpoint.clone();
+            if let Some(version) = version {
+                endpoint.query_pairs_mut().append_pair("client_version", version);
+            }
+            let request = self.client.get(endpoint.clone())
+                .header("accept", "application/json")
+                .timeout(Duration::from_secs(35));
+            self.authenticate(request, &endpoint)
+        }).collect())
+    }
+
+    fn authenticate(&self, mut request: RequestBuilder, endpoint: &Url) -> RequestBuilder {
         let key = self.config.api_key.trim();
         match self.protocol {
             Protocol::Anthropic => {

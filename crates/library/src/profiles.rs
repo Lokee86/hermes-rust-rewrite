@@ -4,6 +4,7 @@
 //! they are listed, but renamed and deleted from the Bots page.
 use crate::Library;
 use anyhow::{Context, Result, bail, ensure};
+use fs2::FileExt;
 use std::{fs, path::{Path, PathBuf}, process::Command};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +32,21 @@ fn describe(name: &str, path: &Path, is_default: bool, is_bot: bool) -> Profile 
 
 impl Library {
     fn profiles_dir(&self) -> PathBuf { self.root().join("profiles") }
+    pub(crate) fn lock_profiles(&self) -> Result<fs::File> {
+        let path = self.root().join("profiles.lock");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            ensure!(metadata.file_type().is_file(), "Profile lock must be a regular file");
+        }
+        let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        lock.lock_exclusive()?;
+        Ok(lock)
+    }
+    pub(crate) fn ensure_profiles_dir(&self) -> Result<PathBuf> {
+        let path = self.profiles_dir();
+        fs::create_dir_all(&path)?;
+        ensure!(fs::symlink_metadata(&path)?.file_type().is_dir(), "Profiles must be stored in a regular directory");
+        Ok(path)
+    }
     pub fn profiles(&self) -> Result<Vec<Profile>> {
         let bots: Vec<String> = self.bots().unwrap_or_default().into_iter().map(|b| b.name).collect();
         let mut out = vec![describe("default", self.root(), true, false)];
@@ -47,12 +63,16 @@ impl Library {
         Ok(self.profiles_dir().join(name))
     }
     pub fn create_profile(&self, name: &str) -> Result<Profile> {
+        let _lock = self.lock_profiles()?;
         let path = self.profile_path(name)?;
+        ensure!(!self.bots()?.iter().any(|bot| bot.name == name), "A bot with that name already exists");
         ensure!(name != "default" && !path.exists(), "A profile with that name already exists");
-        fs::create_dir_all(&path)?;
+        self.ensure_profiles_dir()?;
+        fs::create_dir(&path).context("A profile with that name already exists")?;
         Ok(describe(name, &path, false, false))
     }
     pub fn rename_profile(&self, from: &str, to: &str) -> Result<()> {
+        let _lock = self.lock_profiles()?;
         ensure!(from != "default", "The default profile can't be renamed");
         ensure!(!self.bots()?.iter().any(|b| b.name == from), "Rename bots from the Bots page");
         let (a, b) = (self.profile_path(from)?, self.profile_path(to)?);
@@ -62,6 +82,7 @@ impl Library {
         Ok(())
     }
     pub fn delete_profile(&self, name: &str) -> Result<()> {
+        let _lock = self.lock_profiles()?;
         ensure!(name != "default", "The default profile can't be deleted");
         ensure!(!self.bots()?.iter().any(|b| b.name == name), "Delete bots from the Bots page");
         let path = self.profile_path(name)?;
@@ -88,6 +109,7 @@ impl Library {
     }
     /// Import an archive made by `export_profile`; returns the profile's name.
     pub fn import_profile(&self, archive: &Path) -> Result<String> {
+        let _lock = self.lock_profiles()?;
         let listing = Command::new("tar").arg("-tzf").arg(archive).output().context("tar is not available")?;
         ensure!(listing.status.success(), "That file is not a profile archive");
         let entries = String::from_utf8_lossy(&listing.stdout).into_owned();
@@ -97,7 +119,8 @@ impl Library {
         ensure!(valid_name(name), "The archive's profile name is not valid");
         ensure!(!entries.lines().any(|l| l.starts_with('/') || l.split('/').any(|p| p == "..")), "The archive has unsafe paths");
         ensure!(!self.profiles_dir().join(name).exists(), "A profile named {name} already exists");
-        fs::create_dir_all(self.profiles_dir())?;
+        ensure!(!self.bots()?.iter().any(|bot| bot.name == *name), "A bot with that name already exists");
+        self.ensure_profiles_dir()?;
         let status = Command::new("tar").arg("-xzf").arg(archive).arg("-C").arg(self.profiles_dir()).status()?;
         ensure!(status.success(), "Could not unpack the profile archive");
         Ok(name.to_string())

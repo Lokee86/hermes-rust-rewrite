@@ -243,6 +243,7 @@ impl Gateway {
             telegram,
             creates: Mutex::new(HashMap::new()),
             catalog_edits: Mutex::new(()),
+            admissions: StdMutex::new(()),
             turns: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
             gateway_tasks: tokio_util::task::TaskTracker::new(),
@@ -355,6 +356,8 @@ struct Shared {
     telegram: Arc<telegram_host::Host>,
     creates: Mutex<HashMap<String, (String, String)>>,
     catalog_edits: Mutex<()>,
+    // Serialize the final admission commit with an idle provider restart.
+    admissions: StdMutex<()>,
     turns: Mutex<Vec<JoinHandle<()>>>,
     connections: AtomicUsize,
     gateway_tasks: tokio_util::task::TaskTracker,
@@ -747,7 +750,11 @@ impl Shared {
                 if !peer.canonical { return Err(RpcError::unsupported("A native session is required")); }
                 let id = required_string(params, "job_id")?;
                 let request_id = required_string(params, "request_id")?;
-                let claim = self.scheduler.claim_gateway_now(id, request_id, chrono::Utc::now()).map_err(RpcError::internal)?;
+                let claim = {
+                    let _admissions = lock(&self.admissions);
+                    if self.shutdown.is_cancelled() { return Err(RpcError::new(4001, "shutdown", "Gateway is shutting down")); }
+                    self.scheduler.claim_gateway_now(id, request_id, chrono::Utc::now()).map_err(RpcError::internal)?
+                };
                 self.scheduler_notify.notify_one();
                 let run = tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
@@ -1426,6 +1433,8 @@ impl Shared {
             return Err(RpcError::invalid("request_id must contain 1-256 bytes"));
         }
         let fingerprint=json!({"operation":operation,"payload":payload,"expected_revision":params["expected_revision"],"expected_generation":params["expected_generation"]}).to_string();
+        let _admissions = lock(&self.admissions);
+        if self.shutdown.is_cancelled() { return Err(RpcError::new(4001, "shutdown", "Gateway is shutting down")); }
         // The lock order is shared with info(): summary, settings, config, view.
         let mut summary = lock(&session.summary);
         let mut settings = lock(&session.settings);
@@ -2067,6 +2076,17 @@ async fn upgrade(
         .into_response()
 }
 
+const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn close_websocket<S, Item>(sink: &mut S)
+where
+    S: futures_util::Sink<Item> + Unpin,
+{
+    // Closing flushes buffered output too, including a write that already
+    // timed out. A stalled peer must not keep the owner alive during teardown.
+    let _ = tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, sink.close()).await;
+}
+
 async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool, local_native: bool, revoked: CancellationToken) {
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Value>(256);
@@ -2088,13 +2108,20 @@ async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool, l
             tokio::select! {
                 _=writer_stop.cancelled()=>break,
                 frame=rx.recv()=>match frame {
-                    Some(frame)=>if !matches!(tokio::time::timeout(Duration::from_secs(10),sink.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break;},
+                    Some(frame) => {
+                        let sent = tokio::select! {
+                            _ = writer_stop.cancelled() => false,
+                            result = tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Text(frame.to_string().into()))) => matches!(result, Ok(Ok(()))),
+                        };
+                        if !sent { break; }
+                    }
                     None=>break,
                 },
             }
         }
-        let _ = sink.close().await;
+        rx.close();
         writer_stop.cancel();
+        close_websocket(&mut sink).await;
     });
     // Keep dispatch ordered while the reader continues polling WebSocket
     // control frames. The bounded queue applies backpressure during bursts.

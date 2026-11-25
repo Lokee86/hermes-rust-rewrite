@@ -8,9 +8,9 @@ This is an independent community project, not an official Nous Research release.
 
 | Platform | Download |
 | --- | --- |
-| macOS (Apple Silicon) | [Hermes-macOS.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/latest/download/Hermes-macOS.zip) |
-| Windows (x64) | [Hermes-windows-AMD64.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/latest/download/Hermes-windows-AMD64.zip) |
-| Linux (x86_64) | [Hermes-linux-x86_64.tar.gz](https://github.com/itsflownium/hermes-rust-rewrite/releases/latest/download/Hermes-linux-x86_64.tar.gz) |
+| macOS (Apple Silicon) | [Hermes-macOS.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-macOS.zip) |
+| Windows (x64) | [Hermes-windows-AMD64.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-windows-AMD64.zip) |
+| Linux (x86_64) | [Hermes-linux-x86_64.tar.gz](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-linux-x86_64.tar.gz) |
 
 Every build comes from [the CI workflow](.github/workflows/build.yml), which runs the test suite on all three platforms first. No build is notarized or signed with a developer certificate. On macOS, the first time you open the app, right-click it and choose **Open**. On Linux, install WebKitGTK 4.1 and GTK 3 from your distribution.
 
@@ -101,17 +101,54 @@ Hermes plugins written in Python (`plugin.yaml` + `__init__.py` with `register(c
 
 ## Build from source
 
-You need a recent stable Rust (`rustup update stable`) and a Python 3 with its shared library for PyO3 to link against (python.org's macOS installer, or a distribution's `python3-dev`). To use the same pinned runtime as the release builds, set `PYO3_PYTHON` first: `export PYO3_PYTHON=$(scripts/python-runtime.sh)` (on Windows, `$env:PYO3_PYTHON = ./scripts/python-runtime.ps1`). On Linux you also need the development packages listed in the [CI workflow](.github/workflows/build.yml).
+Install a recent stable Rust (`rustup update stable`), Git, and [Zig 0.16.0](https://ziglang.org/download/). Put `zig` on `PATH`, or set `ZIG` to its absolute executable path. The `embedded-herdr` feature builds the pinned Herdr terminal core into Hermes; the Python plugin host is a separate binary that must be built beside the desktop executable.
+
+Platform prerequisites:
+
+- **macOS (Apple Silicon):** install Xcode Command Line Tools with `xcode-select --install`.
+- **Linux (x86_64):** install a C/C++ compiler, `pkg-config`, `curl`, `rsync`, and the development libraries used by the [CI workflow](.github/workflows/build.yml). On Ubuntu 24.04:
+
+  ```bash
+  sudo apt-get update
+  sudo apt-get install -y build-essential pkg-config curl rsync \
+      libxkbcommon-dev libwayland-dev libdbus-1-dev libasound2-dev libfontconfig1-dev \
+      libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
+  ```
+
+- **Windows (x64):** install Visual Studio 2022 Build Tools with **Desktop development with C++** and a Windows SDK, use the `stable-x86_64-pc-windows-msvc` Rust toolchain, and install the Microsoft Edge WebView2 Runtime. Git for Windows must provide `sh.exe` on `PATH` for shell commands. Run the Windows commands below in PowerShell.
+
+From the repository root, use the pinned CPython runtime shipped in releases. On macOS and Linux, import both environment settings one line at a time so paths containing spaces stay intact:
 
 ```bash
-cargo run --locked -p hermes-desktop
+python_settings=$(scripts/python-runtime.sh)
+while IFS= read -r setting; do
+    export "$setting"
+done <<EOF
+$python_settings
+EOF
+cargo build --locked -p hermes-python-host
+cargo run --locked --features embedded-herdr -p hermes-desktop
 ```
+
+On Windows, add the Python DLL directory to this shell's `PATH` and stage the pinned ConPTY helpers next to the debug executables:
+
+```powershell
+$env:PYO3_PYTHON = ./scripts/python-runtime.ps1
+$env:PATH = "$(Split-Path -Parent $env:PYO3_PYTHON);$env:PATH"
+cargo build --locked -p hermes-python-host
+$fixture = ./scripts/prepare-herdr.ps1
+$target = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).target_directory
+Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $fixture) "conpty") -Destination (Join-Path $target "debug") -Recurse -Force
+cargo run --locked --features embedded-herdr -p hermes-desktop
+```
+
+Run the workspace tests in the same shell after setting up Python:
 
 ```bash
 cargo test --locked --workspace
 ```
 
-The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh` and `scripts/package-windows.ps1`. Pushing a `v*` tag builds all three platforms and publishes them as a GitHub Release.
+The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh` and `scripts/package-windows.ps1`. Pushing a `v*` tag builds all three platforms and publishes them as a GitHub Release. Tags containing a hyphen (such as `v0.2.0-rc.1`) publish prereleases; other `v*` tags publish full releases.
 
 ## Layout
 

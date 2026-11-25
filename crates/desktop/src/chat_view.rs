@@ -10,7 +10,9 @@ pub(super) struct View {
     generation: u64,
     pub pending_queue: Vec<Queued>,
     pending: Option<(String, Value)>,
-    submitting: bool,
+    pub submitting: bool,
+    pub settings_explicit: bool,
+    settings_revision: u64,
     creating: bool,
     create_params: Option<Value>,
     quick_prompt: Option<String>,
@@ -38,8 +40,34 @@ impl Drop for View {
         }
     }
 }
+#[cfg(test)]
+impl View {
+    pub fn has_startup_provider(&self, provider: &Config) -> bool {
+        self.connection.as_ref().is_some_and(|connection| connection.has_startup_provider(provider))
+    }
+}
 
 impl Hermes {
+    pub(super) fn sync_selected_settings(&mut self) -> Task<Message> {
+        self.chat.settings_explicit = true;
+        if self.connections.config.mode != connections::Mode::Local || self.chat.submitting {
+            return Task::none();
+        }
+        let Some(sid) = self.chat.sid.clone() else { return Task::none(); };
+        let conn = match self.chat_connection() {
+            Ok(conn) => conn,
+            Err(error) => { self.error(error); return Task::none(); }
+        };
+        self.chat.settings_revision = self.chat.settings_revision.wrapping_add(1);
+        let revision = self.chat.settings_revision;
+        let selection = conn.select_settings();
+        let provider = self.config.clone();
+        let options = self.models.options.clone();
+        let epoch = self.run_id;
+        self.note("Applying chat settings…");
+        Task::perform(async move { conn.configure_session(&sid, &provider, &options, selection).await },
+            move |result| Message::Gateway(epoch, remote::Update::Configured(revision, result)))
+    }
     pub fn restore_gateway_chat(&mut self, existing: Option<SessionSummary>) {
         let conn = match self.chat_connection() {
             Ok(c) => c,
@@ -178,6 +206,13 @@ impl Hermes {
         dispatch_plugin_command(pending.connection,session_id.to_owned(),pending.epoch,pending.name,pending.args)
     }
     pub fn find_chat(&self, id: &str) -> Option<SessionSummary> {
+        if let Some(remote::Route::Remote { origin, .. }) = self.chat.connection.as_ref().map(|conn| &conn.route) {
+            return self.sessions.iter().find(|summary| summary.id == id).cloned().or_else(|| {
+                let library = self.library.as_ref()?;
+                let title = self.tabs.entries.iter().find(|tab| tab.id == id).map(|tab| tab.title.as_str()).unwrap_or("New chat");
+                remote::remote_summary(library.root(), origin, &json!({"id":id,"title":title}))
+            });
+        }
         self.sessions
             .iter()
             .find(|s| s.id == id)
@@ -447,6 +482,17 @@ impl Hermes {
         if !self.draft_files.files.is_empty() {
             params["attachments"] = json!(self.draft_files.files);
         }
+        let local = conn.route == remote::Route::Local;
+        let provider = self.config.clone();
+        let options = self.models.options.clone();
+        let explicit = self.chat.settings_explicit;
+        // Retrying text after changing settings is a new intentional submission.
+        // These client fields never enter the gateway wire payload.
+        if local {
+            params["client_model"] = json!(provider.model);
+            params["client_options"] = json!(options);
+            params["client_provider"] = json!(provider.base_url);
+        }
         let id = self
             .chat
             .pending
@@ -456,6 +502,13 @@ impl Hermes {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.chat.pending = Some((id.clone(), params.clone()));
         self.chat.submitting = true;
+        let selection = conn.select_settings();
+        let sid = sid.clone();
+        if local {
+            params.as_object_mut().unwrap().remove("client_model");
+            params.as_object_mut().unwrap().remove("client_options");
+            params.as_object_mut().unwrap().remove("client_provider");
+        }
         params["submission_id"] = json!(id);
         if self.running {
             params["queued"] = json!(true);
@@ -477,7 +530,8 @@ impl Hermes {
                     }
                     params["attachments"] = Value::Array(refs);
                 }
-                conn.request("prompt.submit", params).await
+                if local { conn.submit_selected(&sid, params, &provider, &options, selection, explicit).await }
+                else { conn.request("prompt.submit", params).await }
             }.await;
                 (id, result)
             },
@@ -488,6 +542,13 @@ impl Hermes {
         use remote::Update;
         let mut followup = Task::none();
         match update {
+            Update::Configured(revision, result) => {
+                if revision != self.chat.settings_revision { return Task::none(); }
+                match result {
+                    Ok(_) => self.note("Chat settings applied"),
+                    Err(error) => self.error(error),
+                }
+            }
             Update::Created(result) => {
                 self.chat.creating = false;
                 match result {

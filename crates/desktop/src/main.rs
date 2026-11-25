@@ -374,6 +374,9 @@ impl Hermes {
             backup: backup::State::default(),
             project_discovery: project_discovery::State::default(),
         };
+        // Restore private credentials and generation options before any chat
+        // connection captures its startup provider configuration.
+        app.models = models::State::open(&mut app.config);
         match Library::open_default() {
             Ok(library) => {
                 app.statusbar = statusbar::State::load(library.root());
@@ -404,7 +407,6 @@ impl Hermes {
             }
             Err(error) => app.error(format!("Could not open your chat library: {error:#}")),
         }
-        app.models=models::State::open(&mut app.config);
         let mut initial = vec![widget::operation::focus(COMPOSER_ID), iced::system::theme().map(Message::SystemTheme)];
         if app.profile_settings.saved.auto_archive { initial.push(Task::done(Message::ProfileSetting(profile_settings::Action::Maintain))); }
         let voice_events = iced::futures::stream::unfold(app.voice.events(), |receiver| async move { receiver.recv().await.ok().map(|event| (event, receiver)) });
@@ -702,7 +704,7 @@ impl Hermes {
                 } else {
                     if self.running { self.note("Stop the current response before switching session tabs."); return Task::none(); }
                     if self.draft_files.pending > 0 { self.note("Wait for the attachment to finish before switching tabs."); return Task::none(); }
-                    let summary = self.library.as_ref().and_then(|library| library.session(&id).ok());
+                    let summary = self.find_chat(&id);
                     if let Some(summary) = summary { self.open_chat(summary); } else { self.error("This session is no longer in the local library."); return Task::none(); }
                 }
                 if pressed { self.tabs.dragging = Some(id.clone()); }
@@ -720,7 +722,7 @@ impl Hermes {
                 let next = self.tabs.close(&id);
                 if current {
                     if let Some(next) = next {
-                        if let Some(summary) = self.library.as_ref().and_then(|library| library.session(&next).ok()) {
+                        if let Some(summary) = self.find_chat(&next) {
                             self.open_chat(summary);
                             if self.current.as_ref().is_none_or(|current| current.id != next) { self.tabs = previous; return Task::none(); }
                         } else { self.tabs = previous; self.error("Could not open the next session tab."); return Task::none(); }
@@ -763,7 +765,7 @@ impl Hermes {
             Action::Reopen => {
                 if self.running { self.note("Stop the current response before reopening a session tab."); return Task::none(); }
                 while let Some(id) = self.tabs.reopen() {
-                    if let Some(summary) = self.library.as_ref().and_then(|library| library.session(&id).ok()) { self.open_chat(summary); break; }
+                    if let Some(summary) = self.find_chat(&id) { self.open_chat(summary); break; }
                 }
                 self.save_tabs();
             }
@@ -864,12 +866,28 @@ impl Hermes {
         self.webview.sync(file, background, scale, Message::WebviewBounds)
     }
     fn update(&mut self, message: Message) -> Task<Message> {
+        let edits_settings = matches!(&message,
+            Message::ChoosePortal(_) | Message::BaseUrl(_) | Message::Model(_) | Message::ApiKey(_)
+            | Message::Models(models::Action::Select(_) | models::Action::Preset(_) | models::Action::UseEndpoint(_)
+                | models::Action::SaveEndpoint | models::Action::ApplyProvider(_) | models::Action::SaveOptions | models::Action::ResetOptions)
+            | Message::Reasoning(reasoning::Action::Pick(_) | reasoning::Action::Fast | reasoning::Action::Toggle)
+            | Message::Account(accounts::Action::Use(_)) | Message::SaveProvider);
+        if self.chat.submitting && edits_settings {
+            self.note("Wait for the message to be acknowledged before changing chat settings.");
+            return Task::none();
+        }
+        let before = (self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone(), serde_json::json!(self.models.options));
+        let draft_edit = matches!(&message, Message::BaseUrl(_) | Message::Model(_) | Message::ApiKey(_));
+        let commit = matches!(&message, Message::SaveProvider | Message::Models(models::Action::SaveEndpoint | models::Action::ApplyProvider(_)));
         let alert=notifications::on_event(self,&message);
         if self.hud.on && matches!(&message, Message::Edit(_) | Message::Send | Message::Engine(..)) { self.hud.touch(); }
         if matches!(&message,Message::Models(models::Action::Disconnected(_))|Message::PortalStart){self.billing.clear();}
         let work = self.update_inner(message);
+        let changed = before != (self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone(), serde_json::json!(self.models.options));
+        if changed { self.chat.settings_explicit = true; }
+        let settings = if (changed && !draft_edit) || commit { self.sync_selected_settings() } else { Task::none() };
         let queued = std::mem::take(&mut self.chat.tasks);
-        Task::batch([alert, work, Task::batch(queued)])
+        Task::batch([alert, work, settings, Task::batch(queued)])
     }
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         let task = self.update_message(message);

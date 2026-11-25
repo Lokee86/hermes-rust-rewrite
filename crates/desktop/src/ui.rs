@@ -531,7 +531,7 @@ impl Hermes {
         content.push(self.composer_view()).into()
     }
 
-    fn banner_view<'a>(&self, banner: &'a Banner) -> Element<'a, Message> {
+    pub(super) fn banner_view<'a>(&self, banner: &'a Banner) -> Element<'a, Message> {
         let p = palette(self.dark);
         container(row![text(&banner.text).size(12).color(if banner.error { hex(0xcf222e) } else { p.muted }).width(Fill),
             icon_button("close", "Dismiss", Message::Dismiss, p)].spacing(10).align_y(Alignment::Center)).padding([8, 20]).width(Fill)

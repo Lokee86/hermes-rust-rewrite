@@ -80,10 +80,7 @@ impl Provider {
             }
             Protocol::Responses => {
                 let mut body = responses_body(model, messages, &[]);
-                if let Some(effort) = &self.options.reasoning_effort {
-                    let effort = if effort == "ultra" { "max" } else { effort };
-                    body["reasoning"] = json!({"effort":effort});
-                }
+                self.options.apply_responses_reasoning(&mut body)?;
                 body["text"] = json!({"format":{"type":"json_schema", "name":name,
                     "strict":true, "schema":schema}});
                 let request = self

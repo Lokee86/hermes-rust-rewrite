@@ -18,7 +18,8 @@ pub(super) fn start(shared: Arc<Shared>, store: Store) -> JoinHandle<()> {
                 _ = shared.scheduler_notify.notified() => Vec::new(),
                 _ = interval.tick() => {
                     let mut claims = match store.gateway_claims() { Ok(claims) => claims, Err(error) => { eprintln!("scheduler recovery: {error:#}"); vec![] } };
-                    if shared.provider.validate().is_ok() {
+                    let _admissions = lock(&shared.admissions);
+                    if !shared.shutdown.is_cancelled() && shared.provider.validate().is_ok() {
                         match store.claim_due(chrono::Utc::now()) { Ok(due) => claims.extend(due), Err(error) => eprintln!("scheduler claim: {error:#}") }
                     }
                     claims
@@ -54,6 +55,82 @@ async fn session_for(shared: &Arc<Shared>, store: &Store, claim: &Claim, workspa
     shared.session(&id).await.map_err(|error| anyhow::anyhow!(error.message))
 }
 
+fn prepare_workspace(store: &Store, claim: &Claim, config: &mut Config) -> Result<PathBuf> {
+    let workspace = cron::prepare_job(store, claim, config)?;
+    let workspace = workspace.canonicalize().context("Could not open the scheduled working directory")?;
+    ensure!(workspace.is_dir(), "Scheduled working directory must be a folder");
+    Ok(workspace)
+}
+
+struct SavedAdmission {
+    receipt: Receipt,
+    turn: Option<hermes_engine::Turn>,
+}
+
+fn saved_admission(shared: &Shared, claim: &Claim, submission: &str) -> Result<Option<SavedAdmission>> {
+    let Some(id) = &claim.run.gateway_session else { return Ok(None); };
+    let record = read_record(&shared.library.session_dir(id)?)?;
+    Ok(record.authority.as_ref().and_then(|authority| {
+        authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some(submission)).map(|receipt| {
+            SavedAdmission {
+                receipt: receipt.clone(),
+                turn: receipt.turn_index.and_then(|index| record.history.turns.get(index).cloned()),
+            }
+        })
+    }))
+}
+
+fn fail_unadmitted(store: &Store, claim: &Claim, error: impl std::fmt::Display) -> Result<()> {
+    let outcome = if store.cancellation_requested(&claim.run.id)? {
+        Outcome::Cancelled { reason: "Stopped by the user".into() }
+    } else {
+        Outcome::Failed { error: error.to_string() }
+    };
+    store.finish(claim, outcome, chrono::Utc::now())
+}
+
+async fn wait_for_turn(shared: &Arc<Shared>, store: &Store, claim: &Claim, session: &Arc<LiveSession>, submission: &str) -> Result<Option<SavedAdmission>> {
+    loop {
+        if shared.shutdown.is_cancelled() { return Ok(None); }
+        let cancellation_requested = store.cancellation_requested(&claim.run.id).unwrap_or(true);
+        let (finished, cancelled_queued) = {
+            let mut view = lock(&session.view);
+            let index = view.authority.receipts.iter().position(|receipt| receipt.input_id.as_deref() == Some(submission))
+                .context("Scheduled admission is missing")?;
+            let receipt = &view.authority.receipts[index];
+            // A completed run can share its chat with later user work. Its
+            // cancellation flag must never reach that work's token.
+            let mut cancelled_queued = false;
+            if cancellation_requested && matches!(receipt.status.as_str(), "queued" | "parked") {
+                let mut next = view.authority.clone();
+                next.receipts[index].status = "terminal".into();
+                next.receipts[index].outcome = Some("cancelled".into());
+                next.persist(&session.writer, None)?;
+                view.authority = next;
+                view.revision += 1;
+                cancelled_queued = true;
+            } else if cancellation_requested && receipt.status == "started"
+                && view.current_admission.as_deref() == Some(receipt.id.as_str())
+            {
+                if let Some(cancel) = &view.cancel { cancel.cancel(); }
+            }
+            let receipt = &view.authority.receipts[index];
+            let finished = (receipt.status == "terminal").then(|| SavedAdmission {
+                receipt: receipt.clone(),
+                turn: receipt.turn_index.and_then(|index| view.history.turns.get(index).cloned()),
+            });
+            (finished, cancelled_queued)
+        };
+        if cancelled_queued {
+            shared.emit(session, "session.info", shared.info(session));
+            if let Some(next) = shared.claim_next(session)? { shared.spawn_worker(session.clone(), next).await; }
+        }
+        if finished.is_some() { return Ok(finished); }
+        // Unknown external effects remain fenced until explicitly resolved.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 pub(super) async fn routine_for(shared: &Arc<Shared>, job_id: &str, title: &str) -> Result<Arc<LiveSession>> {
     let _guard = shared.creates.lock().await;
     let path = shared.library.root().join("routine-chats.json");
@@ -81,47 +158,53 @@ pub(super) async fn routine_for(shared: &Arc<Shared>, job_id: &str, title: &str)
 async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
     let submission = format!("cron:{}", claim.run.id);
     // Once admitted, the durable receipt is authoritative even if the job or
-    // provider configuration has changed before recovery.
-    let existing = if let Some(id) = &claim.run.gateway_session {
-        let session = shared.session(id).await.map_err(|error| anyhow::anyhow!(error.message))?;
-        let admitted = shared.submission_receipt(&session, &submission).is_some();
-        Some((session, admitted))
-    } else { None };
-    let session = if let Some((session, true)) = &existing {
-        session.clone()
+    // provider configuration or working directory has changed before recovery.
+    let saved = saved_admission(&shared, &claim, &submission)?;
+    let finished = if saved.as_ref().is_some_and(|saved| saved.receipt.status == "terminal") {
+        saved.expect("terminal admission")
     } else {
-        let mut config = shared.provider.clone();
-        let workspace = match cron::prepare_job(&store, &claim, &mut config) {
-            Ok(workspace) => workspace,
-            Err(error) => { store.finish(&claim, Outcome::Failed { error: format!("{error:#}") }, chrono::Utc::now())?; return Ok(()); }
+        let session = if saved.is_some() {
+            // Opening a claimed admission may fail, but that is never permission
+            // to resubmit or settle an uncertain external effect.
+            shared.session(claim.run.gateway_session.as_deref().expect("saved session")).await
+                .map_err(|error| anyhow::anyhow!(error.message))?
+        } else {
+            if store.cancellation_requested(&claim.run.id)? {
+                store.finish(&claim, Outcome::Cancelled { reason: "Stopped by the user".into() }, chrono::Utc::now())?;
+                return Ok(());
+            }
+            let mut config = shared.provider.clone();
+            let workspace = match prepare_workspace(&store, &claim, &mut config) {
+                Ok(workspace) => workspace,
+                Err(error) => { fail_unadmitted(&store, &claim, format!("{error:#}"))?; return Ok(()); }
+            };
+            let session = match session_for(&shared, &store, &claim, &workspace, &config.model).await {
+                Ok(session) => session,
+                Err(error) => { fail_unadmitted(&store, &claim, format!("{error:#}"))?; return Ok(()); }
+            };
+            if claim.run.status == RunStatus::Claimed
+                && let Err(error) = store.begin(&claim, chrono::Utc::now())
+            {
+                fail_unadmitted(&store, &claim, format!("{error:#}"))?;
+                return Ok(());
+            }
+            if let Err(error) = shared.submit_background(session.clone(), claim.job.prompt.clone(), submission.clone(), !claim.run.manual).await {
+                // A failed directory sync can follow a successful atomic write.
+                // Re-read the receipt before declaring that no work was admitted.
+                let record = read_record(&session.dir)?;
+                if record.authority.is_some_and(|authority| authority.receipts.iter().any(|receipt| receipt.input_id.as_deref() == Some(&submission))) {
+                    return Err(anyhow::anyhow!(error.message));
+                }
+                fail_unadmitted(&store, &claim, error.message)?;
+                return Ok(());
+            }
+            session
         };
-        if store.cancellation_requested(&claim.run.id)? {
-            store.finish(&claim, Outcome::Cancelled { reason: "Stopped by the user".into() }, chrono::Utc::now())?;
-            return Ok(());
-        }
-        let session = if let Some((session, _)) = existing { session } else { session_for(&shared, &store, &claim, &workspace, &config.model).await? };
-        if claim.run.status == RunStatus::Claimed { store.begin(&claim, chrono::Utc::now())?; }
-        shared.submit_background(session.clone(), claim.job.prompt.clone(), submission.clone(), !claim.run.manual).await
-            .map_err(|error| anyhow::anyhow!(error.message))?;
-        session
-    };
-    let turn = loop {
+        let finished = wait_for_turn(&shared, &store, &claim, &session, &submission).await?;
         if shared.shutdown.is_cancelled() { return Ok(()); }
-        if store.cancellation_requested(&claim.run.id).unwrap_or(true) {
-            if let Some(cancel) = &lock(&session.view).cancel { cancel.cancel(); }
-        }
-        let state = {
-            let view = lock(&session.view);
-            view.authority.receipts.iter().find(|r| r.input_id.as_deref() == Some(&submission)).map(|r| {
-                (r.status.clone(), r.turn_index.and_then(|i| view.history.turns.get(i).cloned()))
-            })
-        };
-        if let Some((status, turn)) = state {
-            if status == "terminal" { break turn; }
-            // An uncertain external effect is deliberately not rerun or settled.
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        finished.context("Scheduled admission did not finish")?
     };
+    let turn = finished.turn;
     if let Some(turn) = &turn {
         let routine = routine_for(&shared, &claim.job.id, claim.job.title()).await?;
         loop {
@@ -140,6 +223,7 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
             hermes_engine::Status::Failed(error) => Outcome::Failed { error },
             hermes_engine::Status::Running => Outcome::Failed { error: "Run ended without a terminal status".into() },
         },
+        None if finished.receipt.outcome.as_deref() == Some("cancelled") => Outcome::Cancelled { reason: "Stopped by the user".into() },
         None => Outcome::Failed { error: "Run ended without a conversation turn".into() },
     };
     store.finish(&claim, outcome, chrono::Utc::now())?;
@@ -164,15 +248,175 @@ mod tests {
         ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n").into_response()
     }
 
+    async fn isolated_gateway(root: &Path) -> (RunningGateway, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/chat/completions", post(model))).await.unwrap();
+        });
+        let config = Config { base_url: base, model: "fixture".into(), api_key: String::new() };
+        let mut gateway = Gateway::start(GatewayConfig::new(root, config)).await.unwrap();
+        let scheduler = gateway.scheduler_task.take().unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
+        (gateway, server)
+    }
+
+    async fn bound_claim(gateway: &RunningGateway) -> (Claim, Arc<LiveSession>) {
+        let store = &gateway.shared.scheduler;
+        let job = store.create(cron::Draft { prompt: "scheduled".into(), paused: true, ..Default::default() }, chrono::Utc::now()).unwrap();
+        let claim = store.claim_gateway_now(&job.id, "manual", chrono::Utc::now()).unwrap();
+        let mut config = gateway.shared.provider.clone();
+        let workspace = prepare_workspace(store, &claim, &mut config).unwrap();
+        let session = session_for(&gateway.shared, store, &claim, &workspace, &config.model).await.unwrap();
+        store.begin(&claim, chrono::Utc::now()).unwrap();
+        let claim = store.gateway_claims().unwrap().into_iter().find(|saved| saved.run.id == claim.run.id).unwrap();
+        (claim, session)
+    }
+
+    async fn wait_for_receipt(shared: &Shared, session: &LiveSession, input: &str, status: &str) {
+        timeout(Duration::from_secs(5), async {
+            while shared.submission_receipt(session, input).is_none_or(|receipt| receipt["status"] != status) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+    }
+
     #[tokio::test]
-    async fn completed_run_publishes_after_restart_with_changed_provider() {
+    async fn missing_workdirs_settle_new_and_previously_bound_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("removed-workspace");
+        fs::create_dir(&workspace).unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let store = Store::open_gateway(dir.path()).unwrap();
+        let mut run_ids = Vec::new();
+        let mut unbound_id = None;
+        for bound in [false, true] {
+            let job = store.create(cron::Draft {
+                prompt: "must not execute".into(), workdir: Some(workspace.clone()), paused: true,
+                ..Default::default()
+            }, chrono::Utc::now()).unwrap();
+            let claim = store.claim_gateway_now(&job.id, &format!("missing-{bound}"), chrono::Utc::now()).unwrap();
+            if bound {
+                let summary = library.create_session(None, None).unwrap();
+                Settings { source: "scheduled".into(), cwd: Some(workspace.clone()), model: Some("fixture".into()), ..Default::default() }
+                    .save(&summary.directory).unwrap();
+                store.bind_gateway_session(&claim.run.id, &summary.id).unwrap();
+                store.begin(&claim, chrono::Utc::now()).unwrap();
+            } else { unbound_id = Some(claim.run.id.clone()); }
+            run_ids.push((job.id, claim.run.id));
+        }
+        fs::remove_dir(&workspace).unwrap();
+        drop(store);
+        let view = Store::open_view(dir.path()).unwrap();
+        let config = Config { base_url: "http://127.0.0.1:1/v1".into(), model: "fixture".into(), api_key: String::new() };
+        let mut gateway = Gateway::start(GatewayConfig::new(dir.path(), config)).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if run_ids.iter().all(|(job, id)| view.runs(job).unwrap().iter().any(|run| run.id == *id && run.status == RunStatus::Failed)) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let scheduler = gateway.scheduler_task.take().unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
+        assert!(gateway.shared.scheduler.gateway_claims().unwrap().is_empty());
+        for (job, _) in &run_ids {
+            let run = view.runs(job).unwrap().into_iter().next().unwrap();
+            assert!(run.error.unwrap().contains("working directory"));
+            if Some(&run.id) == unbound_id.as_ref() { assert!(run.gateway_session.is_none()); }
+        }
+        let job = view.create(cron::Draft { prompt: "next job".into(), schedule: "every 1m".into(), ..Default::default() }, chrono::Utc::now()).unwrap();
+        let due = cron::instant(job.next_run_at.as_deref().unwrap()).unwrap();
+        assert_eq!(gateway.shared.scheduler.claim_due(due).unwrap().len(), 1, "failed workspaces must release scheduler capacity");
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_active_run_does_not_interrupt_its_followup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let (claim, session) = bound_claim(&gateway).await;
+        let submission = format!("cron:{}", claim.run.id);
+        gateway.shared.submit_background(session.clone(), "slow".into(), submission.clone(), false).await.unwrap();
+        gateway.shared.submit_background(session.clone(), "slow".into(), "followup".into(), false).await.unwrap();
+        wait_for_receipt(&gateway.shared, &session, &submission, "started").await;
+        wait_for_receipt(&gateway.shared, &session, "followup", "queued").await;
+        gateway.shared.scheduler.cancel(&claim.run.id).unwrap();
+        timeout(Duration::from_secs(5), run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone())).await.unwrap().unwrap();
+        wait_for_receipt(&gateway.shared, &session, "followup", "started").await;
+        let view = lock(&session.view);
+        assert!(!view.cancel.as_ref().unwrap().is_cancelled(), "a later admission owns this cancellation token");
+        assert_eq!(view.authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some("followup")).unwrap().status, "started");
+        drop(view);
+        assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Cancelled);
+        drop(session);
+        gateway.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_run_does_not_interrupt_the_active_user_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let (claim, session) = bound_claim(&gateway).await;
+        let submission = format!("cron:{}", claim.run.id);
+        gateway.shared.submit_background(session.clone(), "slow".into(), "active-user".into(), false).await.unwrap();
+        gateway.shared.submit_background(session.clone(), "scheduled".into(), submission.clone(), false).await.unwrap();
+        gateway.shared.scheduler.cancel(&claim.run.id).unwrap();
+        timeout(Duration::from_secs(5), run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone())).await.unwrap().unwrap();
+        let view = lock(&session.view);
+        assert!(!view.cancel.as_ref().unwrap().is_cancelled());
+        assert_eq!(view.authority.receipts.iter().find(|receipt| receipt.input_id.as_deref() == Some(&submission)).unwrap().outcome.as_deref(), Some("cancelled"));
+        drop(view);
+        assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Cancelled);
+        drop(session);
+        gateway.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_workdir_does_not_resubmit_or_settle_an_uncertain_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let (claim, session) = bound_claim(&gateway).await;
+        let submission = format!("cron:{}", claim.run.id);
+        gateway.shared.submit_background(session.clone(), "scheduled".into(), submission.clone(), false).await.unwrap();
+        wait_for_receipt(&gateway.shared, &session, &submission, "terminal").await;
+        for worker in std::mem::take(&mut *gateway.shared.turns.lock().await) { worker.await.unwrap(); }
+        let id = lock(&session.summary).id.clone();
+        let workspace = lock(&session.settings).cwd.clone().unwrap();
+        let path = session.dir.join("conversation.json");
+        gateway.shared.sessions.lock().await.remove(&id);
+        drop(session);
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["authority"]["receipts"][0]["status"] = json!("started");
+        record["authority"]["receipts"][0]["outcome"] = Value::Null;
+        record["authority"]["receipts"][0]["result"] = Value::Null;
+        record["turns"][0]["status"] = json!({"state":"running"});
+        let before = serde_json::to_vec(&record).unwrap();
+        fs::write(&path, &before).unwrap();
+        fs::remove_dir(&workspace).unwrap();
+
+        assert!(run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone()).await.is_err());
+        assert_eq!(fs::read(&path).unwrap(), before, "an uncertain admission must retain its original identity and disposition");
+        assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Running);
+        gateway.shared.scheduler.finish(&claim, Outcome::Cancelled { reason: "test complete".into() }, chrono::Utc::now()).unwrap();
+        gateway.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn completed_run_publishes_after_restart_without_its_provider_or_workspace() {
         use hermes_engine::cron::{Draft, RunStatus};
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, Router::new().route("/v1/chat/completions", post(model))).await.unwrap(); });
         let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("removed-workspace");
+        fs::create_dir(&workspace).unwrap();
         let view = Store::open_view(dir.path()).unwrap();
-        let job = view.create(Draft { name: "Recovery".into(), prompt: "scheduled".into(), paused: true, ..Draft::default() }, chrono::Utc::now()).unwrap();
+        let job = view.create(Draft { name: "Recovery".into(), prompt: "scheduled".into(), workdir: Some(workspace.clone()), paused: true, ..Draft::default() }, chrono::Utc::now()).unwrap();
         let config = Config { base_url: base, model: "fixture".into(), api_key: String::new() };
         let gateway = Gateway::start(GatewayConfig::new(dir.path(), config)).await.unwrap();
         let routine = routine_for(&gateway.shared, &job.id, job.title()).await.unwrap();
@@ -191,6 +435,7 @@ mod tests {
         assert_eq!(view.runs(&job.id).unwrap()[0].status, RunStatus::Running);
         drop(routine);
         gateway.shutdown().await.unwrap();
+        fs::remove_dir(&workspace).unwrap();
         let invalid = Config { base_url: String::new(), model: "fixture".into(), api_key: String::new() };
         let gateway = Gateway::start(GatewayConfig::new(dir.path(), invalid)).await.unwrap();
         timeout(Duration::from_secs(20), async { loop {

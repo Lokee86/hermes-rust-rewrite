@@ -91,6 +91,9 @@ impl OwnerConnection {
     pub fn is_native(&self) -> bool {
         self.native
     }
+    pub fn instance_id(&self) -> &str {
+        &self.instance
+    }
 
     async fn request(&self, verb: &str, params: Value) -> Result<Value> {
         query(&self.control_home, verb, params)
@@ -158,6 +161,9 @@ impl OwnerConnection {
             "Manage the stock gateway with its own service controls"
         );
         self.request("rust.stop", self.identity()).await?;
+        self.wait_stopped().await
+    }
+    async fn wait_stopped(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             // A draining owner can close a control connection without answering it (on Unix
@@ -326,6 +332,34 @@ pub async fn discover(root: &Path) -> Result<Option<OwnerConnection>> {
 pub async fn ensure_local(root: &Path, provider: &Config) -> Result<OwnerConnection> {
     ensure_with(root, provider, &std::env::current_exe()?).await
 }
+
+/// Apply an explicitly selected provider to this profile's managed owner.
+/// Model selection is per session and never restarts the owner. Credentials
+/// are represented only by a digest on the private control endpoint.
+pub async fn ensure_configured(root: &Path, provider: &Config) -> Result<OwnerConnection> {
+    provider.validate()?;
+    for _ in 0..3 {
+        let owner = ensure_local(root, provider).await?;
+        ensure!(owner.is_native(), "Change provider settings through the existing gateway's own controls");
+        let mut params = owner.identity();
+        params["configuration"] = json!(provider_identity(provider, owner.instance_id()));
+        let reply = owner.request("rust.configure-provider", params).await?;
+        if reply["configured"] == true { return Ok(owner); }
+        ensure!(reply["stopping"] == true, "The gateway did not acknowledge provider configuration");
+        owner.wait_stopped().await?;
+    }
+    bail!("Another client changed the provider; retry your selection")
+}
+
+fn provider_identity(provider: &Config, instance: &str) -> String {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(instance.as_bytes());
+    digest.update(&[0]);
+    digest.update(provider.base_url.trim().trim_end_matches('/').as_bytes());
+    digest.update(&[0]);
+    digest.update(provider.api_key.trim().as_bytes());
+    digest.finish().as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
+}
 async fn ensure_with(root: &Path, provider: &Config, exe: &Path) -> Result<OwnerConnection> {
     fs::create_dir_all(root)?;
     if let Some(owner) = discover(root).await? {
@@ -392,7 +426,7 @@ async fn serve_control(
             let _ = timeout(CONTROL_TIMEOUT, async {
                 let mut stream = stream;
                 let req = read_line(&mut stream, 64 * 1024).await?;
-                let (reply, stopping) = control_reply(&req, &profile, &shared);
+                let (reply, stopping) = control_reply(&req, &profile, &shared).await;
                 send_line(&mut stream, &reply).await?;
                 if stopping {
                     stop.cancel();
@@ -404,12 +438,12 @@ async fn serve_control(
     }
 }
 
-fn control_reply(req: &Value, home: &str, shared: &Shared) -> (Value, bool) {
+async fn control_reply(req: &Value, home: &str, shared: &Shared) -> (Value, bool) {
     let id = &req["id"];
     let instance = &shared.instance_id;
     let params = &req["params"];
     let mut stop = false;
-    let result = (|| -> Result<Value> {
+    let result = async {
         ensure!(
             req["protocol"] == 1
                 && req.as_object().is_some_and(|o| o
@@ -469,9 +503,49 @@ fn control_reply(req: &Value, home: &str, shared: &Shared) -> (Value, bool) {
                     }
                 }
             }
+            Some("rust.configure-provider") => {
+                ensure!(params["profile_id"] == home && params["instance_id"] == instance.as_str(), "owner_identity_mismatch");
+                let configuration = params["configuration"].as_str().context("Missing provider configuration")?;
+                ensure!(configuration.len() == 64 && configuration.bytes().all(|byte| byte.is_ascii_hexdigit()), "Invalid provider configuration");
+                ensure!(!shared.shutdown.is_cancelled(), "owner_draining");
+                if configuration == provider_identity(&shared.provider, instance) {
+                    return Ok(json!({"configured":true}));
+                }
+                let sessions = shared.sessions.lock().await;
+                let _admissions = super::lock(&shared.admissions);
+                ensure!(!shared.shutdown.is_cancelled(), "owner_draining");
+                ensure!(shared.scheduler.gateway_claims()?.is_empty(), "Wait for scheduled gateway work to finish before changing providers");
+                ensure!(sessions.values().all(|session| {
+                    let view = super::lock(&session.view);
+                    !view.running && view.authority.receipts.iter().all(|receipt| receipt.status == "terminal")
+                }), "Stop or settle pending gateway work before changing providers");
+                for summary in shared.library.authority_sessions()? {
+                    if sessions.contains_key(&summary.id) { continue; }
+                    match File::open(summary.directory.join("conversation.json")) {
+                        Ok(file) => {
+                            let saved: Value = serde_json::from_reader(file)?;
+                            ensure!(saved["authority"]["receipts"].as_array().into_iter().flatten()
+                                .all(|receipt| receipt["status"] == "terminal"),
+                                "Stop or settle pending gateway work before changing providers");
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    if let Ok(file) = File::open(summary.directory.join("queued-prompts.json")) {
+                        let saved: Value = serde_json::from_reader(file)?;
+                        ensure!(saved["entries"].as_array().is_none_or(Vec::is_empty) && saved["in_flight"].is_null(),
+                            "Stop or settle pending gateway work before changing providers");
+                    }
+                }
+                // Fence new admissions before acknowledging the restart. The
+                // selected endpoint can never be applied to an old queued turn.
+                shared.shutdown.cancel();
+                stop = true;
+                Ok(json!({"stopping":true}))
+            }
             _ => bail!("unknown_verb"),
         }
-    })();
+    }.await;
     match result {
         Ok(result) => (
             json!({"ok":true,"id":id,"protocol":1,"result":result}),
@@ -488,6 +562,49 @@ fn control_reply(req: &Value, home: &str, shared: &Shared) -> (Value, bool) {
 mod tests {
     use super::*;
     use crate::{Gateway, GatewayConfig, client::ClientOptions};
+
+    #[test]
+    fn provider_comparison_is_instance_scoped_and_ignores_model_selection() {
+        let mut config = Config { base_url: "https://api.openai.com/v1/".into(), model: "first".into(), api_key: "synthetic-key".into() };
+        let first = provider_identity(&config, "owner-a");
+        config.model = "second".into();
+        config.base_url.pop();
+        assert_eq!(first, provider_identity(&config, "owner-a"));
+        assert_ne!(first, provider_identity(&config, "owner-b"));
+        config.api_key.push('2');
+        assert_ne!(first, provider_identity(&config, "owner-a"));
+        assert!(!first.contains("synthetic-key"));
+    }
+
+    #[tokio::test]
+    async fn provider_restart_refuses_work_then_fences_late_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = profile_id(directory.path()).unwrap();
+        let config = Config { base_url: "http://127.0.0.1:1/v1".into(), model: "first".into(), api_key: "synthetic-key".into() };
+        let gateway = Gateway::start(GatewayConfig::new(directory.path(), config.clone())).await.unwrap();
+        let summary = gateway.shared.library.create_session(None, None).unwrap();
+        let session = gateway.shared.session(&summary.id).await.unwrap_or_else(|error| panic!("{}", error.message));
+        super::super::lock(&session.view).running = true;
+        let request = |provider: &Config| json!({"id":1,"protocol":1,"verb":"rust.configure-provider","params":{
+            "profile_id":home,"instance_id":gateway.shared.instance_id,
+            "configuration":provider_identity(provider, &gateway.shared.instance_id)}});
+        let mut model_only = config.clone(); model_only.model = "second".into();
+        let (same, stopping) = control_reply(&request(&model_only), &home, &gateway.shared).await;
+        assert_eq!(same["result"]["configured"], true); assert!(!stopping);
+        let mut changed = config.clone(); changed.base_url = "http://127.0.0.1:2/v1".into();
+        let (busy, stopping) = control_reply(&request(&changed), &home, &gateway.shared).await;
+        assert_eq!(busy["ok"], false); assert!(!stopping); assert!(!gateway.shared.shutdown.is_cancelled());
+        super::super::lock(&session.view).running = false;
+        let (ready, stopping) = control_reply(&request(&changed), &home, &gateway.shared).await;
+        assert_eq!(ready["result"]["stopping"], true); assert!(stopping);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let peer = crate::Peer { id: "late-client".into(), tx, stop: CancellationToken::new(), canonical: true, local_native: true };
+        super::super::lock(&session.peers).insert(peer.id.clone(), peer.clone());
+        let late = gateway.shared.submit(&json!({"session_id":summary.id,"text":"late","submission_id":"late"}), &peer).await;
+        assert!(late.is_err());
+        assert!(super::super::lock(&session.view).authority.receipts.is_empty());
+        gateway.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn stock_discovery_and_ticket_name_the_same_ready_authority() {

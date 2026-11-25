@@ -89,6 +89,36 @@ fn test_root() -> PathBuf {
     path
 }
 
+#[test]
+#[ignore = "needs a new empty HERMES_RUST_DATA_DIR and no provider environment overrides"]
+fn saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets() {
+    let root = test_root();
+    assert!(std::env::var_os("HERMES_RUST_BASE_URL").is_none());
+    assert!(std::env::var_os("HERMES_RUST_API_KEY").is_none());
+    let config = Config { base_url: hermes_engine::OPENAI.into(), model: "saved-model".into(), api_key: "synthetic-saved-key".into() };
+    let vault = hermes_engine::credentials::EndpointStore::open(&root.join("providers")).unwrap();
+    vault.save(None, "Saved provider", &config).unwrap();
+    Preferences::save(&config).unwrap();
+    let (mut app, boot) = Hermes::new();
+    assert!(app.chat.has_startup_provider(&config), "the gateway captures the restored credential");
+    drop(boot);
+    app.chat = chat_view::View::default();
+    app.connections.config.mode = connections::Mode::Remote;
+    let origin = "http://127.0.0.1:1";
+    app.connections.config.url = origin.into();
+    let a = remote::remote_summary(&root, origin, &json!({"id":"remote-a","title":"A"})).unwrap();
+    let b = remote::remote_summary(&root, origin, &json!({"id":"remote-b","title":"B"})).unwrap();
+    app.open_gateway_chat(a);
+    app.open_gateway_chat(b);
+    app.sessions.clear(); // A search/filter can omit either tab from the sidebar.
+    let _ = app.tab_action(tabs::Action::Select("remote-a".into()));
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-a");
+    let _ = app.tab_action(tabs::Action::Close("remote-a".into()));
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-b");
+    let _ = app.tab_action(tabs::Action::Reopen);
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-a");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a new empty HERMES_RUST_DATA_DIR for the process-wide desktop profile"]
 async fn two_desktop_viewers_resume_the_same_tool_turn() {

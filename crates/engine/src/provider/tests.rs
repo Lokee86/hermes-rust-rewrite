@@ -59,6 +59,92 @@ fn user_messages() -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn streamed_and_structured_responses_share_selected_reasoning() {
+    let router = Router::new().route("/responses", post(|Json(body): Json<Value>| async move {
+        assert!(body.get("reasoning_effort").is_none());
+        let effort = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        if effort == "default" {
+            assert!(body.get("reasoning").is_none());
+        } else {
+            assert_eq!(body["reasoning"], json!({"effort": effort}));
+        }
+        sse(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"ok\\\":true}\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        ))
+    }));
+    let (base, server) = serve(router).await;
+    for (selected, wire) in [(None, "default"), (Some("low"), "low"), (Some("high"), "high"),
+        (Some("none"), "none"), (Some("ultra"), "max")]
+    {
+        let mut provider = Provider::new_with_options(config(&base), crate::models::GenerationOptions {
+            reasoning_effort: selected.map(str::to_owned),
+            ..Default::default()
+        }).unwrap();
+        provider.protocol = Protocol::Responses;
+        provider.endpoint = format!("{base}/responses").parse().unwrap();
+        let mut text = String::new();
+        provider.stream_with_tools(vec![json!({"role":"user","content":wire})], &[], |delta| {
+            text.push_str(delta);
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(text, "{\"ok\":true}");
+        assert_eq!(provider.complete_json("Output JSON.", wire, "fixture_schema", &json!({"type":"object"}))
+            .await.unwrap(), json!({"ok":true}));
+    }
+    server.abort();
+}
+
+#[test]
+fn catalog_requests_use_provider_routes_and_authentication() {
+    for (base, expected, anthropic, bearer) in [
+        (OPENAI, format!("{OPENAI}/models"), false, true),
+        (ANTHROPIC, format!("{ANTHROPIC}/models"), true, false),
+        ("http://127.0.0.1:12345/custom/chat/completions", "http://127.0.0.1:12345/custom/models".into(), false, true),
+    ] {
+        let provider = Provider::new(Config { api_key: "catalog-fixture-token".into(), ..config(base) }).unwrap();
+        let mut requests = provider.catalog_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = requests.remove(0).build().unwrap();
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(request.url().as_str(), expected);
+        assert!(request.body().is_none());
+        assert_eq!(request.headers().get("authorization").map(|value| value.to_str().unwrap()),
+            bearer.then_some("Bearer catalog-fixture-token"));
+        assert_eq!(request.headers().get("x-api-key").map(|value| value.to_str().unwrap()),
+            anthropic.then_some("catalog-fixture-token"));
+        assert_eq!(request.headers().get("anthropic-version").map(|value| value.to_str().unwrap()),
+            anthropic.then_some("2023-06-01"));
+    }
+    let subscription = crate::accounts::CATALOG.iter().find(|account| {
+        Url::parse(account.base_url).unwrap().host_str() == Some("chatgpt.com")
+    }).unwrap();
+    let expected_path = format!("{}/models", Url::parse(subscription.base_url).unwrap().path());
+    for base in [subscription.base_url.to_owned(), format!("{}/responses", subscription.base_url)] {
+        let provider = Provider::new(Config { api_key: "subscription-fixture-token".into(), ..config(base) }).unwrap();
+        let requests = provider.catalog_requests().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, version) in requests.into_iter().zip(["99.0.0", "0.0.0"]) {
+            let request = request.build().unwrap();
+            assert_eq!(request.url().path(), expected_path);
+            assert_eq!(request.url().query(), Some(format!("client_version={version}").as_str()));
+            assert_eq!(request.headers()["originator"], "hermes-agent");
+            assert_eq!(request.headers()["authorization"], "Bearer subscription-fixture-token");
+        }
+    }
+    let gateway = crate::accounts::CATALOG.iter().find(|account| {
+        Url::parse(account.base_url).unwrap().path().ends_with("/anthropic")
+    }).unwrap();
+    let expected_path = format!("{}/v1/models", Url::parse(gateway.base_url).unwrap().path());
+    for base in [gateway.base_url.to_owned(), format!("{}/v1/messages", gateway.base_url)] {
+        let provider = Provider::new(Config { api_key: "gateway-fixture-token".into(), ..config(base) }).unwrap();
+        let request = provider.catalog_requests().unwrap().remove(0).build().unwrap();
+        assert_eq!(request.url().path(), expected_path);
+        assert_eq!(request.headers()["authorization"], "Bearer gateway-fixture-token");
+    }
+}
+
+#[tokio::test]
 async fn structured_completion_uses_the_native_provider_request() {
     let router = Router::new()
         .route(

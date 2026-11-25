@@ -227,6 +227,9 @@ impl Library {
                 let original_id = record.id.clone();
                 record.id = new_id("chat");
                 record.project_id = None;
+                // Owners are not part of this detached restore. Keep their
+                // conversations reachable through the ordinary session list.
+                record.bot = None;
                 let directory = self.create_directory(&record.id)?;
                 for blob in &saved.files {
                     if matches!(blob.path.as_str(), "queued-prompts.json") {
@@ -541,4 +544,43 @@ fn write_blob(root: &Path, blob: &Blob, target: &str) -> Result<()> {
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restored_bot_and_group_conversations_are_visible_detached_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Library::open(dir.path().join("source")).unwrap();
+        let first = source.create_bot("First", "", "", "").unwrap();
+        let second = source.create_bot("Second", "", "", "").unwrap();
+        let group = source.create_group("Team", &[first.name.clone(), second.name.clone()]).unwrap();
+        let chats = [source.bot_chat(&first.name).unwrap(), source.group_chat(&group.id).unwrap()];
+        for (index, chat) in chats.iter().enumerate() {
+            let mut history = History::default();
+            history.turns.push(hermes_engine::Turn {
+                prompt: format!("Saved conversation {index}"), context: String::new(), attachments: vec![],
+                model: "fixture".into(), entries: vec![], status: hermes_engine::Status::Complete,
+            });
+            atomic_json(&chat.directory.join("conversation.json"), &history).unwrap();
+            source.touch_session(&chat.id).unwrap();
+        }
+        let archive = dir.path().join("backup.hermes-native.json");
+        source.export_native_backup(&archive).unwrap();
+        let target = Library::open(dir.path().join("target")).unwrap();
+        let report = target.import_native_backup(&inspect_native_backup(&archive).unwrap()).unwrap();
+        assert_eq!(report.sessions, 2);
+        assert!(target.bots().unwrap().is_empty());
+        assert!(target.groups().unwrap().is_empty());
+        let restored = target.list_sessions(&SessionQuery { hide_empty: true, ..Default::default() }).unwrap();
+        assert_eq!(restored.len(), 2);
+        for chat in restored {
+            assert!(chat.bot.is_none());
+            assert!(chat.project_id.is_none());
+            let session = hermes_engine::Session::open(&chat.directory).unwrap();
+            assert!(session.history().turns[0].prompt.starts_with("Saved conversation"));
+        }
+    }
 }

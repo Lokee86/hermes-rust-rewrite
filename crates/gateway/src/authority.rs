@@ -261,6 +261,12 @@ enum AdmissionOrigin {
     Background { unattended: bool },
 }
 
+struct SubmissionFence {
+    instance: String,
+    revision: u64,
+    generation: u64,
+}
+
 impl Shared {
     pub(super) async fn attach_file(&self, params: &Value, peer: &Peer) -> RpcResult {
         let session = self.attached(params, peer).await?;
@@ -346,7 +352,14 @@ impl Shared {
             ));
         }
         lock(&session.peers).insert(peer.id.clone(), peer.clone());
-        let receipt = self.admit(session, text, attachments, input, queue, AdmissionOrigin::Chat).await?;
+        let fence = if let Some(instance) = params.get("expected_instance_id") {
+            Some(SubmissionFence {
+                instance: instance.as_str().filter(|s| !s.is_empty()).ok_or_else(|| RpcError::invalid("Invalid expected_instance_id"))?.into(),
+                revision: params["expected_revision"].as_u64().ok_or_else(|| RpcError::invalid("expected_revision is required"))?,
+                generation: params["expected_generation"].as_u64().ok_or_else(|| RpcError::invalid("expected_generation is required"))?,
+            })
+        } else { None };
+        let receipt = self.admit(session, text, attachments, input, queue, AdmissionOrigin::Chat, fence).await?;
         if peer.canonical { Ok(receipt) } else { Ok(json!({"status":"streaming","admission_id":receipt["admission_id"]})) }
     }
 
@@ -354,7 +367,7 @@ impl Shared {
         if text.trim().is_empty() || text.len() > MAX_PROMPT_BYTES || submission_id.is_empty() || submission_id.len() > 256 {
             return Err(RpcError::invalid("Invalid background submission"));
         }
-        self.admit(session, text, Vec::new(), Some(submission_id), true, AdmissionOrigin::Background { unattended }).await
+        self.admit(session, text, Vec::new(), Some(submission_id), true, AdmissionOrigin::Background { unattended }, None).await
     }
 
     pub(crate) fn submission_receipt(&self, session: &LiveSession, submission_id: &str) -> Option<Value> {
@@ -396,7 +409,7 @@ impl Shared {
         Ok(true)
     }
 
-    async fn admit(self: &Arc<Self>, session: Arc<LiveSession>, text:String, attachments:Vec<Attachment>, input:Option<String>, queue: bool, origin: AdmissionOrigin) -> RpcResult {
+    async fn admit(self: &Arc<Self>, session: Arc<LiveSession>, text:String, attachments:Vec<Attachment>, input:Option<String>, queue: bool, origin: AdmissionOrigin, fence: Option<SubmissionFence>) -> RpcResult {
         let summary = lock(&session.summary).clone();
         let sid = summary.id.clone();
         let config = lock(&session.config).clone();
@@ -441,6 +454,9 @@ impl Shared {
             group: None,
         };
         let first = {
+            let _admissions = lock(&self.admissions);
+            let settings = lock(&session.settings);
+            let config = lock(&session.config);
             let mut view = lock(&session.view);
             if let Some(input) = &candidate.input_id
                 && let Some(existing) = view
@@ -462,6 +478,18 @@ impl Shared {
             if self.shutdown.is_cancelled() {
                 return Err(RpcError::new(4001, "shutdown", "Gateway is shutting down"));
             }
+            if let Some(fence) = &fence {
+                if fence.instance != self.instance_id {
+                    return Err(RpcError::fenced("owner_changed", "The gateway restarted; reconnect before sending", &view));
+                }
+                if fence.revision != view.revision || fence.generation != view.generation {
+                    return Err(RpcError::fenced("revision_conflict", "Session settings changed; reconnect before sending", &view));
+                }
+            }
+            // Snapshot settings while holding the same locks as session.mutate.
+            // A concurrent model change must not slip between fencing and admission.
+            candidate.model = config.model.clone();
+            candidate.options = settings.generation_options.clone();
             let pending = view
                 .authority
                 .receipts
@@ -780,6 +808,64 @@ impl Shared {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+    #[tokio::test]
+    async fn selected_model_admission_is_fenced_and_retryable() {
+        let requests = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let captured = requests.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    lock(&captured).push(body);
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                }
+            }))).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::start(GatewayConfig::new(directory.path(), Config {
+            base_url: format!("http://{address}/v1"), model: "first".into(), api_key: String::new(),
+        })).await.unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let peer = Peer { id: "settings-client".into(), tx, stop: CancellationToken::new(), canonical: true, local_native: true };
+        let created = gateway.shared.create(&json!({"source":"gui"}), &peer).await.unwrap_or_else(|e| panic!("{}", e.message));
+        let sid = created["session_id"].as_str().unwrap();
+        let session = gateway.shared.session(sid).await.unwrap_or_else(|e| panic!("{}", e.message));
+        lock(&session.peers).insert(peer.id.clone(), peer.clone());
+        let before = gateway.shared.snapshot(&session, &peer, false);
+        let changed = gateway.shared.mutate(&json!({"session_id":sid,"operation":"model","request_id":"select-second",
+            "expected_revision":before["revision"],"expected_generation":before["execution_generation"],
+            "payload":{"model":"second","generation_options":{"temperature":0.4,"reasoning_effort":"high"}}}), &peer, true)
+            .await.unwrap_or_else(|e| panic!("{}", e.message));
+        let mut prompt = json!({"session_id":sid,"text":"Use the selected settings.","submission_id":"selected-once",
+            "expected_instance_id":gateway.shared.instance_id,"expected_revision":before["revision"],
+            "expected_generation":before["execution_generation"]});
+        let stale = gateway.shared.submit(&prompt, &peer).await.err().unwrap();
+        assert_eq!(stale.data["reason"], "revision_conflict");
+        prompt["expected_revision"] = changed["revision"].clone();
+        prompt["expected_instance_id"] = json!("another-owner");
+        let stale = gateway.shared.submit(&prompt, &peer).await.err().unwrap();
+        assert_eq!(stale.data["reason"], "owner_changed");
+        assert!(lock(&session.view).authority.receipts.is_empty());
+        prompt["expected_instance_id"] = json!(gateway.shared.instance_id);
+        let receipt = gateway.shared.submit(&prompt, &peer).await.unwrap_or_else(|e| panic!("{}", e.message));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while lock(&session.view).running { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        prompt["expected_instance_id"] = json!("previous-owner");
+        let retry = gateway.shared.submit(&prompt, &peer).await.unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(retry["admission_id"], receipt["admission_id"]);
+        assert_eq!(lock(&session.view).history.turns.len(), 1);
+        let sent = lock(&requests);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["model"], "second");
+        assert_eq!(sent[0]["temperature"], 0.4);
+        assert_eq!(sent[0]["reasoning_effort"], "high");
+        drop(sent);
+        gateway.shutdown().await.unwrap(); server.abort();
+    }
     #[tokio::test]
     async fn legacy_parked_group_expands_atomically_at_resume() {
         let dir = tempfile::tempdir().unwrap();
