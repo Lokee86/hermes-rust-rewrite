@@ -37,7 +37,6 @@ impl Shared {
             .map_err(RpcError::internal)?;
             for id in &archived {
                 self.fence_python_source(id, python_memory::TerminalReason::Archive).await.map_err(RpcError::internal)?;
-                self.memory_source_terminal(id).await.map_err(RpcError::internal)?;
             }
             return Ok(json!({"archived":archived}));
         }
@@ -72,7 +71,6 @@ impl Shared {
                 .map_err(RpcError::internal)?;
                 if archived == Some(true) {
                     self.fence_python_source(&id, python_memory::TerminalReason::Archive).await.map_err(RpcError::internal)?;
-                    self.memory_source_terminal(&id).await.map_err(RpcError::internal)?;
                 }
                 let live = self.sessions.lock().await.get(&id).cloned();
                 if let Some(live) = live {
@@ -105,8 +103,9 @@ impl Shared {
                     .map_err(RpcError::internal)?
                     .map_err(RpcError::internal)?;
                 self.fence_python_source(&id, python_memory::TerminalReason::Delete).await.map_err(RpcError::internal)?;
-                self.memory_source_terminal(&id).await.map_err(RpcError::internal)?;
-                Ok(json!({"deleted":true,"session_id":id}))
+                self.memory.wake.notify_one();
+                let memory_synced = self.deliver_memory_deletion(&id).await.unwrap_or(false);
+                Ok(json!({"deleted":true,"session_id":id,"memory_synced":memory_synced}))
             }
             _ => unreachable!(),
         }

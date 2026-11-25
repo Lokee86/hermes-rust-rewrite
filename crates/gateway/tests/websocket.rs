@@ -428,6 +428,7 @@ const REQUEST_OBSERVATION: &str = "Look up the verified Observation about the la
 const OBSERVATION_FACT: &str = "Amethyst Lantern 741 is the workspace project name.";
 const OBSERVATION_PARAPHRASE: &str = "Initiative designation";
 const REQUEST_PARAPHRASE: &str = "Recall the initiative designation.";
+const PROJECT_CONTROL: &str = "The project deploys with a weekly smoke test checklist.";
 const PROJECT_CHALLENGE: &str = "Correction: our workspace project has always been called Copper Finch 862.";
 const CHALLENGE_RECEPTOR: &str = "a different project name";
 const PROFILE_NOTE: &str = "The notes canary is violet.";
@@ -464,7 +465,7 @@ async fn embed_memory_fixture(
         let text = input.as_str().unwrap();
         let (_, body) = text.split_once('\n').unwrap_or(("", text));
         let embedding = match body {
-            OBSERVATION_PARAPHRASE | OBSERVATION_FACT | PROJECT_FACT | "Amethyst Lantern" => [1.0, 0.0],
+            OBSERVATION_PARAPHRASE | OBSERVATION_FACT | PROJECT_FACT | PROJECT_CONTROL | "Amethyst Lantern" => [1.0, 0.0],
             PROJECT_CHALLENGE | CHALLENGE_RECEPTOR => [0.0, 1.0],
             _ => [-1.0, 0.0],
         };
@@ -529,7 +530,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
                 let id = id.as_str().unwrap();
                 let source = episode["turns"].as_array().unwrap().iter().find(|turn| turn["id"] == id).unwrap();
                 let clauses = if source["role"] == "user"
-                    && matches!(source["content"].as_str(), Some(PROJECT_FACT | PROJECT_CHALLENGE))
+                    && matches!(source["content"].as_str(), Some(PROJECT_FACT | PROJECT_CHALLENGE | PROJECT_CONTROL))
                 {
                     json!([{"disposition":"retain", "authority_kind":"direct", "category":"fact",
                         "type":"project", "lifecycle":"current", "proposition":source["content"],
@@ -559,6 +560,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
                     let title = match text {
                         PROJECT_FACT => "Amethyst Lantern",
                         PROJECT_CHALLENGE => "Copper Finch",
+                        PROJECT_CONTROL => "Weekly smoke test",
                         _ => panic!("unexpected retained proposition: {text}"),
                     };
                     json!({
@@ -574,7 +576,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             let payload: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let approved = payload["state"]["candidates"].as_array().into_iter().flatten()
                 .filter(|candidate| candidate["content"].as_str().is_some_and(|text| {
-                    text.contains(PROJECT_FACT) || text == OBSERVATION_FACT
+                    text.contains(PROJECT_FACT) || text == OBSERVATION_FACT || text == PROJECT_CONTROL
                 }))
                 .map(|candidate| candidate["memory"].clone()).collect::<Vec<_>>();
             json!({"version":1,"approved":approved})
@@ -723,6 +725,24 @@ impl PortableGateway {
         let result = client.request(method, params).await.unwrap();
         client.close();
         result
+    }
+
+    async fn rewind(&self, session_id: &str, keep_turns: usize) -> Value {
+        use hermes_gateway::{client::{ClientOptions, GatewayClient}, owner};
+        let control = owner::discover(&self.home).await.unwrap().unwrap();
+        let client = GatewayClient::new(ClientOptions::default());
+        control.connect(&client).await.unwrap();
+        let session = client.request("session.resume", json!({"session_id":session_id})).await.unwrap();
+        let request = json!({
+            "session_id":session_id, "request_id":"source-cascade-rewind", "operation":"rewind",
+            "expected_revision":session["revision"], "expected_generation":session["execution_generation"],
+            "payload":{"keep_turns":keep_turns}
+        });
+        let changed = client.request("session.mutate", request.clone()).await.unwrap();
+        let retry = client.request("session.mutate", request).await.unwrap();
+        assert_eq!(retry["execution_generation"], changed["execution_generation"]);
+        client.close();
+        changed
     }
 
     async fn reconcile_memory(&self) -> Value {
@@ -1064,10 +1084,80 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
 
     let restored = wait_for_observation(&mut next, pending_id, REQUEST_OBSERVATION).await;
     assert_eq!(restored["observations"], lexical["observations"]);
+
+    let challenge_record = library.session(challenge_id).unwrap().directory.join("conversation.json");
+    memory_capture_receipt(&challenge_record, 0).await;
+    let before_rewind = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":pending_id, "query":"Copper Finch 862"
+    })).await;
+    assert!(before_rewind["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+        hit["text"].as_str().is_some_and(|text| text.contains(PROJECT_CHALLENGE))
+    })), "{before_rewind}");
+    set_provider("off");
+    let rewound = restarted.rewind(challenge_id, 0).await;
+    assert_eq!(rewound["kept_turns"], 0);
+    assert_eq!(rewound["memory_synced"], false);
+    let stopped: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+    assert_eq!(stopped["turns"], json!([]));
+    assert_eq!(stopped["authority"]["source_rewinds"][0]["acknowledged"], false);
+
+    drop(next);
+    restarted.shutdown().await;
+    set_provider("reliquary");
+    let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
+    let mut next = restarted.client().await;
+    next.ok("session.resume", json!({"session_id":challenge_id})).await;
+    next.ok("session.resume", json!({"session_id":pending_id})).await;
+    timeout(Duration::from_secs(25), async {
+        loop {
+            let row: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+            if row["authority"]["source_rewinds"][0]["acknowledged"] == true {
+                assert!(row["authority"]["source_rewinds"][0]["resulting_head"].is_array());
+                assert!(row["authority"]["source_rewinds"][0]["removed_message_uids"].is_array());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }).await.expect("committed rewind never reached REL");
+    let removed = restarted.private_request("plugins.memory.archive_search", json!({
+        "session_id":pending_id, "query":"Copper Finch 862"
+    })).await;
+    assert!(!removed.to_string().contains(PROJECT_CHALLENGE));
+
+    next.ok("prompt.submit", json!({
+        "session_id":challenge_id, "submission_id":"after-rewind", "text":PROJECT_CONTROL
+    })).await;
+    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    memory_capture_receipt(&challenge_record, 1).await;
+
     restarted.private_request("catalog.session.set", json!({
         "session_id":source_id, "archived":true
     })).await;
+    let archived = wait_for_observation(&mut next, pending_id, REQUEST_PARAPHRASE).await;
+    assert_eq!(archived["observations"], lexical["observations"]);
+
+    set_provider("off");
+    let deleted = restarted.private_request("catalog.session.delete", json!({"session_id":source_id})).await;
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["memory_synced"], false);
+    assert!(library.session(source_id).is_err());
+    assert!(library.pending_memory_deletions().unwrap().iter().any(|id| id == source_id));
+    drop(next);
+    restarted.shutdown().await;
+
+    set_provider("reliquary");
+    let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
+    let mut next = restarted.client().await;
+    next.ok("session.resume", json!({"session_id":pending_id})).await;
+    timeout(Duration::from_secs(25), async {
+        while library.pending_memory_deletions().unwrap().contains(&source_id.to_owned()) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }).await.expect("committed deletion never reached REL");
     let terminal = query_observation(&mut next, pending_id, "terminal-source", REQUEST_OBSERVATION).await;
+    assert!(terminal["memories"].as_array().is_some_and(|memories|
+        memories.iter().any(|row| row["content"] == PROJECT_CONTROL)), "{terminal}");
+    assert!(!terminal.to_string().contains(PROJECT_FACT), "{terminal}");
     assert_eq!(terminal.get("observations"), None, "{terminal}");
     drop(next);
     restarted.shutdown().await;

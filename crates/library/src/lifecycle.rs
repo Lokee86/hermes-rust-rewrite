@@ -25,6 +25,35 @@ pub struct SessionQuery {
     pub hide_empty: bool,
 }
 
+#[derive(Deserialize)]
+struct CaptureStagingStatus {
+    authority: Option<CaptureStagingAuthority>,
+}
+
+#[derive(Deserialize)]
+struct CaptureStagingAuthority {
+    #[serde(default)]
+    receipts: Vec<CaptureStagingReceipt>,
+}
+
+#[derive(Deserialize)]
+struct CaptureStagingReceipt {
+    capture: Option<hermes_engine::memory_capture::PendingMemoryCapture>,
+}
+
+fn has_unacknowledged_stage(directory: &Path) -> Result<bool> {
+    let status: CaptureStagingStatus = match File::open(directory.join("conversation.json")) {
+        Ok(file) => serde_json::from_reader(file)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(status.authority.is_some_and(|authority| {
+        authority.receipts.iter().any(|receipt| {
+            receipt.capture.as_ref().is_some_and(|capture| capture.staging && capture.receipt.is_none())
+        })
+    }))
+}
+
 impl Library {
     /// Archive by last activity, excluding the foreground conversation and pins.
     pub fn archive_inactive(&self,days:u32,current:Option<&str>)->Result<()>{
@@ -60,16 +89,34 @@ impl Library {
         let directory=self.session_dir(id)?;
         let lock=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(directory.join("session.lock"))?;
         lock.try_lock_exclusive().context("Close the conversation before deleting it")?;
+        ensure!(
+            !has_unacknowledged_stage(&directory)?,
+            "Memory is staging a copied turn. Retry the deletion after it is recorded."
+        );
         self.with_catalog(true,|catalog|{
             let record=find_session(catalog,id)?;
             ensure!(record.archived && catalog.active_session.as_deref()!=Some(id),"Only archived, inactive conversations can be deleted here");
             catalog.sessions.retain(|s|s.id!=id);
             catalog.pinned_order.retain(|p|p!=id);
             catalog.pending_deletion.push(id.to_owned());
+            catalog.pending_memory_deletions.push(id.to_owned());
             Ok(())
         })?;
         self.finish_deletions()
     }
+    /// Deletion commits leave this receipt even after session file cleanup.
+    pub fn pending_memory_deletions(&self) -> Result<Vec<String>> {
+        self.with_catalog(false, |catalog| Ok(catalog.pending_memory_deletions.clone()))
+    }
+
+    pub fn acknowledge_memory_deletion(&self, id: &str) -> Result<()> {
+        ensure!(safe_id(id), "Invalid session identity");
+        self.with_catalog(true, |catalog| {
+            catalog.pending_memory_deletions.retain(|entry| entry != id);
+            Ok(())
+        })
+    }
+
     pub(crate) fn finish_deletions(&self)->Result<()> {
         if self.with_catalog(false,|c|Ok(c.pending_deletion.is_empty()))? {return Ok(());}
         self.with_catalog(true,|catalog|{

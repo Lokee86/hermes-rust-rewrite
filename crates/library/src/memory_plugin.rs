@@ -37,7 +37,7 @@ pub trait MemoryStore: Send + Sync {
         &self,
         capture: &PendingMemoryCapture,
         turn: &Turn,
-        previous: Option<&CaptureReceipt>,
+        previous: Option<[u8; 32]>,
     ) -> Result<CaptureReceipt>;
     fn ensure_processing(
         &self,
@@ -47,8 +47,17 @@ pub trait MemoryStore: Send + Sync {
         config: &Config,
     ) -> Result<bool>;
     fn stop_processing(&self);
-    fn reconcile_tombstones(&self, summaries: &[SessionSummary]) -> Result<()>;
-    fn terminal_source(&self, session_id: &str) -> Result<()>;
+    /// True after Core has acknowledged the deletion, or if no copy exists.
+    fn terminal_source(&self, session_id: &str, config: &Config) -> Result<bool>;
+    fn rewind_source(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        event_id: &str,
+        preceding_head: [u8; 32],
+        last_surviving_message_uid: Option<&str>,
+        config: &Config,
+    ) -> Result<[u8; 32]>;
     fn search_user_archive(
         &self,
         sources: &dyn MemorySources,
@@ -82,10 +91,6 @@ pub struct MemoryTurn {
 /// The host verifies current access and receipts against its own conversation log.
 pub trait MemorySources: Send + Sync {
     fn check_session(&self, session_id: &str, binding: &CaptureBinding) -> Result<()>;
-    fn copied_message_receipt(
-        &self,
-        session_id: &str,
-        binding: &CaptureBinding,
-        message_uid: &str,
-    ) -> Result<Option<CaptureReceipt>>;
+    /// Local outbox barrier while a committed source change awaits Core.
+    fn copied_source_change_pending(&self, session_id: &str) -> Result<bool>;
 }

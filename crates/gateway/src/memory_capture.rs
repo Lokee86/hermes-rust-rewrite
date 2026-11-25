@@ -1,6 +1,6 @@
 //! Reconcile copied-source receipts from the committed native record.
 use super::*;
-use hermes_engine::memory_capture::{CaptureReceipt, CapturedReasoningSummary};
+use hermes_engine::memory_capture::CapturedReasoningSummary;
 use hermes_library::{
     SessionSource,
     memory_plugin::{MemorySources, MemoryStore},
@@ -13,7 +13,195 @@ pub(super) struct CommittedRecord {
     pub(super) authority: Option<Authority>,
 }
 
+/// Written in the same native record as the shortened transcript.
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct CommittedRewind {
+    request_id: String,
+    event_id: String,
+    kept_turns: usize,
+    generation: u64,
+    revision: u64,
+    preceding_head: Option<[u8; 32]>,
+    last_surviving_message_uid: Option<String>,
+    #[serde(default)]
+    surviving_capture_generation: u64,
+    removed_message_uids: Vec<String>,
+    #[serde(default)]
+    acknowledged: bool,
+    #[serde(default)]
+    resulting_head: Option<[u8; 32]>,
+}
+
 impl Shared {
+    pub(super) async fn rewind_committed(
+        &self,
+        session: &LiveSession,
+        params: &Value,
+        peer: &Peer,
+    ) -> RpcResult {
+        if !peer.local_native {
+            return Err(RpcError::new(
+                4403,
+                "permission_denied",
+                "Rewind requires the private profile client",
+            ));
+        }
+        let request = required_string(params, "request_id")?;
+        if request.is_empty() || request.len() > 256 {
+            return Err(RpcError::invalid("request_id must contain 1-256 bytes"));
+        }
+        let kept = params["payload"]["keep_turns"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| RpcError::invalid("keep_turns is required"))?;
+        let _order = self.catalog_edits.lock().await;
+        let id = lock(&session.summary).id.clone();
+        let response = {
+            let mut view = lock(&session.view);
+            let describe = |change: &CommittedRewind| {
+                json!({
+                    "session_id":id, "operation":"rewind", "revision":change.revision,
+                    "execution_generation":change.generation, "kept_turns":change.kept_turns,
+                    "memory_synced":change.acknowledged, "ok":true,
+                })
+            };
+            if let Some(old) = view
+                .authority
+                .source_rewinds
+                .iter()
+                .find(|old| old.request_id == request)
+            {
+                if old.kept_turns != kept {
+                    return Err(RpcError::new(
+                        4001,
+                        "request_conflict",
+                        "Rewind request identity was reused",
+                    ));
+                }
+                return Ok(describe(old));
+            }
+            if params["expected_revision"].as_u64() != Some(view.revision)
+                || params["expected_generation"].as_u64() != Some(view.generation)
+            {
+                return Err(RpcError::fenced(
+                    "revision_conflict",
+                    "Session changed; resume before rewinding",
+                    &view,
+                ));
+            }
+            if view.running
+                || view
+                    .authority
+                    .receipts
+                    .iter()
+                    .any(|row| row.status != "terminal")
+            {
+                return Err(RpcError::fenced(
+                    "session_busy",
+                    "Finish or cancel outstanding turns before rewinding",
+                    &view,
+                ));
+            }
+            if view.authority.receipts.iter().any(|row| {
+                row.capture
+                    .as_ref()
+                    .is_some_and(|marker| marker.staging && marker.receipt.is_none())
+            }) {
+                self.memory.wake.notify_one();
+                return Err(RpcError::fenced(
+                    "memory_capture_pending",
+                    "Memory is staging a copied turn. Retry the rewind after it is recorded.",
+                    &view,
+                ));
+            }
+            if kept >= view.history.turns.len() {
+                return Err(RpcError::invalid(
+                    "Rewind must remove at least one committed turn",
+                ));
+            }
+            let generation = view
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| RpcError::internal("generation overflow"))?;
+            let revision = view
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| RpcError::internal("revision overflow"))?;
+            let mut authority = view.authority.clone();
+            let previous_generation = authority
+                .source_rewinds
+                .last()
+                .map_or(0, |row| row.generation);
+            let mut change = CommittedRewind {
+                request_id: request.to_owned(),
+                event_id: format!("rewind-{}", new_id()),
+                kept_turns: kept,
+                generation,
+                revision,
+                preceding_head: None,
+                last_surviving_message_uid: None,
+                surviving_capture_generation: 0,
+                removed_message_uids: Vec::new(),
+                acknowledged: false,
+                resulting_head: None,
+            };
+            for admission in &mut authority.receipts {
+                let Some(index) = admission.turn_index else {
+                    continue;
+                };
+                if let Some(marker) = &admission.capture {
+                    let original = view.history.turns.get(index).ok_or_else(|| {
+                        RpcError::internal("capture points outside committed transcript")
+                    })?;
+                    let rows = marker.verified_rows(original).map_err(RpcError::internal)?;
+                    if let Some(receipt) = &marker.receipt {
+                        if admission.generation > previous_generation {
+                            change.preceding_head = Some(receipt.source_sha256);
+                        }
+                        if index < kept {
+                            change.last_surviving_message_uid =
+                                rows.last().map(|row| row.message_uid.clone());
+                            change.surviving_capture_generation = admission.generation;
+                        } else {
+                            change
+                                .removed_message_uids
+                                .extend(rows.into_iter().map(|row| row.message_uid));
+                        }
+                    }
+                }
+                if index >= kept {
+                    // Retain submission identity so an old delivery cannot regenerate a removed turn.
+                    admission.turn_index = None;
+                    admission.capture = None;
+                    admission.text.clear();
+                    admission.attachments.clear();
+                    admission.outcome = Some("rewound".into());
+                    admission.result = Some(json!({"status":"rewound"}));
+                }
+            }
+            authority.generation = generation;
+            let response = describe(&change);
+            authority.source_rewinds.push(change);
+            let mut history = view.history.clone();
+            history.turns.truncate(kept);
+            authority
+                .persist(&session.writer, Some(&history))
+                .map_err(RpcError::internal)?;
+            view.history = history;
+            view.authority = authority;
+            view.generation = generation;
+            view.revision = revision;
+            view.replay.clear();
+            view.replay_bytes = 0;
+            view.evicted_through = view.sequence;
+            response
+        };
+        self.memory.wake.notify_one();
+        self.emit(session, "session.updated", response.clone());
+        self.emit(session, "session.info", self.info(session));
+        Ok(response)
+    }
+
     pub(super) fn pending_memory_capture(
         &self,
         session: &LiveSession,
@@ -91,15 +279,20 @@ impl Shared {
                 if !owner.memory.active() {
                     return Ok(Vec::new());
                 }
-                let mut summaries = owner.library.sessions(None)?;
-                // Preserve a terminal memory source when archived and restored while disabled.
-                for summary in &mut summaries {
-                    summary.archived |= source_ended(&summary.directory);
+                for id in owner.library.pending_memory_deletions()? {
+                    if matches!(
+                        owner
+                            .memory
+                            .with_selected(|memory| memory.terminal_source(&id, &owner.provider)),
+                        Some(Ok(true))
+                    ) {
+                        owner.library.acknowledge_memory_deletion(&id)?;
+                    }
                 }
-                let _ = owner
-                    .memory
-                    .with_selected(|memory| memory.reconcile_tombstones(&summaries));
-                Ok(summaries)
+                owner.library.list_sessions(&hermes_library::SessionQuery {
+                    archive: hermes_library::ArchiveFilter::All,
+                    ..Default::default()
+                })
             })
             .await
             {
@@ -143,24 +336,26 @@ impl Shared {
                         .flatten())
                 })
                 .await;
-                let Ok(Ok(Some((marker, outcome)))) = staged else {
+                let Ok(Ok(Some(outcome))) = staged else {
                     continue;
                 };
 
                 // Re-read the owner after staging. If it is live, the receipt
                 // merges into the latest authority under the same mutex as admission.
+                let staging_marked =
+                    matches!(&outcome, SourceUpdate::Capture(_, CaptureUpdate::Staging));
                 let sessions = self.sessions.lock().await;
-                if let Some(session) = sessions.get(&summary.id).cloned() {
+                let persisted = if let Some(session) = sessions.get(&summary.id).cloned() {
                     drop(sessions);
-                    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                    tokio::task::spawn_blocking(move || -> Result<()> {
                         let mut view = lock(&session.view);
                         let mut next = view.authority.clone();
-                        install_capture_update(&mut next, &marker, outcome)?;
+                        install_source_update(&mut next, outcome)?;
                         next.persist(&session.writer, None)?;
                         view.authority = next;
                         Ok(())
                     })
-                    .await;
+                    .await
                 } else {
                     // Briefly acquire the native writer while the session map
                     // fences a concurrent open. Root staging has already finished.
@@ -168,15 +363,18 @@ impl Shared {
                         continue;
                     };
                     drop(sessions);
-                    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                    tokio::task::spawn_blocking(move || -> Result<()> {
                         let Some(value) = writer.authority() else {
                             return Ok(());
                         };
                         let mut authority: Authority = serde_json::from_value(value)?;
-                        install_capture_update(&mut authority, &marker, outcome)?;
+                        install_source_update(&mut authority, outcome)?;
                         authority.persist(&writer, None)
                     })
-                    .await;
+                    .await
+                };
+                if staging_marked && matches!(persisted, Ok(Ok(()))) {
+                    self.memory.wake.notify_one();
                 }
             }
         }
@@ -186,8 +384,7 @@ impl Shared {
 }
 
 pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<CommittedRecord>> {
-    if summary.archived
-        || source_ended(&summary.directory)
+    if source_ended(&summary.directory)
         || Settings::read(&summary.directory)?.memory_binding.is_none()
     {
         return Ok(None);
@@ -206,18 +403,52 @@ fn stage_next(
     history: &History,
     authority: &Authority,
     config: &Config,
-) -> Result<Option<(PendingMemoryCapture, CaptureUpdate)>> {
-    if summary.archived || !matches!(summary.source, hermes_library::SessionSource::Native) {
+) -> Result<Option<SourceUpdate>> {
+    if !matches!(summary.source, hermes_library::SessionSource::Native) {
         return Ok(None);
     }
     let Some(binding) = Settings::read(&summary.directory)?.memory_binding else {
         return Ok(None);
     };
-    let mut previous = None;
+    let latest_rewind = authority
+        .source_rewinds
+        .iter()
+        .rev()
+        .find(|row| row.acknowledged);
+    if let Some(rewind) = authority
+        .source_rewinds
+        .iter()
+        .find(|row| !row.acknowledged)
+    {
+        let resulting_head = match rewind
+            .preceding_head
+            .or(latest_rewind.and_then(|row| row.resulting_head))
+        {
+            Some(head) if !rewind.removed_message_uids.is_empty() => Some(memory.rewind_source(
+                &binding,
+                &summary.id,
+                &rewind.event_id,
+                head,
+                rewind.last_surviving_message_uid.as_deref(),
+                config,
+            )?),
+            head => head,
+        };
+        return Ok(Some(SourceUpdate::Rewind {
+            event_id: rewind.event_id.clone(),
+            resulting_head,
+        }));
+    }
+    let mut previous = latest_rewind.and_then(|row| row.resulting_head);
+    let surviving_capture_generation =
+        latest_rewind.map_or(0, |row| row.surviving_capture_generation);
     for admission in &authority.receipts {
         let Some(marker) = &admission.capture else {
             continue;
         };
+        if latest_rewind.is_some() && admission.generation <= surviving_capture_generation {
+            continue;
+        }
         ensure!(
             marker.binding == binding
                 && marker.session_id == summary.id
@@ -238,18 +469,54 @@ fn stage_next(
                 config.model.clone_from(&admission.model);
                 return Ok(memory
                     .ensure_processing(&binding, &summary.id, receipt, &config)?
-                    .then(|| (marker.clone(), CaptureUpdate::Settled)));
+                    .then(|| SourceUpdate::Capture(marker.clone(), CaptureUpdate::Settled)));
             }
-            previous = Some(receipt);
+            previous = Some(receipt.source_sha256);
         } else {
+            if !marker.staging {
+                return Ok((!summary.archived)
+                    .then(|| SourceUpdate::Capture(marker.clone(), CaptureUpdate::Staging)));
+            }
             let receipt = memory.stage(marker, turn, previous)?;
-            return Ok(Some((marker.clone(), CaptureUpdate::Staged(receipt))));
+            return Ok(Some(SourceUpdate::Capture(
+                marker.clone(),
+                CaptureUpdate::Staged(receipt),
+            )));
         }
     }
     Ok(None)
 }
 
+enum SourceUpdate {
+    Capture(PendingMemoryCapture, CaptureUpdate),
+    Rewind {
+        event_id: String,
+        resulting_head: Option<[u8; 32]>,
+    },
+}
+
+fn install_source_update(authority: &mut Authority, update: SourceUpdate) -> Result<()> {
+    match update {
+        SourceUpdate::Capture(marker, update) => install_capture_update(authority, &marker, update),
+        SourceUpdate::Rewind {
+            event_id,
+            resulting_head,
+        } => {
+            let pending = authority
+                .source_rewinds
+                .iter_mut()
+                .find(|row| !row.acknowledged)
+                .filter(|row| row.event_id == event_id)
+                .context("committed rewind changed")?;
+            pending.acknowledged = true;
+            pending.resulting_head = resulting_head;
+            Ok(())
+        }
+    }
+}
+
 enum CaptureUpdate {
+    Staging,
     Staged(hermes_engine::memory_capture::CaptureReceipt),
     Settled,
 }
@@ -270,7 +537,11 @@ fn install_capture_update(
         "committed memory marker changed during staging"
     );
     match update {
-        CaptureUpdate::Staged(receipt) => saved.receipt = Some(receipt),
+        CaptureUpdate::Staging => saved.staging = true,
+        CaptureUpdate::Staged(receipt) => {
+            saved.receipt = Some(receipt);
+            saved.staging = false;
+        }
         CaptureUpdate::Settled => saved.settled = true,
     }
     Ok(())
@@ -284,24 +555,29 @@ pub(super) fn source_ended(directory: &Path) -> bool {
 }
 
 impl Shared {
-    pub(super) async fn memory_source_terminal(self: &Arc<Self>, session_id: &str) -> Result<()> {
+    pub(super) async fn deliver_memory_deletion(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Result<bool> {
         let shared = self.clone();
         let session_id = session_id.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            if let Ok(directory) = shared.library.session_dir(&session_id)
-                && Settings::read(&directory)?.memory_binding.is_some()
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            if !shared
+                .library
+                .pending_memory_deletions()?
+                .contains(&session_id)
             {
-                match File::create_new(directory.join(ENDED)) {
-                    Ok(file) => file.sync_all()?,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-                    Err(error) => return Err(error.into()),
-                }
+                return Ok(true);
             }
-            shared
+            let synced = shared
                 .memory
-                .with_selected(|memory| memory.terminal_source(&session_id))
-                .transpose()?;
-            Ok(())
+                .with_selected(|memory| memory.terminal_source(&session_id, &shared.provider))
+                .transpose()?
+                .unwrap_or(false);
+            if synced {
+                shared.library.acknowledge_memory_deletion(&session_id)?;
+            }
+            Ok(synced)
         })
         .await?
     }
@@ -310,8 +586,7 @@ impl Shared {
 pub(super) struct CaptureSources(pub Library);
 
 fn eligible_source(summary: &SessionSummary, binding: &CaptureBinding) -> bool {
-    !summary.archived
-        && !source_ended(&summary.directory)
+    !source_ended(&summary.directory)
         && summary.bot.is_none()
         && matches!(summary.source, SessionSource::Native)
         && summary.project_id == binding.project_id
@@ -328,69 +603,33 @@ impl MemorySources for CaptureSources {
         );
         let summary = self.0.session(session_id)?;
         ensure!(
-            eligible_source(&summary, binding)
+            !summary.archived
+                && eligible_source(&summary, binding)
                 && Settings::read(&summary.directory)?.memory_binding.as_ref() == Some(binding),
             "Native session binding is unavailable"
         );
         Ok(())
     }
 
-    fn copied_message_receipt(
-        &self,
-        session_id: &str,
-        binding: &CaptureBinding,
-        message_uid: &str,
-    ) -> Result<Option<CaptureReceipt>> {
-        let Ok(summary) = self.0.session(session_id) else {
-            return Ok(None);
-        };
-        if !eligible_source(&summary, binding) {
-            return Ok(None);
-        }
-        verify_copied_message(&summary, binding, message_uid)
-    }
-}
-
-fn verify_copied_message(
-    summary: &SessionSummary,
-    binding: &CaptureBinding,
-    message_uid: &str,
-) -> Result<Option<CaptureReceipt>> {
-    let Some(record) = read_committed(summary)? else {
-        return Ok(None);
-    };
-    let Some(authority) = record.authority else {
-        return Ok(None);
-    };
-    for admission in &authority.receipts {
-        let Some(marker) = &admission.capture else {
-            continue;
-        };
-        let Some(receipt) = &marker.receipt else {
-            continue;
-        };
-        if !message_uid.starts_with(&format!("generation-{}-", marker.generation)) {
-            continue;
-        }
-        ensure!(
-            &marker.binding == binding
-                && marker.session_id == summary.id
-                && marker.admission_id == admission.id
-                && marker.generation == admission.generation
-                && Some(marker.turn_index) == admission.turn_index
-                && admission.status == "terminal",
-            "copied memory does not match its native admission"
-        );
-        let turn = record
-            .history
-            .turns
-            .get(marker.turn_index)
-            .context("memory source turn disappeared")?;
-        return Ok(marker
-            .verified_rows(turn)?
+    fn copied_source_change_pending(&self, session_id: &str) -> Result<bool> {
+        if self
+            .0
+            .pending_memory_deletions()?
             .iter()
-            .any(|row| row.message_uid == message_uid)
-            .then(|| receipt.clone()));
+            .any(|id| id == session_id)
+        {
+            return Ok(true);
+        }
+        let Ok(summary) = self.0.session(session_id) else {
+            return Ok(false);
+        };
+        Ok(read_committed(&summary)?
+            .and_then(|record| record.authority)
+            .is_some_and(|authority| {
+                authority
+                    .source_rewinds
+                    .iter()
+                    .any(|change| !change.acknowledged)
+            }))
     }
-    Ok(None)
 }

@@ -11,8 +11,7 @@ use hermes_engine::{
 use hermes_library::memory_plugin::{MemorySources, MemoryTurn};
 use reliquary_memory::{
     ChatRetrieval, HermesCopiedSourceTurn, InspectionItem, InspectionQuery, Instance, MemoryId,
-    OwnerId, ProductErrorKind, RetrievalPreview,
-    SourceAvailability, TemporalBasis,
+    OwnerId, ProductErrorKind, RetrievalPreview, SourceAvailability, TemporalBasis,
 };
 use serde_json::{Value, json};
 use std::{
@@ -64,7 +63,6 @@ impl GatewayMemoryQuery {
                 preview,
                 owner,
                 instance,
-                &self.memory,
                 self.sources.as_ref(),
                 &self.binding.profile_id,
             )?;
@@ -293,13 +291,11 @@ impl GatewayMemoryQuery {
                 source.profile_id == self.binding.profile_id,
                 "Archive belongs to a different profile"
             );
-            let receipt = self
-                .sources
-                .copied_message_receipt(&source.session_id, &self.binding, &source.message_uid)?
-                .context("Archive no longer has a committed source")?;
             ensure!(
-                receipt.source_sha256 == source.source_sha256,
-                "Archive source digest changed"
+                !self
+                    .sources
+                    .copied_source_change_pending(&source.session_id)?,
+                "Archive source removal is still syncing"
             );
             ensure!(
                 !contains_inline_data(&row.archive.content)
@@ -341,7 +337,6 @@ fn check_provenance(
     preview: &RetrievalPreview,
     owner: OwnerId,
     instance: &Instance,
-    memory: &EmbeddedMemory,
     sources: &dyn MemorySources,
     profile_id: &str,
 ) -> Result<()> {
@@ -403,12 +398,7 @@ fn check_provenance(
                 )?;
                 ensure!(
                     scope.conversation_id() == turn.conversation_id
-                        && memory.source_available(
-                            &imported.conversation_id,
-                            &imported.message_id,
-                            owner,
-                            sources
-                        )?,
+                        && !sources.copied_source_change_pending(&imported.conversation_id)?,
                     "retrieval source is no longer eligible"
                 );
             }

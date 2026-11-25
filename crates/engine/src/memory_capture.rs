@@ -49,6 +49,9 @@ pub struct PendingMemoryCapture {
     reasoning_summaries: Vec<CapturedReasoningSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<CaptureReceipt>,
+    /// Persisted before staging starts, so an interrupted import keeps its source.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub staging: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub settled: bool,
 }
@@ -126,6 +129,7 @@ impl PendingMemoryCapture {
             archive_by_entry: true,
             reasoning_summaries: Vec::new(),
             receipt: None,
+            staging: false,
             settled: false,
         };
         let rows = capture.rows(turn);

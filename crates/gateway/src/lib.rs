@@ -1404,6 +1404,9 @@ impl Shared {
         } else {
             "rename"
         };
+        if operation == "rewind" {
+            return self.rewind_committed(&session, params, peer).await;
+        }
         if !matches!(operation, "rename" | "model") {
             return Err(RpcError::unsupported(format!(
                 "session.mutate operation {operation} is not implemented"
