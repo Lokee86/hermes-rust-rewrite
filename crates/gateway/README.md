@@ -94,7 +94,7 @@ Events use `{"jsonrpc":"2.0","method":"event","params":{"type":"message.delta","
 
 ## Persistence and limits
 
-Conversation content is the engine's atomically saved `conversation.json`. Creation identity/model/source/cwd metadata lives alongside it in `gateway.json`; the catalog remains owned by `hermes-library`. The gateway cannot open a conversation while another desktop/process holds its exclusive engine lock; it reports a `session_busy` refusal. Close the other owner before opening that conversation through the gateway. Separate sessions can run concurrently.
+Conversation content and the gateway's turn records are saved together in the profile's `mercury.db`. Creation identity/model/source/cwd metadata lives alongside it in `gateway.json`; the catalog remains owned by `hermes-library`. The gateway cannot open a conversation while another desktop/process holds its exclusive engine lock; it reports a `session_busy` refusal. Close the other owner before opening that conversation through the gateway. Separate sessions can run concurrently.
 
 Replay is at most 512 events and 512 KiB per loaded session; admissions and mutation receipts retain the last 256 entries. Those caches reset on process restart. Clients must refetch history after a replay gap/restart and must not blindly resend an old ambiguous tool-producing turn outside the retained admission window. Unfinished saved turns recover as interrupted through the engine. This crate does not claim upstream's durable admission ledger or exactly-once semantics across process death.
 

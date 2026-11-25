@@ -1,7 +1,6 @@
 //! Local session tabs. Geometry and verbs follow stock PaneTab/PaneTabStrip
 //! and tree/renderer/tree-group.tsx at 0284ce17. Closing a tab does not delete
 //! its session, draft, queued messages, or attachments.
-use hermes_engine::History;
 use hermes_library::{ArchiveFilter, Library, SessionQuery, SessionSource, SessionSummary};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, fs, io::Write, path::Path};
@@ -81,7 +80,7 @@ impl State {
 
 pub(super) fn empty_native(summary:&SessionSummary)->bool {
     if summary.title!="New chat"||!matches!(summary.source,SessionSource::Native|SessionSource::LegacyRust){return false}
-    fs::read(summary.directory.join("conversation.json")).ok().and_then(|bytes|serde_json::from_slice::<History>(&bytes).ok()).is_some_and(|history|history.turns.is_empty())
+    hermes_engine::saved_conversation(&summary.directory).ok().flatten().is_some_and(|(history,_)|history.turns.is_empty())
 }
 pub(super) fn pristine(summary:&SessionSummary)->bool {
     empty_native(summary)

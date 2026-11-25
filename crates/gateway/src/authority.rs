@@ -641,18 +641,9 @@ impl Shared {
     pub(super) async fn recover_queued(self: &Arc<Self>) -> Result<()> {
         for summary in self.library.authority_sessions()? {
             // Only acquire the session lock for work owned by this gateway.
-            let path = summary.directory.join("conversation.json");
-            let file = match File::open(path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            #[derive(Deserialize)]
-            struct Stored {
-                authority: Option<Authority>,
-            }
-            let stored: Stored = serde_json::from_reader(file)?;
-            if !stored.authority.is_some_and(|a| {
+            let (_, authority) = hermes_engine::read_conversation(&summary.directory)?;
+            let authority: Option<Authority> = authority.map(serde_json::from_value).transpose()?;
+            if !authority.is_some_and(|a| {
                 a.receipts
                     .iter()
                     .find(|r| r.status != "terminal")

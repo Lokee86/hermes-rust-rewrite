@@ -520,13 +520,9 @@ impl Shared {
             .map(|live| lock(&live.config).api_key.clone())
             .unwrap_or_else(|| self.provider.api_key.clone());
         let settings = Settings::read(&summary.directory)?;
-        let path = summary.directory.join("conversation.json");
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
+        let Some(record) = CommittedRecord::read(&summary.directory)? else {
+            return Ok(None);
         };
-        let record: CommittedRecord = serde_json::from_reader(file)?;
         Ok(record.authority.map(|authority| PythonSource {
             summary,
             settings,
@@ -827,11 +823,7 @@ impl Shared {
             .map(|summary| summary.id.clone())
             .collect::<BTreeSet<_>>();
         for summary in summaries {
-            let path = summary.directory.join("conversation.json");
-            let Ok(file) = File::open(path) else {
-                continue;
-            };
-            let Ok(record) = serde_json::from_reader::<_, CommittedRecord>(file) else {
+            let Ok(Some(record)) = CommittedRecord::read(&summary.directory) else {
                 continue;
             };
             if let Some(selection) = &configured
@@ -996,17 +988,10 @@ impl Shared {
         let summary = self.library.session(id).ok();
         let mut providers = BTreeSet::new();
         if let Some(summary) = &summary {
-            match File::open(summary.directory.join("conversation.json")) {
-                Ok(file) => {
-                    let committed: CommittedRecord = serde_json::from_reader(file)?;
-                    if let Some(authority) = committed.authority {
-                        providers.extend(authority.receipts.into_iter().filter_map(|receipt| {
-                            receipt.python_selection.map(|selection| selection.id)
-                        }));
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+            if let Some(authority) = CommittedRecord::read(&summary.directory)?.and_then(|committed| committed.authority) {
+                providers.extend(authority.receipts.into_iter().filter_map(|receipt| {
+                    receipt.python_selection.map(|selection| selection.id)
+                }));
             }
         }
         let _order = lock(&self.python_memory.fence_files);

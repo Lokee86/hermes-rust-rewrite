@@ -522,16 +522,10 @@ async fn control_reply(req: &Value, home: &str, shared: &Shared) -> (Value, bool
                 }), "Stop or settle pending gateway work before changing providers");
                 for summary in shared.library.authority_sessions()? {
                     if sessions.contains_key(&summary.id) { continue; }
-                    match File::open(summary.directory.join("conversation.json")) {
-                        Ok(file) => {
-                            let saved: Value = serde_json::from_reader(file)?;
-                            ensure!(saved["authority"]["receipts"].as_array().into_iter().flatten()
-                                .all(|receipt| receipt["status"] == "terminal"),
-                                "Stop or settle pending gateway work before changing providers");
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
+                    let (_, authority) = hermes_engine::read_conversation(&summary.directory)?;
+                    ensure!(authority.unwrap_or_default()["receipts"].as_array().into_iter().flatten()
+                        .all(|receipt| receipt["status"] == "terminal"),
+                        "Stop or settle pending gateway work before changing providers");
                     if let Ok(file) = File::open(summary.directory.join("queued-prompts.json")) {
                         let saved: Value = serde_json::from_reader(file)?;
                         ensure!(saved["entries"].as_array().is_none_or(Vec::is_empty) && saved["in_flight"].is_null(),

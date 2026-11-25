@@ -19,7 +19,7 @@ pub use native_backup::{NativeBackupPlan, NativeBackupSummary, NativeRestoreRepo
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
-use hermes_engine::History;
+use hermes_engine::{History, db};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -163,7 +163,7 @@ impl Library {
         library.with_catalog(true, |catalog| {
             // Upgrade the original one-conversation Rust build by copying its
             // transcript. The old conversation and lock file remain untouched.
-            if catalog.sessions.is_empty() && !library.root.join("library.json").exists() {
+            if catalog.sessions.is_empty() && !library.has_catalog()? {
                 let old = library.root.join("conversation.json");
                 if old.is_file() {
                     let history: History = serde_json::from_reader(File::open(old)?).context(
@@ -175,8 +175,7 @@ impl Library {
                         SessionSource::LegacyRust,
                     );
                     let directory = library.create_directory(&record.id)?;
-                    if let Err(error) = atomic_json(&directory.join("conversation.json"), &history)
-                    {
+                    if let Err(error) = hermes_engine::create_conversation(&directory, &history) {
                         let _ = fs::remove_dir(&directory);
                         return Err(error);
                     }
@@ -189,9 +188,8 @@ impl Library {
                 for record in &mut catalog.sessions {
                     if record.last_active.is_some() { continue; }
                     let has_turns = match record.source {
-                        SessionSource::Native => File::open(library.root.join("sessions").join(&record.id).join("conversation.json")).ok()
-                            .and_then(|file| serde_json::from_reader::<_, History>(file).ok())
-                            .is_some_and(|history| !history.turns.is_empty()),
+                        SessionSource::Native => hermes_engine::read_history(&library.root.join("sessions").join(&record.id))
+                            .is_ok_and(|history| !history.turns.is_empty()),
                         _ => true,
                     };
                     if has_turns { record.last_active = Some(record.updated_at.clone()); }
@@ -255,7 +253,7 @@ impl Library {
             if request_key.is_none() && title.is_none() && let Some(existing) = catalog.sessions.iter().find(|record| {
                 record.last_active.is_none() && record.bot.is_none() && matches!(record.source, SessionSource::Native) && !record.archived && !record.pinned
                     && record.title == "New chat" && record.project_id.as_deref() == project_id
-                    && self.root.join("sessions").join(&record.id).join("conversation.json").is_file()
+                    && hermes_engine::has_conversation(&self.root.join("sessions").join(&record.id)).unwrap_or(false)
             }) {
                 let summary = self.summary(existing);
                 catalog.active_session = Some(existing.id.clone());
@@ -282,8 +280,7 @@ impl Library {
             };
             let summary = self.summary(&record);
             initialize(&summary, workspace.as_deref())?;
-            let transcript = directory.join("conversation.json");
-            if !transcript.exists() { atomic_json(&transcript,&History::default())?; }
+            if !hermes_engine::has_conversation(&directory)? { hermes_engine::create_conversation(&directory, &History::default())?; }
             catalog.active_session = Some(record.id.clone());
             catalog.selected_project = record.project_id.clone();
             catalog.sessions.push(record);
@@ -309,8 +306,7 @@ impl Library {
     pub fn touch_session(&self, id: &str) -> Result<SessionSummary> {
         self.with_catalog(true, |catalog| {
             let session = find_session_mut(catalog, id)?;
-            let path = self.checked_directory(id)?.join("conversation.json");
-            let history: History = serde_json::from_slice(&fs::read(path)?)
+            let (history, _) = hermes_engine::saved_conversation(&self.checked_directory(id)?)?
                 .context("Could not refresh the conversation title")?;
             if session.title == "New chat" && let Some(title) = title_from_history(&history) {
                 session.title = title;
@@ -517,14 +513,20 @@ impl Library {
             .open(self.root.join("library.lock"))?;
         lock.lock_exclusive()
             .context("Could not lock the native conversation catalog")?;
-        let path = self.root.join("library.json");
-        let mut catalog: Catalog = match File::open(&path) {
-            Ok(file) => serde_json::from_reader(file)
-                .context("Could not read the native conversation catalog")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Catalog::default(),
-            Err(error) => {
-                return Err(error).context("Could not open the native conversation catalog");
-            }
+        let mut db = db::open(&self.root)?;
+        let saved = db::read_document(&mut db, CATALOG)?;
+        // The catalog was this file before the database.
+        let legacy = self.root.join("library.json");
+        let mut catalog = match &saved {
+            Some(document) => Catalog::from_document(document)?,
+            None => match File::open(&legacy) {
+                Ok(file) => serde_json::from_reader(file)
+                    .context("Could not read the native conversation catalog")?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Catalog::default(),
+                Err(error) => {
+                    return Err(error).context("Could not open the native conversation catalog");
+                }
+            },
         };
         validate_catalog(&catalog)?;
         for session in &catalog.sessions {
@@ -533,10 +535,65 @@ impl Library {
         let result = f(&mut catalog)?;
         if save {
             validate_catalog(&catalog)?;
-            atomic_json(&path, &catalog)
+            db::write_document(&mut db, CATALOG, saved.as_ref(), &catalog.to_document()?)
                 .context("Could not save the native conversation catalog")?;
+            if saved.is_none() {
+                db::retire(&legacy);
+            }
         }
         Ok(result)
+    }
+
+    fn has_catalog(&self) -> Result<bool> {
+        Ok(db::document_revision(&self.root, CATALOG)?.is_some() || self.root.join("library.json").exists())
+    }
+
+    /// Changes whenever the catalog does, in this process or another.
+    pub fn catalog_revision(&self) -> Option<i64> {
+        db::document_revision(&self.root, CATALOG).ok().flatten()
+    }
+}
+
+const CATALOG: &str = "catalog";
+
+/// How many chats a profile has.
+pub(crate) fn session_count(root: &Path) -> usize {
+    match db::record_count(root, CATALOG, "session") {
+        Ok(Some(count)) => count,
+        // Not opened since its catalog was a file.
+        Ok(None) => fs::read(root.join("library.json")).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|catalog| catalog["sessions"].as_array().map(Vec::len)).unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+impl Catalog {
+    fn from_document(document: &db::Document) -> Result<Self> {
+        const DAMAGED: &str = "Could not read the native conversation catalog";
+        let mut head: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&document.body).context(DAMAGED)?;
+        for (field, kind) in [("projects", "project"), ("sessions", "session")] {
+            let records = document.records.iter().filter(|(of, ..)| of == kind)
+                .map(|(.., body)| serde_json::from_str(body)).collect::<serde_json::Result<Vec<serde_json::Value>>>().context(DAMAGED)?;
+            head.insert(field.into(), records.into());
+        }
+        serde_json::from_value(head.into()).context(DAMAGED)
+    }
+
+    /// Projects and chats as records, and the rest as one small document.
+    fn to_document(&self) -> Result<db::Document> {
+        let mut head = serde_json::to_value(self)?;
+        let fields = head.as_object_mut().context("Invalid catalog")?;
+        fields.remove("projects");
+        fields.remove("sessions");
+        let mut records = Vec::new();
+        for project in &self.projects {
+            records.push(("project".to_owned(), project.id.clone(), serde_json::to_string(project)?));
+        }
+        for session in &self.sessions {
+            records.push(("session".to_owned(), session.id.clone(), serde_json::to_string(session)?));
+        }
+        Ok(db::Document { body: head.to_string(), records })
     }
 }
 

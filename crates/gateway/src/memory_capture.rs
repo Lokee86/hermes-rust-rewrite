@@ -192,11 +192,14 @@ pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<Committe
     {
         return Ok(None);
     }
-    let path = summary.directory.join("conversation.json");
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+    CommittedRecord::read(&summary.directory)
+}
+
+impl CommittedRecord {
+    pub(super) fn read(directory: &Path) -> Result<Option<Self>> {
+        hermes_engine::saved_conversation(directory)?.map(|(history, authority)| {
+            Ok(Self { history, authority: authority.map(serde_json::from_value).transpose()? })
+        }).transpose()
     }
 }
 

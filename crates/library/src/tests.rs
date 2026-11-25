@@ -108,7 +108,7 @@ fn title_comes_from_first_prompt_and_user_rename_is_retained() {
         entries: vec![],
         status: Status::Complete,
     });
-    atomic_json(&session.directory.join("conversation.json"), &history).unwrap();
+    save_history(&session.directory, &history);
     assert_eq!(
         library.touch_session(&session.id).unwrap().title,
         "Help with release notes"
@@ -467,17 +467,73 @@ fn symlink_session_directories_are_rejected() {
     let temporary = tempfile::tempdir().unwrap();
     let library = Library::open(temporary.path().join("native")).unwrap();
     let session = library.create_session(None, None).unwrap();
-    fs::remove_file(session.directory.join("conversation.json")).unwrap();
     fs::remove_dir(&session.directory).unwrap();
     std::os::unix::fs::symlink(temporary.path(), &session.directory).unwrap();
     assert!(library.session_dir(&session.id).is_err());
     assert!(library.select_session(&session.id).is_err());
 }
 
+pub(crate) fn save_history(directory: &Path, history: &History) {
+    hermes_engine::restore_conversation(directory, serde_json::to_value(history).unwrap()).unwrap();
+}
+
+/// Turn a profile back into what an earlier version left: its catalog in a file.
+pub(crate) fn catalog_as_file(root: &Path) -> serde_json::Value {
+    let mut db = db::open(root).unwrap();
+    let catalog = Catalog::from_document(&db::read_document(&mut db, CATALOG).unwrap().unwrap()).unwrap();
+    db.execute("DELETE FROM documents", []).unwrap();
+    serde_json::to_value(catalog).unwrap()
+}
+
+#[test]
+fn a_catalog_file_moves_into_the_database_once() {
+    let temporary = tempfile::tempdir().unwrap();
+    let library = Library::open(temporary.path()).unwrap();
+    let first = library.create_session(None, Some("First")).unwrap();
+    let second = library.create_session(None, Some("Second")).unwrap();
+    library.set_pinned(&first.id, true).unwrap();
+    library.set_archived(&second.id, true).unwrap();
+    let file = temporary.path().join("library.json");
+    let catalog = catalog_as_file(temporary.path());
+    atomic_json(&file, &catalog).unwrap();
+    let saved = fs::read(&file).unwrap();
+    assert_eq!(session_count(temporary.path()), 2);
+    let moved = Library::open(temporary.path()).unwrap();
+    assert!(!file.exists());
+    assert_eq!(fs::read(temporary.path().join("library.json.before-sqlite")).unwrap(), saved);
+    assert!(moved.session(&first.id).unwrap().pinned && moved.session(&second.id).unwrap().archived);
+    assert_eq!(serde_json::to_value(moved.with_catalog(false, |catalog| Ok(serde_json::to_value(&*catalog)?)).unwrap()).unwrap(), catalog);
+    assert_eq!(session_count(temporary.path()), 2);
+    // A file an older version left behind does not bring back what has changed since.
+    fs::write(&file, &saved).unwrap();
+    let revision = moved.catalog_revision();
+    moved.rename_session(&first.id, "Renamed").unwrap();
+    assert_ne!(moved.catalog_revision(), revision);
+    assert_eq!(Library::open(temporary.path()).unwrap().session(&first.id).unwrap().title, "Renamed");
+}
+
+#[test]
+fn deleting_a_chat_removes_it_from_the_database() {
+    let temporary = tempfile::tempdir().unwrap();
+    let library = Library::open(temporary.path()).unwrap();
+    let kept = library.create_session(None, Some("Kept")).unwrap();
+    let gone = library.create_session(None, Some("Gone")).unwrap();
+    send_turn(&library, &kept, "kept text");
+    send_turn(&library, &gone, "text that must not stay");
+    library.set_archived(&gone.id, true).unwrap();
+    library.delete_archived(&gone.id).unwrap();
+    assert!(!hermes_engine::has_conversation(&gone.directory).unwrap() && !gone.directory.exists());
+    assert_eq!(hermes_engine::read_history(&kept.directory).unwrap().turns.len(), 1);
+    for entry in fs::read_dir(temporary.path()).unwrap().flatten().filter(|entry| entry.path().is_file()) {
+        let bytes = fs::read(entry.path()).unwrap();
+        assert!(!bytes.windows(23).any(|window| window == b"text that must not stay"), "{:?}", entry.path());
+    }
+}
+
 fn send_turn(library: &Library, session: &SessionSummary, prompt: &str) {
     let mut history = History::default();
     history.turns.push(Turn { context: String::new(), attachments: vec![], prompt: prompt.to_owned(), model: "test".to_owned(), entries: vec![], status: Status::Complete });
-    atomic_json(&session.directory.join("conversation.json"), &history).unwrap();
+    save_history(&session.directory, &history);
     library.touch_session(&session.id).unwrap();
 }
 
@@ -520,7 +576,7 @@ fn existing_catalog_backfills_activity_once() {
     let library = Library::open(temporary.path()).unwrap();
     let used = library.create_session(None, None).unwrap();
     send_turn(&library, &used, "used");
-    let mut catalog: serde_json::Value = serde_json::from_slice(&fs::read(temporary.path().join("library.json")).unwrap()).unwrap();
+    let mut catalog: serde_json::Value = catalog_as_file(temporary.path());
     catalog.as_object_mut().unwrap().remove("activity_migrated");
     for session in catalog["sessions"].as_array_mut().unwrap() { session.as_object_mut().unwrap().remove("last_active"); }
     // An old build also left an empty "New chat" behind.

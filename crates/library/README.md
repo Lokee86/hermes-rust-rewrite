@@ -32,16 +32,29 @@ The default root is `hermes_engine::Session::default_dir()` and can be overridde
 with `HERMES_RUST_DATA_DIR`. Tests pass private temporary directories explicitly.
 
 ```
-library.json                   # versioned catalog, projects and selection
+mercury.db                     # chats, gateway turn records, catalog, routines and runs (SQLite)
 library.lock                   # brief cross-process catalog lock
 sessions/<native-id>/
-  conversation.json            # engine transcript, atomically saved
   session.lock                 # engine's exclusive conversation lock
+  attachments/                 # files sent with the chat
+  gateway.json, draft.txt, …   # settings and unsent text for the chat
   hermes-source.json           # imported upstream rows, when applicable
 ```
 
-The catalog uses same-directory atomic replacement plus file and directory
-syncing. Projects are existing canonical folders; imported upstream `cwd` is
+`mercury.db` is Mercury's own file ([`hermes_engine::db`](../engine/src/db.rs)). It is not a Hermes
+profile's `state.db`, which Mercury only reads to import. Each turn and each gateway receipt is a
+row, so a reply writes its own rows rather than the whole chat, and a chat's transcript and gateway
+state are saved in one transaction. The database uses WAL, full syncing, and overwrites what is
+deleted. It is readable only by the user's account.
+
+Earlier versions kept a `conversation.json` per chat, `library.json` and `cron/jobs.json`. A chat
+moves when its owner next opens it, the catalog when the library opens, and routines at their next
+change. Each is written, read back where it is a chat, and only then is its file renamed to
+`*.before-sqlite`. Those files are kept: Hermes does not read them again, and a chat's goes when the
+chat is deleted. Until a chat moves, readers use its file. A version from before the database does
+not see chats that have moved.
+
+Projects are existing canonical folders; imported upstream `cwd` is
 provenance and never automatically grants execution access. A selected native
 conversation supplies its own workspace, so desktop and gateway share history
 without depending on process cwd. The catalog lock is never kept for a model

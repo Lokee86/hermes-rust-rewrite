@@ -2,6 +2,7 @@ mod attachment;
 pub use attachment::Attachment;
 pub mod herdr;
 mod history;
+pub mod db;
 mod mcp;
 mod plugin_inference;
 mod plugin_worker;
@@ -38,7 +39,7 @@ pub mod starmap;
 pub mod subagents;
 pub mod petgen;
 
-pub use history::{Entry, History, Status, ToolCall, Turn, read_conversation, read_history};
+pub use history::{Entry, History, Status, ToolCall, Turn, read_conversation, read_history, conversation_json, create_conversation, delete_conversation, has_conversation, restore_conversation, saved_conversation};
 pub use provider::{Config, DEFAULT_MODEL, OPENROUTER, OPENAI, ANTHROPIC};
 pub use history::Store as ConversationWriter;
 use history::Store;
