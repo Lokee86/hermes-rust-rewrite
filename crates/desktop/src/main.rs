@@ -43,6 +43,7 @@ mod date_groups;
 mod bots;
 mod shell_art;
 mod connections;
+mod credential_files;
 mod onboarding;
 mod slash;
 mod platforms;
@@ -1554,6 +1555,7 @@ impl Hermes {
             Message::Connection(action) => {
                 let switch = matches!(&action, connections::Action::Save | connections::Action::UseSaved(_)
                     | connections::Action::GatewaySignedIn(_, Ok(())) | connections::Action::GatewaySignOut
+                    | connections::Action::ResetUnreadableGatewaySignIns
                     | connections::Action::SshConnected(_, Ok(_)) | connections::Action::DisconnectSsh);
                 let connection = connections::update(self, action);
                 if switch { self.refresh_gateway_route(); }

@@ -23,13 +23,13 @@ const ASK: Duration = Duration::from_secs(30);
 type Key = [u8; 32];
 
 fn own_directory(dir: &Path) -> bool {
-    if cfg!(test) {
-        return dir.join(".sealed-in-tests").exists();
+    #[cfg(test)]
+    if dir.join(".sealed-in-tests").exists() {
+        return true;
     }
-    if std::env::var_os("HERMES_RUST_DATA_DIR").is_some() {
-        return false;
-    }
-    let Ok(base) = crate::Session::default_dir() else { return false };
+    // The gateway and named profile windows set HERMES_RUST_DATA_DIR to select
+    // a profile. Credential eligibility depends on where that profile lives.
+    let Ok(base) = crate::history::Store::application_dir() else { return false };
     let resolve = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
     resolve(dir).starts_with(resolve(&base))
 }
@@ -71,7 +71,7 @@ fn entry(service: &str, account: &str) -> Result<keyring::Entry> {
 }
 
 fn load_or_create() -> Result<Key> {
-    let base = crate::Session::default_dir()?;
+    let base = crate::history::Store::application_dir()?;
     std::fs::create_dir_all(&base)?;
     // The desktop app and its gateway may both be the first to need the key.
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(base.join("storage-key.lock"))?;
@@ -87,6 +87,14 @@ fn load_or_create() -> Result<Key> {
             Ok(key)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// Ask for the storage key now if `dir` uses it. The system may wait for the user, and nobody else
+/// should have to wait for a lock held meanwhile.
+pub fn prepare(dir: &Path) {
+    if own_directory(dir) {
+        key();
     }
 }
 
@@ -157,6 +165,35 @@ mod tests {
     fn other_directories_do_not_use_the_credential_store() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(seal(dir.path(), "value").unwrap(), "value");
+    }
+
+    #[test]
+    fn data_directory_override_does_not_disable_application_encryption() {
+        const CHILD: &str = "HERMES_CREDENTIAL_POLICY_TEST_CHILD";
+        let app_dir = crate::history::Store::application_dir().unwrap();
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(crate::Session::default_dir().unwrap(), app_dir);
+            let sealed = seal(&app_dir, "test credential").unwrap();
+            assert!(is_sealed(&sealed));
+            assert_eq!(unseal(&sealed).unwrap(), "test credential");
+            return;
+        }
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "secret::tests::data_directory_override_does_not_disable_application_encryption",
+            ])
+            .env("HERMES_RUST_DATA_DIR", &app_dir)
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
     }
 
     /// Uses the real credential store: `cargo test -- --ignored the_system_store`

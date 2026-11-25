@@ -3,7 +3,7 @@
 //! SSH host details with ~/.ssh/config aliases, saved connections, tests and
 //! diagnostics. Tests are real: the remote test calls the gateway's
 //! `/api/status`, the SSH test runs `ssh` and asks the remote `hermes --version`.
-use super::{Hermes, Message, settings, ui};
+use super::{Hermes, Message, credential_files, gateway_oauth::{self, Status}, settings, ui};
 use crate::appearance::text;
 use iced::{Alignment, Color, Element, Fill, Length, Task, widget::{Space, button, column, container, pick_list, row, text_input}};
 use hermes_engine::secret;
@@ -30,7 +30,7 @@ pub(super) struct Config { pub mode: Mode, pub url: String, pub ssh: Ssh, pub sa
 pub(super) enum Action {
     Mode(Mode), Url(String), Token(String), Host(String), User(String), Port(String), Key(String), HermesPath(String),
     Save, TestRemote, TestSsh, ConnectSsh, SshConnected(u64, Result<super::ssh_tunnel::Tunnel, String>), DisconnectSsh, Tested(u64, Result<String, String>), SaveAs(String), SaveNamed, UseSaved(usize), RemoveSaved(usize), OpenLogs,
-    GatewaySignIn(String), GatewaySignedIn(String, Result<(), String>), GatewaySignOut,
+    GatewaySignIn(String), GatewaySignedIn(String, Result<(), String>), GatewaySignOut, AskResetGatewaySignIns(bool), ResetUnreadableGatewaySignIns,
     CloudDiscover(Option<String>), CloudLoaded(u64, Result<hermes_engine::portal::CloudDiscovery, String>), CloudConnect(String),
 }
 
@@ -40,7 +40,7 @@ pub(super) struct State {
     testing: bool, revision: u64, result: Option<Result<String, String>>, aliases: Vec<String>,
     /// The live SSH tunnel; chats run through it while it is up.
     pub tunnel: Option<super::ssh_tunnel::Tunnel>, connecting: bool,
-    signing_in: bool,
+    signing_in: bool, confirm_reset: bool,
     cloud: Option<Result<hermes_engine::portal::CloudDiscovery, String>>, cloud_loading: bool, cloud_org: Option<String>,
 }
 
@@ -56,21 +56,44 @@ pub(super) fn saved_token(root: &Path) -> Result<String, String> {
     }
 }
 fn save_token(root: &Path, token: &str) -> Result<(), String> {
+    let path = token_path(root);
+    secret::prepare(root);
+    let _lock = credential_files::lock(&path)?;
     let sealed = secret::seal(root, token).map_err(|e| format!("{e:#}"))?;
-    let temp = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
-    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?; }
-    std::io::Write::write_all(&mut temp.as_file(), sealed.as_bytes()).map_err(|e| e.to_string())?;
-    temp.persist(token_path(root)).map(|_| ()).map_err(|e| e.to_string())
+    credential_files::replace(&path, sealed.as_bytes())
+}
+
+fn delete_token(root: &Path) -> Result<(), String> {
+    let path = token_path(root);
+    let _lock = credential_files::lock(&path)?;
+    credential_files::remove(&path)
+}
+
+fn migrate_token(root: &Path) -> Result<(), String> {
+    let path = token_path(root);
+    if std::fs::read_to_string(&path).is_ok_and(|token| !token.trim().is_empty() && !secret::is_sealed(token.trim())) {
+        secret::prepare(root);
+    }
+    let _lock = credential_files::lock(&path)?;
+    let token = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let token = token.trim();
+    if !token.is_empty() && !secret::is_sealed(token) {
+        let sealed = secret::seal(root, token).map_err(|e| format!("{e:#}"))?;
+        if secret::is_sealed(&sealed) {
+            credential_files::replace(&path, sealed.as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 impl State {
     pub fn load(root: &Path) -> Self {
         // Protect a token saved by a version that stored it as text.
-        if let Ok(text) = std::fs::read_to_string(token_path(root)) && !text.trim().is_empty() && !secret::is_sealed(text.trim())
-            && secret::seal(root, text.trim()).is_ok_and(|sealed| secret::is_sealed(&sealed))
-        {
-            let _ = save_token(root, text.trim());
-        }
+        let _ = migrate_token(root);
         let config = std::fs::read(path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Self { config, has_token: token_path(root).is_file(), aliases: ssh_aliases(), ..Default::default() }
     }
@@ -175,15 +198,18 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             state.result = Some(Ok("Approve the sign-in in your browser…".into()));
             let (root, target) = (root.clone(), url.clone());
             return Task::perform(async move {
-                if !super::gateway_oauth::supports_native(&target).await? { return Err("NO_NATIVE".to_owned()); }
-                super::gateway_oauth::sign_in(root, target).await
+                if !gateway_oauth::supports_native(&target).await? { return Err("NO_NATIVE".to_owned()); }
+                gateway_oauth::sign_in(root, target).await
             }, move |r| Message::Connection(Action::GatewaySignedIn(url.clone(), r)));
         }
         Action::GatewaySignedIn(url, result) => {
             state.signing_in = false; changed = false;
             state.result = Some(match result {
-                Ok(()) => { let _ = std::fs::remove_file(root.join("connection-token")); state.has_token = false;
-                    state.save(&root).map(|_| format!("Signed in. Chats now run on {url}.")) }
+                Ok(()) => delete_token(&root).and_then(|()| {
+                    state.token.clear();
+                    state.has_token = false;
+                    state.save(&root).map(|_| format!("Signed in. Chats now run on {url}."))
+                }),
                 Err(e) if e == "NO_NATIVE" => { state.dirty = true; let _ = super::open_url(&url);
                     Err("This gateway has no browser sign-in. Paste the session token from its dashboard, then Save.".into()) }
                 Err(e) => Err(e),
@@ -191,7 +217,14 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         }
         Action::GatewaySignOut => {
             changed = false;
-            state.result = Some(super::gateway_oauth::sign_out(&root, &state.config.url).map(|_| "Signed out of this gateway.".into()));
+            state.result = Some(gateway_oauth::sign_out(&root, &state.config.url).map(|_| "Signed out of this gateway.".into()));
+        }
+        Action::AskResetGatewaySignIns(ask) => { state.confirm_reset = ask; changed = false; }
+        Action::ResetUnreadableGatewaySignIns => {
+            changed = false;
+            state.confirm_reset = false;
+            state.result = Some(gateway_oauth::reset_unreadable(&root)
+                .map(|_| "Saved gateway sign-ins were reset. Sign in again with your browser.".into()));
         }
         Action::Url(v) => state.config.url = v,
         Action::Token(v) => state.token = v,
@@ -217,7 +250,14 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         },
         Action::RemoveSaved(i) => { if i < state.config.saved.len() { state.config.saved.remove(i); } changed = false; state.result = Some(state.save(&root).map(|_| "Removed.".into())); }
         Action::TestRemote => {
-            let token = if state.token.trim().is_empty() { std::fs::read_to_string(token_path(&root)).unwrap_or_default() } else { state.token.clone() };
+            let token = if state.token.trim().is_empty() {
+                match saved_token(&root) {
+                    Ok(token) => token,
+                    Err(error) => { state.result = Some(Err(error)); return Task::none(); }
+                }
+            } else {
+                state.token.clone()
+            };
             state.revision += 1; let rev = state.revision; state.testing = true; state.result = None;
             let url = state.config.url.clone();
             return Task::perform(test_remote(url, token), move |r| Message::Connection(Action::Tested(rev, r)));
@@ -297,12 +337,26 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
                         .on_input(|v| Message::Connection(Action::Token(v))).into(), dark),
             ], dark));
             let url = state.config.url.trim().to_owned();
-            let signed = app.library.as_ref().is_some_and(|l| super::gateway_oauth::signed_in(l.root(), &url));
+            let status = app.library.as_ref().map(|l| gateway_oauth::status(l.root(), &url)).unwrap_or_default();
+            let signed = status == Status::SignedIn;
             let mut oauth = row![text(if signed { "Signed in with the gateway's browser sign-in." } else { "Hosted gateways sign in with your browser; self-hosted ones may use a session token." }).size(12).color(p.muted).width(Fill)].spacing(8).align_y(Alignment::Center);
             if signed { oauth = oauth.push(button(text("Sign out").size(12)).padding([5, 10]).style(ui::quiet_button).on_press(Message::Connection(Action::GatewaySignOut))); }
             oauth = oauth.push(button(text(if state.signing_in { "Waiting for browser…" } else if signed { "Sign in again" } else { "Sign in with browser" }).size(12)).padding([5, 12])
-                .on_press_maybe((!state.signing_in && !url.is_empty()).then(|| Message::Connection(Action::GatewaySignIn(url.clone())))));
+                .on_press_maybe((!state.signing_in && !url.is_empty() && status != Status::ResetAvailable)
+                    .then(|| Message::Connection(Action::GatewaySignIn(url.clone())))));
             body = body.push(Space::new().height(6)).push(oauth);
+            if status == Status::ResetAvailable {
+                let ask = |label, action| button(text(label).size(12)).padding([5, 10]).style(ui::quiet_button)
+                    .on_press_maybe((!state.signing_in).then_some(Message::Connection(action)));
+                let (about, controls) = if state.confirm_reset {
+                    ("This deletes the sign-ins of every gateway in this profile and cannot be undone. Reset them?",
+                        row![ask("Cancel", Action::AskResetGatewaySignIns(false)), ask("Reset all gateway sign-ins", Action::ResetUnreadableGatewaySignIns)].spacing(8))
+                } else {
+                    ("Hermes could not open them. If your system's keychain is locked or Hermes was refused access, unlock it and restart Hermes. Reset them only if the key is lost.",
+                        row![ask("Reset…", Action::AskResetGatewaySignIns(true))])
+                };
+                body = body.push(settings::card(vec![settings::card_row("Saved browser sign-ins are unreadable", about, controls.into(), dark)], dark));
+            }
         }
         Mode::Cloud => {
             let signed_in = app.portal_connected;
@@ -391,6 +445,32 @@ mod tests {
         assert!(reopened.has_token);
         assert!(!std::fs::read_to_string(dir.path().join("connection.json")).unwrap().contains("secret"), "the token is not in the config file");
     }
+    #[test]
+    fn startup_waits_for_a_concurrent_session_token_delete() {
+        use std::{sync::mpsc, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = token_path(dir.path());
+        std::fs::write(&path, "legacy-token").unwrap();
+        let guard = credential_files::lock(&path).unwrap();
+
+        let (started, starting) = mpsc::channel();
+        let (finished, loaded) = mpsc::channel();
+        let root = dir.path().to_owned();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let _ = finished.send(State::load(&root).has_token);
+        });
+        starting.recv().unwrap();
+        assert_eq!(loaded.recv_timeout(Duration::from_millis(75)), Err(mpsc::RecvTimeoutError::Timeout));
+        credential_files::remove(&path).unwrap();
+        drop(guard);
+
+        assert!(!loaded.recv_timeout(Duration::from_secs(2)).unwrap());
+        thread.join().unwrap();
+        assert!(!path.exists());
+    }
+
     #[test]
     fn ssh_rejects_option_injection() {
         assert!(test_ssh(Ssh { host: "-oProxyCommand=x".into(), ..Default::default() }).is_err());

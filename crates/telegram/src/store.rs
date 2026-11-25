@@ -100,15 +100,27 @@ impl Store {
             return Ok(None);
         }
         let _lock = self.lock("settings.lock")?;
-        let settings = self.read_settings()?;
-        if settings.version != 1 {
-            return Err("Unsupported native Telegram settings version".into());
+        let mut saved = self.read_saved()?;
+        let settings = Self::decode_settings(saved.clone())?;
+        // Older versions could leave the token in plaintext.
+        if let Some(token) = saved["token"].as_str().filter(|token| !secret::is_sealed(token))
+            && let Ok(sealed) = secret::seal(&self.root, token)
+            && secret::is_sealed(&sealed)
+        {
+            saved["token"] = sealed.into();
+            let _ = atomic_json(&path, &saved);
         }
         Ok(Some(settings))
     }
     pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
-        self.write_settings(settings)
+        let mut saved = serde_json::to_value(settings).map_err(|error| error.to_string())?;
+        if let Some(token) = saved["token"].as_str() {
+            saved["token"] = secret::seal(&self.root, token)
+                .map_err(|error| format!("{error:#}"))?
+                .into();
+        }
+        atomic_json(&self.root.join("settings.json"), &saved)
     }
     fn read_saved(&self) -> Result<Value, String> {
         let saved: Value = private_json(&self.root.join("settings.json"), 1024 * 1024)?;
@@ -117,27 +129,18 @@ impl Store {
         }
         Ok(saved)
     }
-    /// The token is encrypted on disk where the system has a credential store.
-    fn read_settings(&self) -> Result<Settings, String> {
-        let mut saved = self.read_saved()?;
-        let token = saved["token"].as_str().map(str::to_owned);
-        if let Some(token) = &token {
-            saved["token"] = secret::unseal(token).map_err(|error| format!("{error:#}"))?.into();
+    fn decode_settings(mut saved: Value) -> Result<Settings, String> {
+        if let Some(token) = saved["token"].as_str() {
+            saved["token"] = secret::unseal(token)
+                .map_err(|error| format!("{error:#}"))?
+                .into();
         }
         let settings: Settings = serde_json::from_value(saved)
             .map_err(|_| "Could not read native Telegram storage".to_owned())?;
-        // Protect a token saved by a version that stored it as text.
-        if token.is_some_and(|token| !secret::is_sealed(&token)) {
-            let _ = self.write_settings(&settings);
+        if settings.version != 1 {
+            return Err("Unsupported native Telegram settings version".into());
         }
         Ok(settings)
-    }
-    fn write_settings(&self, settings: &Settings) -> Result<(), String> {
-        let mut saved = serde_json::to_value(settings).map_err(|error| error.to_string())?;
-        if let Some(token) = saved["token"].as_str() {
-            saved["token"] = secret::seal(&self.root, token).map_err(|error| format!("{error:#}"))?.into();
-        }
-        atomic_json(&self.root.join("settings.json"), &saved)
     }
     pub fn clear_token(&self) -> Result<Option<Settings>, String> {
         let _lock = self.lock("settings.lock")?;
@@ -165,7 +168,8 @@ impl Store {
     }
     pub fn remember_bot(&self, identity: &Identity, token: &Token) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
-        let mut settings = self.read_settings()?;
+        let mut saved = self.read_saved()?;
+        let settings = Self::decode_settings(saved.clone())?;
         if settings.token.as_ref() != Some(token) {
             return Err(
                 "Telegram setup changed. Reopen Messaging and enable the saved setup.".into(),
@@ -180,14 +184,14 @@ impl Store {
                 "Telegram bot identity changed; review the saved setup before reconnecting".into(),
             );
         }
-        settings.bot = Some(identity.clone());
-        settings.enabled = true;
-        self.write_settings(&settings)
+        // A connection change must keep the on-disk token as saved.
+        saved["bot"] = serde_json::to_value(identity).map_err(|error| error.to_string())?;
+        saved["enabled"] = Value::Bool(true);
+        atomic_json(&self.root.join("settings.json"), &saved)
     }
     fn connection_settings(&self, bot: &Identity, token: &Token) -> Result<Settings, String> {
-        let settings = self.read_settings()?;
-        if settings.version != 1
-            || settings.token.as_ref() != Some(token)
+        let settings = Self::decode_settings(self.read_saved()?)?;
+        if settings.token.as_ref() != Some(token)
             || !settings.enabled
             || settings.bot.as_ref().map(|identity| identity.id) != Some(bot.id)
         {
@@ -381,4 +385,76 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .and_then(|dir| dir.sync_all())
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "uses the real system credential store with a temporary profile"]
+    fn managed_gateway_preserves_saved_ciphertext() {
+        const CHILD: &str = "HERMES_TELEGRAM_CREDENTIAL_TEST_CHILD";
+        let data_dir = hermes_engine::Session::default_dir().unwrap();
+        let token = Token::parse("123456:abcdefghijklmnopqrstuvwxyz1234567890").unwrap();
+
+        if std::env::var_os(CHILD).is_some() {
+            let store = Store::new(&data_dir);
+            assert_eq!(store.load_settings().unwrap().unwrap().token.as_ref(), Some(&token));
+            let bot = Identity {
+                id: 123456,
+                username: "synthetic_bot".into(),
+                name: "Synthetic".into(),
+            };
+            let before = store.read_saved().unwrap();
+            assert!(before["token"].as_str().is_some_and(secret::is_sealed));
+            for _ in 0..2 {
+                store.remember_bot(&bot, &token).unwrap();
+                let saved = store.read_saved().unwrap();
+                assert_eq!(saved["token"], before["token"]);
+                assert_eq!(saved["allowed"], before["allowed"]);
+                assert_eq!(saved["enabled"], true);
+                assert_eq!(saved["bot"]["id"], bot.id);
+            }
+            return;
+        }
+
+        fs::create_dir_all(&data_dir).unwrap();
+        let profile = tempfile::tempdir_in(data_dir).unwrap();
+        let store = Store::new(profile.path());
+        let settings = Settings {
+            version: 1,
+            token: Some(token),
+            allowed: BTreeSet::from([42]),
+            bot: None,
+            enabled: false,
+        };
+        let run_gateway = || {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "store::tests::managed_gateway_preserves_saved_ciphertext"])
+                .env("HERMES_RUST_DATA_DIR", profile.path())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr),
+            );
+        };
+
+        store.save_settings(&settings).unwrap();
+        let before = store.read_saved().unwrap();
+        assert!(before["token"].as_str().is_some_and(secret::is_sealed));
+        run_gateway();
+        assert_eq!(store.read_saved().unwrap()["token"], before["token"]);
+
+        // Simulate a token left in plaintext by an older gateway.
+        atomic_json(&store.root.join("settings.json"), &settings).unwrap();
+        run_gateway();
+        let migrated = store.read_saved().unwrap();
+        assert!(migrated["token"].as_str().is_some_and(secret::is_sealed));
+        assert_eq!(migrated["enabled"], true);
+    }
 }

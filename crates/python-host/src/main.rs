@@ -137,10 +137,17 @@ fn dispatch(host: &Py<PyAny>, method: &str, request: &Value) -> Result<Value, St
     }).map_err(|error: PyErr| error.to_string())
 }
 
-fn call_tool(host: &Py<PyAny>, request: &Value) -> Result<Value, String> {
+fn call_tool(host: &Py<PyAny>, request: &Value, tool: &wire::ToolCall) -> Result<Value, String> {
     let params = request.get("params").map(Value::to_string).unwrap_or_else(|| "{}".into());
     Python::attach(|py| {
-        let encoded: String = host.call_method1(py, "call_tool_json", (request["id"].to_string(), params))?.extract(py)?;
+        let running = host.call_method0(py, "prepare_tool")?;
+        let cancel = running.clone_ref(py);
+        if tool.set_cancel_handler(Box::new(move || {
+            let _ = Python::attach(|py| cancel.call_method0(py, "cancel").map(|_| ()));
+        })) {
+            running.call_method0(py, "cancel")?;
+        }
+        let encoded: String = host.call_method1(py, "call_tool_json", (params, running))?.extract(py)?;
         serde_json::from_str::<Value>(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
     }).map_err(|error: PyErr| error.to_string())
 }
@@ -182,19 +189,19 @@ fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
         }
     };
     let host = Arc::new(host);
-    let canceller = host.clone();
-    std::thread::spawn(move || for id in cancelled {
-        let _ = Python::attach(|py| canceller.call_method1(py, "cancel_tool", (id.to_string(),)).map(|_| ()));
+    std::thread::spawn(move || for cancel in cancelled {
+        cancel();
     });
-    for request in incoming {
-        let Some(id) = request.get("id") else { continue };
+    for wire::Request { message: request, tool } in incoming {
+        let id = &request["id"];
         let method = request["method"].as_str().unwrap_or_default();
         // Tools run beside each other, as in the Python agent, so a slow one in one chat does not
         // hold up the rest. Hooks, commands and memory calls keep their order.
-        if method == "tools/call" {
-            let (host, wire, request) = (host.clone(), wire.clone(), request.clone());
+        if let Some(tool) = tool {
+            let (host, wire) = (host.clone(), wire.clone());
             std::thread::spawn(move || {
-                let result = call_tool(&host, &request);
+                let result = call_tool(&host, &request, &tool);
+                drop(tool);
                 let _ = wire.reply(&request["id"], result);
             });
             continue;
