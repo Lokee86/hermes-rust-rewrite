@@ -707,7 +707,7 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
 mod mac {
     use super::{Preferences, Signal, Voice};
     use block2::RcBlock;
-    use foundation3::{NSBundle, NSError, NSLocale, NSString};
+    use objc2_foundation::{NSBundle, NSError, NSLocale, NSString};
     use objc2_avf_audio::{
         AVAudioApplication, AVAudioEngine, AVAudioInputNode, AVAudioPCMBuffer, AVAudioTime,
         AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
@@ -716,7 +716,7 @@ mod mac {
         SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognitionTask,
         SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
     };
-    use objc2modern::{
+    use objc2::{
         AnyThread,
         rc::Retained,
         runtime::{AnyClass, Bool},

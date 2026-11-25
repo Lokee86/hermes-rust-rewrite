@@ -35,7 +35,7 @@ mod mac {
             let Some(content) = content.as_ref() else { return };
             let superview: *mut AnyObject = msg_send![content, superview];
             let Some(superview) = superview.as_ref() else { return };
-            let Some(class) = AnyClass::get("NSVisualEffectView") else { return };
+            let Some(class) = AnyClass::get(c"NSVisualEffectView") else { return };
             let subviews: *mut AnyObject = msg_send![superview, subviews];
             let count: usize = msg_send![subviews, count];
             for i in 0..count {
@@ -70,7 +70,7 @@ mod mac {
             let key: bool = msg_send![window, isKeyWindow];
             if key { return Some(true) }
             let frame: Rect = msg_send![window, frame];
-            let event = AnyClass::get("NSEvent")?;
+            let event = AnyClass::get(c"NSEvent")?;
             let at: Point = msg_send![event, mouseLocation];
             Some(at.x >= frame.origin.x && at.x <= frame.origin.x + frame.size.w && at.y >= frame.origin.y && at.y <= frame.origin.y + frame.size.h)
         }
@@ -154,15 +154,15 @@ pub(super) fn synthesize(window: &dyn window::Window, x: f64, y: f64, text: &str
         unsafe impl objc2::Encode for R { const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGRect", &[P::ENCODING, S::ENCODING]); }
         let frame: R = msg_send![content, frame];
         let at = P { x, y: frame.s.h - y };
-        let event = AnyClass::get("NSEvent").unwrap();
-        let app_class = AnyClass::get("NSApplication").unwrap();
+        let event = AnyClass::get(c"NSEvent").unwrap();
+        let app_class = AnyClass::get(c"NSApplication").unwrap();
         let app: *mut AnyObject = msg_send![app_class, sharedApplication];
         let null: *mut AnyObject = std::ptr::null_mut();
         for kind in [1usize, 2usize] { // leftMouseDown, leftMouseUp
             let e: *mut AnyObject = msg_send![event, mouseEventWithType: kind, location: at, modifierFlags: 0usize, timestamp: 0.0f64, windowNumber: number, context: null, eventNumber: 0isize, clickCount: 1isize, pressure: 1.0f32];
             let _: () = msg_send![app, postEvent: e, atStart: false];
         }
-        let ns_string = AnyClass::get("NSString").unwrap();
+        let ns_string = AnyClass::get(c"NSString").unwrap();
         for ch in text.chars() {
             let s = std::ffi::CString::new(ch.to_string()).unwrap();
             let chars: *mut AnyObject = msg_send![ns_string, stringWithUTF8String: s.as_ptr()];

@@ -37,7 +37,7 @@ pub(super) fn initial(root:Option<&Path>)->(Size,Position){
 }
 pub(super) fn save(root:&Path)->anyhow::Result<()>{
     let Some(main)=MainThreadMarker::new()else{return Ok(())};
-    let Some(window)=(unsafe{NSApplication::sharedApplication(main).mainWindow()})else{return Ok(())};
+    let Some(window)=NSApplication::sharedApplication(main).mainWindow()else{return Ok(())};
     if window.isZoomed() || window.styleMask().contains(NSWindowStyleMask::FullScreen){return Ok(());}
     let Some(primary)=NSScreen::screens(main).iter().next().map(|s|s.frame())else{return Ok(())};
     let rect=window.frame();

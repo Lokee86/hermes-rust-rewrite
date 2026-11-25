@@ -149,8 +149,8 @@ async fn deliver(_:&str,_:bool)->Result<(),String>{Err("Native alerts are unavai
 #[cfg(target_os="macos")]
 async fn deliver(body:&str,mute:bool)->Result<(),String>{
     use block2::RcBlock;
-    use foundation3::{NSBundle,NSError,NSString};
-    use objc2modern::runtime::Bool;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSBundle,NSError,NSString};
     use objc2_user_notifications::{UNAuthorizationOptions as Options,UNMutableNotificationContent,UNNotificationRequest,UNNotificationSound,UNUserNotificationCenter};
     // Objective-C objects and blocks are created and registered in synchronous
     // scopes. Only the owned Rust channels cross suspension points.
