@@ -33,7 +33,7 @@ This table counts the 263 names under `methods`.
 | `cron` | 1 | 1 | Verify the actions and replies behind `cron.manage`. |
 | `process`, `file`, and `shell` | 5 | 5 | Verify process control, attachment retrieval, and `shell.exec` through stock clients. |
 
-`rpc.discover` returns the same list on every connection, so a name in it can still be refused. The profile-level methods, `cron.chat`, and `cron.trigger` need a native session. Selected operations also need the private profile client. On a legacy connection the profile-level handler answers `4001` (`unsupported_control`) before it looks at the name. An unknown method therefore also gets `4001` there, while the gateway README and stock clients expect `-32601`. Check discovery and both connection modes for each method. [Profile-level handlers](crates/gateway/src/methods.rs) · [Documented errors](crates/gateway/README.md)
+`rpc.discover` returns the same list on every connection, so a name in it can still be refused. The profile-level methods, `cron.chat`, and `cron.trigger` need a native session. Selected operations also need the private profile client. On a legacy connection they answer `4001` (`unsupported_control`). At `1ac307f` an unknown method also got `4001` there. Since `7386ebb` it gets the `-32601` that the gateway README documents and stock clients expect. Check discovery and both connection modes for each method. [Profile-level handlers](crates/gateway/src/methods.rs) · [Documented errors](crates/gateway/README.md)
 
 ## Storage and profile compatibility
 
