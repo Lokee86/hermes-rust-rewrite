@@ -18,6 +18,7 @@ pub(super) fn memory_plugin() -> Option<&'static dyn MemoryPlugin> {
 pub fn delete_profile(library: &Library, name: &str) -> Result<()> {
     let home = library.profile_path_for_deletion(name)?;
     let _profiles = owner::lock_profile_renames(&home)?;
+    let _installation = hermes_engine::plugins::lock_profile_plugin_deletion(&home)?;
     let active_check = owner::try_local_owner_lock(&home)?
         .context("Stop this profile's gateway before deleting the profile")?;
     // Startup takes the parent fence, so the owner file can be closed before
@@ -44,6 +45,7 @@ pub fn rename_profile(library: &Library, from: &str, to: &str) -> Result<Option<
     ensure!(from != "default", "The default profile can't be renamed");
     let home = library.profile_path(from)?;
     let _renames = owner::lock_profile_renames(&home)?;
+    let _installation = hermes_engine::plugins::lock_profile_plugin_deletion(&home)?;
     let active_check = owner::try_local_owner_lock(&home)?
         .context("Stop this profile's gateway before renaming the profile")?;
     drop(active_check);

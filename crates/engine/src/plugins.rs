@@ -85,7 +85,7 @@ pub fn lock_profile_plugin_deletion(home: &Path) -> Result<Option<fs::File>> {
         return Ok(None);
     };
     let lock = open_profile_install_fence(&home, parent)?;
-    lock.try_lock().context("Wait for the profile's plugin installation before deleting it")?;
+    lock.try_lock().context("A plugin installation is in progress for this profile")?;
     Ok(Some(lock))
 }
 
