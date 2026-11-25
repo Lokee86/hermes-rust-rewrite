@@ -492,10 +492,29 @@ fn first(schedule: &Schedule, now: DateTime<Utc>, zone: &str) -> Result<Option<D
     }
 }
 fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result<Job> {
+    let (script, monitor) = (draft.script.trim().to_owned(), draft.monitor.trim().to_owned());
     ensure!(
-        !draft.prompt.trim().is_empty() && draft.prompt.len() <= 65536,
+        (draft.no_agent || !draft.prompt.trim().is_empty()) && draft.prompt.len() <= 65536,
         "Prompt is required (maximum 64 KiB)"
     );
+    ensure!(!draft.no_agent || !script.is_empty(), "A script-only job needs a script");
+    ensure!(script.len() <= 1024 && monitor.len() <= 2048, "The script or monitor is too long");
+    let mut extra = previous.map_or_else(BTreeMap::new, |job| job.extra.clone());
+    let web = monitor.starts_with("http://") || monitor.starts_with("https://");
+    for (name, value) in [
+        ("script", script.as_str()),
+        ("monitor_script", if web { "" } else { &monitor }),
+        ("monitor_url", if web { &monitor } else { "" }),
+    ] {
+        match value.is_empty() {
+            true => extra.remove(name),
+            false => extra.insert(name.into(), value.into()),
+        };
+    }
+    match draft.no_agent {
+        true => extra.insert("no_agent".into(), true.into()),
+        false => extra.remove("no_agent"),
+    };
     ensure!(draft.name.len() <= 240, "Name is too long");
     ensure!(
         draft.model.as_ref().is_none_or(|model| model.len() <= 256),
@@ -535,7 +554,8 @@ fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result
         first(&schedule, now, &draft.timezone)?.map(stamp)
     };
     let name = if draft.name.trim().is_empty() {
-        draft.prompt.chars().take(50).collect()
+        let source = if draft.prompt.trim().is_empty() { &script } else { &draft.prompt };
+        source.chars().take(50).collect()
     } else {
         draft.name.trim().into()
     };
@@ -571,7 +591,7 @@ fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result
         last_error: previous.and_then(|job| job.last_error.clone()),
         paused_at: draft.paused.then(|| stamp(now)),
         definition_revision: previous.map_or(1, |job| job.definition_revision + 1),
-        extra: previous.map_or_else(BTreeMap::new, |job| job.extra.clone()),
+        extra,
     };
     if exhausted(&job) {
         job.enabled = false;

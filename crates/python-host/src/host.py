@@ -280,7 +280,7 @@ class PluginHost:
                         except ValueError:
                             results.append(text)
                 except Exception as exc:
-                    if name in _LIFECYCLE_HOOKS:
+                    if name == "pre_tool_call" or name in _LIFECYCLE_HOOKS:
                         raise
                     print(f"{self.plugin_id}: {name} hook failed: {exc}", file=sys.stderr)
         return {"results": results}
@@ -416,5 +416,16 @@ def install(target, requirements):
     # host, and no plugin code should run at install time anyway.
     from pip._internal.cli.main import main
 
-    return main(["install", "--disable-pip-version-check", "--no-input", "--only-binary=:all:",
-                 "--upgrade", "--target", target, *requirements])
+    status = main(["install", "--disable-pip-version-check", "--no-input", "--only-binary=:all:",
+                   "--upgrade", "--target", target, *requirements])
+    if status == 0:
+        import sysconfig
+        from pathlib import Path
+
+        suffix = sysconfig.get_config_var("EXT_SUFFIX")
+        if sys.implementation.name == "cpython" and suffix:
+            marker_path = Path(target) / ".hermes-python-abi"
+            marker_path.unlink(missing_ok=True)
+            with marker_path.open("x", encoding="ascii") as marker:
+                marker.write(suffix)
+    return status

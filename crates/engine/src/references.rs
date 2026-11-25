@@ -122,32 +122,51 @@ fn expand_git(r: &Reference, workspace: &Path) -> Result<String, String> {
     Ok(format!("🧾 git {} ({} tokens)\n```diff\n{text}\n```", args.join(" "), tokens(&text)))
 }
 
+fn private(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.octets()[0] == 0 || ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64,
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// GET a public page. Every hop's host is resolved, refused if any of its addresses is private,
+/// and connected to at the addresses that were checked. Returns the text and whether it is HTML.
+async fn get_public(address: &str) -> Result<(String, bool), String> {
+    let mut url = reqwest::Url::parse(address).map_err(|_| "invalid URL".to_owned())?;
+    for _ in 0..4 {
+        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() { return Err("only plain http(s) links are fetched".into()); }
+        let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']).to_owned();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|_| "could not resolve host".to_owned())?.collect();
+        if addrs.iter().any(|addr| private(addr.ip())) { return Err("refused: that link points at a private network address".into()); }
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none()).no_proxy()
+            .resolve_to_addrs(&host, &addrs).user_agent(concat!("HermesRust/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
+        let mut response = client.get(url.clone()).send().await.map_err(|e| format!("fetch failed: {e}"))?;
+        if response.status().is_redirection() {
+            let next = response.headers().get("location").and_then(|v| v.to_str().ok()).ok_or("redirect without a destination")?;
+            url = url.join(next).map_err(|_| "invalid redirect".to_owned())?;
+            continue;
+        }
+        if !response.status().is_success() { return Err(format!("HTTP {}", response.status())); }
+        let html = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("html"));
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > MAX_URL_BYTES * 4 { break; }
+        }
+        return Ok((String::from_utf8_lossy(&bytes).into_owned(), html));
+    }
+    Err("too many redirects".into())
+}
+
+/// A public page's body, unchanged (cron monitors compare it).
+pub(crate) async fn fetch_public(url: &str) -> Result<String, String> {
+    get_public(url).await.map(|(text, _)| text)
+}
+
 async fn expand_url(r: &Reference) -> Result<String, String> {
-    let url = reqwest::Url::parse(&r.value).map_err(|_| "invalid URL".to_owned())?;
-    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() { return Err("only plain http(s) links are fetched".into()); }
-    let host = url.host_str().unwrap_or_default().to_owned();
-    // No private, loopback or link-local destinations (SSRF).
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|_| "could not resolve host".to_owned())?;
-    for addr in addrs {
-        let private = match addr.ip() {
-            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64,
-            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
-        };
-        if private { return Err("refused: that link points at a private network address".into()); }
-    }
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).redirect(reqwest::redirect::Policy::limited(3))
-        .user_agent(concat!("HermesRust/", env!("CARGO_PKG_VERSION"))).build().map_err(|e| e.to_string())?;
-    let mut response = client.get(url).send().await.map_err(|e| format!("fetch failed: {e}"))?;
-    if !response.status().is_success() { return Err(format!("HTTP {}", response.status())); }
-    let html = response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("html"));
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_URL_BYTES * 4 { break; }
-    }
-    let raw = String::from_utf8_lossy(&bytes);
-    let mut text = if html { html_text(&raw) } else { raw.into_owned() };
+    let (raw, html) = get_public(&r.value).await?;
+    let mut text = if html { html_text(&raw) } else { raw };
     if text.trim().is_empty() { return Err("no content extracted".into()); }
     if text.len() > MAX_URL_BYTES { let mut cut = MAX_URL_BYTES; while !text.is_char_boundary(cut) { cut -= 1; } text.truncate(cut); text.push_str("\n… (truncated)"); }
     Ok(format!("🌐 {} ({} tokens)\n{}", r.raw, tokens(&text), text.trim()))

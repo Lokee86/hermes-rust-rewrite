@@ -441,19 +441,17 @@ impl GatewayClient {
                 let Some(frame) = outbound else {
                     break;
                 };
-                if !matches!(
-                    timeout(
-                        Duration::from_secs(10),
-                        sink.send(Message::Text(frame.to_string().into()))
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
+                let sent = tokio::select! {
+                    _ = stop.cancelled() => false,
+                    result = timeout(Duration::from_secs(10), sink.send(Message::Text(frame.to_string().into()))) => matches!(result, Ok(Ok(()))),
+                };
+                if !sent {
                     break;
                 }
             }
-            let _ = sink.close().await;
+            rx.close();
             inner.disconnect_generation(generation);
+            crate::close_websocket(&mut sink).await;
         });
         Ok(())
     }
@@ -592,13 +590,17 @@ impl Inner {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(ClientError::Cancelled);
         }
-        let tx = lock(&self.connection)
-            .as_ref()
-            .map(|connection| connection.tx.clone())
-            .ok_or(ClientError::NotConnected)?;
-        let id = format!("r{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-        let (reply, result) = oneshot::channel();
-        lock(&self.pending).insert(id.clone(), reply);
+        let (tx, id, result) = {
+            // Disconnect holds this lock through draining pending replies. Keep
+            // registration in the same critical section as selecting its socket.
+            let connection = lock(&self.connection);
+            let tx = connection.as_ref().map(|connection| connection.tx.clone())
+                .ok_or(ClientError::NotConnected)?;
+            let id = format!("r{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+            let (reply, result) = oneshot::channel();
+            lock(&self.pending).insert(id.clone(), reply);
+            (tx, id, result)
+        };
         let _registration = PendingRegistration {
             inner: self,
             id: id.clone(),
@@ -729,6 +731,38 @@ mod tests {
         client.inner.set_state(ConnectionState::Open);
         (client, rx)
     }
+
+    #[test]
+    fn disconnect_cannot_pass_a_request_waiting_to_register_its_reply() {
+        let (client, _outgoing) = synthetic_connection();
+        let pending = lock(&client.inner.pending);
+        let requesting = client.inner.clone();
+        let request = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+                requesting.request("synthetic.racing", json!({}), Duration::from_secs(2), None),
+            )
+        });
+        // Hold reply registration at its real mutex. The request must retain
+        // its selected connection until that registration becomes visible.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut connection_held = false;
+        while Instant::now() < deadline {
+            if client.inner.connection.try_lock().is_err() {
+                connection_held = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let disconnecting = client.inner.clone();
+        let disconnect = std::thread::spawn(move || disconnecting.disconnect());
+        drop(pending);
+        disconnect.join().unwrap();
+        let result = request.join().unwrap();
+        assert!(connection_held, "disconnect must serialize with selecting a socket and registering its reply");
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+        assert!(lock(&client.inner.pending).is_empty());
+    }
+
     #[tokio::test]
     async fn response_handles_send_once_and_have_no_secret_debug_fields() {
         let (client, mut outgoing) = synthetic_connection();

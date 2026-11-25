@@ -8,17 +8,19 @@ This is an independent community project, not an official Nous Research release.
 
 | Platform | Download |
 | --- | --- |
-| macOS (Apple Silicon) | [Hermes-macOS.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/latest/download/Hermes-macOS.zip) |
-| Windows (x64) | [Hermes-windows-AMD64.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/latest/download/Hermes-windows-AMD64.zip) |
-| Linux (x86_64) | [Hermes-linux-x86_64.tar.gz](https://github.com/itsflownium/hermes-rust-rewrite/releases/latest/download/Hermes-linux-x86_64.tar.gz) |
+| macOS (Apple Silicon) | [Hermes-macOS.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-macOS.zip) |
+| Windows (x64) | [Hermes-windows-AMD64.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-windows-AMD64.zip) |
+| Linux (x86_64) | [Hermes-linux-x86_64.tar.gz](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-linux-x86_64.tar.gz) |
 
-Every build comes from [the CI workflow](.github/workflows/build.yml), which runs the test suite on all three platforms first. No build is notarized or signed with a developer certificate. On macOS, the first time you open the app, right-click it and choose **Open**. On Linux, install WebKitGTK 4.1 and GTK 3 from your distribution.
+These links are the v0.1.0 pre-release. Newer builds are on the [releases page](https://github.com/itsflownium/hermes-rust-rewrite/releases); from the next release on there is also a macOS disk image, a Windows installer and a Debian package. **Settings › About** can look for a newer release, download it and check its checksum.
+
+Every build comes from [the CI workflow](.github/workflows/build.yml), which runs the test suite on all three platforms, then starts each packaged app and requires its window. No build is notarized or signed with a developer certificate yet (the workflow signs when it is given certificates). On macOS, the first time you open the app, right-click it and choose **Open**. For the Linux tar archive, install WebKitGTK 4.1, GTK 3, and the X11 keyboard library (`libxkbcommon-x11-0` on Ubuntu). The Debian package declares these dependencies.
 
 Packages built from this revision embed [Reliquary](https://github.com/Lokee86/Reliquary) for native profile memory. Reliquary is MPL-2.0 software. Each package includes its exact source revision, source-archive link and license links in `Reliquary-NOTICE` (under `Notices`, the macOS app's `Contents/Resources/Notices`, or Linux's `share/licenses/hermes`). The corresponding source for the pinned revision is also available directly from [GitHub](https://github.com/Lokee86/Reliquary/tree/91b6ea7081d4b5c2e7bf1eaab1145da345235abd).
 
 To enable Perception for a Reliquary profile, save a provider endpoint under Models with the native decisions URL and model `typesafe/jev-1.13`. Select it under **Persistent memory → Perception decision** and configure the General and Embedding routes. Mercury runs Perception on the profile’s writable General and project RELs. The existing memory query and refine tools search Memories and current Observations together and return exact Observation citations. Archive and Echo reads remain explicit operations.
 
-## Rust vs Electron benchmark
+## Rust vs Electron benchmark (v0.1.0)
 
 The same machine, the same source baseline, and a returning user in both cases (each app's data folder was isolated and already set up).
 
@@ -41,12 +43,12 @@ Measured on an Apple M4 with 16 GB of memory and macOS 27.0.1. Each figure is th
 - **Memory:** the physical footprint reported by `/usr/bin/footprint` (what Activity Monitor calls *Memory*), summed over every process the app started, 15 s after launch.
 - **Idle CPU:** CPU time used by the whole process tree over the next 10 s, divided by 10 s.
 
-The Electron app starts its Python gateway as a detached background process, outside its own process tree. It was measured separately with the same tools ([`electron-gateway-macos.json`](benchmarks/results/electron-gateway-macos.json)) and is counted in the "app + backend" rows. The Rust engine runs inside the app process.
+The Electron app starts its Python gateway as a detached background process, outside its own process tree. It was measured separately with the same tools ([`electron-gateway-macos.json`](benchmarks/results/electron-gateway-macos.json)) and is counted in the "app + backend" rows. In v0.1.0 the Rust engine ran inside the app process.
 
 Caveats:
 
 - One Rust run took 21.5 s to show its window. It is excluded by the median but still listed in the raw results; it looks like the window opened on another macOS Space.
-- These figures predate the built-in Python for plugins. The bundled CPython runtime adds about 17 MB to the macOS download (≈56 MB zipped now). It only runs while a Python plugin is enabled, so memory and CPU at idle are unchanged.
+- **These figures are v0.1.0's and have not been measured again.** Since then the app bundles CPython, Herdr and Reliquary, and each profile's chats run in a gateway process of the same program that stays up after the window closes. Downloads are larger now (about 59 MB on macOS, 70 MB on Windows and Linux), and the process count and memory rows no longer describe the current app.
 - These are macOS numbers only. The Windows and Linux builds are tested in CI and have not been benchmarked.
 
 To reproduce:
@@ -64,6 +66,7 @@ python3 benchmarks/summarize.py
   - `@file`, `@folder`, `@diff` and `@url` references;
   - attachments, a prompt queue, group chats, subagents;
   - chats in their own windows, with the chat list kept in sync across windows.
+- **Long chats:** older messages are summarized when a chat outgrows the model. The saved chat stays whole.
 - **Accounts and models:**
   - Nous Portal, OpenAI Codex, xAI, MiniMax and Qwen device sign-ins;
   - API keys, custom endpoints;
@@ -72,13 +75,13 @@ python3 benchmarks/summarize.py
   - skills and MCP servers (HTTP, stdio, OAuth 2.1);
   - the plugin catalog, with Agent Plugins v1 packages running natively;
   - Python plugins, run in the built-in Python interpreter.
-- **Routines (cron):** templates, a sidebar section with countdowns, and one chat per routine that streams its run live.
+- **Routines (cron):** templates, scripts that collect data or are the whole job, monitors that run only on a change, a sidebar section with countdowns, and one chat per routine that streams its run live.
 - **Pages:** artifacts (with HTML preview in the OS webview), messaging, webhooks, profiles, agents, command center, star map.
 - **Floating windows:**
   - HUD mode with native frosted glass, idle fade and click-through;
   - quick entry (⌘⇧Space);
   - a desktop pet with AI pet generation.
-- **Voice (macOS):** dictation and voice conversation. The wake word uses the "hey hermes" model when the Python agent is installed.
+- **Voice:** dictation and voice conversation, recognized on this computer. macOS uses its own recognizer. Windows and Linux download one (faster-whisper, about 400 MB) the first time. The wake word uses the "hey hermes" model when the Python agent is installed.
 - **Connections:** local and remote gateways (token or OAuth), SSH, Hermes Cloud discovery.
 
 [`FEATURE_PARITY.md`](FEATURE_PARITY.md) lists every screen against the Electron app and says what is verified live, covered by tests, or only built.
@@ -96,24 +99,63 @@ Hermes plugins written in Python (`plugin.yaml` + `__init__.py` with `register(c
   | macOS | `libpython3.13.dylib` | `Hermes.app/Contents/Resources/python` |
   | Linux | `libpython3.13.so.1.0` | `lib/hermes/python` |
 
-- The plugin `ctx` is implemented in Rust: `register_tool` (with `check_fn`, `requires_env` and async handlers), `register_hook` and `get_config`. Other `register_*` calls are skipped with a note on stderr.
+- A plugin registers tools (with `check_fn`, `requires_env` and async handlers), hooks, slash commands and a memory provider, and reads its settings with `get_config`. Other `register_*` calls are skipped and listed under **Capabilities › Plugins**.
+- Its tools run beside each other, so a slow one does not hold up other chats.
+- A desktop page (`desktop/plugin.js`) opens from **Capabilities › Plugins** in a web view without network, files or access to your chats. It gets React and the page part of the plugin SDK; panes docked into the app, themes and composer extensions are not supported.
 - These hooks run around every tool call: `pre_tool_call` (it can block the call), `transform_tool_result` and `post_tool_call`.
 - A plugin's `python_dependencies` are installed as wheels into the plugin's own data folder when you install it. Nothing runs at install time.
 - A plugin that imports Hermes internals (`hermes_cli`, `tools`, ...) falls back to an installed Hermes Python agent, if there is one.
 
 ## Build from source
 
-You need a recent stable Rust (`rustup update stable`) and a Python 3 with its shared library for PyO3 to link against (python.org's macOS installer, or a distribution's `python3-dev`). To use the same pinned runtime as the release builds, set `PYO3_PYTHON` first: `export PYO3_PYTHON=$(scripts/python-runtime.sh)` (on Windows, `$env:PYO3_PYTHON = ./scripts/python-runtime.ps1`). On Linux you also need the development packages listed in the [CI workflow](.github/workflows/build.yml).
+Install a recent stable Rust (`rustup update stable`), Git, and [Zig 0.16.0](https://ziglang.org/download/). Put `zig` on `PATH`, or set `ZIG` to its absolute executable path. The `embedded-herdr` feature builds the pinned Herdr terminal core into Hermes; the Python plugin host is a separate binary that must be built beside the desktop executable.
+
+Platform prerequisites:
+
+- **macOS (Apple Silicon):** install Xcode Command Line Tools with `xcode-select --install`.
+- **Linux (x86_64):** install a C/C++ compiler, `pkg-config`, `curl`, `rsync`, and the development libraries used by the [CI workflow](.github/workflows/build.yml). On Ubuntu 24.04:
+
+  ```bash
+  sudo apt-get update
+  sudo apt-get install -y build-essential pkg-config curl rsync \
+      libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libdbus-1-dev libasound2-dev libfontconfig1-dev \
+      libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
+  ```
+
+- **Windows (x64):** install Visual Studio 2022 Build Tools with **Desktop development with C++** and a Windows SDK, use the `stable-x86_64-pc-windows-msvc` Rust toolchain, and install the Microsoft Edge WebView2 Runtime. Git for Windows must provide `sh.exe` on `PATH` for shell commands. Run the Windows commands below in PowerShell.
+
+From the repository root, use the pinned CPython runtime shipped in releases. On macOS and Linux, import both environment settings one line at a time so paths containing spaces stay intact:
 
 ```bash
-cargo run --locked -p hermes-desktop
+python_settings=$(scripts/python-runtime.sh)
+while IFS= read -r setting; do
+    export "$setting"
+done <<EOF
+$python_settings
+EOF
+cargo build --locked -p hermes-python-host
+cargo run --locked --features embedded-herdr -p hermes-desktop
 ```
+
+On Windows, add the Python DLL directory to this shell's `PATH` and stage the pinned ConPTY helpers next to the debug executables:
+
+```powershell
+$env:PYO3_PYTHON = ./scripts/python-runtime.ps1
+$env:PATH = "$(Split-Path -Parent $env:PYO3_PYTHON);$env:PATH"
+cargo build --locked -p hermes-python-host
+$fixture = ./scripts/prepare-herdr.ps1
+$target = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).target_directory
+Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $fixture) "conpty") -Destination (Join-Path $target "debug") -Recurse -Force
+cargo run --locked --features embedded-herdr -p hermes-desktop
+```
+
+Run the workspace tests in the same shell after setting up Python:
 
 ```bash
 cargo test --locked --workspace
 ```
 
-The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh` and `scripts/package-windows.ps1`. Pushing a `v*` tag builds all three platforms and publishes them as a GitHub Release.
+The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh` and `scripts/package-windows.ps1`. Pushing a `v*` tag builds all three platforms and publishes them as a GitHub Release. Tags containing a hyphen (such as `v0.2.0-rc.1`) publish prereleases; other `v*` tags publish full releases.
 
 ## Layout
 
@@ -122,17 +164,22 @@ The packaging scripts are `scripts/package-macos.sh`, `scripts/package-linux.sh`
 | `crates/engine` | Agent engine: providers (OpenAI-compatible, Anthropic, Responses), tools, MCP, subagents, accounts, plugins, references |
 | `crates/library` | Local storage: sessions, projects, bots and groups, webhooks, profiles |
 | `crates/gateway` | JSON-RPC gateway server and client, webhook receiver |
-| `crates/desktop` | The Iced app |
+| `crates/desktop` | The Iced app, which also runs the gateway (`hermes-desktop gateway`) |
 | `crates/python-host` | Embedded CPython that runs Python plugins |
 | `benchmarks/` | Benchmark harness and results |
 
+## Credentials
+
+Saved API keys and sign-in tokens are encrypted with a key kept in the macOS Keychain, Windows Credential Manager or the Linux Secret Service. Without one (a headless Linux host), they stay in files only your account can read. Because builds are not signed with a developer certificate, macOS may ask once after an update whether Hermes may use the key.
+
 ## Not done yet
 
-- **Not tried by hand:** Windows and Linux (CI builds and tests only), SSH against a real host, and connecting to a reachable cloud agent.
+- **Not tried by hand:** Windows and Linux (CI tests them and starts the packaged apps), and connecting to a reachable cloud agent. SSH is tested against a real OpenSSH server on the same machine, with a stand-in for the remote Hermes.
 - **Missing:**
-  - dictation on Windows and Linux;
-  - desktop pages contributed by plugins;
-  - notarization, installers and auto-update.
+  - signing and notarization, which need paid certificates;
+  - installing updates by itself: Hermes downloads, verifies and opens the installer when you ask;
+  - most of the stock gateway's methods ([`FEATURE_PARITY.md`](FEATURE_PARITY.md) lists them), and desktop plugin surfaces other than pages;
+  - conversations in a database: they are JSON files, and only the running reply is rewritten while it streams.
 
 ## License
 

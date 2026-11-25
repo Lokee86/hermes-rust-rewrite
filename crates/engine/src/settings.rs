@@ -118,7 +118,14 @@ pub struct ProfileSettings {
     pub auto_archive: bool,
     pub auto_archive_days: u32,
     pub keep_awake: bool,
+    /// Which defaults the saved file was written with. Not a user setting.
+    pub settings_version: u32,
 }
+/// Saved files hold every field, so a changed default must be told apart from a choice.
+const SETTINGS_VERSION: u32 = 1;
+const DEFAULT_MAX_TURNS: usize = 90;
+/// The default before version 1, too few rounds for most tasks.
+const FORMER_MAX_TURNS: usize = 8;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryEmbedding {
     pub endpoint_id: String,
@@ -127,7 +134,7 @@ pub struct MemoryEmbedding {
 impl Default for ProfileSettings {
     fn default()->Self {Self {memory_provider: MemoryProvider::Auto, memory_provider_revision: 0, external_memory_connector: false, memory_embedding: None, memory_perception_endpoint: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
         memory_enabled:true,user_profile_enabled:true,memory_char_limit:crate::memory::DEFAULT_MEMORY_CHAR_LIMIT,
-        user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:8,
+        user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:DEFAULT_MAX_TURNS, settings_version:SETTINGS_VERSION,
         file_read_max_chars:100_000,tool_output_bytes:50000,tool_output_lines:2000,tool_output_line_length:2000,
         auto_archive:false,auto_archive_days:3,keep_awake:false }}
 }
@@ -135,7 +142,14 @@ impl ProfileSettings {
     pub fn load(root:&Path)->Result<Self>{
         match fs::File::open(root.join("agent-settings.json")) {
             Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(Self::default()),
-            file=>{let value:Self=serde_json::from_reader(file?)?;value.validate()?;Ok(value)}
+            file=>{
+                let saved:serde_json::Value=serde_json::from_reader(file?)?;
+                let version=saved["settings_version"].as_u64().unwrap_or(0);
+                let mut value:Self=serde_json::from_value(saved)?;
+                if version==0 && value.max_turns==FORMER_MAX_TURNS {value.max_turns=DEFAULT_MAX_TURNS;}
+                value.settings_version=SETTINGS_VERSION;
+                value.validate()?;Ok(value)
+            }
         }
     }
     pub fn validate(&self)->Result<()>{
@@ -158,7 +172,7 @@ impl ProfileSettings {
             let mut current=serde_json::to_value(previous)?;
             let fields=current.as_object_mut().context("Invalid profile settings")?;
             for (key,value) in changes {
-                ensure!(key != "memory_provider_revision" && fields.contains_key(key),"Unknown profile setting {key}");
+                ensure!(!matches!(key.as_str(),"memory_provider_revision"|"settings_version") && fields.contains_key(key),"Unknown profile setting {key}");
                 fields.insert(key.clone(),value.clone());
             }
             let mut next:Self=serde_json::from_value(current)?;
@@ -348,6 +362,18 @@ mod memory_provider_tests {
 #[cfg(test)]
 mod approval_tests {
     use super::*;
+    #[test]
+    fn the_former_iteration_limit_is_replaced_only_where_it_was_the_default() {
+        let root=tempfile::tempdir().unwrap();
+        let write=|text:&str|std::fs::write(root.path().join("agent-settings.json"),text).unwrap();
+        write(r#"{"max_turns":8}"#);
+        assert_eq!(ProfileSettings::load(root.path()).unwrap().max_turns,90);
+        write(r#"{"max_turns":20}"#);
+        assert_eq!(ProfileSettings::load(root.path()).unwrap().max_turns,20);
+        let chosen=serde_json::json!({"max_turns":8});
+        ProfileSettings::update(root.path(),chosen.as_object().unwrap()).unwrap();
+        assert_eq!(ProfileSettings::load(root.path()).unwrap().max_turns,8);
+    }
     #[test]
     fn approval_modes() {
         let mut s=ProfileSettings::default();

@@ -10,6 +10,9 @@ use std::{collections::BTreeMap, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const VERSION: &str = "2025-06-18";
+/// A server that answers nothing must not hold a turn forever. Tools may work for a while.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TOOL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 enum Transport {
@@ -36,7 +39,7 @@ impl Mcp {
     pub(crate) async fn connect(url:&str,token:Option<String>)->Result<Self>{ Self::connect_http(url, token, vec![], "mcp").await }
     pub(crate) async fn connect_http(url:&str,token:Option<String>,headers:Vec<(String,String)>,prefix:&str)->Result<Self>{
         let url=crate::connector::validated(url)?;
-        let client = Client::builder().timeout(Duration::from_secs(45)).redirect(reqwest::redirect::Policy::none()).build()?;
+        let client = Client::builder().connect_timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).build()?;
         Self { transport: Transport::Http { client, url, token, headers, session: None }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: prefix.into(), hooks: vec![] }.handshake().await
     }
     pub(crate) async fn connect_stdio(spec: Stdio, prefix: &str) -> Result<Self> {
@@ -139,6 +142,16 @@ impl Mcp {
         if let Transport::Plugin(worker) = &self.transport {
             return worker.request(method, params).await;
         }
+        let limit = if method == "tools/call" { TOOL_TIMEOUT } else { REQUEST_TIMEOUT };
+        self.request_within(method, params, limit).await
+    }
+
+    async fn request_within(&mut self, method: &str, params: Value, limit: Duration) -> Result<Value> {
+        tokio::time::timeout(limit, self.exchange(method, params)).await
+            .with_context(|| format!("MCP {method} did not answer within {} seconds", limit.as_secs()))?
+    }
+
+    async fn exchange(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
         let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
@@ -217,6 +230,19 @@ impl Mcp {
 mod tests {
     use super::*;
     use axum::{Json, Router, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::post};
+
+    /// A stdio server that reads requests and never answers. Skipped where there is no `sh`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_stdio_server_ends_in_an_error_instead_of_hanging() {
+        let mut child = tokio::process::Command::new("sh").args(["-c", "cat >/dev/null"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut server = Mcp { transport: Transport::Stdio { child, stdin, lines }, version: VERSION.into(), next_id: 0, tools: BTreeMap::new(), prefix: "t".into(), hooks: vec![] };
+        let error = server.request_within("tools/call", json!({}), Duration::from_millis(200)).await.unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error}");
+    }
 
     async fn endpoint(headers: HeaderMap, Json(msg): Json<Value>) -> Response {
         assert_eq!(headers.get("authorization").unwrap(),"Bearer fixture-token");

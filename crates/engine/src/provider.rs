@@ -167,15 +167,35 @@ pub(crate) fn messages(history: &History, directory: &std::path::Path) -> Result
     let mut messages = vec![
         json!({"role":"system","content":"You are Hermes, a helpful desktop agent. Use available tools when needed to answer accurately or complete the user's request. Report actual tool results. Respect a tool denial and do not request the denied action again in the same turn. Do not claim to have read or changed files without a successful tool result."}),
     ];
-    for turn in &history.turns {
-        if !matches!(turn.status, Status::Complete | Status::Running) {
-            continue;
-        }
+    let mut skipped = 0;
+    if let Some(summary) = history.active_summary() {
+        skipped = summary.through;
+        messages.push(json!({"role":"user","content":format!("[Summary of the earlier part of this conversation, written to fit the model's context. It is background, not a new request.]\n{}", summary.text)}));
+        messages.push(json!({"role":"assistant","content":"Understood. I will continue from there."}));
+    }
+    for turn in &history.turns[skipped..] {
+        // A running turn maps one entry to one message; callers rely on that.
+        let stopped = match turn.status {
+            Status::Complete | Status::Running => None,
+            Status::Interrupted => Some("[The user stopped this reply before it finished.]"),
+            Status::Failed(_) => Some("[This reply failed before it finished.]"),
+        };
+        let mut unanswered: Vec<&str> = Vec::new();
         let prompt = if turn.context.is_empty() { std::borrow::Cow::Borrowed(turn.prompt.as_str()) } else { std::borrow::Cow::Owned(format!("{}{}", turn.prompt, turn.context)) };
         messages.push(json!({"role":"user","content":crate::Attachment::user_content(directory,&prompt,&turn.attachments)?}));
         for entry in &turn.entries {
             match entry {
                 Entry::Assistant { text, calls } => {
+                    if stopped.is_some() {
+                        answer_unfinished(&mut messages, &mut unanswered);
+                        // A reply cut off while streaming can hold arguments that are not JSON yet.
+                        let valid = calls.iter().all(|call| serde_json::from_str::<serde_json::Map<String, Value>>(&call.arguments).is_ok());
+                        if !valid || (text.trim().is_empty() && calls.is_empty()) {
+                            if !text.trim().is_empty() { messages.push(json!({"role":"assistant","content":text})); }
+                            continue;
+                        }
+                        unanswered.extend(calls.iter().map(|call| call.id.as_str()));
+                    }
                     let mut value = json!({"role":"assistant","content":text});
                     if !calls.is_empty() {
                         value["tool_calls"] = calls.iter().map(|call| json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}})).collect();
@@ -183,12 +203,66 @@ pub(crate) fn messages(history: &History, directory: &std::path::Path) -> Result
                     messages.push(value);
                 }
                 Entry::Tool { id, result, .. } => {
+                    if stopped.is_some() {
+                        let Some(position) = unanswered.iter().position(|call| call == id) else { continue };
+                        unanswered.remove(position);
+                    }
                     messages.push(json!({"role":"tool","tool_call_id":id,"content":result}))
                 }
             }
         }
+        if let Some(note) = stopped {
+            answer_unfinished(&mut messages, &mut unanswered);
+            match messages.last_mut() {
+                Some(last) if last["role"] == "assistant" && last.get("tool_calls").is_none() => {
+                    let text = last["content"].as_str().unwrap_or_default();
+                    last["content"] = Value::String(format!("{text}\n\n{note}"));
+                }
+                _ => messages.push(json!({"role":"assistant","content":note})),
+            }
+        }
     }
     Ok(messages)
+}
+
+/// Every tool call sent to a provider needs a result, including calls that never ran.
+fn answer_unfinished(messages: &mut Vec<Value>, unanswered: &mut Vec<&str>) {
+    for id in unanswered.drain(..) {
+        messages.push(json!({"role":"tool","tool_call_id":id,"content":"{\"error\":\"The reply stopped before this tool ran\"}"}));
+    }
+}
+
+/// Anthropic reuses a prompt prefix it was asked to cache: the tools and system prompt, then the
+/// conversation up to each of the last two user messages (the previous round's end and this one's).
+fn cache_anthropic_prefix(body: &mut Value) {
+    let mark = json!({"type":"ephemeral"});
+    if let Some(text) = body["system"].as_str().filter(|text| !text.is_empty()) {
+        body["system"] = json!([{"type":"text","text":text,"cache_control":mark}]);
+    }
+    if let Some(tool) = body["tools"].as_array_mut().and_then(|tools| tools.last_mut()) {
+        tool["cache_control"] = mark.clone();
+    }
+    let users = body["messages"].as_array_mut().into_iter().flatten().rev().filter(|message| message["role"] == "user");
+    for message in users.take(2) {
+        if let Some(block) = message["content"].as_array_mut().and_then(|content| content.last_mut()) {
+            block["cache_control"] = mark.clone();
+        }
+    }
+}
+
+/// The same models behind OpenRouter take the marks on OpenAI-style text parts.
+fn cache_openrouter_prefix(endpoint: &Url, body: &mut Value) {
+    let marked = body["model"].as_str().is_some_and(|model| model.contains("claude"));
+    if !marked || endpoint.host_str() != Some("openrouter.ai") {
+        return;
+    }
+    let messages = body["messages"].as_array_mut().map(Vec::as_mut_slice).unwrap_or_default();
+    let last_user = messages.iter().rposition(|message| message["role"] == "user");
+    for (index, message) in messages.iter_mut().enumerate() {
+        if (index == 0 || Some(index) == last_user) && let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
+            message["content"] = json!([{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]);
+        }
+    }
 }
 
 fn anthropic_body(model: &str, messages: Vec<Value>, tools: &[Value]) -> Result<Value> {
@@ -693,7 +767,8 @@ impl Provider {
         let (protocol, endpoint) = config.endpoint()?;
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(180))
+            // Silence, not length: a long reply may stream for many minutes.
+            .read_timeout(Duration::from_secs(180))
             .user_agent(concat!("HermesRust/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -773,18 +848,60 @@ impl Provider {
             Protocol::Anthropic => anthropic_body(self.config.model.trim(), messages, tools)?,
             Protocol::Responses => responses_body(self.config.model.trim(), messages, tools),
         };
-        if self.protocol != Protocol::Responses { self.options.apply(&mut body,self.protocol==Protocol::Anthropic)?; }
+        match self.protocol {
+            Protocol::Anthropic => cache_anthropic_prefix(&mut body),
+            Protocol::OpenAi => cache_openrouter_prefix(&self.endpoint, &mut body),
+            Protocol::Responses => {}
+        }
+        if self.protocol == Protocol::Responses {
+            self.options.apply_responses_reasoning(&mut body)?;
+        } else {
+            self.options.apply(&mut body, self.protocol == Protocol::Anthropic)?;
+        }
         let request = self.post(&self.endpoint, &body, "text/event-stream");
         let response = Self::send_request(request).await?;
         self.read_stream(response, emit).await
     }
 
     fn post(&self, endpoint: &Url, body: &Value, accept: &str) -> RequestBuilder {
-        let mut request = self
+        let request = self
             .client
             .post(endpoint.clone())
             .header("accept", accept)
             .json(body);
+        self.authenticate(request, endpoint)
+    }
+
+    pub(crate) fn catalog_requests(&self) -> Result<Vec<RequestBuilder>> {
+        let suffix = match self.protocol {
+            Protocol::OpenAi => "/chat/completions",
+            Protocol::Anthropic => "/messages",
+            Protocol::Responses => "/responses",
+        };
+        let base = self.endpoint.path().strip_suffix(suffix)
+            .ok_or_else(|| anyhow!("Invalid model catalog endpoint"))?;
+        let mut endpoint = self.endpoint.clone();
+        endpoint.set_path(&format!("{base}/models"));
+        // The subscription catalog gates models on CLI compatibility, independently of
+        // this desktop's release. An empty catalog can try the legacy sentinel.
+        let versions: &[Option<&str>] = if self.protocol == Protocol::Responses {
+            &[Some("99.0.0"), Some("0.0.0")]
+        } else {
+            &[None]
+        };
+        Ok(versions.iter().map(|version| {
+            let mut endpoint = endpoint.clone();
+            if let Some(version) = version {
+                endpoint.query_pairs_mut().append_pair("client_version", version);
+            }
+            let request = self.client.get(endpoint.clone())
+                .header("accept", "application/json")
+                .timeout(Duration::from_secs(35));
+            self.authenticate(request, &endpoint)
+        }).collect())
+    }
+
+    fn authenticate(&self, mut request: RequestBuilder, endpoint: &Url) -> RequestBuilder {
         let key = self.config.api_key.trim();
         match self.protocol {
             Protocol::Anthropic => {

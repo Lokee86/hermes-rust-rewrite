@@ -1287,6 +1287,7 @@ fn write_file(context: &Context, path: &Path, content: &str) -> Result<Value> {
             .hard_link(&temporary.name, &directory, destination)
             .context("Destination appeared while creating the file; it was left untouched")?;
     }
+    if let Some(token) = &checkpoint { token.mark_applied(); }
     drop(temporary);
     let actual = read_text(context, path)?;
     ensure!(
@@ -1503,6 +1504,21 @@ mod tests {
 
     fn read(context: &Context, path: &str) -> Value {
         invoke("read_file", &json!({"path":path}), context).unwrap()
+    }
+
+    #[test]
+    fn approved_file_writes_keep_a_restorable_checkpoint() {
+        let (directory, context) = workspace();
+        let profile = tempfile::tempdir().unwrap();
+        let context = context.with_checkpoints(profile.path(), true, 1).unwrap().with_write_approval(true);
+        let result = invoke("write_file", &json!({"path":"saved.txt","content":"saved content"}), &context).unwrap();
+        assert_eq!(result["checkpoint_ready"], true);
+        let store = crate::checkpoint::Store::open(profile.path(), 1).unwrap();
+        let saved = store.list().unwrap().pop().unwrap();
+        assert!(saved.ready);
+        let plan = store.prepare_restore(&saved.id).unwrap();
+        store.restore(&plan, true).unwrap();
+        assert!(!directory.path().join("saved.txt").exists());
     }
 
     #[test]

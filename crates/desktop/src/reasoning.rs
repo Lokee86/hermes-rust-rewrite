@@ -44,7 +44,7 @@ pub(super) fn update(app:&mut Hermes,action:Action)->Task<Message>{
                 app.models.options.reasoning_effort=Some(level.into());
                 app.models.options.reasoning_object=app.models.current_model(&app.config).is_some_and(|m|m.supports("reasoning"));
                 app.reasoning.cursor=LEVELS.iter().position(|(v,_)|*v==level).unwrap_or(2);
-            }else if fast(app){app.models.options.fast=!old.fast;}else{return Task::none();}
+            }else if fast(app){app.models.options.fast = !old.fast;}else{return Task::none();}
             if let Err(error)=app.models.save_options(&app.config){
                 app.models.options=old;app.error(error);
             }else{app.models.reasoning=app.models.options.reasoning_effort.clone().unwrap_or_default();}

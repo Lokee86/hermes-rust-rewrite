@@ -89,6 +89,55 @@ fn test_root() -> PathBuf {
     path
 }
 
+#[test]
+fn saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets() {
+    const CHILD: &str = "HERMES_DESKTOP_ISOLATED_BOOTSTRAP_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let isolated = tempfile::tempdir().unwrap();
+        let profile = isolated.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interaction_tests::saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1").env("HERMES_RUST_DATA_DIR", &profile)
+            .env("HERMES_HOME", isolated.path().join("stock-home"))
+            .env_remove("HERMES_RUST_BASE_URL").env_remove("HERMES_RUST_API_KEY").env_remove("HERMES_RUST_MODEL")
+            .env_remove("OPENROUTER_API_KEY").env_remove("OPENAI_API_KEY").env_remove("ANTHROPIC_API_KEY")
+            .output().unwrap();
+        assert!(result.status.success(), "isolated bootstrap failed:\n{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        return;
+    }
+    let root = test_root();
+    assert!(std::env::var_os("HERMES_RUST_BASE_URL").is_none());
+    assert!(std::env::var_os("HERMES_RUST_API_KEY").is_none());
+    assert!(std::env::var_os("HERMES_RUST_MODEL").is_none());
+    let config = Config { base_url: hermes_engine::OPENAI.into(), model: "saved-model".into(), api_key: "synthetic-saved-key".into() };
+    let vault = hermes_engine::credentials::EndpointStore::open(&root.join("providers")).unwrap();
+    vault.save(None, "Saved provider", &config).unwrap();
+    Preferences::save(&config).unwrap();
+    let (mut app, boot) = Hermes::new();
+    assert!(app.chat.has_startup_provider(&config), "the gateway captures the restored credential");
+    drop(boot);
+    app.chat = chat_view::View::default();
+    app.connections.config.mode = connections::Mode::Remote;
+    let origin = "http://127.0.0.1:1";
+    app.connections.config.url = origin.into();
+    let a = remote::remote_summary(&root, origin, &json!({"id":"remote-a","title":"A"})).unwrap();
+    let b = remote::remote_summary(&root, origin, &json!({"id":"remote-b","title":"B"})).unwrap();
+    app.open_gateway_chat(a);
+    app.open_gateway_chat(b);
+    app.sessions.clear(); // A search/filter can omit either tab from the sidebar.
+    let _ = app.tab_action(tabs::Action::Select("remote-a".into()));
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-a");
+    let _ = app.tab_action(tabs::Action::Close("remote-a".into()));
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-b");
+    let _ = app.tab_action(tabs::Action::Reopen);
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-a");
+    app.connections.config.mode = connections::Mode::Local;
+    app.refresh_gateway_route();
+    assert!(app.tabs.entries.iter().all(|tab| !tab.id.starts_with("remote-")));
+    assert!(app.sessions.iter().all(|session| !session.id.starts_with("remote-")));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a new empty HERMES_RUST_DATA_DIR for the process-wide desktop profile"]
 async fn two_desktop_viewers_resume_the_same_tool_turn() {

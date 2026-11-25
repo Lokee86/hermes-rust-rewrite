@@ -82,8 +82,13 @@ fn now() -> i64 { chrono::Utc::now().timestamp() }
 
 // ---------------------------------------------------------------- store
 fn store_path() -> Result<PathBuf> { Ok(Session::default_dir()?.join("accounts-oauth.json")) }
-fn read_store() -> BTreeMap<String, Value> {
-    store_path().ok().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+fn read_store() -> BTreeMap<String, Value> { try_read_store().unwrap_or_default() }
+fn try_read_store() -> Result<BTreeMap<String, Value>> {
+    match std::fs::read_to_string(store_path()?) {
+        Ok(text) => Ok(serde_json::from_str(&crate::secret::unseal(text.trim())?).unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.into()),
+    }
 }
 fn write_store(store: &BTreeMap<String, Value>) -> Result<()> {
     let path = store_path()?;
@@ -91,12 +96,13 @@ fn write_store(store: &BTreeMap<String, Value>) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let temp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600))?; }
-    serde_json::to_writer(temp.as_file(), store)?;
+    std::io::Write::write_all(&mut temp.as_file(), crate::secret::seal(dir, &serde_json::to_string(store)?)?.as_bytes())?;
     temp.as_file().sync_all()?;
     temp.persist(path)?;
     Ok(())
 }
-fn save(id: &str, state: Value) -> Result<()> { let mut s = read_store(); s.insert(id.into(), state); write_store(&s) }
+// A store that cannot be opened right now must not be replaced by one with a single account.
+fn save(id: &str, state: Value) -> Result<()> { let mut s = try_read_store().context("Could not open your saved accounts")?; s.insert(id.into(), state); write_store(&s) }
 
 fn hermes_home() -> Option<PathBuf> {
     std::env::var_os("HERMES_HOME").map(PathBuf::from).or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".hermes")))
@@ -125,7 +131,7 @@ pub fn status(id: &str) -> Status {
     Status::default()
 }
 pub fn disconnect(id: &str) -> Result<bool> {
-    let mut s = read_store();
+    let mut s = try_read_store().context("Could not open your saved accounts")?;
     let removed = s.remove(id).is_some();
     write_store(&s)?;
     Ok(removed)
@@ -318,15 +324,59 @@ async fn qwen_token() -> Result<String> {
 }
 
 /// Fill in a signed-in account's token for a chat pointed at its inference URL.
-pub(crate) async fn resolve(mut config: Config) -> Result<Config> {
+pub(crate) async fn resolve(config: Config) -> Result<Config> {
+    resolve_with(config, access_token).await
+}
+
+pub(crate) async fn resolve_with<F, Fut>(mut config: Config, token: F) -> Result<Config>
+where
+    F: FnOnce(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
     if !config.api_key.trim().is_empty() { return Ok(config); }
-    if let Some(provider) = for_base_url(&config.base_url) { config.api_key = access_token(provider.id).await?; }
+    if let Some(provider) = for_base_url(&config.base_url) { config.api_key = token(provider.id).await?; }
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_routes_resolve_only_their_own_oauth_credentials() {
+        for account in CATALOG.iter().filter(|account| for_base_url(account.base_url).is_some()) {
+            let original = Config {
+                base_url: account.base_url.into(),
+                model: account.default_model.into(),
+                api_key: String::new(),
+            };
+            let resolved = resolve_with(original.clone(), |id| {
+                assert_eq!(id, account.id);
+                std::future::ready(Ok("subscription-fixture-token".into()))
+            }).await.unwrap();
+            assert_eq!(resolved.api_key, "subscription-fixture-token");
+            assert_eq!(resolved.base_url, original.base_url);
+            assert_eq!(resolved.model, original.model);
+        }
+        let managed = CATALOG.iter().find(|account| for_base_url(account.base_url).is_some()).unwrap();
+        for base_url in [managed.base_url, "http://127.0.0.1:12345/v1"] {
+            let original = Config {
+                base_url: base_url.into(), model: "fixture-model".into(), api_key: "explicit-fixture-key".into(),
+            };
+            let resolved = resolve_with(original, |_| {
+                std::future::ready(Err(anyhow::anyhow!("Explicit keys must not resolve an account")))
+            }).await.unwrap();
+            assert_eq!(resolved.api_key, "explicit-fixture-key");
+        }
+        let custom = Config {
+            base_url: "http://127.0.0.1:12345/v1".into(), model: "fixture-model".into(), api_key: String::new(),
+        };
+        let resolved = resolve_with(custom, |_| {
+            std::future::ready(Err(anyhow::anyhow!("Custom endpoints must not borrow an account")))
+        }).await.unwrap();
+        assert!(resolved.api_key.is_empty());
+    }
+
     #[test]
     fn catalog_matches_the_electron_accounts_list() {
         let ids: Vec<_> = CATALOG.iter().map(|p| p.id).collect();

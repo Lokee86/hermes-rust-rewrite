@@ -8,6 +8,75 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 
+#[cfg(windows)]
+#[tokio::test]
+async fn deleting_a_bot_releases_its_embedded_python_file_lock() {
+    use super::client::{ClientOptions, GatewayClient};
+    use hermes_engine::plugins::{Installed, python_host};
+
+    if python_host().is_none() {
+        eprintln!("Build hermes-python-host to exercise the embedded plugin in this test");
+        return;
+    }
+
+    let profile = tempfile::tempdir().unwrap();
+    let gateway = Gateway::start(GatewayConfig::new(profile.path(), Config::from_env()))
+        .await
+        .unwrap();
+    let library = &gateway.shared.library;
+    let bot = library.create_bot("Lock Fixture", "", "", "").unwrap();
+    let home = library.bot_profile(&bot.name).unwrap();
+    let plugins = home.join("plugins");
+    let plugin = plugins.join("hold-file");
+    fs::create_dir_all(&plugin).unwrap();
+    fs::write(plugin.join("plugin.yaml"), "name: hold-file\nversion: 1.0.0\n").unwrap();
+    fs::write(
+        plugin.join("__init__.py"),
+        r#"
+from pathlib import Path
+import os
+
+def register(ctx):
+    global held
+    held = (Path(os.environ["PLUGIN_DATA"]) / "held.txt").open("w")
+    held.write("held by the embedded plugin")
+    held.flush()
+"#,
+    )
+    .unwrap();
+    let installed = Installed {
+        name: "hold-file".into(),
+        title: "Hold file".into(),
+        enabled: true,
+        servers: vec!["python".into()],
+        ..Default::default()
+    };
+    fs::write(
+        plugins.join("installed.json"),
+        serde_json::to_vec(&[installed]).unwrap(),
+    )
+    .unwrap();
+
+    let runtime = gateway.shared.plugin_runtime(&home).await;
+    let statuses = runtime.inventory().await;
+    assert_eq!(statuses.len(), 1);
+    assert!(statuses[0].issue.is_none(), "{:?}", statuses[0].issue);
+    let held = home.join("plugin-data/hold-file/held.txt");
+    assert!(held.is_file());
+    assert!(fs::remove_file(&held).is_err(), "the plugin must hold the file open");
+
+    let client = GatewayClient::new(ClientOptions::default());
+    let ticket = gateway.shared.issue_ticket().unwrap();
+    client.connect_local_grant(&gateway.http_url(), &ticket).await.unwrap();
+    let result = client.request("catalog.bot.delete", json!({"name": bot.name})).await.unwrap();
+    assert_eq!(result["deleted"], true);
+    assert!(!home.exists());
+    assert!(runtime.inventory().await.is_empty());
+
+    client.close();
+    gateway.shutdown().await.unwrap();
+}
+
 fn request(id: u64, method: &str, params: Value) -> Message {
     Message::Text(
         json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
@@ -21,6 +90,34 @@ fn response(frame: Message) -> Value {
         Message::Text(text) => serde_json::from_str(&text).unwrap(),
         other => panic!("expected JSON-RPC response, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn closing_a_stalled_writer_has_a_deadline() {
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    struct StalledWriter(AtomicUsize);
+    impl futures_util::Sink<()> for StalledWriter {
+        type Error = Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
+        fn start_send(self: Pin<&mut Self>, _: ()) -> Result<(), Self::Error> { Ok(()) }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+    }
+
+    let mut writer = StalledWriter(AtomicUsize::new(0));
+    timeout(super::SOCKET_CLOSE_TIMEOUT + Duration::from_secs(1), super::close_websocket(&mut writer))
+        .await.expect("a peer that stops reading must not stall teardown");
+    assert!(writer.0.load(Ordering::Relaxed) > 0);
 }
 
 #[tokio::test]

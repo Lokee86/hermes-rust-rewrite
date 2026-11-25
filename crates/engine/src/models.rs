@@ -1,10 +1,8 @@
 //! Read-only model discovery and supported request options for native providers.
-use crate::{Config, portal};
+use crate::{Config, accounts, portal, provider::Provider};
 use anyhow::{Context, Result, anyhow, ensure};
-use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -93,40 +91,48 @@ impl GenerationOptions {
         }
         Ok(())
     }
+
+    pub(crate) fn apply_responses_reasoning(&self, body: &mut Value) -> Result<()> {
+        self.validate()?;
+        if let Some(effort) = &self.reasoning_effort {
+            let effort = if effort == "ultra" { "max" } else { effort };
+            body["reasoning"] = json!({"effort": effort});
+        }
+        Ok(())
+    }
 }
 
 /// GET /models only: selecting or inspecting a model never invokes inference.
 pub async fn discover(config: Config) -> Result<Vec<Model>> {
+    let config = catalog_config(config, accounts::access_token).await?;
+    let provider = Provider::new_with_options(config, GenerationOptions::default())?;
+    discover_catalog(provider.catalog_requests()?).await
+}
+
+async fn catalog_config<F, Fut>(config: Config, token: F) -> Result<Config>
+where
+    F: FnOnce(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
     let mut config = config;
     if config.model.trim().is_empty() {
         config.model = "catalog-discovery".into();
     }
     config.validate()?;
-    let config = portal::catalog_credentials(config).await?;
-    let mut url = Url::parse(config.base_url.trim()).context("Invalid model catalog endpoint")?;
-    let path = url.path().trim_end_matches('/');
-    let anthropic = url.host_str() == Some("api.anthropic.com") || path.ends_with("/messages");
-    let base = path
-        .strip_suffix("/chat/completions")
-        .or_else(|| path.strip_suffix("/messages"))
-        .unwrap_or(path);
-    let path = format!("{}/models", if base.is_empty() { "/v1" } else { base });
-    url.set_path(&path);
-    let client = Client::builder()
-        .user_agent(concat!("HermesRust/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(35))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let mut request = client.get(url).header("accept", "application/json");
-    if anthropic {
-        request = request.header("anthropic-version", "2023-06-01");
-        if !config.api_key.trim().is_empty() {
-            request = request.header("x-api-key", config.api_key.trim());
+    accounts::resolve_with(portal::catalog_credentials(config).await?, token).await
+}
+
+async fn discover_catalog(requests: Vec<reqwest::RequestBuilder>) -> Result<Vec<Model>> {
+    for request in requests {
+        let models = read_catalog(request).await?;
+        if !models.is_empty() {
+            return Ok(models);
         }
-    } else if !config.api_key.trim().is_empty() {
-        request = request.bearer_auth(config.api_key.trim());
     }
+    anyhow::bail!("Provider returned an empty model catalog")
+}
+
+async fn read_catalog(request: reqwest::RequestBuilder) -> Result<Vec<Model>> {
     let mut response = request
         .send()
         .await
@@ -159,13 +165,19 @@ pub async fn discover(config: Config) -> Result<Vec<Model>> {
     for entry in entries.iter().take(20_000) {
         let Some(id) = entry
             .get("id")
+            .or_else(|| entry.get("slug"))
             .or_else(|| entry.get("name"))
             .and_then(Value::as_str)
             .filter(|id| !id.trim().is_empty() && id.len() <= 1024)
         else {
             continue;
         };
-        let supported_parameters = entry
+        if entry.get("visibility").and_then(Value::as_str).is_some_and(|value| {
+            value.eq_ignore_ascii_case("hide") || value.eq_ignore_ascii_case("hidden")
+        }) {
+            continue;
+        }
+        let mut supported_parameters: Vec<String> = entry
             .get("supported_parameters")
             .and_then(Value::as_array)
             .into_iter()
@@ -174,6 +186,12 @@ pub async fn discover(config: Config) -> Result<Vec<Model>> {
             .filter(|name| name.len() < 128)
             .map(str::to_owned)
             .collect();
+        if entry.get("supported_reasoning_levels").and_then(Value::as_array)
+            .is_some_and(|levels| levels.iter().any(|level| level["effort"].is_string()))
+            && !supported_parameters.iter().any(|parameter| parameter == "reasoning")
+        {
+            supported_parameters.push("reasoning".into());
+        }
         let zero = |key: &str| {
             entry
                 .pointer(&format!("/pricing/{key}"))
@@ -196,6 +214,7 @@ pub async fn discover(config: Config) -> Result<Vec<Model>> {
             context_length: entry
                 .get("context_length")
                 .or_else(|| entry.get("max_input_tokens"))
+                .or_else(|| entry.get("context_window"))
                 .and_then(Value::as_u64),
             max_output_tokens: entry
                 .pointer("/top_provider/max_completion_tokens")
@@ -212,16 +231,135 @@ pub async fn discover(config: Config) -> Result<Vec<Model>> {
             .then_with(|| a.id.cmp(&b.id))
     });
     models.dedup_by(|a, b| a.id == b.id);
-    ensure!(
-        !models.is_empty(),
-        "Provider returned an empty model catalog"
-    );
     Ok(models)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_catalog_configuration_resolves_account_tokens() {
+        for account in accounts::CATALOG.iter().filter(|account| accounts::for_base_url(account.base_url).is_some()) {
+            let config = catalog_config(Config {
+                base_url: account.base_url.into(), model: String::new(), api_key: String::new(),
+            }, |selected| {
+                assert_eq!(selected, account.id);
+                std::future::ready(Ok("catalog-fixture-token".into()))
+            }).await.unwrap();
+            let provider = Provider::new_with_options(config, GenerationOptions::default()).unwrap();
+            for request in provider.catalog_requests().unwrap() {
+                let request = request.build().unwrap();
+                assert_eq!(request.headers()["authorization"], "Bearer catalog-fixture-token");
+                assert_eq!(request.method(), reqwest::Method::GET);
+                assert!(request.body().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_discovery_reads_native_rows_without_running_inference() {
+        use axum::{Json, Router, http::HeaderMap, routing::get};
+
+        let app = Router::new().route("/v1/models", get(|headers: HeaderMap| async move {
+            assert_eq!(headers["authorization"], "Bearer catalog-fixture-token");
+            Json(json!({"models":[
+                {"slug":"subscription-fixture-model", "display_name":"Subscription fixture",
+                 "context_window":262144, "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+                {"slug":"hidden-fixture-model", "visibility":"hide"},
+                {"id":"compatible-fixture-model", "name":"Compatible fixture", "context_length":8192,
+                 "supported_parameters":["temperature"], "pricing":{"prompt":"0","completion":"0"}}
+            ]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let catalog = discover(Config {
+            base_url: format!("http://{address}/v1/chat/completions"),
+            model: String::new(),
+            api_key: "catalog-fixture-token".into(),
+        }).await.unwrap();
+        assert_eq!(catalog.len(), 2);
+        let native = catalog.iter().find(|model| model.id == "subscription-fixture-model").unwrap();
+        assert_eq!(native.name, "Subscription fixture");
+        assert_eq!(native.context_length, Some(262144));
+        assert!(native.supports("reasoning"));
+        let compatible = catalog.iter().find(|model| model.id == "compatible-fixture-model").unwrap();
+        assert!(compatible.supports("temperature"));
+        assert!(compatible.free);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_compatibility_fallback_stays_on_the_selected_route() {
+        use axum::{Json, Router, extract::Query, http::HeaderMap, routing::get};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let calls = seen.clone();
+        let app = Router::new().route("/subscription/models", get(move |headers: HeaderMap, Query(query): Query<std::collections::HashMap<String, String>>| {
+            let calls = calls.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer catalog-fixture-token");
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(query["client_version"], if index == 0 { "99.0.0" } else { "0.0.0" });
+                Json(if index == 0 { json!({"models":[]}) } else { json!({"models":[{"slug":"fallback-fixture-model"}]}) })
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        let requests = ["99.0.0", "0.0.0"].iter().map(|version| {
+            client.get(format!("http://{address}/subscription/models"))
+                .query(&[("client_version", version)])
+                .bearer_auth("catalog-fixture-token")
+        }).collect();
+        let catalog = discover_catalog(requests).await.unwrap();
+        assert_eq!(catalog[0].id, "fallback-fixture-model");
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_failures_do_not_retry_the_compatibility_request() {
+        use axum::{Router, extract::Query, http::StatusCode, routing::get};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let calls = seen.clone();
+        let app = Router::new().route("/models", get(move |Query(query): Query<std::collections::HashMap<String, u16>>| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::from_u16(query["status"]).unwrap(), "fixture failure")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        for status in [401, 429, 503] {
+            seen.store(0, Ordering::SeqCst);
+            let requests = vec![
+                client.get(format!("http://{address}/models?status={status}")),
+                client.get(format!("http://{address}/models?status=200")),
+            ];
+            let error = discover_catalog(requests).await.unwrap_err().to_string();
+            assert!(error.contains(&format!("HTTP {status}")));
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+        }
+        // A framing failure also must not turn into another catalog request.
+        seen.store(0, Ordering::SeqCst);
+        let requests = vec![
+            client.get(format!("http://{address}/models?status=200")),
+            client.get(format!("http://{address}/models?status=200")),
+        ];
+        assert!(discover_catalog(requests).await.is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     fn body(options: GenerationOptions) -> Value {
         let mut body = json!({"model": "m"});
         options.apply(&mut body, false).unwrap();
