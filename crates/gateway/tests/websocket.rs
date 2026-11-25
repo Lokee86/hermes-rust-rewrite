@@ -466,7 +466,8 @@ async fn embed_memory_fixture(
         let (_, body) = text.split_once('\n').unwrap_or(("", text));
         let embedding = match body {
             OBSERVATION_PARAPHRASE | OBSERVATION_FACT | PROJECT_FACT | PROJECT_CONTROL | "Amethyst Lantern" => [1.0, 0.0],
-            PROJECT_CHALLENGE | CHALLENGE_RECEPTOR => [0.0, 1.0],
+            CHALLENGE_RECEPTOR => [0.0, 1.0],
+            text if text.to_ascii_lowercase().contains("copper finch 862") => [0.0, 1.0],
             _ => [-1.0, 0.0],
         };
         json!({"index": index, "embedding": embedding})
