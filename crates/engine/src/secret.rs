@@ -23,7 +23,10 @@ const ASK: Duration = Duration::from_secs(30);
 type Key = [u8; 32];
 
 fn own_directory(dir: &Path) -> bool {
-    if cfg!(test) || std::env::var_os("HERMES_RUST_DATA_DIR").is_some() {
+    if cfg!(test) {
+        return dir.join(".sealed-in-tests").exists();
+    }
+    if std::env::var_os("HERMES_RUST_DATA_DIR").is_some() {
         return false;
     }
     let Ok(base) = crate::Session::default_dir() else { return false };
@@ -33,6 +36,9 @@ fn own_directory(dir: &Path) -> bool {
 
 /// The storage key, created on first use. Asked for once per process.
 fn key() -> Option<&'static Key> {
+    if cfg!(test) {
+        return Some(&[7; 32]); // Tests leave the system's credential store alone.
+    }
     static KEY: OnceLock<Option<Key>> = OnceLock::new();
     KEY.get_or_init(|| {
         let (send, receive) = std::sync::mpsc::channel();
@@ -85,7 +91,7 @@ fn load_or_create() -> Result<Key> {
 }
 
 /// Encrypt text that will be stored in `dir`, where that is possible.
-pub(crate) fn seal(dir: &Path, text: &str) -> Result<String> {
+pub fn seal(dir: &Path, text: &str) -> Result<String> {
     if text.is_empty() || !own_directory(dir) {
         return Ok(text.to_owned());
     }
@@ -96,11 +102,11 @@ pub(crate) fn seal(dir: &Path, text: &str) -> Result<String> {
 }
 
 /// Whether this value is stored encrypted.
-pub(crate) fn is_sealed(text: &str) -> bool {
+pub fn is_sealed(text: &str) -> bool {
     text.starts_with(MARK)
 }
 
-pub(crate) fn unseal(text: &str) -> Result<String> {
+pub fn unseal(text: &str) -> Result<String> {
     if !is_sealed(text) {
         return Ok(text.to_owned());
     }

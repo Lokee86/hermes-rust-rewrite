@@ -138,6 +138,33 @@ fn a_plugin_registers_tools_and_hooks_through_the_rust_ctx() {
 }
 
 #[test]
+fn an_abandoned_tool_stops_at_its_next_await() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("slow");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(plugin.join("plugin.yaml"), "name: slow\n").unwrap();
+    std::fs::write(plugin.join("__init__.py"), r#"
+import asyncio
+async def _slow(args, **_):
+    await asyncio.sleep(60)
+def register(ctx):
+    ctx.register_tool("slow", "slow", {"name": "slow", "description": "", "parameters": {"type": "object"}}, _slow, is_async=True)
+"#).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_hermes-python-host")).arg("serve").arg(&plugin)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut host = Host::new(child);
+    host.request("initialize", json!({"protocolVersion": "2025-06-18"}));
+    host.send(json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "slow", "arguments": {}}}));
+    host.send(json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}}));
+    let reply = host.read("tools/call");
+    assert_eq!(reply["id"], 7);
+    assert_eq!(reply["result"]["isError"], true);
+    // The plugin goes on working.
+    assert_eq!(host.request("ping", json!({}))["result"], json!({}));
+    host.expect_exit();
+}
+
+#[test]
 fn a_plugin_that_fails_to_load_exits_with_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("needs-hermes");

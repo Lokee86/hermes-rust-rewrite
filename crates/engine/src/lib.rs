@@ -29,7 +29,7 @@ pub mod inference;
 mod context;
 pub mod models;
 pub mod credentials;
-mod secret;
+pub mod secret;
 pub mod transcribe;
 pub mod portal;
 pub mod accounts;

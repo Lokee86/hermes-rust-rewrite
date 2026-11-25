@@ -17,6 +17,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// A tool may legitimately work for a while (a download, a render) as long as a caller waits.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DEADLINE_CHECK: Duration = Duration::from_secs(5);
+const ABANDONED_CHECK: Duration = Duration::from_millis(250);
 const MAX_REQUESTS: usize = 32;
 const MAX_SERVICES: usize = 4;
 
@@ -38,7 +39,15 @@ struct Pending {
     /// When the host started on it. Tools start at once; other requests run one at a time in
     /// order, and those waiting must not use up their own time.
     since: Option<Instant>,
+    /// Whether the plugin was told that nobody waits for this any more.
+    cancelled: bool,
     reply: oneshot::Sender<Result<Value>>,
+}
+
+/// Tools whose caller has gone since the last check.
+fn abandoned(pending: &mut BTreeMap<u64, Pending>) -> Vec<u64> {
+    pending.iter_mut().filter(|(_, request)| request.tool && !request.cancelled && request.reply.is_closed())
+        .map(|(id, request)| { request.cancelled = true; *id }).collect()
 }
 
 /// Whether the worker is stuck and has to be replaced.
@@ -138,11 +147,17 @@ async fn exchange(
     let mut next_id = 0_u64;
     let mut services = JoinSet::new();
     let mut check = tokio::time::interval(DEADLINE_CHECK);
+    let mut callers = tokio::time::interval(ABANDONED_CHECK);
     loop {
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
             _ = check.tick(), if !pending.is_empty() => {
                 ensure!(!stuck(&mut pending, Instant::now()), "A Python plugin callback exceeded its deadline");
+            }
+            _ = callers.tick(), if pending.values().any(|request| request.tool && !request.cancelled) => {
+                for id in abandoned(&mut pending) {
+                    send(&mut input, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}}), stop).await?;
+                }
             }
             request = inbox.recv(), if pending.len() < MAX_REQUESTS => {
                 let Some(request) = request else { return Ok(()) };
@@ -151,7 +166,7 @@ async fn exchange(
                     "jsonrpc":"2.0", "id":next_id, "method":request.method, "params":request.params
                 });
                 let tool = request.method == "tools/call";
-                pending.insert(next_id, Pending { tool, since: tool.then(Instant::now), reply: request.reply });
+                pending.insert(next_id, Pending { tool, since: tool.then(Instant::now), cancelled: false, reply: request.reply });
                 send(&mut input, frame, stop).await?;
             }
             message = receive(&mut output, &mut bytes) => {
@@ -241,11 +256,11 @@ mod tests {
         let now = Instant::now();
         let mut pending = BTreeMap::new();
         let (reply, tool_caller) = oneshot::channel();
-        pending.insert(1, Pending { tool: true, since: Some(now), reply });
+        pending.insert(1, Pending { tool: true, since: Some(now), cancelled: false, reply });
         let (reply, _first) = oneshot::channel();
-        pending.insert(2, Pending { tool: false, since: None, reply });
+        pending.insert(2, Pending { tool: false, since: None, cancelled: false, reply });
         let (reply, _second) = oneshot::channel();
-        pending.insert(3, Pending { tool: false, since: None, reply });
+        pending.insert(3, Pending { tool: false, since: None, cancelled: false, reply });
         assert!(!stuck(&mut pending, now));
         // The second ordinary request has not started, so only the first one's time counts.
         pending.remove(&2);
@@ -254,7 +269,10 @@ mod tests {
         pending.remove(&3);
         // A slow tool may go on while its caller waits, and ends soon after everyone left.
         assert!(!stuck(&mut pending, now + REQUEST_TIMEOUT * 3));
+        assert!(abandoned(&mut pending).is_empty());
         drop(tool_caller);
+        assert_eq!(abandoned(&mut pending), [1]);
+        assert!(abandoned(&mut pending).is_empty(), "told once");
         assert!(stuck(&mut pending, now + REQUEST_TIMEOUT * 3));
     }
 

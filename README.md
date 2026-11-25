@@ -8,11 +8,11 @@ This is an independent community project, not an official Nous Research release.
 
 | Platform | Download |
 | --- | --- |
-| macOS (Apple Silicon) | [Hermes-macOS.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-macOS.zip) |
-| Windows (x64) | [Hermes-windows-AMD64.zip](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-windows-AMD64.zip) |
-| Linux (x86_64) | [Hermes-linux-x86_64.tar.gz](https://github.com/itsflownium/hermes-rust-rewrite/releases/download/v0.1.0/Hermes-linux-x86_64.tar.gz) |
+| macOS (Apple Silicon) | [Hermes-macOS.zip](https://github.com/itsflownium/mercury-hermes-rust-rewrite/releases/download/v0.1.0/Hermes-macOS.zip) |
+| Windows (x64) | [Hermes-windows-AMD64.zip](https://github.com/itsflownium/mercury-hermes-rust-rewrite/releases/download/v0.1.0/Hermes-windows-AMD64.zip) |
+| Linux (x86_64) | [Hermes-linux-x86_64.tar.gz](https://github.com/itsflownium/mercury-hermes-rust-rewrite/releases/download/v0.1.0/Hermes-linux-x86_64.tar.gz) |
 
-These links are the v0.1.0 pre-release. Newer builds are on the [releases page](https://github.com/itsflownium/hermes-rust-rewrite/releases); from the next release on there is also a macOS disk image, a Windows installer and a Debian package. **Settings › About** can look for a newer release, download it and check its checksum.
+These links are the v0.1.0 pre-release. Newer builds are on the [releases page](https://github.com/itsflownium/mercury-hermes-rust-rewrite/releases); from the next release on there is also a macOS disk image, a Windows installer and a Debian package. **Settings › About** can look for a newer release, download it and check its checksum.
 
 Every build comes from [the CI workflow](.github/workflows/build.yml), which runs the test suite on all three platforms, then starts each packaged app and requires its window. No build is notarized or signed with a developer certificate yet (the workflow signs when it is given certificates). On macOS, the first time you open the app, right-click it and choose **Open**. For the Linux tar archive, install WebKitGTK 4.1, GTK 3, and the X11 keyboard library (`libxkbcommon-x11-0` on Ubuntu). The Debian package declares these dependencies.
 
@@ -98,7 +98,7 @@ Hermes plugins written in Python (`plugin.yaml` + `__init__.py` with `register(c
   | Linux | `libpython3.13.so.1.0` | `lib/hermes/python` |
 
 - A plugin registers tools (with `check_fn`, `requires_env` and async handlers), hooks, slash commands and a memory provider, and reads its settings with `get_config`. Other `register_*` calls are skipped and listed under **Capabilities › Plugins**.
-- Its tools run beside each other, so a slow one does not hold up other chats.
+- Its tools run beside each other, so a slow one does not hold up other chats. Cancelling a reply stops an async tool at its next `await`; Python cannot interrupt one that blocks.
 - A desktop page (`desktop/plugin.js`) opens from **Capabilities › Plugins** in a web view without network, files or access to your chats. It gets React and the page part of the plugin SDK; panes docked into the app, themes and composer extensions are not supported.
 - These hooks run around every tool call: `pre_tool_call` (it can block the call), `transform_tool_result` and `post_tool_call`.
 - A plugin's `python_dependencies` are installed as wheels into the plugin's own data folder when you install it. Nothing runs at install time.

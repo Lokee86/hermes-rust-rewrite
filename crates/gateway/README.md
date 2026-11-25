@@ -100,7 +100,7 @@ Replay is at most 512 events and 512 KiB per loaded session; admissions and muta
 
 At most 64 sessions are loaded and 32 sockets connected. WebSocket frames/messages are capped at 1 MiB and prompts at 256 KiB; a slow client is disconnected when its bounded outgoing queue fills and can reconcile from history/replay. Closing a socket leaves its active turn running, so a short transport failure does not abandon an approval. The approval deadline and explicit interruption still apply. Stop the gateway gracefully to persist shutdown interruption.
 
-Unsupported: queued/steered/redirected inputs, multimodal attachments, edit/regenerate/rewind/branch/compression/reset/delete mutations, cross-profile routing, legacy server-to-client request RPCs, upstream tool/plugin catalogs, process/control-socket discovery, bot/room transports, billing, scheduler, voice, screen/browser control, dashboard settings REST and automatic handoff to a Python gateway. Any optional MCP server is external to Rust; it is connected through the engine, not a fallback to Python.
+Unsupported: queued/steered/redirected inputs, multimodal attachments, edit/regenerate/rewind/branch/reset mutations, cross-profile routing, legacy server-to-client request RPCs, tool and plugin management, process/control-socket discovery, bot/room transports, billing, voice, screen/browser control, dashboard settings REST and automatic handoff to a Python gateway. Any optional MCP server is external to Rust; it is connected through the engine, not a fallback to Python.
 
 ## Profile memory provider
 

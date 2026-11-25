@@ -1,7 +1,9 @@
 //! Private, atomic native Telegram settings and per-bot inbox persistence.
 use super::telegram::{Identity, Incoming, Receipt, Token};
 use fs2::FileExt;
+use hermes_engine::secret;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashSet},
     fs::{self, File, OpenOptions},
@@ -98,7 +100,7 @@ impl Store {
             return Ok(None);
         }
         let _lock = self.lock("settings.lock")?;
-        let settings: Settings = private_json(&path, 1024 * 1024)?;
+        let settings = self.read_settings()?;
         if settings.version != 1 {
             return Err("Unsupported native Telegram settings version".into());
         }
@@ -106,7 +108,36 @@ impl Store {
     }
     pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
-        atomic_json(&self.root.join("settings.json"), settings)
+        self.write_settings(settings)
+    }
+    fn read_saved(&self) -> Result<Value, String> {
+        let saved: Value = private_json(&self.root.join("settings.json"), 1024 * 1024)?;
+        if !saved.is_object() {
+            return Err("Could not read native Telegram storage".into());
+        }
+        Ok(saved)
+    }
+    /// The token is encrypted on disk where the system has a credential store.
+    fn read_settings(&self) -> Result<Settings, String> {
+        let mut saved = self.read_saved()?;
+        let token = saved["token"].as_str().map(str::to_owned);
+        if let Some(token) = &token {
+            saved["token"] = secret::unseal(token).map_err(|error| format!("{error:#}"))?.into();
+        }
+        let settings: Settings = serde_json::from_value(saved)
+            .map_err(|_| "Could not read native Telegram storage".to_owned())?;
+        // Protect a token saved by a version that stored it as text.
+        if token.is_some_and(|token| !secret::is_sealed(&token)) {
+            let _ = self.write_settings(&settings);
+        }
+        Ok(settings)
+    }
+    fn write_settings(&self, settings: &Settings) -> Result<(), String> {
+        let mut saved = serde_json::to_value(settings).map_err(|error| error.to_string())?;
+        if let Some(token) = saved["token"].as_str() {
+            saved["token"] = secret::seal(&self.root, token).map_err(|error| format!("{error:#}"))?.into();
+        }
+        atomic_json(&self.root.join("settings.json"), &saved)
     }
     pub fn clear_token(&self) -> Result<Option<Settings>, String> {
         let _lock = self.lock("settings.lock")?;
@@ -114,12 +145,13 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
-        let mut settings: Settings = private_json(&path, 1024 * 1024)?;
-        settings.token = None;
-        settings.enabled = false;
-        settings.bot = None;
-        atomic_json(&path, &settings)?;
-        Ok(Some(settings))
+        // Removing a token must work even when it cannot be opened.
+        let mut saved = self.read_saved()?;
+        saved["token"] = Value::Null;
+        saved["bot"] = Value::Null;
+        saved["enabled"] = Value::Bool(false);
+        atomic_json(&path, &saved)?;
+        serde_json::from_value(saved).map(Some).map_err(|_| "Could not read native Telegram storage".into())
     }
     pub fn set_disabled(&self) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
@@ -127,14 +159,13 @@ impl Store {
         if !path.exists() {
             return Ok(());
         }
-        let mut settings: Settings = private_json(&path, 1024 * 1024)?;
-        settings.enabled = false;
-        atomic_json(&path, &settings)
+        let mut saved = self.read_saved()?;
+        saved["enabled"] = Value::Bool(false);
+        atomic_json(&path, &saved)
     }
     pub fn remember_bot(&self, identity: &Identity, token: &Token) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
-        let path = self.root.join("settings.json");
-        let mut settings: Settings = private_json(&path, 1024 * 1024)?;
+        let mut settings = self.read_settings()?;
         if settings.token.as_ref() != Some(token) {
             return Err(
                 "Telegram setup changed. Reopen Messaging and enable the saved setup.".into(),
@@ -151,10 +182,10 @@ impl Store {
         }
         settings.bot = Some(identity.clone());
         settings.enabled = true;
-        atomic_json(&path, &settings)
+        self.write_settings(&settings)
     }
     fn connection_settings(&self, bot: &Identity, token: &Token) -> Result<Settings, String> {
-        let settings: Settings = private_json(&self.root.join("settings.json"), 1024 * 1024)?;
+        let settings = self.read_settings()?;
         if settings.version != 1
             || settings.token.as_ref() != Some(token)
             || !settings.enabled
