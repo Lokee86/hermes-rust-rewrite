@@ -1,6 +1,6 @@
 # Hermes gateway and storage parity report
 
-This report compares Mercury, the Rust rewrite in this repository, with stock Hermes Agent v0.23.3 for existing profiles and Desktop, Webapp, TUI, and headless clients. A drop-in release must use the stock on-disk profile model. The source baseline is Mercury `1ac307f5427405a6ae571f188d6a7ea5c6bec4d0` and stock Hermes `caafe5389ae585ef77387a962aee05b1bcf17029`. See [the full method inventory](FEATURE_PARITY.md#gateway-contract-inventory) and [the stock OpenRPC registry](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/apps/shared/src/gateway-contract.openrpc.json).
+This report compares Mercury, the Rust rewrite in this repository, with stock Hermes Agent v0.23.3 for existing profiles and Desktop, Webapp, TUI, and headless clients. The source baseline is Mercury `1ac307f5427405a6ae571f188d6a7ea5c6bec4d0` and stock Hermes `caafe5389ae585ef77387a962aee05b1bcf17029`. See [the full method inventory](FEATURE_PARITY.md#gateway-contract-inventory) and [the stock OpenRPC registry](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/apps/shared/src/gateway-contract.openrpc.json).
 
 ## Advertised methods
 
@@ -37,7 +37,7 @@ This table counts the 263 names under `methods`.
 
 ## Storage and profile compatibility
 
-**Required cutover.** Mercury must open the existing Hermes profile under `HERMES_HOME` and read and write the stock stores directly. Use the stock SQLite schemas, migrations, indexes, triggers, and persistence semantics. Preserve the profile files and their precedence. Stock Hermes must be able to reopen that same profile after Mercury has added history.
+**Direction.** Mercury keeps its own data folder and does not write to a Hermes profile. Its chats are moving from JSON files to Mercury's own SQLite database. Opening an existing Hermes profile under `HERMES_HOME` and writing the stock stores directly is an [option for later](#option-share-the-stock-stores), not a requirement. It would be off unless a user turned it on.
 
 This comparison describes the source revisions above. Paths are relative to the selected profile unless noted. Stock resolves its home through `HERMES_HOME`. Mercury's native data directory can be set with `HERMES_RUST_DATA_DIR`. [Stock profile paths](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/hermes_constants.py) · [Mercury library root](crates/library/README.md#storage-and-concurrency)
 
@@ -54,15 +54,17 @@ Mercury's manual history importer copies the SQLite database and any WAL into a 
 
 The native backup uses a versioned JSON archive. Restore creates detached chats with new IDs and keeps settings, memory, and queued work as recovery copies. Credentials and workspace files are not in the archive. [Native backup and restore](crates/library/src/native_backup.rs)
 
-### Replace the active JSON stores
+### Option: share the stock stores
+
+This describes what sharing one profile with stock Hermes would take. A fault in Mercury could then damage the user's Hermes data, and a stock schema change could break Mercury, so it needs its own decision and opt-in. It would mean using the stock SQLite schemas, migrations, indexes, triggers, and persistence semantics, and preserving the profile files and their precedence. Stock Hermes would have to be able to reopen the same profile after Mercury has added history.
 
 - Move the session catalog and transcripts from `library.json` and `conversation.json` to `state.db`. Preserve the existing stock IDs, lineage, message identities, archive/pin state, tool results, stored prompts, attachment references, and full-text search. Use stock runtime tables and transaction rules for admissions, execution receipts, interruption, and recovery. This replaces the separate running checkpoint and queue as active sources of truth.
 - Move projects and workspace selection out of `library.json` into `projects.db`. Preserve stock project IDs, folders, and session associations through the stock workspace rules.
 - Move profile settings from `agent-settings.json` to the stock `config.yaml` keys. Reuse the stock environment and credential locations, `SOUL.md`, and `memories/` Markdown files. Match the stock `cron/jobs.json` schema and behavior. Map the remaining Mercury JSON state for stock-backed features to the corresponding stock stores.
 
-### Migrate once and verify a profile handoff
+### Checks for that option
 
-For existing Mercury profiles, back up the original files and pause active writers before converting the JSON state. Match previously imported chats to their stock origins. Preserve Mercury-added turns and divergent branches, record ID collisions and unmapped fields, and verify the result before activating the stock stores. After cutover, retire the replaced JSON files as active state.
+Before converting existing Mercury profiles, back up the original files and pause active writers before converting the JSON state. Match previously imported chats to their stock origins. Preserve Mercury-added turns and divergent branches, record ID collisions and unmapped fields, and verify the result before activating the stock stores. After cutover, retire the replaced JSON files as active state.
 
 **Acceptance.** Open a disposable populated Hermes profile in Mercury, resume an existing session, complete a turn, and reopen that same profile in stock Hermes. Stock must find the new turn under the original session ID, including through search. Check attachments, projects, effective settings, prompt files, and ownership after restart. Separately migrate a populated Mercury profile twice and interrupt a migration before completion. Confirm recovery, stable mappings, and no duplicated messages, tool effects, or scheduled jobs. [Existing SQLite fixtures](crates/library/src/tests.rs)
 
@@ -87,7 +89,7 @@ Windows Application Control blocked Rust Anything v4.1.0 and a fresh local Mercu
 ## Drop-in acceptance checks
 
 1. **Launch and connect.** Run unchanged stock clients against the Mercury package. Mercury starts its gateway with `gateway run` and has no `serve` command. Check `hermes serve` invocation, readiness and shutdown, `/api/health`, `/api/status`, and configuration routes. Compare the required response fields and errors. Exercise both private local discovery and deployed HTTPS sign-in.
-2. **Use the stock storage model.** Complete the [storage cutover](#storage-and-profile-compatibility). Both applications must read each other's saved work in the same profile, and existing Mercury JSON profiles must migrate once. Verify history order and pagination with unchanged stock client decoders.
+2. **Open and migrate sessions.** Run the import and storage checks on populated stock profiles without changing them, and migrate existing Mercury JSON chats once. Verify history order and pagination across restart with unchanged stock client decoders. The [shared-store checks](#checks-for-that-option) apply only if that option is built.
 3. **Run, approve, and recover turns.** Replay simultaneous submissions, implicit queueing, first receipts, approval after disconnect, cancellation, and restart boundaries. Verify that a retried request yields one committed outcome and the expected ordered events. [Gateway integration plan](ONE-GATEWAY-HERDR-PLAN.md#what-follows-the-first-demonstration)
 4. **Exercise terminals and management APIs.** Run the existing stock browser-terminal and composer fixtures. Cover profile, project, group, MCP, plugin, and routine workflows using the stock method names and the appropriate client roles. [Browser-terminal fixture](scripts/verify_stock_browser_terminal.cjs) · [Composer fixture](scripts/verify_stock_composer_shell.py)
 5. **Exercise headless callers.** Stock's opt-in OpenAI-compatible adapter serves `/v1/models`, Chat Completions, and Responses. Those routes are absent from the audited Mercury gateway router. For deployments that use this adapter, include the HTTP, SSE, response retrieval, and retry behaviors in the acceptance suite. [Stock API adapter](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/gateway/platforms/api_server.py) · [Mercury router](crates/gateway/src/lib.rs)
