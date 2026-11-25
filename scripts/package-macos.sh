@@ -62,6 +62,12 @@ image="$(dirname "$destination")/Hermes-macOS.dmg"
 layout=$(mktemp -d)
 ditto "$destination" "$layout/Hermes.app"
 ln -s /Applications "$layout/Applications"
-hdiutil create -quiet -ov -volname Hermes -srcfolder "$layout" -format UDZO "$image"
+# hdiutil can fail with "Resource busy" while the system still holds the folder.
+attempt=1
+until hdiutil create -ov -volname Hermes -srcfolder "$layout" -format UDZO "$image"; do
+    [ "$attempt" -lt 4 ] || exit 1
+    attempt=$((attempt + 1))
+    sleep 10
+done
 if [ "$identity" != - ]; then codesign --force --timestamp --sign "$identity" "$image"; fi
 printf 'Built %s and %s\n' "$destination" "$image"

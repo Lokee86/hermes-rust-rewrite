@@ -2,6 +2,7 @@
 name = "hermes-library"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true
