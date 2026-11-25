@@ -1,0 +1,30 @@
+name: Mercury archive-fence integration
+on:
+  push:
+    branches: [ci/mercury-archive-fence]
+permissions:
+  contents: read
+jobs:
+  archive-fence:
+    runs-on: windows-2022
+    timeout-minutes: 50
+    env:
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          ref: 630866837ec45c1a9343886c1df3117ccf4d0317
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.16.0
+      - run: rustup update stable
+      - name: Set up the pinned Python runtime
+        run: |
+          $python = ./scripts/python-runtime.ps1
+          "PYO3_PYTHON=$python" >> $env:GITHUB_ENV
+          Split-Path $python >> $env:GITHUB_PATH
+      - name: Run the Mercury archive-fence fixture
+        run: |
+          git rev-parse HEAD
+          cargo test --locked -p hermes-gateway --test websocket -j 1 stock_reliquary_enrolls_renames_and_recalls_only_on_request -- --exact --nocapture
