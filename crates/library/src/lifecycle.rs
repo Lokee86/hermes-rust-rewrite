@@ -350,7 +350,7 @@ mod tests {
         let bound = library.create_session(None, Some("Copied")).unwrap();
         let plain = library.create_session(None, Some("Not copied")).unwrap();
         let saved = serde_json::json!({"version":1,"turns":[],"authority":{"receipts":[{"capture":{"staging":true}}]}});
-        fs::write(bound.directory.join("conversation.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        hermes_engine::restore_conversation(&bound.directory, saved).unwrap();
         fs::write(bound.directory.join("gateway.json"), br#"{"memory_binding":{"rel_id":"r"}}"#).unwrap();
         library.create_session(None, Some("Open")).unwrap();
         for chat in [&bound, &plain] {

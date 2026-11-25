@@ -95,7 +95,7 @@ pub fn lock_profile_plugin_deletion(home: &Path) -> Result<Option<fs::File>> {
         return Ok(None);
     };
     let lock = open_profile_install_fence(&home, parent)?;
-    lock.try_lock().context("A plugin installation is in progress for this profile")?;
+    crate::file_lock::exclusive(&lock).context("A plugin installation is in progress for this profile")?;
     Ok(Some(lock))
 }
 
@@ -110,7 +110,7 @@ fn lock_profile_plugin_install(home: &Path) -> Result<Vec<fs::File>> {
     }
     let locks = scopes.into_iter().rev().map(|(home, parent)| {
         let lock = open_profile_install_fence(home, parent)?;
-        lock.try_lock_shared().context("The profile is being deleted")?;
+        crate::file_lock::shared(&lock).context("The profile is being deleted")?;
         Ok(lock)
     }).collect::<Result<Vec<_>>>()?;
     ensure!(home.is_dir(), "The plugin profile no longer exists");
@@ -141,7 +141,7 @@ fn wait_for_installation(root: &Path) -> Result<InstallationLock> {
 
 fn lock_plugin_startup(root: &Path) -> Result<InstallationLock> {
     let lock = open_install_lock(root)?;
-    lock.try_lock_shared().context("The plugin is being installed or changed")?;
+    crate::file_lock::shared(&lock).context("The plugin is being installed or changed")?;
     Ok(InstallationLock(lock))
 }
 

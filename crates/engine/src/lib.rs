@@ -3,6 +3,7 @@ pub use attachment::Attachment;
 pub mod herdr;
 mod history;
 pub mod db;
+mod file_lock;
 mod mcp;
 mod plugin_inference;
 mod plugin_worker;

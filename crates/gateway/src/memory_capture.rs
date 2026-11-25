@@ -774,7 +774,7 @@ mod tests {
         lock(&requests).clear();
         say("after-rewind").await;
         assert!(!lock(&requests).iter().any(|body| body.contains("removed-turn")), "{requests:?}");
-        let saved: Value = serde_json::from_slice(&fs::read(session.dir.join("conversation.json")).unwrap()).unwrap();
+        let saved = hermes_engine::conversation_json(&session.dir).unwrap().unwrap();
         let prompts: Vec<_> = saved["turns"].as_array().unwrap().iter().map(|turn| turn["prompt"].as_str().unwrap()).collect();
         assert_eq!(prompts, ["kept-turn", "after-rewind"]);
         gateway.shutdown().await.unwrap();

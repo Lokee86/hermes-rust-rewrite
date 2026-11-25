@@ -905,7 +905,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
 
     // Reproduce an older archive intent that reached the adapter but never
     // committed a Core tombstone. Recovery must prove the accepted source is live.
-    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    let old_fence = record_path.join("gateway-memory-ended");
     fs::write(&old_fence, b"").unwrap();
     let (sidecar, mut saved) = fs::read_dir(state.join("native-capture-sources-v1")).unwrap()
         .filter_map(|item| {
@@ -938,7 +938,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let record_path = library.session(source_id).unwrap().directory.clone();
     let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
     let mut next = restarted.client().await;
-    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    let old_fence = record_path.join("gateway-memory-ended");
     timeout(Duration::from_secs(15), async {
         while old_fence.exists() {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1116,7 +1116,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let restored = wait_for_observation(&mut next, pending_id, REQUEST_OBSERVATION).await;
     assert_eq!(restored["observations"], lexical["observations"]);
 
-    let challenge_record = library.session(challenge_id).unwrap().directory.join("conversation.json");
+    let challenge_record = library.session(challenge_id).unwrap().directory.clone();
     memory_capture_receipt(&challenge_record, 0).await;
     let before_rewind = restarted.private_request("plugins.memory.archive_search", json!({
         "session_id":pending_id, "query":"Copper Finch 862"
@@ -1128,7 +1128,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let rewound = restarted.rewind(challenge_id, 0).await;
     assert_eq!(rewound["kept_turns"], 0);
     assert_eq!(rewound["memory_synced"], false);
-    let stopped: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+    let stopped: Value = saved_json(&challenge_record);
     assert_eq!(stopped["turns"], json!([]));
     assert_eq!(stopped["authority"]["source_rewinds"][0]["acknowledged"], false);
 
@@ -1141,7 +1141,7 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     next.ok("session.resume", json!({"session_id":pending_id})).await;
     timeout(Duration::from_secs(25), async {
         loop {
-            let row: Value = serde_json::from_slice(&fs::read(&challenge_record).unwrap()).unwrap();
+            let row: Value = saved_json(&challenge_record);
             if row["authority"]["source_rewinds"][0]["acknowledged"] == true {
                 assert!(row["authority"]["source_rewinds"][0]["resulting_head"].is_array());
                 assert!(row["authority"]["source_rewinds"][0]["removed_message_uids"].is_array());

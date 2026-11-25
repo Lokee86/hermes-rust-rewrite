@@ -1,7 +1,6 @@
 use crate::db;
 use anyhow::{Context, Result, bail, ensure};
 use directories::ProjectDirs;
-use fs2::FileExt;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -304,7 +303,7 @@ impl Store {
         fs::create_dir_all(dir).context("Could not create the conversation directory")?;
         let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
             .open(dir.join("session.lock")).context("Could not open the conversation lock")?;
-        lock.try_lock_exclusive().context("This conversation is already open in another window or cannot be locked")?;
+        crate::file_lock::exclusive(&lock).context("This conversation is already open in another window or cannot be locked")?;
         let (root, id) = db::place(dir);
         let mut db = db::open(&root)?;
         let mut record = load_record(&mut db, &id)?;
