@@ -58,6 +58,22 @@ fn lock_installation(root: &Path) -> Result<fs::File> {
     Ok(lock)
 }
 
+fn wait_for_installation(root: &Path) -> Result<fs::File> {
+    use std::time::{Duration, Instant};
+
+    let lock = open_install_lock(root)?;
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < Duration::from_secs(45) => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error).context("Could not lock the installed plugin packages for publication"),
+        }
+    }
+}
+
 fn lock_plugin_startup(root: &Path) -> Result<fs::File> {
     let lock = open_install_lock(root)?;
     lock.try_lock_shared().context("The plugin is being installed or changed")?;
@@ -145,7 +161,9 @@ fn install_checkout(
         None
     };
     let python_package_generation = staged.as_ref().map(python_packages::selector).transpose()?;
-    let _lock = lock_installation(root)?;
+    // Catalog installs run off the UI thread, so wait for any Python startup
+    // to finish loading the current checkout before publishing the replacement.
+    let _lock = wait_for_installation(root)?;
     let mut list = installed(root)?;
     let revision = list.iter().find(|plugin| plugin.name == entry.name).map_or(0, |plugin| plugin.revision);
     if list.iter().any(|plugin| plugin.name == entry.name) {
@@ -522,12 +540,31 @@ mod tests {
         assert_eq!(installed(&root).unwrap(), vec![old]);
         assert_eq!(fs::read_to_string(installed_checkout.join("__init__.py")).unwrap(), "old checkout");
 
-        let first = install_checkout(&root, &entry, &source, read_package(&source).unwrap(), |stage, requirements| {
-            assert_eq!(requirements, ["local-fixture"]);
-            assert_ne!(stage, legacy);
-            fs::write(stage.join("native.pyd"), "new native image")?;
-            Ok(())
-        }).unwrap();
+        let first = std::thread::scope(|threads| {
+            let startup = lock_plugin_startup(&root).unwrap();
+            let (staged, stage_ready) = std::sync::mpsc::channel();
+            let (finished, published) = std::sync::mpsc::channel();
+            let (root, entry, source, legacy) = (&root, &entry, &source, &legacy);
+            let installer = threads.spawn(move || {
+                let result = install_checkout(root, entry, source, read_package(source).unwrap(), |stage, requirements| {
+                    assert_eq!(requirements, ["local-fixture"]);
+                    assert_ne!(stage, legacy);
+                    fs::write(stage.join("native.pyd"), "new native image")?;
+                    staged.send(()).unwrap();
+                    Ok(())
+                });
+                finished.send(result).unwrap();
+            });
+            stage_ready.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                published.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(startup);
+            let first = published.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+            installer.join().unwrap();
+            first
+        });
         assert_eq!(first.revision, 4);
         assert_eq!(installed(&root).unwrap(), vec![first.clone()]);
         let first_path = python_packages::selected(&data, first.python_package_generation.as_deref()).unwrap();
