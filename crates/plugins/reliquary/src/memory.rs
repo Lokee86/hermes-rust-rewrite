@@ -355,7 +355,7 @@ impl EmbeddedMemory {
 
 impl MemoryStore for EmbeddedMemory {
     fn configure_profile_runtime(&self, config: &Config) -> Result<()> {
-        self.gateway.set_runtime(None)?;
+        self.gateway.set_perception_runtime(None)?;
         let Some(endpoint_id) = ProfileSettings::load(&self.home)?.memory_perception_endpoint
         else {
             return Ok(());
@@ -367,7 +367,7 @@ impl MemoryStore for EmbeddedMemory {
         for (&owner, instance) in &self.instances {
             self.check_embedding_identity(owner, instance, &identity)?;
         }
-        self.gateway.set_runtime(Some(&runtime))?;
+        self.gateway.set_perception_runtime(Some(&runtime))?;
         Ok(())
     }
 
@@ -578,7 +578,7 @@ impl MemoryStore for EmbeddedMemory {
     }
 
     fn stop_processing(&self) {
-        let _ = self.gateway.set_runtime(None);
+        let _ = self.gateway.set_perception_runtime(None);
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
         for job in jobs.values() {
             job.task.request_stop();
