@@ -69,7 +69,7 @@ jobs:
           path: .stock-hermes
           persist-credentials: false
       - if: inputs.stock_composer
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.14'
       - if: inputs.stock_composer
@@ -96,7 +96,7 @@ jobs:
           set -o pipefail
           python scripts/compare_composer_classifiers.py --source-checkout .stock-hermes --rust-classifier "$classifier" --json | tee "composer-classifier-$RUNNER_OS.json"
       - if: always() && inputs.stock_composer
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: composer-shell-${{ runner.os }}
           path: |
@@ -158,12 +158,12 @@ jobs:
       - if: runner.os == 'macOS'
         run: scripts/smoke-macos.sh dist/Hermes.app dist/smoke-macos.png
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-${{ runner.os }}
           path: dist/smoke-*.png
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Hermes-${{ runner.os }}
           path: |
@@ -180,7 +180,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           pattern: Hermes-*
