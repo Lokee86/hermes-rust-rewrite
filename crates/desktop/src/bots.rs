@@ -11,7 +11,7 @@ use iced::{Alignment, Border, Color, Element, Fill, Task,
 pub(super) enum Action {
     Roster(bool), Open(String), New, Edit(String), Cancel,
     Name(String), Description(String), Emoji(String), Soul(text_editor::Action),
-    Save, Delete(String), ConfirmDelete, Menu, Toasts,
+    Save, Delete(String), ConfirmDelete, DeleteDone(String, std::path::PathBuf, Result<serde_json::Value, String>), Menu, Toasts,
     // Roster sections (user-sections.ts)
     NewSection(Option<String>), RenameSection(String), SectionName(String), SaveSection, DeleteSection(String),
     MoveSection(String, i32), RowMenu(String), MoveTo(String, Option<String>), SectionMenu(String),
@@ -194,12 +194,45 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         Action::Delete(name) => { state.deleting = Some(name); state.form = None; app.screen = Screen::Bots; }
         Action::ConfirmDelete => {
             let (Some(library), Some(name)) = (library, state.deleting.take()) else { return Task::none() };
-            let open = app.current.as_ref().is_some_and(|c| c.bot.as_deref() == Some(name.as_str()));
+            let open = app.current.as_ref().is_some_and(|c| c.bot.as_deref() == Some(name.as_str())
+                || name.strip_prefix("group:").is_some_and(|group| c.bot.as_deref() == Some(&format!("group:{group}"))));
             if open && app.running { state.error = Some("Stop the current response before deleting this bot.".into()); return Task::none(); }
-            let result = match name.strip_prefix("group:") { Some(id) => library.delete_group(id), None => library.delete_bot(&name) };
+            if let Some(id) = name.strip_prefix("group:") {
+                match library.delete_group(id) {
+                    Ok(()) => {
+                        state.refresh(Some(&library));
+                        if open { app.screen = Screen::Bots; let _ = app.update(Message::NewChat); app.screen = Screen::Bots; }
+                    }
+                    Err(e) => state.error = Some(format!("{e:#}")),
+                }
+            } else {
+                let root = library.root().to_owned();
+                let provider = app.config.clone();
+                let request_name = name.clone();
+                let result_root = root.clone();
+                return Task::perform(
+                    super::local_gateway::catalog_request(root, provider, "catalog.bot.delete", serde_json::json!({"name":request_name})),
+                    move |result| Message::Bot(Action::DeleteDone(name, result_root, result)),
+                );
+            }
+        }
+        Action::DeleteDone(name, root, result) => {
+            let Some(library) = library else { return Task::none() };
+            if library.root() != root { return Task::none(); }
             match result {
-                Ok(()) => { state.refresh(Some(&library)); if open { app.screen = Screen::Bots; let _ = app.update(Message::NewChat); app.screen = Screen::Bots; } }
-                Err(e) => state.error = Some(format!("{e:#}")),
+                Ok(_) => {
+                    state.error = None;
+                    state.refresh(Some(&library));
+                    if app.current.as_ref().is_some_and(|current| current.bot.as_deref() == Some(name.as_str())) {
+                        app.screen = Screen::Bots;
+                        let _ = app.update(Message::NewChat);
+                        app.screen = Screen::Bots;
+                    }
+                }
+                Err(error) => {
+                    state.deleting = Some(name);
+                    state.error = Some(format!("Could not delete bot: {error}"));
+                }
             }
         }
     }
