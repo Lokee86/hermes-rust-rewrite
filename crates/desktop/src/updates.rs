@@ -16,6 +16,8 @@ pub(super) enum Action {
     Checked(bool, Result<Option<Update>, String>),
     Download,
     Downloaded(Result<PathBuf, String>),
+    /// Open what was downloaded and close Hermes so it can be replaced.
+    Install,
     AtStartup(bool),
 }
 
@@ -142,6 +144,23 @@ async fn download(update: Update) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Start the downloaded installer. Returns whether Hermes must close for it.
+fn open_installer(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::process::Command;
+    if cfg!(windows) {
+        Command::new(path).args(["/SILENT", "/CLOSEAPPLICATIONS"]).spawn()?;
+        return Ok(true);
+    }
+    if cfg!(target_os = "macos") {
+        // Shows Hermes beside the Applications folder.
+        Command::new("/usr/bin/open").arg(path).spawn()?;
+        return Ok(true);
+    }
+    // An archive has to be unpacked over the old folder; show where it is.
+    Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()?;
+    Ok(false)
+}
+
 pub(super) fn at_startup(app: &mut Hermes) -> Task<Message> {
     if !app.updates.at_startup {
         return Task::none();
@@ -182,11 +201,23 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             state.busy = false;
             match result {
                 Ok(path) => {
-                    state.note = Some(format!("Saved and verified: {}. Quit Hermes, then open it to install.", path.display()));
+                    state.note = Some(format!("Saved and verified: {}.", path.display()));
                     state.saved = Some(path);
                 }
                 Err(error) => state.note = Some(error),
             }
+        }
+        Action::Install if !state.busy => {
+            let Some(path) = state.saved.clone() else { return Task::none() };
+            if app.running || !app.approvals.is_empty() {
+                state.note = Some("Wait for the current response, or stop it, before installing.".into());
+                return Task::none();
+            }
+            return match open_installer(&path) {
+                Ok(true) => iced::exit(),
+                Ok(false) => Task::none(),
+                Err(error) => { state.note = Some(format!("Could not open {}: {error}", path.display())); Task::none() }
+            };
         }
         Action::AtStartup(on) => {
             state.at_startup = on;

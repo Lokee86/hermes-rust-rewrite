@@ -18,7 +18,7 @@ Every build comes from [the CI workflow](.github/workflows/build.yml), which run
 
 Packages built from this revision embed [Reliquary](https://github.com/Lokee86/Reliquary) for native profile memory. Reliquary is MPL-2.0 software. Each package includes its exact source revision, source-archive link and license links in `Reliquary-NOTICE` (under `Notices`, the macOS app's `Contents/Resources/Notices`, or Linux's `share/licenses/hermes`). The corresponding source for the pinned revision is also available directly from [GitHub](https://github.com/Lokee86/Reliquary/tree/f212204d4d099f5b4d87db2dbf636cea55111b82).
 
-## Rust vs Electron benchmark
+## Rust vs Electron benchmark (v0.1.0)
 
 The same machine, the same source baseline, and a returning user in both cases (each app's data folder was isolated and already set up).
 
@@ -41,12 +41,12 @@ Measured on an Apple M4 with 16 GB of memory and macOS 27.0.1. Each figure is th
 - **Memory:** the physical footprint reported by `/usr/bin/footprint` (what Activity Monitor calls *Memory*), summed over every process the app started, 15 s after launch.
 - **Idle CPU:** CPU time used by the whole process tree over the next 10 s, divided by 10 s.
 
-The Electron app starts its Python gateway as a detached background process, outside its own process tree. It was measured separately with the same tools ([`electron-gateway-macos.json`](benchmarks/results/electron-gateway-macos.json)) and is counted in the "app + backend" rows. The Rust engine runs inside the app process.
+The Electron app starts its Python gateway as a detached background process, outside its own process tree. It was measured separately with the same tools ([`electron-gateway-macos.json`](benchmarks/results/electron-gateway-macos.json)) and is counted in the "app + backend" rows. In v0.1.0 the Rust engine ran inside the app process.
 
 Caveats:
 
 - One Rust run took 21.5 s to show its window. It is excluded by the median but still listed in the raw results; it looks like the window opened on another macOS Space.
-- These figures predate the built-in Python for plugins. The bundled CPython runtime adds about 17 MB to the macOS download (≈56 MB zipped now). It only runs while a Python plugin is enabled, so memory and CPU at idle are unchanged.
+- **These figures are v0.1.0's and have not been measured again.** Since then the app bundles CPython, Herdr and Reliquary, and each profile's chats run in a gateway process of the same program that stays up after the window closes. Downloads are larger now (about 59 MB on macOS, 70 MB on Windows and Linux), and the process count and memory rows no longer describe the current app.
 - These are macOS numbers only. The Windows and Linux builds are tested in CI and have not been benchmarked.
 
 To reproduce:
@@ -138,7 +138,7 @@ Saved API keys and sign-in tokens are encrypted with a key kept in the macOS Key
 - **Not tried by hand:** Windows and Linux (CI tests them and starts the packaged apps), and connecting to a reachable cloud agent. SSH is tested against a real OpenSSH server on the same machine, with a stand-in for the remote Hermes.
 - **Missing:**
   - signing and notarization, which need paid certificates;
-  - installing an update without opening the downloaded installer;
+  - installing updates by itself: Hermes downloads, verifies and opens the installer when you ask;
   - most of the stock gateway's methods ([`FEATURE_PARITY.md`](FEATURE_PARITY.md) lists them), and desktop plugin surfaces other than pages;
   - conversations in a database: they are JSON files, and only the running reply is rewritten while it streams.
 
