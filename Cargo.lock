@@ -2450,7 +2450,6 @@ dependencies = [
  "async-channel",
  "axum",
  "base64 0.22.1",
- "block2 0.5.1",
  "block2 0.6.2",
  "cap-std",
  "chrono",
