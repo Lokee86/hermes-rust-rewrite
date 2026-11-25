@@ -122,7 +122,7 @@ Selecting **Reliquary** enrolls a private PHY named for the profile and `general
 
 Existing manual enrollments still use their registered owner files and the original service lease. A profile rename updates any registered paths that moved with the profile and preserves the original owner identities and external paths. A newly created ordinary chat binds to its assigned General or project REL and the authorized private PHY. Chats created before enrollment, imported or restored chats, and background jobs are excluded from automatic capture.
 
-The owners are not part of Hermes profile exports, and deleting a profile leaves them in place. A profile imported into another data directory gets independent owners on enrollment.
+Managed owners live outside profile exports. An imported profile gets independent owners on enrollment. Deleting a profile after its gateway stops removes the profile's registered managed store, including its Archive and Echo copies.
 
 Open **Capabilities → Plugins → Reliquary → Configure** to edit the profile’s Reliquary Switchboard routes in **Settings → Memory & Context**. The Switchboard selects models for General, Insomnia, Insomnia Metadata, Entity Extraction, General Decision, Entity Resolution Decision, Memory Retrieval Decision, Entity Resolution, Dream, and Embedding. General and Entity Resolution initially follow the Hermes chat model. Insomnia and Dream fall back to General. Ownership metadata falls back to Insomnia, and decisions use a dedicated route, the shared General Decision route, or General in that order. Completed-turn processing also requires configured Entity Resolution and Embedding routes.
 

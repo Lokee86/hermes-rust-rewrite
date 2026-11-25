@@ -42,6 +42,12 @@ fn soul(bot: &Bot, instructions: &str) -> String {
 
 impl Library {
     fn roster_path(&self) -> PathBuf { self.root.join("bots.json") }
+    fn lock_bot_roster(&self) -> Result<File> {
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(self.root.join(".bots.lock"))?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    }
     fn read_roster(&self) -> Result<Roster> {
         match fs::read(self.roster_path()) {
             Ok(bytes) => serde_json::from_slice(&bytes).context("Could not read the bot roster"),
@@ -54,9 +60,25 @@ impl Library {
         ensure!(safe_id(name), "Invalid bot name");
         Ok(self.root.join("profiles").join(name))
     }
+    /// Verify a bot profile is the exact direct child owned by this library.
+    /// `None` is allowed after a prior directory-removal attempt, while the
+    /// roster still provides the bot's ownership record for retrying cleanup.
+    pub fn canonical_bot_profile(&self, name: &str) -> Result<Option<PathBuf>> {
+        let expected = self.bot_profile(name)?;
+        let metadata = match fs::symlink_metadata(&expected) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(metadata.file_type().is_dir(), "Bot profile path is not a directory");
+        let canonical = fs::canonicalize(&expected).context("Could not verify bot profile ownership")?;
+        ensure!(canonical == expected, "Bot profile path does not match its library-owned location");
+        Ok(Some(canonical))
+    }
     pub fn bots(&self) -> Result<Vec<Bot>> { Ok(self.read_roster()?.bots) }
 
     pub fn create_bot(&self, display_name: &str, description: &str, instructions: &str, emoji: &str) -> Result<Bot> {
+        let _roster_lock = self.lock_bot_roster()?;
         let display_name = display_name.trim();
         ensure!(!display_name.is_empty(), "Give the bot a name");
         ensure!(display_name.chars().count() <= 60, "A bot name must contain at most 60 characters");
@@ -78,6 +100,7 @@ impl Library {
     }
 
     pub fn update_bot(&self, name: &str, display_name: &str, description: &str, emoji: &str) -> Result<Bot> {
+        let _roster_lock = self.lock_bot_roster()?;
         let mut roster = self.read_roster()?;
         let bot = roster.bots.iter_mut().find(|bot| bot.name == name).context("This bot no longer exists")?;
         ensure!(!display_name.trim().is_empty(), "Give the bot a name");
@@ -91,6 +114,7 @@ impl Library {
         Ok(fs::read_to_string(self.bot_profile(name)?.join("SOUL.md")).unwrap_or_default())
     }
     pub fn set_bot_soul(&self, name: &str, text: &str) -> Result<()> {
+        let _roster_lock = self.lock_bot_roster()?;
         ensure!(self.bots()?.iter().any(|bot| bot.name == name), "This bot no longer exists");
         let profile = self.bot_profile(name)?; fs::create_dir_all(&profile)?;
         let mut file = NamedTempFile::new_in(&profile)?; file.write_all(text.as_bytes())?; file.persist(profile.join("SOUL.md"))?;
@@ -99,23 +123,28 @@ impl Library {
 
     /// Removes the bot and its profile. Its chat is archived, never deleted.
     pub fn delete_bot(&self, name: &str) -> Result<()> {
+        let _roster_lock = self.lock_bot_roster()?;
         let mut roster = self.read_roster()?;
-        let before = roster.bots.len();
-        roster.bots.retain(|bot| bot.name != name);
-        ensure!(roster.bots.len() < before, "This bot no longer exists");
-        atomic_json(&self.roster_path(), &roster)?;
+        ensure!(roster.bots.iter().any(|bot| bot.name == name), "This bot no longer exists");
+        if let Some(profile) = self.canonical_bot_profile(name)? {
+            // Remove first. On Windows, an open plugin file can make this fail;
+            // keep the roster and archived conversation metadata untouched so
+            // the user can close the worker and retry.
+            hermes_engine::plugins::remove_dir(&profile)?;
+        }
         self.with_catalog(true, |catalog| {
             for record in catalog.sessions.iter_mut().filter(|r| r.bot.as_deref() == Some(name)) { record.archived = true; record.bot = None; record.title = format!("{} (deleted bot)", record.title); }
             Ok(())
         })?;
-        let profile = self.bot_profile(name)?;
-        // Its plugins stop once the gateway sees that the bot is gone.
-        hermes_engine::plugins::remove_dir(&profile)
+        roster.bots.retain(|bot| bot.name != name);
+        atomic_json(&self.roster_path(), &roster)?;
+        Ok(())
     }
 
     /// Resolve the registry every time: the session titled "Bot Chat" owned by
     /// this bot. Created (adopt-before-mint, under the catalog lock) when missing.
     pub fn bot_chat(&self, name: &str) -> Result<SessionSummary> {
+        let _roster_lock = self.lock_bot_roster()?;
         ensure!(self.bots()?.iter().any(|bot| bot.name == name), "This bot no longer exists");
         self.with_catalog(true, |catalog| {
             if let Some(record) = catalog.sessions.iter_mut().find(|r| r.bot.as_deref() == Some(name) && r.title == BOT_CHAT_TITLE) {
@@ -161,6 +190,33 @@ mod tests {
         assert!(library.bots().unwrap().is_empty());
         assert!(!library.bot_profile(&bot.name).unwrap().exists());
         assert!(library.bot_chat(&bot.name).is_err());
+    }
+
+    #[test]
+    fn failed_profile_removal_keeps_roster_and_chat_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let bot = library.create_bot("Retry Helper", "", "", "🤖").unwrap();
+        let chat = library.bot_chat(&bot.name).unwrap();
+        let profile = library.bot_profile(&bot.name).unwrap();
+        fs::remove_dir_all(&profile).unwrap();
+        fs::write(&profile, b"not a profile directory").unwrap();
+
+        assert!(library.delete_bot(&bot.name).is_err());
+        assert!(library.bots().unwrap().iter().any(|entry| entry.name == bot.name));
+        let retained = library.session(&chat.id).unwrap();
+        assert!(!retained.archived);
+        assert_eq!(retained.bot.as_deref(), Some(bot.name.as_str()));
+
+        fs::remove_file(&profile).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        library.delete_bot(&bot.name).unwrap();
+        assert!(library.bots().unwrap().iter().all(|entry| entry.name != bot.name));
+        assert!(!profile.exists());
+        let archived = library.session(&chat.id).unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived.bot, None);
+        assert!(archived.title.contains("deleted bot"));
     }
 }
 
