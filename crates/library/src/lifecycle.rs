@@ -25,35 +25,6 @@ pub struct SessionQuery {
     pub hide_empty: bool,
 }
 
-#[derive(Deserialize)]
-struct CaptureStagingStatus {
-    authority: Option<CaptureStagingAuthority>,
-}
-
-#[derive(Deserialize)]
-struct CaptureStagingAuthority {
-    #[serde(default)]
-    receipts: Vec<CaptureStagingReceipt>,
-}
-
-#[derive(Deserialize)]
-struct CaptureStagingReceipt {
-    capture: Option<hermes_engine::memory_capture::PendingMemoryCapture>,
-}
-
-fn has_unacknowledged_stage(directory: &Path) -> Result<bool> {
-    let status: CaptureStagingStatus = match File::open(directory.join("conversation.json")) {
-        Ok(file) => serde_json::from_reader(file)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(status.authority.is_some_and(|authority| {
-        authority.receipts.iter().any(|receipt| {
-            receipt.capture.as_ref().is_some_and(|capture| capture.staging && capture.receipt.is_none())
-        })
-    }))
-}
-
 /// Whether the chat was ever bound to profile memory. One that cannot be read counts as bound.
 fn has_memory_binding(directory: &Path) -> bool {
     match std::fs::read(directory.join("gateway.json")) {
@@ -97,10 +68,6 @@ impl Library {
         let directory=self.session_dir(id)?;
         let lock=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(directory.join("session.lock"))?;
         lock.try_lock_exclusive().context("Close the conversation before deleting it")?;
-        ensure!(
-            !has_unacknowledged_stage(&directory)?,
-            "Memory is staging a copied turn. Retry the deletion after it is recorded."
-        );
         let bound = has_memory_binding(&directory);
         self.with_catalog(true,|catalog|{
             let record=find_session(catalog,id)?;
@@ -115,7 +82,8 @@ impl Library {
         })?;
         self.finish_deletions()
     }
-    /// Deletion commits leave this receipt even after session file cleanup.
+    /// Deletion commits leave this receipt even after session file cleanup. Reliquary recorded the
+    /// copy's owner before staging it, so an interrupted copy can be removed without the chat.
     pub fn pending_memory_deletions(&self) -> Result<Vec<String>> {
         self.with_catalog(false, |catalog| Ok(catalog.pending_memory_deletions.clone()))
     }
@@ -372,6 +340,27 @@ mod tests {
         );
         assert!(library.set_archived("unknown", true).is_err());
         assert!(library.set_pinned("unknown", true).is_err());
+    }
+
+    #[test]
+    fn a_chat_is_deleted_while_its_memory_copy_is_unfinished() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = Library::open(temp.path()).unwrap();
+        let bound = library.create_session(None, Some("Copied")).unwrap();
+        let plain = library.create_session(None, Some("Not copied")).unwrap();
+        let saved = serde_json::json!({"version":1,"turns":[],"authority":{"receipts":[{"capture":{"staging":true}}]}});
+        fs::write(bound.directory.join("conversation.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        fs::write(bound.directory.join("gateway.json"), br#"{"memory_binding":{"rel_id":"r"}}"#).unwrap();
+        library.create_session(None, Some("Open")).unwrap();
+        for chat in [&bound, &plain] {
+            library.set_archived(&chat.id, true).unwrap();
+            library.delete_archived(&chat.id).unwrap();
+            assert!(!chat.directory.exists());
+        }
+        // Only the copied chat leaves a removal request, and it survives reopening.
+        assert_eq!(Library::open(temp.path()).unwrap().pending_memory_deletions().unwrap(), [bound.id.clone()]);
+        library.acknowledge_memory_deletion(&bound.id).unwrap();
+        assert!(library.pending_memory_deletions().unwrap().is_empty());
     }
 
     #[test]

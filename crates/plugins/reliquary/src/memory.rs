@@ -40,7 +40,8 @@ pub(super) struct EmbeddedMemory {
     home: PathBuf,
     directory: PathBuf,
     managed_projects: Option<Vec<Project>>,
-    jobs: Mutex<BTreeMap<OwnerId, OwnerProcessingJob>>,
+    /// The import each owner is processing.
+    jobs: Mutex<BTreeMap<OwnerId, (String, OwnerProcessingJob)>>,
     embeddings: Mutex<()>,
     source_index: Mutex<()>,
     // The stock host takes the same lease. Drop after dropping the instances.
@@ -307,7 +308,7 @@ impl EmbeddedMemory {
         let Ok((owner, instance)) = self.route(&source.binding) else {
             return Ok(false);
         };
-        self.resume_before_removal(owner, instance, source, config)?;
+        self.stop_before_removal(owner, instance, source, config)?;
         if let Some(status) = instance.native_import_status(owner, &source.import_id)? {
             if status.source_key != hex(&source.source_sha256) || status.receipt_digest.is_none() {
                 return Ok(false);
@@ -356,7 +357,11 @@ impl EmbeddedMemory {
         sources.copied_source_change_pending(session_id)
     }
 
-    fn resume_before_removal(
+    /// Core records a removal only while no import is open, and cannot cancel one. Stop this
+    /// source's work rather than give a model text that its user removed; the removal then stays
+    /// pending until Core can close the import. A settled import has nothing left to extract:
+    /// closing it checks the embedding route and sends none of the chat.
+    fn stop_before_removal(
         &self,
         owner: OwnerId,
         instance: &Instance,
@@ -364,16 +369,24 @@ impl EmbeddedMemory {
         config: &Config,
     ) -> Result<()> {
         let import_id = source.latest_import.as_deref().unwrap_or(&source.import_id);
-        if let Some(status) = instance.native_import_status(owner, import_id)?
-            && matches!(
-                status.state,
-                NativeImportState::Staged | NativeImportState::Settled
-            )
-            && status.receipt_digest.is_some()
-        {
-            self.start_import(owner, instance, import_id, config)?;
+        let Some(status) = instance.native_import_status(owner, import_id)? else {
+            return Ok(());
+        };
+        match status.state {
+            NativeImportState::Settled if status.receipt_digest.is_some() => {
+                self.start_import(owner, instance, import_id, config)
+            }
+            NativeImportState::Staging | NativeImportState::Staged => {
+                let jobs = self.jobs.lock().expect("memory jobs lock");
+                if let Some((running, job)) = jobs.get(&owner)
+                    && running == import_id
+                {
+                    job.request_stop();
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     fn start_import(
@@ -384,10 +397,10 @@ impl EmbeddedMemory {
         config: &Config,
     ) -> Result<()> {
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
-        if jobs.get(&owner).is_some_and(|job| !job.is_finished()) {
+        if jobs.get(&owner).is_some_and(|(_, job)| !job.is_finished()) {
             return Ok(());
         }
-        if let Some(job) = jobs.remove(&owner) {
+        if let Some((_, job)) = jobs.remove(&owner) {
             let _ = job.join();
         }
         if let Some(runtime) = self.runtime(owner, instance, config)? {
@@ -399,7 +412,7 @@ impl EmbeddedMemory {
                     ..ProcessOptions::default()
                 },
             )?;
-            jobs.insert(owner, job);
+            jobs.insert(owner, (import_id.to_owned(), job));
         }
         Ok(())
     }
@@ -607,7 +620,7 @@ impl MemoryStore for EmbeddedMemory {
     fn stop_processing(&self) {
         let _ = self.gateway.set_perception_runtime(None);
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
-        for job in jobs.values() {
+        for (_, job) in jobs.values() {
             job.request_stop();
         }
         jobs.clear();
@@ -749,7 +762,7 @@ impl MemoryStore for EmbeddedMemory {
                 &source.binding == binding && source.session_id == session_id,
                 "invalid copied source record"
             );
-            self.resume_before_removal(owner, instance, &source, config)?;
+            self.stop_before_removal(owner, instance, &source, config)?;
         }
         let scope = HermesCopyScope::new(self.profile_id.clone(), session_id.to_owned())?;
         instance
@@ -945,6 +958,63 @@ mod tests {
     use hermes_engine::{Entry, Status};
     use serde_json::json;
     use std::fs;
+
+    /// Deleting a chat must not hand its text to a model on the way out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_an_unextracted_chat_contacts_no_provider() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let contacts = Arc::new(AtomicUsize::new(0));
+        let seen = contacts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                seen.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        tokio::task::spawn_blocking(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("reliquary");
+            fs::create_dir(&dir).unwrap();
+            let general = Rel::create(tmp.path().join("general.rel")).unwrap();
+            let phy = Phylactery::create(tmp.path().join("user.phy")).unwrap();
+            let topology = json!({"version":2,"profile_id":"default","principal_id":"owner",
+                "main_rel":general.owner_id(),"active_phy":phy.owner_id(),"projects":{},"owners":{
+                    general.owner_id().to_string():{"kind":"rel","path":general.path()},
+                    phy.owner_id().to_string():{"kind":"phylactery","path":phy.path()}}});
+            fs::write(dir.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
+            fs::write(dir.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
+            let config = Config { base_url: format!("http://{address}/v1"), model: "fixture".into(), api_key: String::new() };
+            let endpoint = hermes_engine::credentials::EndpointStore::open(&tmp.path().join("providers")).unwrap()
+                .save(Some("embedding"), "Embedding", &config).unwrap();
+            let settings = json!({"memory_embedding":{"endpoint_id":endpoint.id,"dimensions":8}});
+            ProfileSettings::update(tmp.path(), settings.as_object().unwrap()).unwrap();
+            let mem = legacy(tmp.path(), "default").unwrap().unwrap();
+            let library = hermes_library::Library::open(tmp.path().join("library")).unwrap();
+            let chat = library.create_session(None, Some("Private")).unwrap();
+            let binding = mem.binding_for_new_session(&chat).unwrap().unwrap();
+            let turn = Turn { prompt: "a private message".into(), entries: vec![Entry::Assistant { text: "noted".into(), calls: vec![] }],
+                status: Status::Complete, model: "mock".into(), attachments: vec![], context: String::new() };
+            let capture = PendingMemoryCapture::new(&binding, &chat.id, "admission", 1, 0, 10, 11, &turn).unwrap();
+            let receipt = mem.stage(&capture, &turn, None).unwrap();
+            let status = || {
+                let (owner, instance) = mem.route(&binding).unwrap();
+                instance.native_import_status(owner, &receipt.import_id).unwrap().unwrap().state
+            };
+            assert!(matches!(status(), NativeImportState::Staged));
+            // Retried, as the gateway does: the removal waits for Core and the chat stays withheld.
+            for _ in 0..3 {
+                assert!(!mem.terminal_source(&chat.id, &config).unwrap());
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            assert!(matches!(status(), NativeImportState::Staged));
+            assert_eq!(mem.unfinished_removals().unwrap(), [chat.id.clone()]);
+            assert!(!mem.ensure_processing(&binding, &chat.id, &receipt, &config).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }).await.unwrap();
+        assert_eq!(contacts.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn committed_turn_replays_real_archive_receipt_under_frozen_project_and_principal() {

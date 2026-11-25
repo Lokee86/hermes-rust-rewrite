@@ -410,15 +410,22 @@ fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
                     ).await
                 },move|result|Message::ProfileSetting(Action::DeleteDone(message_id,result)));
             }
-            state.feedback=Some(lib.delete_archived(&id).map(|_|"Session deleted".into()).map_err(|e|e.to_string()));
+            state.feedback=Some(lib.delete_archived(&id).map_err(|e|e.to_string()).map(|()|{
+                let pending=lib.pending_memory_deletions().is_ok_and(|pending|pending.contains(&id));
+                deleted_message(pending).into()
+            }));
             state.archived(&lib);app.refresh_sessions();
         },
         Action::DeleteDone(_id,result)=>{
-            state.feedback=Some(result.map(|_|"Session deleted".into()));
+            state.feedback=Some(result.map(|reply|deleted_message(reply["memory_synced"]==false).into()));
             state.archived(&lib);app.refresh_sessions();
         }
     }
     Task::none()
+}
+
+fn deleted_message(cleanup_pending:bool)->&'static str {
+    if cleanup_pending {"Chat deleted. Reliquary cleanup pending."} else {"Session deleted"}
 }
 
 #[cfg(feature = "reliquary")]
