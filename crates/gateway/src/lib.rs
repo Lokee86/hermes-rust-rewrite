@@ -60,7 +60,7 @@ use std::{
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, RwLock, mpsc, OwnedRwLockReadGuard, OwnedRwLockWriteGuard},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -103,6 +103,7 @@ pub const METHODS: &[&str] = &[
     "prompt.cancel",
     "catalog.session.set",
     "catalog.session.delete",
+    "catalog.bot.delete",
     "catalog.archive_inactive",
     "plugins.memory.sync",
     "plugins.memory.archive_search",
@@ -237,6 +238,7 @@ impl Gateway {
             instance_id: new_id(),
             shutdown,
             sessions: Mutex::new(HashMap::new()),
+            bot_lifecycle_locks: Mutex::new(HashMap::new()),
             tickets: auth::Tickets::default(),
             auth,
             terminal: terminal::Host::new(),
@@ -350,6 +352,7 @@ struct Shared {
     instance_id: String,
     shutdown: CancellationToken,
     sessions: Mutex<HashMap<String, Arc<LiveSession>>>,
+    bot_lifecycle_locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
     tickets: auth::Tickets,
     auth: auth::Auth,
     terminal: terminal::Host,
@@ -495,6 +498,36 @@ impl RpcError {
 }
 
 impl Shared {
+    async fn bot_lifecycle_lock(&self, name: &str) -> Arc<RwLock<()>> {
+        self.bot_lifecycle_locks.lock().await
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    async fn bot_read_guard(&self, name: &str) -> OwnedRwLockReadGuard<()> {
+        self.bot_lifecycle_lock(name).await.read_owned().await
+    }
+
+    async fn try_bot_read_guard(&self, name: &str) -> Option<OwnedRwLockReadGuard<()>> {
+        self.bot_lifecycle_lock(name).await.try_read_owned().ok()
+    }
+
+    async fn bot_read_guards(&self, names: &[String]) -> Vec<OwnedRwLockReadGuard<()>> {
+        let mut names = names.to_vec();
+        names.sort();
+        names.dedup();
+        let mut guards = Vec::with_capacity(names.len());
+        for name in names {
+            guards.push(self.bot_read_guard(&name).await);
+        }
+        guards
+    }
+
+    async fn bot_write_guard(&self, name: &str) -> OwnedRwLockWriteGuard<()> {
+        self.bot_lifecycle_lock(name).await.write_owned().await
+    }
+
     async fn stop_turns(&self) {
         for session in self.sessions.lock().await.values() {
             if let Some(cancel) = &lock(&session.view).cancel {
@@ -512,10 +545,12 @@ impl Shared {
             let _ = task.await;
         }
         self.stop_python_memory().await;
-        self.plugins.unload().await;
-        let profiles = std::mem::take(&mut *self.other_plugin_profiles.lock().await);
-        for runtime in profiles.into_values() {
-            runtime.unload().await;
+        let _ = self.plugins.close().await;
+        // A concurrent bot deletion can still find each profile's workers
+        // here until their exits have been confirmed.
+        let profiles: Vec<_> = self.other_plugin_profiles.lock().await.values().cloned().collect();
+        for runtime in profiles {
+            let _ = runtime.close().await;
         }
     }
 
@@ -543,6 +578,12 @@ impl Shared {
     async fn session(&self, id: &str) -> std::result::Result<Arc<LiveSession>, RpcError> {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(id) {
+            let bot = lock(&session.summary).bot.clone().filter(|name| !name.starts_with("group:"));
+            let _bot_guard = if let Some(name) = bot.as_deref() {
+                Some(self.try_bot_read_guard(name).await.ok_or_else(|| RpcError::new(
+                    4001, "bot_deleting", "This bot is being deleted; retry after the operation completes",
+                ))?)
+            } else { None };
             return Ok(session.clone());
         }
         if !Self::has_session_capacity(&mut sessions) {
@@ -554,6 +595,16 @@ impl Shared {
         }
         let summary = self.library.session(id).map_err(|error|
             RpcError::new(4004, "not_found", format!("Cannot open session: {error:#}")))?;
+        let bot = summary.bot.as_deref().filter(|name| !name.starts_with("group:"));
+        let _bot_guard = if let Some(name) = bot {
+            let guard = self.try_bot_read_guard(name).await.ok_or_else(|| RpcError::new(
+                4001, "bot_deleting", "This bot is being deleted; retry after the operation completes",
+            ))?;
+            if !self.library.bots().map_err(RpcError::internal)?.iter().any(|bot| bot.name == name) {
+                return Err(RpcError::new(4004, "not_found", "This bot no longer exists"));
+            }
+            Some(guard)
+        } else { None };
         let dir = self.library.session_dir(id).map_err(RpcError::internal)?;
         let mut settings = Settings::read(&dir).map_err(RpcError::internal)?;
         let workspace = self
@@ -818,7 +869,7 @@ impl Shared {
                 self.interrupt(params, peer, method == "prompt.cancel")
                     .await
             }
-            "catalog.session.set" | "catalog.session.delete" | "catalog.archive_inactive" => self.catalog_edit(method,params,peer).await,
+            "catalog.session.set" | "catalog.session.delete" | "catalog.archive_inactive" | "catalog.bot.delete" => self.catalog_edit(method,params,peer).await,
             "plugins.memory.sync" => self.sync_memory_plugin(peer).await,
             "plugins.memory.archive_search" => self.user_archive_search(params, peer).await,
             "commands.catalog" => self.commands_catalog(params, peer).await,

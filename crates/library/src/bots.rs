@@ -98,7 +98,7 @@ fn soul(bot: &Bot, instructions: &str) -> String {
 impl Library {
     fn roster_path(&self) -> PathBuf { self.root.join("bots.json") }
     fn lock_roster(&self) -> Result<File> {
-        let path = self.root.join("bots.lock");
+        let path = self.root.join(".bots.lock");
         if let Ok(metadata) = fs::symlink_metadata(&path) {
             ensure!(metadata.file_type().is_file(), "Bot roster lock must be a regular file");
         }
@@ -123,6 +123,7 @@ impl Library {
             Err(error) => return Err(error.into()),
         };
         ensure!(metadata.file_type().is_dir(), "Bot profile must be a regular directory");
+        ensure!(fs::canonicalize(&profile)? == profile, "Bot profile path does not match its library-owned location");
         let marker = profile.join(PROFILE_OWNER);
         let owned = match (roster.profile_owners.get(name), fs::symlink_metadata(&marker)) {
             (Some(expected), Ok(metadata)) if metadata.file_type().is_file() => {
@@ -140,6 +141,22 @@ impl Library {
     pub fn bot_profile(&self, name: &str) -> Result<PathBuf> {
         ensure!(profiles::valid_name(name), "Invalid bot name");
         Ok(self.root.join("profiles").join(name))
+    }
+    /// Verify a bot profile is an exact canonical direct child of this library.
+    /// Destructive cleanup separately requires its saved ownership marker.
+    /// `None` is allowed after a prior directory-removal attempt, while the
+    /// roster still provides the bot's ownership record for retrying cleanup.
+    pub fn canonical_bot_profile(&self, name: &str) -> Result<Option<PathBuf>> {
+        let expected = self.bot_profile(name)?;
+        let metadata = match fs::symlink_metadata(&expected) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(metadata.file_type().is_dir(), "Bot profile path is not a directory");
+        let canonical = fs::canonicalize(&expected).context("Could not verify bot profile ownership")?;
+        ensure!(canonical == expected, "Bot profile path does not match its library-owned location");
+        Ok(Some(canonical))
     }
     pub fn bots(&self) -> Result<Vec<Bot>> { Ok(self.read_roster()?.bots) }
 
@@ -210,6 +227,16 @@ impl Library {
 
     /// Reports an unverified legacy profile retained after removing the roster entry.
     pub fn delete_bot_with_outcome(&self, name: &str) -> Result<BotDeletion> {
+        self.delete_bot_with_cleanup(name, |_| Ok(()))
+    }
+
+    /// Run host cleanup only for a verified owned profile, before removing it.
+    /// The caller must stop profile services and hold their lifecycle fences.
+    pub fn delete_bot_with_cleanup(
+        &self,
+        name: &str,
+        cleanup: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<BotDeletion> {
         let _profiles_lock = self.lock_profiles()?;
         let _roster_lock = self.lock_roster()?;
         let mut roster = self.read_roster()?;
@@ -226,6 +253,7 @@ impl Library {
                 ensure!(safe_id(&owner), "Invalid bot profile owner");
                 let staging = self.ensure_profiles_dir()?.join(format!(".deleting-bot-{name}-{owner}"));
                 if !roster.profile_deletions.contains_key(name) {
+                    cleanup(&profile)?;
                     roster.profile_deletions.insert(name.to_owned(), owner.clone());
                     atomic_json(&self.roster_path(), &roster)?;
                 }
@@ -334,7 +362,7 @@ mod tests {
         let chat = library.bot_chat("work").unwrap();
         library.set_bot_soul("work", "Updated legacy instructions").unwrap();
 
-        let outcome = library.delete_bot_with_outcome("work").unwrap();
+        let outcome = library.delete_bot_with_cleanup("work", |_| bail!("Legacy profile cleanup must not run")).unwrap();
         assert_eq!(outcome.retained_profile.as_deref(), Some(profile.path.as_path()));
         assert!(library.bots().unwrap().is_empty());
         assert_eq!(fs::read_to_string(profile.path.join("important.txt")).unwrap(), "Existing profile data");
@@ -424,6 +452,58 @@ mod tests {
         assert!(library.bots().unwrap().is_empty());
         assert!(!library.bot_profile(&bot.name).unwrap().exists());
         assert!(library.bot_chat(&bot.name).is_err());
+    }
+
+    #[test]
+    fn failed_profile_removal_keeps_roster_and_chat_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let bot = library.create_bot("Retry Helper", "", "", "🤖").unwrap();
+        let chat = library.bot_chat(&bot.name).unwrap();
+        let profile = library.bot_profile(&bot.name).unwrap();
+        let owner = fs::read(profile.join(PROFILE_OWNER)).unwrap();
+        fs::remove_dir_all(&profile).unwrap();
+        fs::write(&profile, b"not a profile directory").unwrap();
+
+        assert!(library.delete_bot(&bot.name).is_err());
+        assert!(library.bots().unwrap().iter().any(|entry| entry.name == bot.name));
+        let retained = library.session(&chat.id).unwrap();
+        assert!(!retained.archived);
+        assert_eq!(retained.bot.as_deref(), Some(bot.name.as_str()));
+
+        fs::remove_file(&profile).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join(PROFILE_OWNER), owner).unwrap();
+        library.delete_bot(&bot.name).unwrap();
+        assert!(library.bots().unwrap().iter().all(|entry| entry.name != bot.name));
+        assert!(!profile.exists());
+        let archived = library.session(&chat.id).unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived.bot, None);
+        assert!(archived.title.contains("deleted bot"));
+    }
+
+    #[test]
+    fn failed_host_cleanup_keeps_owned_bot_deletion_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let bot = library.create_bot("Helper", "", "", "").unwrap();
+        let chat = library.bot_chat(&bot.name).unwrap();
+        let profile = library.bot_profile(&bot.name).unwrap();
+        assert!(library.delete_bot_with_cleanup(&bot.name, |_| bail!("Cleanup is busy")).is_err());
+        assert!(profile.is_dir());
+        assert_eq!(library.bots().unwrap().len(), 1);
+        assert!(!library.session(&chat.id).unwrap().archived);
+        assert!(library.read_roster().unwrap().profile_deletions.is_empty());
+        let mut cleaned = false;
+        library.delete_bot_with_cleanup(&bot.name, |home| {
+            assert_eq!(home, profile);
+            cleaned = true;
+            Ok(())
+        }).unwrap();
+        assert!(cleaned);
+        assert!(!profile.exists());
+        assert!(library.session(&chat.id).unwrap().archived);
     }
 }
 

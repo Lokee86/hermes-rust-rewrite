@@ -411,6 +411,19 @@ impl Shared {
 
     async fn admit(self: &Arc<Self>, session: Arc<LiveSession>, text:String, attachments:Vec<Attachment>, input:Option<String>, queue: bool, origin: AdmissionOrigin, fence: Option<SubmissionFence>) -> RpcResult {
         let summary = lock(&session.summary).clone();
+        let bot_names = match summary.bot.as_deref() {
+            Some(name) if !name.starts_with("group:") => vec![name.to_owned()],
+            Some(name) if name.starts_with("group:") => self.library.groups().map_err(RpcError::internal)?
+                .into_iter().find(|group| group.id == name.trim_start_matches("group:"))
+                .map(|group| group.members).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let _bot_guards = self.bot_read_guards(&bot_names).await;
+        if let Some(name) = summary.bot.as_deref().filter(|name| !name.starts_with("group:"))
+            && !self.library.bots().map_err(RpcError::internal)?.iter().any(|bot| bot.name == name)
+        {
+            return Err(RpcError::new(4004, "not_found", "This bot no longer exists"));
+        }
         let sid = summary.id.clone();
         let config = lock(&session.config).clone();
         let options = lock(&session.settings).generation_options.clone();
@@ -664,6 +677,19 @@ impl Shared {
         }
         let session = self.attached(params, peer).await?;
         let summary = lock(&session.summary).clone();
+        let bot_names = match summary.bot.as_deref() {
+            Some(name) if !name.starts_with("group:") => vec![name.to_owned()],
+            Some(name) if name.starts_with("group:") => self.library.groups().map_err(RpcError::internal)?
+                .into_iter().find(|group| group.id == name.trim_start_matches("group:"))
+                .map(|group| group.members).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let _bot_guards = self.bot_read_guards(&bot_names).await;
+        if let Some(name) = summary.bot.as_deref().filter(|name| !name.starts_with("group:"))
+            && !self.library.bots().map_err(RpcError::internal)?.iter().any(|bot| bot.name == name)
+        {
+            return Err(RpcError::new(4004, "not_found", "This bot no longer exists; the prompt remains parked"));
+        }
         let sid = summary.id.clone();
         let id = required_string(params, "admission_id")?;
         let result = {

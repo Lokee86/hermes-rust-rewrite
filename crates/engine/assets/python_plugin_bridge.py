@@ -1,6 +1,6 @@
 """Serve one Python Hermes plugin's tools over MCP stdio for the native desktop.
 
-Run with the installed Hermes interpreter: ``python -I bridge.py <hermes-agent root> <plugin dir>``.
+Run with the installed Hermes interpreter: ``python -I bridge.py <hermes-agent root> <plugin dir> [<packages dir>]``.
 The plugin is loaded by Hermes's own PluginManager (so its register(ctx), config and plugin-host
 isolation behave as in the Python agent) and the tools it registered are listed and dispatched
 through tools.registry. stdout carries the protocol; anything a plugin prints goes to stderr.
@@ -9,6 +9,21 @@ through tools.registry. stdout carries the protocol; anything a plugin prints go
 import json
 import os
 import sys
+import sysconfig
+from pathlib import Path
+
+
+def add_compatible_packages(directory):
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if sys.implementation.name != "cpython" or not suffix:
+        return
+    try:
+        with (Path(directory) / ".hermes-python-abi").open(encoding="ascii") as marker:
+            embedded_suffix = marker.read(256)
+    except (OSError, UnicodeError):
+        return
+    if embedded_suffix == suffix:
+        sys.path.insert(0, directory)
 
 
 def main() -> int:
@@ -18,13 +33,13 @@ def main() -> int:
     sys.path.insert(0, root)
     import hermes_bootstrap  # noqa: F401  -- the launcher's own environment setup (site dirs, home pin)
 
-    from pathlib import Path
-
     from hermes_cli.plugins import get_plugin_manager
     from hermes_cli.plugins_discovery import scan_directory
     from hermes_cli.plugins_manifest import manifest_key
     from tools.registry import registry
 
+    if len(sys.argv) > 3:
+        add_compatible_packages(sys.argv[3])
     manager = get_plugin_manager()
     manifests = [m for m in scan_directory(Path(plugin_dir).parent, "user")
                  if m.path and os.path.realpath(m.path) == plugin_dir]

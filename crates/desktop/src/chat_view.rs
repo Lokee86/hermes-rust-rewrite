@@ -142,6 +142,10 @@ impl Hermes {
             self.error(e);
             return;
         }
+        if self.connections.config.mode == connections::Mode::Local {
+            if let Some(library) = &self.library { self.tabs = tabs::State::load(library); }
+            self.refresh_sessions();
+        }
         let prior = self
             .library
             .as_ref()

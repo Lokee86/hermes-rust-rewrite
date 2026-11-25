@@ -90,11 +90,26 @@ fn test_root() -> PathBuf {
 }
 
 #[test]
-#[ignore = "needs a new empty HERMES_RUST_DATA_DIR and no provider environment overrides"]
 fn saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets() {
+    const CHILD: &str = "HERMES_DESKTOP_ISOLATED_BOOTSTRAP_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let isolated = tempfile::tempdir().unwrap();
+        let profile = isolated.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interaction_tests::saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1").env("HERMES_RUST_DATA_DIR", &profile)
+            .env("HERMES_HOME", isolated.path().join("stock-home"))
+            .env_remove("HERMES_RUST_BASE_URL").env_remove("HERMES_RUST_API_KEY").env_remove("HERMES_RUST_MODEL")
+            .env_remove("OPENROUTER_API_KEY").env_remove("OPENAI_API_KEY").env_remove("ANTHROPIC_API_KEY")
+            .output().unwrap();
+        assert!(result.status.success(), "isolated bootstrap failed:\n{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        return;
+    }
     let root = test_root();
     assert!(std::env::var_os("HERMES_RUST_BASE_URL").is_none());
     assert!(std::env::var_os("HERMES_RUST_API_KEY").is_none());
+    assert!(std::env::var_os("HERMES_RUST_MODEL").is_none());
     let config = Config { base_url: hermes_engine::OPENAI.into(), model: "saved-model".into(), api_key: "synthetic-saved-key".into() };
     let vault = hermes_engine::credentials::EndpointStore::open(&root.join("providers")).unwrap();
     vault.save(None, "Saved provider", &config).unwrap();
@@ -117,6 +132,10 @@ fn saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets()
     assert_eq!(app.current.as_ref().unwrap().id, "remote-b");
     let _ = app.tab_action(tabs::Action::Reopen);
     assert_eq!(app.current.as_ref().unwrap().id, "remote-a");
+    app.connections.config.mode = connections::Mode::Local;
+    app.refresh_gateway_route();
+    assert!(app.tabs.entries.iter().all(|tab| !tab.id.starts_with("remote-")));
+    assert!(app.sessions.iter().all(|session| !session.id.starts_with("remote-")));
 }
 
 #[tokio::test(flavor = "multi_thread")]

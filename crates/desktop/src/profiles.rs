@@ -56,7 +56,15 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
         },
         Action::Delete => state.deleting = true,
         Action::ConfirmDelete => if let Some(name) = state.selected.clone() {
-            match library.delete_profile(&name) { Ok(()) => { state.selected = None; state.deleting = false; state.notice = Some(format!("Deleted {name}.")); } Err(e) => { state.deleting = false; state.error = Some(format!("{e:#}")) } }
+            state.deleting = false;
+            match hermes_gateway::stock_plugins::delete_profile(&library, &name) {
+                Ok(()) => {
+                    state.selected = None;
+                    state.error = None;
+                    state.notice = Some(format!("Deleted {name}."));
+                }
+                Err(error) => state.error = Some(format!("{error:#}")),
+            }
         },
         Action::Soul(edit) => state.soul.perform(edit),
         Action::SaveSoul => if let Some(name) = &state.selected {

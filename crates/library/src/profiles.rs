@@ -81,13 +81,28 @@ impl Library {
         fs::rename(a, b)?;
         Ok(())
     }
-    pub fn delete_profile(&self, name: &str) -> Result<()> {
-        let _lock = self.lock_profiles()?;
+    pub fn profile_path_for_deletion(&self, name: &str) -> Result<PathBuf> {
         ensure!(name != "default", "The default profile can't be deleted");
         ensure!(!self.bots()?.iter().any(|b| b.name == name), "Delete bots from the Bots page");
         let path = self.profile_path(name)?;
         ensure!(path.is_dir(), "No such profile");
-        fs::remove_dir_all(path)?;
+        ensure!(
+            fs::canonicalize(&path)? == path,
+            "The profile directory must be inside the local profile store"
+        );
+        Ok(path)
+    }
+
+    pub fn delete_profile(&self, name: &str) -> Result<()> {
+        self.delete_profile_with_cleanup(name, |_| Ok(()))
+    }
+
+    /// Run host cleanup while profile directory mutations are fenced.
+    pub fn delete_profile_with_cleanup(&self, name: &str, cleanup: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+        let _lock = self.lock_profiles()?;
+        let profile = self.profile_path_for_deletion(name)?;
+        cleanup(&profile)?;
+        fs::remove_dir_all(profile)?;
         Ok(())
     }
     pub fn profile_soul(&self, name: &str) -> Result<String> { Ok(fs::read_to_string(self.profile_path(name)?.join("SOUL.md")).unwrap_or_default()) }

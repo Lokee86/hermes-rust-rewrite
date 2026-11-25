@@ -427,10 +427,9 @@ async fn serve_control(
                 let mut stream = stream;
                 let req = read_line(&mut stream, 64 * 1024).await?;
                 let (reply, stopping) = control_reply(&req, &profile, &shared).await;
+                // A lost reply must still complete an acknowledged drain.
+                let _stop_when_done = stopping.then(|| stop.clone().drop_guard());
                 send_line(&mut stream, &reply).await?;
-                if stopping {
-                    stop.cancel();
-                }
                 Result::<()>::Ok(())
             })
             .await;
