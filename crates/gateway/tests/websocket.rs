@@ -833,7 +833,13 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     assert!(!record.to_string().contains(PROJECT_FACT));
     assert_eq!(record["authority"]["receipts"][0]["capture"]["binding"]["rel_id"], general_id);
     drop(next);
+    assert!(hermes_gateway::stock_plugins::delete_profile(&profiles, "office").is_err());
+    assert!(state.is_dir());
     restarted.shutdown().await;
+    hermes_gateway::stock_plugins::delete_profile(&profiles, "office").unwrap();
+    assert!(!state.exists(), "the managed Archive and Echo copies should be removed");
+    assert!(!library.root().exists());
+    assert!(store.is_dir(), "the shared store root belongs to all profiles");
 }
 
 #[tokio::test]

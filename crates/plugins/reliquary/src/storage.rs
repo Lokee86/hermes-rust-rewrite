@@ -15,6 +15,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod deletion;
+pub(crate) use deletion::purge_profile_data;
+
 const ENROLLMENT: &str = "capture-enrollment-v1.json";
 const TOPOLOGY: &str = "topology-v1.json";
 const LOCATION: &str = "reliquary-storage.json";
@@ -121,6 +124,8 @@ struct Location {
     staging_folder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rename: Option<ProfileRename>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deletion: Option<deletion::Progress>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -471,6 +476,10 @@ fn sync_managed_projects(
 ) -> Result<(PathBuf, Topology, File)> {
     check_directory(&location.root)?;
     let _root_lock = lock_root(&location.root)?;
+    ensure!(
+        location.deletion.is_none(),
+        "Retry deleting this profile to finish Reliquary cleanup"
+    );
     finish_enrollment(location)?;
     finish_profile_rename(home, name, location)?;
     let directory = location.profile_directory();
@@ -554,6 +563,7 @@ fn provision(home: &Path, name: &str, root: &Path) -> Result<Location> {
         ),
         root,
         rename: None,
+        deletion: None,
     };
     // Stage a complete initial enrollment before exposing it to the gateway.
     let general = PathBuf::from("general.rel");
@@ -652,6 +662,10 @@ pub(super) fn rename_profile(library: &Library, from: &str, to: &str) -> Result<
     );
     check_directory(&location.root)?;
     let _root_lock = lock_root(&location.root)?;
+    ensure!(
+        location.deletion.is_none(),
+        "Retry deleting this profile to finish Reliquary cleanup"
+    );
     finish_enrollment(&mut location)?;
     finish_profile_rename(&old_home, from, &mut location)?;
     let directory = location.profile_directory();

@@ -22,6 +22,9 @@ pub trait MemoryPlugin: Send + Sync {
 
     /// A warning means the host rename was committed and plugin recovery remains pending.
     fn rename_profile(&self, library: &Library, from: &str, to: &str) -> Result<Option<String>>;
+
+    /// Remove plugin-owned data while the host holds the profile lifecycle fence.
+    fn purge_profile_data(&self, home: &std::path::Path, name: &str) -> Result<()>;
 }
 
 pub trait MemoryStore: Send + Sync {

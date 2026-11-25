@@ -61,12 +61,20 @@ impl Library {
         fs::rename(a, b)?;
         Ok(())
     }
-    pub fn delete_profile(&self, name: &str) -> Result<()> {
+    pub fn profile_path_for_deletion(&self, name: &str) -> Result<PathBuf> {
         ensure!(name != "default", "The default profile can't be deleted");
         ensure!(!self.bots()?.iter().any(|b| b.name == name), "Delete bots from the Bots page");
         let path = self.profile_path(name)?;
         ensure!(path.is_dir(), "No such profile");
-        fs::remove_dir_all(path)?;
+        ensure!(
+            fs::canonicalize(&path)? == path,
+            "The profile directory must be inside the local profile store"
+        );
+        Ok(path)
+    }
+
+    pub fn delete_profile(&self, name: &str) -> Result<()> {
+        fs::remove_dir_all(self.profile_path_for_deletion(name)?)?;
         Ok(())
     }
     pub fn profile_soul(&self, name: &str) -> Result<String> { Ok(fs::read_to_string(self.profile_path(name)?.join("SOUL.md")).unwrap_or_default()) }
