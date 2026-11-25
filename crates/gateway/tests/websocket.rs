@@ -15,13 +15,14 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Notify,
     task::JoinHandle,
     time::timeout,
 };
@@ -166,7 +167,15 @@ struct Provider {
     address: SocketAddr,
     memory_requests: Arc<AtomicUsize>,
     observation_verifications: Arc<AtomicUsize>,
+    observation_review: Arc<ObservationReview>,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ObservationReview {
+    challenged: AtomicBool,
+    started: Notify,
+    finish: Notify,
 }
 impl Drop for Provider {
     fn drop(&mut self) {
@@ -181,6 +190,8 @@ impl Provider {
         let observed = Arc::clone(&memory_requests);
         let observation_verifications = Arc::new(AtomicUsize::new(0));
         let verified = Arc::clone(&observation_verifications);
+        let observation_review = Arc::new(ObservationReview::default());
+        let review = Arc::clone(&observation_review);
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -188,14 +199,14 @@ impl Provider {
                     .route("/v1/chat/completions", post(model))
                     .route("/v1/embeddings", post(embed_memory_fixture))
                     .route("/v1/decisions", post(move |headers, request| {
-                        native_decision_fixture(verified.clone(), headers, request)
+                        native_decision_fixture(verified.clone(), review.clone(), headers, request)
                     }))
                     .with_state(observed),
             )
             .await
             .unwrap();
         });
-        Self { address, memory_requests, observation_verifications, task }
+        Self { address, memory_requests, observation_verifications, observation_review, task }
     }
     fn config(&self) -> Config {
         Config {
@@ -310,19 +321,20 @@ async fn model(
         return ([(header::CONTENT_TYPE, "text/event-stream")],
                 format!("{body}data: [DONE]\n\n")).into_response();
     }
-    if last["role"] == "user" && last["content"] == REQUEST_OBSERVATION {
-        return send(json!({"tool_calls":[tool("observation_query", "memory_query",
-            json!({"query":"Amethyst Lantern"}))]}), "tool_calls");
+    if last["role"] == "user" {
+        let query = match last["content"].as_str() {
+            Some(REQUEST_OBSERVATION) => Some("Amethyst Lantern"),
+            Some(REQUEST_PARAPHRASE) => Some(OBSERVATION_PARAPHRASE),
+            _ => None,
+        };
+        if let Some(query) = query {
+            return send(json!({"tool_calls":[tool("observation_query", "memory_query",
+                json!({"query":query}))]}), "tool_calls");
+        }
     }
     if last["role"] == "tool" && last["tool_call_id"] == "observation_query" {
-        let result: Value = serde_json::from_str(last["content"].as_str().unwrap())
-            .unwrap_or(Value::Null);
-        let found = result["observations"].as_array().into_iter().flatten().any(|row| {
-            row["content"] == OBSERVATION_FACT && row["citation"]["revision"] == 1
-                && row["evidence"].as_array().is_some_and(|items| !items.is_empty())
-        });
-        let reply = if found { "Verified Observation found." } else { "No Observation." };
-        return send(json!({"content":reply}), "stop");
+        // The Gateway persists only the result count. Echo what the model actually received.
+        return send(json!({"content":last["content"]}), "stop");
     }
     if last["content"] == "provider-error" {
         return (
@@ -414,6 +426,10 @@ const PROJECT_FACT: &str = "The workspace project is Amethyst Lantern 741.";
 const REQUEST_QUERY: &str = "Look up the project name in memory.";
 const REQUEST_OBSERVATION: &str = "Look up the verified Observation about the lantern.";
 const OBSERVATION_FACT: &str = "Amethyst Lantern 741 is the workspace project name.";
+const OBSERVATION_PARAPHRASE: &str = "Initiative designation";
+const REQUEST_PARAPHRASE: &str = "Recall the initiative designation.";
+const PROJECT_CHALLENGE: &str = "Correction: our workspace project has always been called Copper Finch 862.";
+const CHALLENGE_RECEPTOR: &str = "a different project name";
 const PROFILE_NOTE: &str = "The notes canary is violet.";
 const CONTEXT_PROBE: &str = "How is the Amethyst Lantern project going?";
 
@@ -444,14 +460,22 @@ async fn embed_memory_fixture(
     assert_memory_route(&headers, &request, "embedding");
     memory_requests.fetch_add(1, Ordering::Relaxed);
     let inputs = request["input"].as_array().unwrap();
-    let data = (0..inputs.len()).map(|index| {
-        json!({"index": index, "embedding": [3.0, 4.0]})
+    let data = inputs.iter().enumerate().map(|(index, input)| {
+        let text = input.as_str().unwrap();
+        let (_, body) = text.split_once('\n').unwrap_or(("", text));
+        let embedding = match body {
+            OBSERVATION_PARAPHRASE | OBSERVATION_FACT | PROJECT_FACT | "Amethyst Lantern" => [1.0, 0.0],
+            PROJECT_CHALLENGE | CHALLENGE_RECEPTOR => [0.0, 1.0],
+            _ => [-1.0, 0.0],
+        };
+        json!({"index": index, "embedding": embedding})
     }).collect::<Vec<_>>();
     Json(json!({"model": request["model"], "data": data}))
 }
 
 async fn native_decision_fixture(
     verified: Arc<AtomicUsize>,
+    review: Arc<ObservationReview>,
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Json<Value> {
@@ -459,18 +483,32 @@ async fn native_decision_fixture(
     assert_eq!(request["model"], "typesafe/jev-1.13");
     assert_eq!(request.as_object().unwrap().len(), 3);
     let questions = request["questions"].as_object().unwrap();
+    let state = &request["state"];
     let mut answers = serde_json::Map::new();
     for id in questions.keys() {
         let answer = match id.as_str() {
             "verify" => "stands_as_written",
             key if key.ends_with("-time") => "change_to_ongoing_claim",
             key if key.ends_with("-scope") => "overlapping_scope",
+            key if state["evidence_hits"][key] == PROJECT_CHALLENGE => {
+                assert_eq!(state["existing_observation"], OBSERVATION_FACT);
+                review.challenged.store(true, Ordering::Release);
+                "material_challenge"
+            }
             _ => "no_material_effect",
         };
         answers.insert(id.clone(), json!({"type":"choice", "choice":answer}));
     }
     if answers.contains_key("verify") {
-        assert_eq!(request["state"]["claim"], OBSERVATION_FACT);
+        assert_eq!(state["claim"], OBSERVATION_FACT);
+        if state["backcheck_hits"].as_array().unwrap().iter().any(|hit| {
+            hit["text"] == PROJECT_CHALLENGE
+        }) {
+            // The worker schedules review before auditing again once it commits the challenge.
+            assert!(review.challenged.load(Ordering::Acquire));
+            review.started.notify_one();
+            review.finish.notified().await;
+        }
         verified.fetch_add(1, Ordering::Relaxed);
     }
     Json(json!({"answers":answers}))
@@ -490,9 +528,11 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             for id in shape["turns"]["required"].as_array().unwrap() {
                 let id = id.as_str().unwrap();
                 let source = episode["turns"].as_array().unwrap().iter().find(|turn| turn["id"] == id).unwrap();
-                let clauses = if source["role"] == "user" && source["content"] == PROJECT_FACT {
+                let clauses = if source["role"] == "user"
+                    && matches!(source["content"].as_str(), Some(PROJECT_FACT | PROJECT_CHALLENGE))
+                {
                     json!([{"disposition":"retain", "authority_kind":"direct", "category":"fact",
-                        "type":"project", "lifecycle":"current", "proposition":PROJECT_FACT,
+                        "type":"project", "lifecycle":"current", "proposition":source["content"],
                         "authority_source_node_id":"", "grounding_source_node_id":"",
                         "reason":"The user gave the project name."}])
                 } else {
@@ -512,14 +552,22 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             json!({"ownership": ownership})
         }
         "insomnia_memory_wording" => {
-            let candidates = shape["candidates"]["items"]["properties"]["source_node_id"]["enum"]
-                .as_array().unwrap().iter().filter(|id| id.as_str().unwrap().ends_with("-user"))
-                .map(|id| json!({
-                    "authority_kind":"direct", "category":"fact", "memory_type":"project",
-                    "temporal_status":"current", "ownership":"project", "title":"Amethyst Lantern",
-                    "content":PROJECT_FACT, "source_node_id":id, "source_quote":PROJECT_FACT,
-                    "authority_source":null, "grounding_source":null, "routing_mentions":[]
-                })).collect::<Vec<_>>();
+            let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+            let candidates = input["synthesis_groups"].as_array().unwrap().iter()
+                .map(|group| {
+                    let text = group["propositions"][0].as_str().unwrap();
+                    let title = match text {
+                        PROJECT_FACT => "Amethyst Lantern",
+                        PROJECT_CHALLENGE => "Copper Finch",
+                        _ => panic!("unexpected retained proposition: {text}"),
+                    };
+                    json!({
+                        "authority_kind":"direct", "category":"fact", "memory_type":"project",
+                        "temporal_status":"current", "ownership":"project", "title":title,
+                        "content":text, "source_node_id":group["source_node_id"], "source_quote":text,
+                        "authority_source":null, "grounding_source":null, "routing_mentions":[]
+                    })
+                }).collect::<Vec<_>>();
             json!({"candidates":candidates})
         }
         "decision_response" => {
@@ -548,7 +596,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
         }
         "observation_receptors_v1" => json!({
             "support":["project named Amethyst Lantern"],
-            "challenge":["a different project name"],
+            "challenge":[CHALLENGE_RECEPTOR],
             "qualification":["Amethyst Lantern project naming exceptions"],
             "other":["changes to project name"],
         }),
@@ -599,6 +647,34 @@ async fn approve_fixture_tool(client: &mut Client, sid: &str, name: &str) {
         "session_id":sid, "prompt_id":request["payload"]["prompt_id"],
         "execution_generation":request["execution_generation"], "choice":"once"
     })).await;
+}
+
+#[cfg(feature = "reliquary")]
+async fn query_observation(client: &mut Client, sid: &str, submission: &str, prompt: &str) -> Value {
+    client.ok("prompt.submit", json!({
+        "session_id":sid, "submission_id":submission, "text":prompt
+    })).await;
+    approve_fixture_tool(client, sid, "memory_query").await;
+    let completed = client.event_with_timeout("message.complete", 65).await;
+    assert_eq!(completed["payload"]["status"], "complete", "{completed}");
+    serde_json::from_str(completed["payload"]["text"].as_str().unwrap())
+        .unwrap_or_else(|error| panic!("invalid memory_query reply for {submission}: {error}: {completed}"))
+}
+
+#[cfg(feature = "reliquary")]
+async fn wait_for_observation(client: &mut Client, sid: &str, prompt: &str) -> Value {
+    let mut last_reply = Value::Null;
+    timeout(Duration::from_secs(25), async {
+        let mut attempt = 0;
+        loop {
+            last_reply = query_observation(client, sid, &format!("observation-{prompt}-{attempt}"), prompt).await;
+            if last_reply["observations"].as_array().is_some_and(|rows| !rows.is_empty()) {
+                return last_reply.clone();
+            }
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }).await.unwrap_or_else(|_| panic!("missing verified Observation for {prompt}: {last_reply}"))
 }
 
 #[cfg(feature = "reliquary")]
@@ -925,27 +1001,74 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let recall = next.ok("session.create",
         json!({"project_id":project.id,"title":"Observation recall"})).await;
     let recall_id = recall["session_id"].as_str().unwrap();
-    let mut found = false;
-    for attempt in 0..3 {
-        next.ok("prompt.submit", json!({"session_id":recall_id,
-            "submission_id":format!("observation-{attempt}"),"text":REQUEST_OBSERVATION})).await;
-        approve_fixture_tool(&mut next, recall_id, "memory_query").await;
-        if next.event_with_timeout("message.complete", 65).await["payload"]["text"]
-            == "Verified Observation found."
-        {
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "expected the committed Observation and exact citation in Mercury recall");
+    let lexical = wait_for_observation(&mut next, recall_id, REQUEST_OBSERVATION).await;
+    let lexical_observations = lexical["observations"].as_array().unwrap();
+    let [expected] = lexical_observations.as_slice() else {
+        panic!("expected a single verified Observation: {lexical}");
+    };
+    assert_eq!(expected["content"], OBSERVATION_FACT);
+    let citation = &expected["citation"];
+    assert_eq!(citation["revision"], 1);
+    assert!(citation["source"]["Observation"].is_array(), "{citation}");
+    assert_eq!(citation["field"], "Content");
+    assert_eq!(citation["start_byte"], 0);
+    assert_eq!(citation["end_byte"], OBSERVATION_FACT.len());
+    let [support] = expected["evidence"].as_array().unwrap().as_slice() else {
+        panic!("expected one exact supporting Memory citation: {expected}");
+    };
+    let support_memory_id: String = support["source"]["Memory"].as_array().unwrap().iter()
+        .map(|byte| format!("{:02x}", byte.as_u64().unwrap())).collect();
+    let control = lexical["memories"].as_array().unwrap().iter()
+        .find(|row| row["id"] == support_memory_id).unwrap();
+    assert_eq!(control["content"], PROJECT_FACT);
+    assert_eq!(support["owner_id"], citation["owner_id"]);
+    assert_eq!(support["history_generation"], citation["history_generation"]);
+    assert_eq!(support["revision"], control["revision"]);
+    assert_eq!(support["field"], "Content");
+    assert_eq!(support["start_byte"], 0);
+    assert_eq!(support["end_byte"], PROJECT_FACT.len());
+
+    let claim_tokens: std::collections::BTreeSet<_> = OBSERVATION_FACT.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_owned).collect();
+    assert!(OBSERVATION_PARAPHRASE.to_ascii_lowercase().split_whitespace()
+        .all(|word| !claim_tokens.contains(word)));
+    let semantic_recall = next.ok("session.create",
+        json!({"project_id":project.id,"title":"Paraphrase recall"})).await;
+    let semantic_recall_id = semantic_recall["session_id"].as_str().unwrap();
+    let paraphrase = wait_for_observation(&mut next, semantic_recall_id, REQUEST_PARAPHRASE).await;
+    assert_eq!(paraphrase["observations"], lexical["observations"]);
+    assert!(paraphrase["memories"].as_array().unwrap().contains(control), "{paraphrase}");
+
+    let challenge = next.ok("session.create",
+        json!({"project_id":project.id,"title":"New evidence"})).await;
+    let challenge_id = challenge["session_id"].as_str().unwrap();
+    next.ok("prompt.submit", json!({
+        "session_id":challenge_id, "submission_id":"challenge", "text":PROJECT_CHALLENGE
+    })).await;
+    assert_eq!(next.event("message.complete").await["payload"]["status"], "complete");
+    timeout(Duration::from_secs(40), memory_provider.observation_review.started.notified())
+        .await.expect("material challenge never reached native Verify for the pending claim");
+
+    let pending = next.ok("session.create",
+        json!({"project_id":project.id,"title":"Observation pending review"})).await;
+    let pending_id = pending["session_id"].as_str().unwrap();
+    let withheld = timeout(Duration::from_secs(15),
+        query_observation(&mut next, pending_id, "pending-review", REQUEST_PARAPHRASE))
+        .await.expect("recall did not finish while Verify was held");
+    assert!(withheld["search_id"].is_string() && withheld["result_id"].is_string(), "{withheld}");
+    assert_ne!(withheld["search_id"], paraphrase["search_id"]);
+    assert_eq!(withheld.get("observations"), None, "{withheld}");
+    assert!(withheld["memories"].as_array().unwrap().contains(control), "{withheld}");
+    memory_provider.observation_review.finish.notify_one();
+
+    let restored = wait_for_observation(&mut next, pending_id, REQUEST_OBSERVATION).await;
+    assert_eq!(restored["observations"], lexical["observations"]);
     restarted.private_request("catalog.session.set", json!({
         "session_id":source_id, "archived":true
     })).await;
-    next.ok("prompt.submit", json!({"session_id":recall_id,
-        "submission_id":"observation-after-terminal-source","text":REQUEST_OBSERVATION})).await;
-    approve_fixture_tool(&mut next, recall_id, "memory_query").await;
-    assert_eq!(next.event_with_timeout("message.complete", 65).await["payload"]["text"],
-        "No Observation.");
+    let terminal = query_observation(&mut next, pending_id, "terminal-source", REQUEST_OBSERVATION).await;
+    assert_eq!(terminal.get("observations"), None, "{terminal}");
     drop(next);
     restarted.shutdown().await;
 }
