@@ -29,6 +29,8 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -A clippy::all -D clippy::correctness -D clippy::suspicious
       - run: cargo install cargo-audit --locked --version 0.22.0
       - run: cargo audit
+      - name: Audit Git-pinned glib against RustSec
+        run: python3 scripts/audit-glib-backport.py
   build:
     strategy:
       fail-fast: false
