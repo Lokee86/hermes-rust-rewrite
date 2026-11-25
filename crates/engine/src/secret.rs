@@ -53,13 +53,24 @@ fn key() -> Option<&'static Key> {
     }).as_ref()
 }
 
+/// Linux: the Secret Service by name. The kernel keyring, which other crates may make the default,
+/// does not outlive a restart.
+fn entry(service: &str, account: &str) -> Result<keyring::Entry> {
+    #[cfg(target_os = "linux")]
+    return Ok(keyring::Entry::new_with_credential(Box::new(
+        keyring::secret_service::SsCredential::new_with_target(None, service, account)?,
+    )));
+    #[cfg(not(target_os = "linux"))]
+    Ok(keyring::Entry::new(service, account)?)
+}
+
 fn load_or_create() -> Result<Key> {
     let base = crate::Session::default_dir()?;
     std::fs::create_dir_all(&base)?;
     // The desktop app and its gateway may both be the first to need the key.
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(base.join("storage-key.lock"))?;
     lock.lock_exclusive()?;
-    let entry = keyring::Entry::new(SERVICE, ACCOUNT)?;
+    let entry = entry(SERVICE, ACCOUNT)?;
     match entry.get_secret() {
         Ok(saved) => saved.try_into().map_err(|_| anyhow!("The saved storage key is not valid")),
         Err(keyring::Error::NoEntry) => {
@@ -146,7 +157,7 @@ mod tests {
     #[test]
     #[ignore = "writes an entry to the system credential store"]
     fn the_system_store_keeps_a_secret() {
-        let entry = keyring::Entry::new("Hermes Rust test", "storage-key-test").unwrap();
+        let entry = entry("Hermes Rust test", "storage-key-test").unwrap();
         entry.set_secret(&[3; 32]).unwrap();
         assert_eq!(entry.get_secret().unwrap(), [3; 32]);
         entry.delete_credential().unwrap();
