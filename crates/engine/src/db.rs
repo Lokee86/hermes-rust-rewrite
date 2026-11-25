@@ -5,7 +5,8 @@
 //! Connections are short-lived, except that an open chat keeps one. Writers hold the same file locks
 //! as before (`session.lock`, `library.lock`, `cron/.jobs.lock`); SQLite makes each change atomic.
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
+use fs2::FileExt;
+use rusqlite::{Connection, config::DbConfig, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{
     collections::HashMap,
     fs,
@@ -104,7 +105,7 @@ fn connect(path: &Path) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     // NOFOLLOW refuses a link anywhere in the path, and a system's temporary folder may be one.
     let path = path.canonicalize().context("Could not open the chat database")?;
-    let mut db = Connection::open_with_flags(path, flags).context("Could not open the chat database")?;
+    let mut db = Connection::open_with_flags(&path, flags).context("Could not open the chat database")?;
     db.busy_timeout(Duration::from_secs(15))?;
     db.pragma_update(None, "foreign_keys", true)?;
     // Deleted chats are overwritten, and a saved turn survives a power cut.
@@ -112,7 +113,14 @@ fn connect(path: &Path) -> Result<Connection> {
     db.pragma_update(None, "synchronous", "FULL")?;
     db.pragma_update(None, "fullfsync", true)?;
     db.pragma_update(None, "checkpoint_fullfsync", true)?;
+    // Most connections last for one small change. Moving the log into the database at each close
+    // would flush the disk several more times; SQLite does it when the log has grown.
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
     if version(&db)? != SCHEMA_VERSION {
+        // One process sets the database up while others wait.
+        let setup = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(path.with_extension("db.setup")).context("Could not set up the chat database")?;
+        setup.lock_exclusive().context("Could not set up the chat database")?;
         db.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         let change = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match version(&change)? {
@@ -130,6 +138,12 @@ fn connect(path: &Path) -> Result<Connection> {
 
 fn version(db: &Connection) -> Result<i64> {
     db.query_row("PRAGMA user_version", [], |row| row.get(0)).context("Could not read the chat database")
+}
+
+/// Remove what was deleted from the log too.
+pub(crate) fn settle(db: &Connection) -> Result<()> {
+    // A reader can hold the log. What it keeps is overwritten once it has been used again.
+    db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).context("Could not settle the chat database")
 }
 
 pub(crate) fn writing(db: &mut Connection) -> Result<Transaction<'_>> {
@@ -268,6 +282,20 @@ mod tests {
         assert_eq!(fs::read(other.path().join(FILE)).unwrap(), before);
     }
 
+    #[test]
+    fn many_first_users_set_up_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let threads: Vec<_> = (0..8).map(|n| {
+            let root = dir.path().to_owned();
+            std::thread::spawn(move || {
+                let document = Document { body: "{}".into(), records: vec![] };
+                write_document(&mut open(&root).unwrap(), &format!("d{n}"), None, &document).unwrap();
+            })
+        }).collect();
+        for thread in threads { thread.join().unwrap(); }
+        for n in 0..8 { assert_eq!(document_revision(dir.path(), &format!("d{n}")).unwrap(), Some(1)); }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_database_is_private_and_not_a_link() {
@@ -276,7 +304,8 @@ mod tests {
         let db = open(dir.path()).unwrap();
         db.execute("INSERT INTO documents VALUES ('d', 1, '{}')", []).unwrap();
         for file in fs::read_dir(dir.path()).unwrap() {
-            assert_eq!(file.unwrap().metadata().unwrap().permissions().mode() & 0o077, 0);
+            let file = file.unwrap();
+            assert!(file.file_name() == "mercury.db.setup" || file.metadata().unwrap().permissions().mode() & 0o077 == 0, "{file:?}");
         }
         drop(db);
         let linked = tempfile::tempdir().unwrap();

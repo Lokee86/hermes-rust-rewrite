@@ -134,7 +134,9 @@ pub fn restore_conversation(dir: &Path, saved: Value) -> Result<()> {
 pub fn delete_conversation(dir: &Path) -> Result<()> {
     let (root, id) = db::place(dir);
     if let Some(db) = db::open_existing(&root)? {
-        db.execute("DELETE FROM conversations WHERE id = ?1", [&id])?;
+        if db.execute("DELETE FROM conversations WHERE id = ?1", [&id])? > 0 {
+            db::settle(&db)?;
+        }
     }
     Ok(())
 }
