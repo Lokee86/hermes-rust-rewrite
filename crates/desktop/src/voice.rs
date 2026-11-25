@@ -706,7 +706,7 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::{Preferences, Signal, Voice};
-    use blockmodern::RcBlock;
+    use block2::RcBlock;
     use foundation3::{NSBundle, NSError, NSLocale, NSString};
     use objc2_avf_audio::{
         AVAudioApplication, AVAudioEngine, AVAudioInputNode, AVAudioPCMBuffer, AVAudioTime,

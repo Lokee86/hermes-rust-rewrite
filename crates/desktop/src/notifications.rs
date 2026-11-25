@@ -149,8 +149,8 @@ async fn deliver(_:&str,_:bool)->Result<(),String>{Err("Native alerts are unavai
 #[cfg(target_os="macos")]
 async fn deliver(body:&str,mute:bool)->Result<(),String>{
     use block2::RcBlock;
-    use objc2::runtime::Bool;
-    use objc2_foundation::{NSBundle,NSError,NSString};
+    use foundation3::{NSBundle,NSError,NSString};
+    use objc2modern::runtime::Bool;
     use objc2_user_notifications::{UNAuthorizationOptions as Options,UNMutableNotificationContent,UNNotificationRequest,UNNotificationSound,UNUserNotificationCenter};
     // Objective-C objects and blocks are created and registered in synchronous
     // scopes. Only the owned Rust channels cross suspension points.
@@ -161,7 +161,7 @@ async fn deliver(body:&str,mute:bool)->Result<(),String>{
             let outcome=if let Some(err)=error.as_ref(){Err(err.localizedDescription().to_string())}else if granted.as_bool(){Ok(())}else{Err("Allow Hermes notifications in macOS System Settings.".into())};
             let _=send.try_send(outcome);
         });
-        UNUserNotificationCenter::currentNotificationCenter().requestAuthorizationWithOptions_completionHandler(Options::UNAuthorizationOptionAlert|Options::UNAuthorizationOptionSound,&callback);
+        UNUserNotificationCenter::currentNotificationCenter().requestAuthorizationWithOptions_completionHandler(Options::Alert|Options::Sound,&callback);
     }
     auth.recv().await.map_err(|_|"Notification authorization was interrupted")??;
     let (send,delivered)=async_channel::bounded(1);
