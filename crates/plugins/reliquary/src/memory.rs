@@ -5,6 +5,7 @@ use hermes_engine::{
     Config, Turn,
     memory_capture::{CaptureBinding, CaptureReceipt, CapturedEchoKind, PendingMemoryCapture},
     native_memory::MemoryQuery,
+    settings::ProfileSettings,
 };
 use hermes_library::{
     Project, SessionSource, SessionSummary,
@@ -34,6 +35,8 @@ pub(super) struct EmbeddedMemory {
     phy: OwnerId,
     projects: BTreeMap<String, OwnerId>,
     instances: BTreeMap<OwnerId, Instance>,
+    gateway: Gateway,
+    _managers: Vec<Instance>,
     home: PathBuf,
     directory: PathBuf,
     managed_projects: Option<Vec<Project>>,
@@ -114,16 +117,26 @@ impl EmbeddedMemory {
             let mounted = gateway.mount_rel(&Rel::open(owner_path(id, OwnerKind::Rel)?)?, true)?;
             ensure!(mounted == id, "project owner identity changed");
             let token = Uuid::new_v4().simple().to_string();
-            credentials.push(HostCredentialBinding::new(
-                &topology.principal_id,
-                &token,
-                [OwnerGrant::OperateRel(id), OwnerGrant::ViewPhylactery(phy)],
-            ));
-            tokens.insert(id, token);
+            let manager = Uuid::new_v4().simple().to_string();
+            credentials.extend([
+                HostCredentialBinding::new(
+                    &topology.principal_id,
+                    &token,
+                    [OwnerGrant::OperateRel(id), OwnerGrant::ViewPhylactery(phy)],
+                ),
+                HostCredentialBinding::new(
+                    &topology.principal_id,
+                    &manager,
+                    [OwnerGrant::ManageRel(id)],
+                ),
+            ]);
+            tokens.insert(id, (token, manager));
         }
         let (adapter, _) = TrustedHostAdmission::new(credentials).install(&gateway)?;
-        for (id, token) in tokens {
+        let mut managers = Vec::with_capacity(tokens.len());
+        for (id, (token, manager)) in tokens {
             instances.insert(id, adapter.authenticate(&token)?);
+            managers.push(adapter.authenticate(&manager)?);
         }
         Ok(Self {
             profile_id: topology.profile_id,
@@ -133,6 +146,8 @@ impl EmbeddedMemory {
             phy,
             projects,
             instances,
+            gateway,
+            _managers: managers,
             home,
             directory,
             managed_projects,
@@ -167,6 +182,16 @@ impl EmbeddedMemory {
         let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
             return Ok(None);
         };
+        self.check_embedding_identity(owner, instance, &identity)?;
+        Ok(Some(runtime))
+    }
+
+    fn check_embedding_identity(
+        &self,
+        owner: OwnerId,
+        instance: &Instance,
+        identity: &super::hosted::EmbeddingIdentity,
+    ) -> Result<()> {
         let _guard = self.embeddings.lock().expect("embedding identity lock");
         let dir = self.directory.join("embedding-identities-v1");
         ensure_directory(&dir)?;
@@ -174,7 +199,7 @@ impl EmbeddedMemory {
         if let Some(file) = regular_file(&path)? {
             let recorded: super::hosted::EmbeddingIdentity = read_state(file)?;
             ensure!(
-                recorded == identity,
+                &recorded == identity,
                 "incompatible memory embedding profile"
             );
         } else {
@@ -182,9 +207,9 @@ impl EmbeddedMemory {
                 !instance.has_active_vectors(owner)?,
                 "unbound memory embedding profile"
             );
-            save_new_state(&path, &identity)?;
+            save_new_state(&path, identity)?;
         }
-        Ok(Some(runtime))
+        Ok(())
     }
 }
 
@@ -329,6 +354,23 @@ impl EmbeddedMemory {
 }
 
 impl MemoryStore for EmbeddedMemory {
+    fn configure_profile_runtime(&self, config: &Config) -> Result<()> {
+        self.gateway.set_runtime(None)?;
+        let Some(endpoint_id) = ProfileSettings::load(&self.home)?.memory_perception_endpoint
+        else {
+            return Ok(());
+        };
+        let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
+            anyhow::bail!("Configure the Reliquary embedding route before enabling Perception");
+        };
+        let runtime = super::hosted::with_native_perception(&self.home, &endpoint_id, runtime)?;
+        for (&owner, instance) in &self.instances {
+            self.check_embedding_identity(owner, instance, &identity)?;
+        }
+        self.gateway.set_runtime(Some(&runtime))?;
+        Ok(())
+    }
+
     fn projects_changed(&self, projects: &[Project]) -> bool {
         self.managed_projects
             .as_deref()
@@ -536,6 +578,7 @@ impl MemoryStore for EmbeddedMemory {
     }
 
     fn stop_processing(&self) {
+        let _ = self.gateway.set_runtime(None);
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
         for job in jobs.values() {
             job.task.request_stop();
@@ -762,7 +805,7 @@ pub(super) fn save_state<T: Serialize>(path: &Path, value: &T, replace: bool) ->
     Ok(())
 }
 
-fn hex(digest: &[u8; 32]) -> String {
+pub(super) fn hex(digest: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut encoded = String::with_capacity(64);
     for byte in digest {

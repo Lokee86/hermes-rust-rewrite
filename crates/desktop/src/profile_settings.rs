@@ -60,6 +60,8 @@ pub(super) enum Action {
     SwitchboardNormalization(String),
     #[cfg(feature = "reliquary")]
     SaveSwitchboard,
+    #[cfg(feature = "reliquary")]
+    SetPerceptionEndpoint(String),
     Set(&'static str,String,View), Edit(&'static str,String),Apply(View),Browse,DirectoryChosen(Result<Option<PathBuf>,String>),
     Restore(String),RestoreDone(String,Result<serde_json::Value,String>),Delete(String),DeleteDone(String,Result<serde_json::Value,String>),CancelDelete,ConfirmDelete,Maintain,MaintainDone(Result<serde_json::Value,String>),
 }
@@ -308,6 +310,7 @@ fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
                 )?;
                 Ok((saved, embedding_applied))
             })();
+            let reload = result.is_ok() && state.saved.memory_perception_endpoint.is_some();
             state.feedback = Some(match result {
                 Ok((saved, embedding_applied)) => {
                     state.switchboard_edits.clear();
@@ -319,6 +322,25 @@ fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
                 }
                 Err(error) => Err(format!("{error:#}")),
             });
+            if reload {
+                return app.sync_workspace_memory(lib.root().to_owned());
+            }
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SetPerceptionEndpoint(id) => {
+            let endpoint = (!id.is_empty()).then_some(id);
+            let changes = serde_json::Map::from_iter([(
+                "memory_perception_endpoint".to_owned(),
+                serde_json::json!(endpoint),
+            )]);
+            match ProfileSettings::update(lib.root(), &changes) {
+                Ok(saved) => {
+                    state.saved = saved;
+                    state.feedback = Some(Ok("Perception decision endpoint saved.".into()));
+                    return app.sync_workspace_memory(lib.root().to_owned());
+                }
+                Err(error) => state.feedback = Some(Err(format!("{error:#}"))),
+            }
         }
         // Switches and pickers save on change, as the original's autosave does.
         Action::Set(key,value,page)=>{state.edits.insert(key,value);return update(app,Action::Apply(page));}
@@ -524,6 +546,35 @@ fn switchboard_rows(app: &Hermes) -> Vec<Element<'_, Message>> {
         "Embedding settings",
         "Set the model’s output dimensions and normalization.",
         controls.into(),
+        app.dark,
+    ));
+    let mut endpoints = vec![SwitchboardEndpointChoice {
+        value: String::new(),
+        label: "Off".into(),
+    }];
+    endpoints.extend(
+        app.models.endpoints.iter()
+            .filter(|endpoint| endpoint.model == "typesafe/jev-1.13")
+            .map(|endpoint| SwitchboardEndpointChoice {
+                value: endpoint.id.clone(),
+                label: endpoint.name.clone(),
+            }),
+    );
+    let endpoint = state.saved.memory_perception_endpoint.as_deref().unwrap_or_default();
+    if !endpoint.is_empty() && !endpoints.iter().any(|choice| choice.value == endpoint) {
+        endpoints.push(SwitchboardEndpointChoice {
+            value: endpoint.into(),
+            label: "Unavailable route".into(),
+        });
+    }
+    let selected = endpoints.iter().find(|choice| choice.value == endpoint).cloned();
+    let picker = pick_list(endpoints, selected, |choice| {
+        Message::ProfileSetting(Action::SetPerceptionEndpoint(choice.value))
+    }).text_size(11).width(165);
+    rows.push(super::settings::card_row(
+        "Perception decision",
+        "Choose a saved native decisions endpoint for typesafe/jev-1.13.",
+        picker.into(),
         app.dark,
     ));
     rows

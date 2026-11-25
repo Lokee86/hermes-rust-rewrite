@@ -14,7 +14,9 @@ This is an independent community project, not an official Nous Research release.
 
 Every build comes from [the CI workflow](.github/workflows/build.yml), which runs the test suite on all three platforms first. No build is notarized or signed with a developer certificate. On macOS, the first time you open the app, right-click it and choose **Open**. On Linux, install WebKitGTK 4.1 and GTK 3 from your distribution.
 
-Packages built from this revision embed [Reliquary](https://github.com/Lokee86/Reliquary) for native profile memory. Reliquary is MPL-2.0 software. Each package includes its exact source revision, source-archive link and license links in `Reliquary-NOTICE` (under `Notices`, the macOS app's `Contents/Resources/Notices`, or Linux's `share/licenses/hermes`). The corresponding source for the pinned revision is also available directly from [GitHub](https://github.com/Lokee86/Reliquary/tree/f212204d4d099f5b4d87db2dbf636cea55111b82).
+Packages built from this revision embed [Reliquary](https://github.com/Lokee86/Reliquary) for native profile memory. Reliquary is MPL-2.0 software. Each package includes its exact source revision, source-archive link and license links in `Reliquary-NOTICE` (under `Notices`, the macOS app's `Contents/Resources/Notices`, or Linux's `share/licenses/hermes`). The corresponding source for the pinned revision is also available directly from [GitHub](https://github.com/Lokee86/Reliquary/tree/f9882b9e10a449ed1ffb56bda86dd0566b384cc3).
+
+To enable Perception for a Reliquary profile, save a provider endpoint under Models with the native decisions URL and model `typesafe/jev-1.13`. Select it under **Persistent memory → Perception decision** and configure the General and Embedding routes. Mercury runs Perception on the profile’s writable General and project RELs. The existing memory query and refine tools can return current Observations with their citations. Archive and Echo reads remain explicit operations.
 
 ## Rust vs Electron benchmark
 

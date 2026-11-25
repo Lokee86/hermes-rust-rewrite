@@ -4,12 +4,13 @@ use super::switchboard::switchboard_config;
 use anyhow::{Context, Result};
 use hermes_engine::{
     Config,
+    credentials::EndpointStore,
     inference::{CompletionInference, EmbeddingInference, InferenceTarget},
 };
 use reliquary_memory::{
-    ConfiguredRuntime, ConfiguredRuntimeError, EmbeddingEndpoint, EmbeddingEndpointError,
-    EmbeddingNormalization, GeneralEndpoint, GeneralEndpointError, ModelSlot,
-    SwitchboardEmbeddingMode,
+    ConfiguredDecisionEndpoint, ConfiguredRuntime, ConfiguredRuntimeError, EmbeddingEndpoint,
+    EmbeddingEndpointError, EmbeddingNormalization, GeneralEndpoint, GeneralEndpointError,
+    ModelSlot, SwitchboardEmbeddingMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -206,4 +207,20 @@ pub(super) fn from_profile(
         |_, _| Ok((metadata.provider.clone(), embedding.clone())),
     )?;
     Ok(Some((runtime, metadata)))
+}
+
+pub(super) fn with_native_perception(
+    home: &Path,
+    endpoint_id: &str,
+    runtime: ConfiguredRuntime,
+) -> Result<ConfiguredRuntime> {
+    let config = EndpointStore::open(&home.join("providers"))?
+        .config(endpoint_id)
+        .context("The saved Perception endpoint is unavailable")?;
+    config.validate()?;
+    let endpoint =
+        ConfiguredDecisionEndpoint::native(&config.base_url, &config.model, &config.api_key)?;
+    let route = format!("mercury-native-jev-v1\0{endpoint_id}\0{}", config.base_url);
+    let identity = blake3::hash(route.as_bytes()).to_hex();
+    Ok(runtime.with_native_perception_decision(Arc::new(endpoint), identity.as_str())?)
 }

@@ -221,7 +221,7 @@ impl Gateway {
             _owner_lock: owner_lock,
             authority_epoch,
             profile_id,
-            memory: profile_memory::NativeSlot::new(library.clone(), &profile_name),
+            memory: profile_memory::NativeSlot::new(library.clone(), &profile_name, config.provider.clone()),
             plugins: hermes_engine::plugins::PluginRuntime::for_profile(
                 library.root().to_owned(), profile_name.clone(), Some(config.provider.clone()),
             ),

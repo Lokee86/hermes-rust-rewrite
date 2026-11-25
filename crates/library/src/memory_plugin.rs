@@ -25,6 +25,11 @@ pub trait MemoryPlugin: Send + Sync {
 }
 
 pub trait MemoryStore: Send + Sync {
+    /// Refresh the managed profile runtime independently of a chat turn.
+    fn configure_profile_runtime(&self, _config: &Config) -> Result<()> {
+        Ok(())
+    }
+
     /// Called before binding a new chat. Existing chats retain their stored binding.
     fn binding_for_new_session(&self, summary: &SessionSummary) -> Result<Option<CaptureBinding>>;
     fn projects_changed(&self, projects: &[Project]) -> bool;
