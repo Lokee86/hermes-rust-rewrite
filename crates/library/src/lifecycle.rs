@@ -25,6 +25,14 @@ pub struct SessionQuery {
     pub hide_empty: bool,
 }
 
+/// Whether the chat was ever bound to profile memory. One that cannot be read counts as bound.
+fn has_memory_binding(directory: &Path) -> bool {
+    match std::fs::read(directory.join("gateway.json")) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).map_or(true, |saved| !saved["memory_binding"].is_null()),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 impl Library {
     /// Archive by last activity, excluding the foreground conversation and pins.
     pub fn archive_inactive(&self,days:u32,current:Option<&str>)->Result<()>{
@@ -60,16 +68,34 @@ impl Library {
         let directory=self.session_dir(id)?;
         let lock=OpenOptions::new().read(true).write(true).create(true).truncate(false).open(directory.join("session.lock"))?;
         lock.try_lock_exclusive().context("Close the conversation before deleting it")?;
+        let bound = has_memory_binding(&directory);
         self.with_catalog(true,|catalog|{
             let record=find_session(catalog,id)?;
             ensure!(record.archived && catalog.active_session.as_deref()!=Some(id),"Only archived, inactive conversations can be deleted here");
             catalog.sessions.retain(|s|s.id!=id);
             catalog.pinned_order.retain(|p|p!=id);
             catalog.pending_deletion.push(id.to_owned());
+            if bound {
+                catalog.pending_memory_deletions.push(id.to_owned());
+            }
             Ok(())
         })?;
         self.finish_deletions()
     }
+    /// Deletion commits leave this receipt even after session file cleanup. Reliquary recorded the
+    /// copy's owner before staging it, so an interrupted copy can be removed without the chat.
+    pub fn pending_memory_deletions(&self) -> Result<Vec<String>> {
+        self.with_catalog(false, |catalog| Ok(catalog.pending_memory_deletions.clone()))
+    }
+
+    pub fn acknowledge_memory_deletion(&self, id: &str) -> Result<()> {
+        ensure!(safe_id(id), "Invalid session identity");
+        self.with_catalog(true, |catalog| {
+            catalog.pending_memory_deletions.retain(|entry| entry != id);
+            Ok(())
+        })
+    }
+
     pub(crate) fn finish_deletions(&self)->Result<()> {
         if self.with_catalog(false,|c|Ok(c.pending_deletion.is_empty()))? {return Ok(());}
         self.with_catalog(true,|catalog|{
@@ -315,6 +341,27 @@ mod tests {
         );
         assert!(library.set_archived("unknown", true).is_err());
         assert!(library.set_pinned("unknown", true).is_err());
+    }
+
+    #[test]
+    fn a_chat_is_deleted_while_its_memory_copy_is_unfinished() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = Library::open(temp.path()).unwrap();
+        let bound = library.create_session(None, Some("Copied")).unwrap();
+        let plain = library.create_session(None, Some("Not copied")).unwrap();
+        let saved = serde_json::json!({"version":1,"turns":[],"authority":{"receipts":[{"capture":{"staging":true}}]}});
+        fs::write(bound.directory.join("conversation.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        fs::write(bound.directory.join("gateway.json"), br#"{"memory_binding":{"rel_id":"r"}}"#).unwrap();
+        library.create_session(None, Some("Open")).unwrap();
+        for chat in [&bound, &plain] {
+            library.set_archived(&chat.id, true).unwrap();
+            library.delete_archived(&chat.id).unwrap();
+            assert!(!chat.directory.exists());
+        }
+        // Only the copied chat leaves a removal request, and it survives reopening.
+        assert_eq!(Library::open(temp.path()).unwrap().pending_memory_deletions().unwrap(), [bound.id.clone()]);
+        library.acknowledge_memory_deletion(&bound.id).unwrap();
+        assert!(library.pending_memory_deletions().unwrap().is_empty());
     }
 
     #[test]

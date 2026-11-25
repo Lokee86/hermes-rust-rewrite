@@ -68,6 +68,8 @@ pub(super) struct Authority {
     version: u32,
     pub(super) generation: u64,
     pub(super) receipts: VecDeque<Receipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) source_rewinds: Vec<memory_capture::CommittedRewind>,
     #[serde(default)]
     imported_queue: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -80,6 +82,7 @@ impl Default for Authority {
             version: 1,
             generation: 0,
             receipts: VecDeque::new(),
+            source_rewinds: Vec::new(),
             imported_queue: false,
             staged: BTreeMap::new(),
         }

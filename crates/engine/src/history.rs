@@ -65,6 +65,15 @@ impl History {
     pub fn active_summary(&self) -> Option<&Summary> {
         self.summary.as_ref().filter(|summary| summary.through <= self.turns.len())
     }
+
+    /// Keep the first `turns` turns. A summary of removed turns goes with them; left in place it
+    /// would apply again once the chat had grown past them.
+    pub fn rewind(&mut self, turns: usize) {
+        self.turns.truncate(turns);
+        if self.active_summary().is_none() {
+            self.summary = None;
+        }
+    }
 }
 
 /// Where chats were kept before `mercury.db`. Read until the chat is next opened by its owner.

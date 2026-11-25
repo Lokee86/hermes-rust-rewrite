@@ -5,6 +5,7 @@ use hermes_engine::{
     Config, Turn,
     memory_capture::{CaptureBinding, CaptureReceipt, CapturedEchoKind, PendingMemoryCapture},
     native_memory::MemoryQuery,
+    settings::ProfileSettings,
 };
 use hermes_library::{
     Project, SessionSource, SessionSummary,
@@ -34,19 +35,17 @@ pub(super) struct EmbeddedMemory {
     phy: OwnerId,
     projects: BTreeMap<String, OwnerId>,
     instances: BTreeMap<OwnerId, Instance>,
+    gateway: Gateway,
+    _managers: Vec<Instance>,
     home: PathBuf,
     directory: PathBuf,
     managed_projects: Option<Vec<Project>>,
-    jobs: Mutex<BTreeMap<OwnerId, SourceJob>>,
+    /// The import each owner is processing.
+    jobs: Mutex<BTreeMap<OwnerId, (String, OwnerProcessingJob)>>,
     embeddings: Mutex<()>,
     source_index: Mutex<()>,
     // The stock host takes the same lease. Drop after dropping the instances.
     _lease: File,
-}
-
-struct SourceJob {
-    session_id: String,
-    task: OwnerProcessingJob,
 }
 
 pub(super) fn regular_file(path: &Path) -> Result<Option<File>> {
@@ -114,16 +113,26 @@ impl EmbeddedMemory {
             let mounted = gateway.mount_rel(&Rel::open(owner_path(id, OwnerKind::Rel)?)?, true)?;
             ensure!(mounted == id, "project owner identity changed");
             let token = Uuid::new_v4().simple().to_string();
-            credentials.push(HostCredentialBinding::new(
-                &topology.principal_id,
-                &token,
-                [OwnerGrant::OperateRel(id), OwnerGrant::ViewPhylactery(phy)],
-            ));
-            tokens.insert(id, token);
+            let manager = Uuid::new_v4().simple().to_string();
+            credentials.extend([
+                HostCredentialBinding::new(
+                    &topology.principal_id,
+                    &token,
+                    [OwnerGrant::OperateRel(id), OwnerGrant::ViewPhylactery(phy)],
+                ),
+                HostCredentialBinding::new(
+                    &topology.principal_id,
+                    &manager,
+                    [OwnerGrant::ManageRel(id)],
+                ),
+            ]);
+            tokens.insert(id, (token, manager));
         }
         let (adapter, _) = TrustedHostAdmission::new(credentials).install(&gateway)?;
-        for (id, token) in tokens {
+        let mut managers = Vec::with_capacity(tokens.len());
+        for (id, (token, manager)) in tokens {
             instances.insert(id, adapter.authenticate(&token)?);
+            managers.push(adapter.authenticate(&manager)?);
         }
         Ok(Self {
             profile_id: topology.profile_id,
@@ -133,6 +142,8 @@ impl EmbeddedMemory {
             phy,
             projects,
             instances,
+            gateway,
+            _managers: managers,
             home,
             directory,
             managed_projects,
@@ -167,6 +178,16 @@ impl EmbeddedMemory {
         let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
             return Ok(None);
         };
+        self.check_embedding_identity(owner, instance, &identity)?;
+        Ok(Some(runtime))
+    }
+
+    fn check_embedding_identity(
+        &self,
+        owner: OwnerId,
+        instance: &Instance,
+        identity: &super::hosted::EmbeddingIdentity,
+    ) -> Result<()> {
         let _guard = self.embeddings.lock().expect("embedding identity lock");
         let dir = self.directory.join("embedding-identities-v1");
         ensure_directory(&dir)?;
@@ -174,7 +195,7 @@ impl EmbeddedMemory {
         if let Some(file) = regular_file(&path)? {
             let recorded: super::hosted::EmbeddingIdentity = read_state(file)?;
             ensure!(
-                recorded == identity,
+                &recorded == identity,
                 "incompatible memory embedding profile"
             );
         } else {
@@ -182,9 +203,9 @@ impl EmbeddedMemory {
                 !instance.has_active_vectors(owner)?,
                 "unbound memory embedding profile"
             );
-            save_new_state(&path, &identity)?;
+            save_new_state(&path, identity)?;
         }
-        Ok(Some(runtime))
+        Ok(())
     }
 }
 
@@ -196,10 +217,19 @@ struct CopiedSource {
     session_id: String,
     source_sha256: [u8; 32],
     import_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_import: Option<String>,
     #[serde(default)]
     terminal: bool,
     #[serde(default)]
     tombstoned: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum SourceFence {
+    CommittedDelete { session_id: String },
+    LegacyArchive(String),
 }
 
 impl EmbeddedMemory {
@@ -233,13 +263,17 @@ impl EmbeddedMemory {
             "memory source is terminal"
         );
         if let Some(file) = regular_file(&path)? {
-            let saved: CopiedSource = read_state(file)?;
+            let mut saved: CopiedSource = read_state(file)?;
             ensure!(
                 saved.session_id == capture.session_id
                     && saved.binding == capture.binding
                     && !saved.terminal,
                 "memory source is terminal or has changed its route"
             );
+            if saved.latest_import.as_deref() != Some(import_id) {
+                saved.latest_import = Some(import_id.to_owned());
+                save_state(&path, &saved, true)?;
+            }
             return Ok(());
         }
         save_new_state(
@@ -249,86 +283,159 @@ impl EmbeddedMemory {
                 session_id: capture.session_id.clone(),
                 source_sha256,
                 import_id: import_id.to_owned(),
+                latest_import: Some(import_id.to_owned()),
                 terminal: false,
                 tombstoned: false,
             },
         )
     }
 
-    pub(super) fn source_available(
-        &self,
-        source_session: &str,
-        source_message: &str,
-        owner: OwnerId,
-        sources: &dyn MemorySources,
-    ) -> Result<bool> {
-        let _guard = self.source_index.lock().expect("memory source index lock");
-        let path = self.source_path(source_session)?;
-        if regular_file(&path.with_extension("terminal"))?.is_some() {
-            return Ok(false);
-        }
-        let Some(file) = regular_file(&path)? else {
-            return Ok(false);
-        };
-        let saved: CopiedSource = read_state(file)?;
-        if saved.terminal || saved.session_id != source_session {
-            return Ok(false);
-        }
-        let (bound_owner, instance) = self.route(&saved.binding)?;
-        if bound_owner != owner {
-            return Ok(false);
-        }
-        let Some(receipt) =
-            sources.copied_message_receipt(source_session, &saved.binding, source_message)?
-        else {
-            return Ok(false);
-        };
-        Ok(instance
-            .native_import_status(owner, &receipt.import_id)?
-            .is_some_and(|status| {
-                status.source_key == hex(&receipt.source_sha256)
-                    && status.receipt_digest == Some(receipt.receipt_digest)
-            }))
-    }
-
     /// Called while holding the source lock. Mark the host fence before asking
     /// Root to reconcile the precise copied source.
-    fn tombstone_source(&self, path: &Path, source: &mut CopiedSource) -> Result<()> {
+    fn tombstone_source(
+        &self,
+        path: &Path,
+        source: &mut CopiedSource,
+        config: &Config,
+    ) -> Result<bool> {
         if source.tombstoned {
-            return Ok(());
+            return Ok(true);
         }
         if !source.terminal {
             source.terminal = true;
             save_state(path, source, true)?;
         }
         let Ok((owner, instance)) = self.route(&source.binding) else {
-            return Ok(());
+            return Ok(false);
         };
-        if let Some(job) = self.jobs.lock().expect("memory jobs lock").get(&owner)
-            && job.session_id == source.session_id
-        {
-            job.task.request_stop();
-        }
+        self.stop_before_removal(owner, instance, source, config)?;
         if let Some(status) = instance.native_import_status(owner, &source.import_id)? {
             if status.source_key != hex(&source.source_sha256) || status.receipt_digest.is_none() {
-                return Ok(());
+                return Ok(false);
             }
             let scope = HermesCopyScope::new(self.profile_id.clone(), source.session_id.clone())?;
             // An open Root import epoch may defer this operation. The host
             // fence already prevents further source extensions.
             if instance
-                .tombstone_hermes_copy(owner, &scope, source.source_sha256)
+                .apply_hermes_copy_source_change(
+                    owner,
+                    &scope,
+                    source.source_sha256,
+                    &format!("delete-{}", source.session_id),
+                    reliquary_memory::HermesCopySourceChange::Delete,
+                )
                 .is_err()
             {
-                return Ok(());
+                return Ok(false);
             }
         }
         source.tombstoned = true;
-        save_state(path, source, true)
+        save_state(path, source, true)?;
+        Ok(true)
+    }
+
+    /// The host fence of a removal that Core has not acknowledged.
+    fn removal_pending(&self, path: &Path, source: &CopiedSource) -> Result<bool> {
+        Ok(!source.tombstoned
+            && (source.terminal || regular_file(&path.with_extension("terminal"))?.is_some()))
+    }
+
+    /// Whether a removal of this source has yet to reach Core. Its copies stay undisclosed until then.
+    pub(super) fn source_change_pending(
+        &self,
+        sources: &dyn MemorySources,
+        session_id: &str,
+    ) -> Result<bool> {
+        // Without the source lock, which is held across embedding requests. The fence is written
+        // before its removal starts, and each record is replaced as a whole.
+        let path = self.source_path(session_id)?;
+        if let Some(file) = regular_file(&path)?
+            && self.removal_pending(&path, &read_state(file)?)?
+        {
+            return Ok(true);
+        }
+        sources.copied_source_change_pending(session_id)
+    }
+
+    /// Core records a removal only while no import is open, and cannot cancel one. Stop this
+    /// source's work rather than give a model text that its user removed; the removal then stays
+    /// pending until Core can close the import. A settled import has nothing left to extract:
+    /// closing it checks the embedding route and sends none of the chat.
+    fn stop_before_removal(
+        &self,
+        owner: OwnerId,
+        instance: &Instance,
+        source: &CopiedSource,
+        config: &Config,
+    ) -> Result<()> {
+        let import_id = source.latest_import.as_deref().unwrap_or(&source.import_id);
+        let Some(status) = instance.native_import_status(owner, import_id)? else {
+            return Ok(());
+        };
+        match status.state {
+            NativeImportState::Settled if status.receipt_digest.is_some() => {
+                self.start_import(owner, instance, import_id, config)
+            }
+            NativeImportState::Staging | NativeImportState::Staged => {
+                let jobs = self.jobs.lock().expect("memory jobs lock");
+                if let Some((running, job)) = jobs.get(&owner)
+                    && running == import_id
+                {
+                    job.request_stop();
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn start_import(
+        &self,
+        owner: OwnerId,
+        instance: &Instance,
+        import_id: &str,
+        config: &Config,
+    ) -> Result<()> {
+        let mut jobs = self.jobs.lock().expect("memory jobs lock");
+        if jobs.get(&owner).is_some_and(|(_, job)| !job.is_finished()) {
+            return Ok(());
+        }
+        if let Some((_, job)) = jobs.remove(&owner) {
+            let _ = job.join();
+        }
+        if let Some(runtime) = self.runtime(owner, instance, config)? {
+            let job = instance.start_processing(
+                owner,
+                &runtime,
+                ProcessOptions {
+                    import_id: Some(import_id.to_owned()),
+                    ..ProcessOptions::default()
+                },
+            )?;
+            jobs.insert(owner, (import_id.to_owned(), job));
+        }
+        Ok(())
     }
 }
 
 impl MemoryStore for EmbeddedMemory {
+    fn configure_profile_runtime(&self, config: &Config) -> Result<()> {
+        self.gateway.set_perception_runtime(None)?;
+        let Some(endpoint_id) = ProfileSettings::load(&self.home)?.memory_perception_endpoint
+        else {
+            return Ok(());
+        };
+        let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
+            anyhow::bail!("Configure the Reliquary embedding route before enabling Perception");
+        };
+        let runtime = super::hosted::with_native_perception(&self.home, &endpoint_id, runtime)?;
+        for (&owner, instance) in &self.instances {
+            self.check_embedding_identity(owner, instance, &identity)?;
+        }
+        self.gateway.set_perception_runtime(Some(&runtime))?;
+        Ok(())
+    }
+
     fn projects_changed(&self, projects: &[Project]) -> bool {
         self.managed_projects
             .as_deref()
@@ -373,7 +480,7 @@ impl MemoryStore for EmbeddedMemory {
         &self,
         capture: &PendingMemoryCapture,
         turn: &Turn,
-        previous: Option<&CaptureReceipt>,
+        previous: Option<[u8; 32]>,
     ) -> Result<CaptureReceipt> {
         let (rel, instance) = self.route(&capture.binding)?;
         let rows = capture.verified_rows(turn)?;
@@ -439,14 +546,12 @@ impl MemoryStore for EmbeddedMemory {
             .collect::<Result<Vec<_>>>()?;
         let plan = match (previous, echo.is_empty()) {
             (Some(previous), true) => {
-                NativeImportPlan::from_hermes_copy_extension(snapshot, previous.source_sha256)?
+                NativeImportPlan::from_hermes_copy_extension(snapshot, previous)?
             }
             (None, true) => NativeImportPlan::from_hermes_copy(snapshot)?,
-            (Some(previous), false) => NativeImportPlan::from_hermes_copy_extension_with_echo(
-                snapshot,
-                previous.source_sha256,
-                echo,
-            )?,
+            (Some(previous), false) => {
+                NativeImportPlan::from_hermes_copy_extension_with_echo(snapshot, previous, echo)?
+            }
             (None, false) => NativeImportPlan::from_hermes_copy_with_echo(snapshot, echo)?,
         };
         let source_sha256 = plan.source_sha256();
@@ -508,90 +613,97 @@ impl MemoryStore for EmbeddedMemory {
             }
             return Ok(true);
         }
-        let mut jobs = self.jobs.lock().expect("memory jobs lock");
-        if jobs.get(&owner).is_some_and(|job| !job.task.is_finished()) {
-            return Ok(false);
-        }
-        if let Some(job) = jobs.remove(&owner) {
-            let _ = job.task.join();
-        }
-        if let Some(runtime) = self.runtime(owner, instance, config)? {
-            let job = instance.start_processing(
-                owner,
-                &runtime,
-                ProcessOptions {
-                    import_id: Some(receipt.import_id.clone()),
-                    ..ProcessOptions::default()
-                },
-            )?;
-            jobs.insert(
-                owner,
-                SourceJob {
-                    session_id: session_id.into(),
-                    task: job,
-                },
-            );
-        }
+        self.start_import(owner, instance, &receipt.import_id, config)?;
         Ok(false)
     }
 
     fn stop_processing(&self) {
+        let _ = self.gateway.set_perception_runtime(None);
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
-        for job in jobs.values() {
-            job.task.request_stop();
+        for (_, job) in jobs.values() {
+            job.request_stop();
         }
         jobs.clear();
     }
 
-    fn reconcile_tombstones(&self, summaries: &[SessionSummary]) -> Result<()> {
+    fn release_legacy_archive_fence(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        initial_proof: Option<(&CaptureReceipt, &str)>,
+    ) -> Result<bool> {
         let _guard = self.source_index.lock().expect("memory source index lock");
-        let dir = self.source_dir();
-        match dir.symlink_metadata() {
-            Ok(meta) => ensure!(
-                meta.is_dir() && !meta.is_symlink(),
-                "invalid memory source directory"
-            ),
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
-        let active: std::collections::BTreeSet<_> = summaries
-            .iter()
-            .filter(|summary| !summary.archived)
-            .map(|summary| summary.id.as_str())
-            .collect();
-        for entry in dir.read_dir()? {
-            let path = entry?.path();
-            if path.extension().is_none_or(|ext| ext != "json") {
-                continue;
+        let path = self.source_path(session_id)?;
+        let marker = path.with_extension("terminal");
+        let fenced = match regular_file(&marker)?.map(read_state).transpose()? {
+            Some(SourceFence::CommittedDelete { .. }) => return Ok(false),
+            Some(SourceFence::LegacyArchive(id)) => {
+                ensure!(id == session_id, "invalid copied source fence");
+                true
             }
-            let Some(file) = regular_file(&path)? else {
-                continue;
-            };
+            None => false,
+        };
+        if let Some(file) = regular_file(&path)? {
             let mut source: CopiedSource = read_state(file)?;
             ensure!(
-                path == self.source_path(&source.session_id)?,
+                &source.binding == binding && source.session_id == session_id,
                 "invalid copied source record"
             );
-            if source.tombstoned {
-                continue;
-            }
-            if source.terminal
-                || !active.contains(source.session_id.as_str())
-                || regular_file(&path.with_extension("terminal"))?.is_some()
-            {
-                self.tombstone_source(&path, &mut source)?;
+            if fenced || source.terminal {
+                let (owner, instance) = self.route(binding)?;
+                if let Some(status) = instance.native_import_status(owner, &source.import_id)? {
+                    ensure!(
+                        status.source_key == hex(&source.source_sha256),
+                        "invalid copied source receipt"
+                    );
+                    if let Some(digest) = status.receipt_digest {
+                        let Some((proof, uid)) = initial_proof else {
+                            return Ok(false);
+                        };
+                        if proof.source_sha256 != source.source_sha256
+                            || proof.receipt_digest != digest
+                        {
+                            return Ok(false);
+                        }
+                        let scope =
+                            HermesCopyScope::new(self.profile_id.clone(), session_id.to_owned())?;
+                        if instance
+                            .read_hermes_copy_source(owner, &scope, proof.source_sha256, uid, uid)?
+                            .is_none()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
+                source.terminal = false;
+                source.tombstoned = false;
+                save_state(&path, &source, true)?;
             }
         }
-        Ok(())
+        if fenced {
+            fs::remove_file(marker)?;
+        }
+        Ok(true)
     }
 
-    fn terminal_source(&self, session_id: &str) -> Result<()> {
+    fn terminal_source(&self, session_id: &str, config: &Config) -> Result<bool> {
         let _guard = self.source_index.lock().expect("memory source index lock");
         let path = self.source_path(session_id)?;
         ensure_directory(&self.source_dir())?;
         let fence = path.with_extension("terminal");
-        if regular_file(&fence)?.is_none() {
-            save_new_state(&fence, &session_id)?;
+        let existing = regular_file(&fence)?
+            .map(read_state::<SourceFence>)
+            .transpose()?;
+        if let Some(SourceFence::CommittedDelete { session_id: id }) = &existing {
+            ensure!(id == session_id, "invalid copied source fence");
+        } else {
+            save_state(
+                &fence,
+                &SourceFence::CommittedDelete {
+                    session_id: session_id.to_owned(),
+                },
+                existing.is_some(),
+            )?;
         }
         if let Some(file) = regular_file(&path)? {
             let mut source: CopiedSource = read_state(file)?;
@@ -599,11 +711,73 @@ impl MemoryStore for EmbeddedMemory {
                 source.session_id == session_id,
                 "invalid copied source record"
             );
-            self.tombstone_source(&path, &mut source)?;
+            return self.tombstone_source(&path, &mut source, config);
         }
-        Ok(())
+        Ok(true)
     }
 
+    fn unfinished_removals(&self) -> Result<Vec<String>> {
+        let _guard = self.source_index.lock().expect("memory source index lock");
+        let entries = match self.source_dir().read_dir() {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut unfinished = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Some(file) = regular_file(&path)? else {
+                continue;
+            };
+            let source: CopiedSource = read_state(file)?;
+            ensure!(
+                path == self.source_path(&source.session_id)?,
+                "invalid copied source record"
+            );
+            if self.removal_pending(&path, &source)? {
+                unfinished.push(source.session_id);
+            }
+        }
+        Ok(unfinished)
+    }
+
+    fn rewind_source(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        event_id: &str,
+        preceding_head: [u8; 32],
+        last_surviving_message_uid: Option<&str>,
+        config: &Config,
+    ) -> Result<[u8; 32]> {
+        use reliquary_memory::HermesCopySourceChange;
+        let _guard = self.source_index.lock().expect("memory source index lock");
+        let (owner, instance) = self.route(binding)?;
+        if let Some(file) = regular_file(&self.source_path(session_id)?)? {
+            let source: CopiedSource = read_state(file)?;
+            ensure!(
+                &source.binding == binding && source.session_id == session_id,
+                "invalid copied source record"
+            );
+            self.stop_before_removal(owner, instance, &source, config)?;
+        }
+        let scope = HermesCopyScope::new(self.profile_id.clone(), session_id.to_owned())?;
+        instance
+            .apply_hermes_copy_source_change(
+                owner,
+                &scope,
+                preceding_head,
+                event_id,
+                HermesCopySourceChange::Rewind {
+                    last_surviving_message_uid: last_surviving_message_uid.map(str::to_owned),
+                },
+            )?
+            .resulting_head_sha256
+            .context("rewind did not retain a copied source head")
+    }
     fn search_user_archive(
         &self,
         sources: &dyn MemorySources,
@@ -680,10 +854,16 @@ impl MemoryStore for EmbeddedMemory {
                 else {
                     continue;
                 };
-                if rows.iter().any(|row| row.source.profile_id != binding.profile_id
-                    || !matches!(sources.copied_message_receipt(&row.source.session_id, &binding, &row.source.message_uid),
-                        Ok(Some(receipt)) if receipt.source_sha256 == row.source.source_sha256))
-                {
+                let mut pending = false;
+                for row in &rows {
+                    if row.source.profile_id != binding.profile_id
+                        || self.source_change_pending(sources, &row.source.session_id)?
+                    {
+                        pending = true;
+                        break;
+                    }
+                }
+                if pending {
                     continue;
                 }
                 let mut excerpt = rows
@@ -762,7 +942,7 @@ pub(super) fn save_state<T: Serialize>(path: &Path, value: &T, replace: bool) ->
     Ok(())
 }
 
-fn hex(digest: &[u8; 32]) -> String {
+pub(super) fn hex(digest: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut encoded = String::with_capacity(64);
     for byte in digest {
@@ -778,6 +958,63 @@ mod tests {
     use hermes_engine::{Entry, Status};
     use serde_json::json;
     use std::fs;
+
+    /// Deleting a chat must not hand its text to a model on the way out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_an_unextracted_chat_contacts_no_provider() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let contacts = Arc::new(AtomicUsize::new(0));
+        let seen = contacts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                seen.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        tokio::task::spawn_blocking(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("reliquary");
+            fs::create_dir(&dir).unwrap();
+            let general = Rel::create(tmp.path().join("general.rel")).unwrap();
+            let phy = Phylactery::create(tmp.path().join("user.phy")).unwrap();
+            let topology = json!({"version":2,"profile_id":"default","principal_id":"owner",
+                "main_rel":general.owner_id(),"active_phy":phy.owner_id(),"projects":{},"owners":{
+                    general.owner_id().to_string():{"kind":"rel","path":general.path()},
+                    phy.owner_id().to_string():{"kind":"phylactery","path":phy.path()}}});
+            fs::write(dir.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
+            fs::write(dir.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
+            let config = Config { base_url: format!("http://{address}/v1"), model: "fixture".into(), api_key: String::new() };
+            let endpoint = hermes_engine::credentials::EndpointStore::open(&tmp.path().join("providers")).unwrap()
+                .save(Some("embedding"), "Embedding", &config).unwrap();
+            let settings = json!({"memory_embedding":{"endpoint_id":endpoint.id,"dimensions":8}});
+            ProfileSettings::update(tmp.path(), settings.as_object().unwrap()).unwrap();
+            let mem = legacy(tmp.path(), "default").unwrap().unwrap();
+            let library = hermes_library::Library::open(tmp.path().join("library")).unwrap();
+            let chat = library.create_session(None, Some("Private")).unwrap();
+            let binding = mem.binding_for_new_session(&chat).unwrap().unwrap();
+            let turn = Turn { prompt: "a private message".into(), entries: vec![Entry::Assistant { text: "noted".into(), calls: vec![] }],
+                status: Status::Complete, model: "mock".into(), attachments: vec![], context: String::new() };
+            let capture = PendingMemoryCapture::new(&binding, &chat.id, "admission", 1, 0, 10, 11, &turn).unwrap();
+            let receipt = mem.stage(&capture, &turn, None).unwrap();
+            let status = || {
+                let (owner, instance) = mem.route(&binding).unwrap();
+                instance.native_import_status(owner, &receipt.import_id).unwrap().unwrap().state
+            };
+            assert!(matches!(status(), NativeImportState::Staged));
+            // Retried, as the gateway does: the removal waits for Core and the chat stays withheld.
+            for _ in 0..3 {
+                assert!(!mem.terminal_source(&chat.id, &config).unwrap());
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            assert!(matches!(status(), NativeImportState::Staged));
+            assert_eq!(mem.unfinished_removals().unwrap(), [chat.id.clone()]);
+            assert!(!mem.ensure_processing(&binding, &chat.id, &receipt, &config).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }).await.unwrap();
+        assert_eq!(contacts.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn committed_turn_replays_real_archive_receipt_under_frozen_project_and_principal() {
@@ -866,20 +1103,53 @@ mod tests {
         assert!(foreign.phylactery_info(ungranted).is_err());
 
         library.set_archived(&summary.id, true).unwrap();
-        reopened
-            .reconcile_tombstones(&library.sessions(None).unwrap())
-            .unwrap();
-        let path = reopened.source_path(&summary.id).unwrap();
-        let deleted: CopiedSource = read_state(File::open(&path).unwrap()).unwrap();
-        assert!(deleted.terminal);
+        assert!(library.pending_memory_deletions().unwrap().is_empty());
+        assert_eq!(receipt, reopened.stage(&capture, &turn, None).unwrap());
+        fs::write(
+            summary.directory.join("gateway.json"),
+            serde_json::to_vec(&serde_json::json!({"memory_binding": binding})).unwrap(),
+        )
+        .unwrap();
         library.delete_archived(&summary.id).unwrap();
         drop(reopened);
         let reopened = legacy(tmp.path(), "default").unwrap().unwrap();
-        reopened
-            .reconcile_tombstones(&library.sessions(None).unwrap())
-            .unwrap();
+        assert_eq!(
+            library.pending_memory_deletions().unwrap(),
+            [summary.id.clone()]
+        );
+        // The open import can delay acknowledgment while the explicit deletion fences capture.
+        let config = Config {
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+        };
+        reopened.terminal_source(&summary.id, &config).unwrap();
         assert!(reopened.stage(&capture, &turn, None).is_err());
         assert!(library.session(&summary.id).is_err());
+
+        // A deletion made before the journal existed left a fence and no acknowledgment. It is
+        // still withheld and still retried.
+        struct NoJournal;
+        impl MemorySources for NoJournal {
+            fn check_session(&self, _: &str, _: &CaptureBinding) -> Result<()> {
+                Ok(())
+            }
+            fn copied_source_change_pending(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+        }
+        let path = reopened.source_path(&summary.id).unwrap();
+        let mut source: CopiedSource = read_state(File::open(&path).unwrap()).unwrap();
+        source.terminal = true;
+        source.tombstoned = false;
+        save_state(&path, &source, true).unwrap();
+        save_state(&path.with_extension("terminal"), &summary.id, true).unwrap();
+        assert!(reopened.source_change_pending(&NoJournal, &summary.id).unwrap());
+        assert_eq!(reopened.unfinished_removals().unwrap(), [summary.id.clone()]);
+        source.tombstoned = true;
+        save_state(&path, &source, true).unwrap();
+        assert!(!reopened.source_change_pending(&NoJournal, &summary.id).unwrap());
+        assert!(reopened.unfinished_removals().unwrap().is_empty());
 
         let retired = library
             .create_session(None, Some("archive before capture"))
@@ -895,7 +1165,7 @@ mod tests {
             &turn,
         )
         .unwrap();
-        reopened.terminal_source(&retired.id).unwrap();
+        reopened.terminal_source(&retired.id, &config).unwrap();
         assert!(reopened.stage(&preempted, &turn, None).is_err());
 
         summary.archived = true;

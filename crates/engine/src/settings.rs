@@ -88,6 +88,8 @@ pub struct ProfileSettings {
     pub external_memory_connector: bool,
     /// Legacy embedding selection used before the profile saves Switchboard routes.
     pub memory_embedding: Option<MemoryEmbedding>,
+    /// Saved endpoint used for native Reliquary Perception decisions.
+    pub memory_perception_endpoint: Option<String>,
     pub checkpoints_enabled: bool,
     pub checkpoint_max_snapshots: usize,
     pub redact_secrets: bool,
@@ -130,7 +132,7 @@ pub struct MemoryEmbedding {
     pub dimensions: u32,
 }
 impl Default for ProfileSettings {
-    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, memory_provider_revision: 0, external_memory_connector: false, memory_embedding: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
+    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, memory_provider_revision: 0, external_memory_connector: false, memory_embedding: None, memory_perception_endpoint: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
         memory_enabled:true,user_profile_enabled:true,memory_char_limit:crate::memory::DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:DEFAULT_MAX_TURNS, settings_version:SETTINGS_VERSION,
         file_read_max_chars:100_000,tool_output_bytes:50000,tool_output_lines:2000,tool_output_line_length:2000,

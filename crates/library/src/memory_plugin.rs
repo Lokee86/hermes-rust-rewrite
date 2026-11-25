@@ -28,6 +28,11 @@ pub trait MemoryPlugin: Send + Sync {
 }
 
 pub trait MemoryStore: Send + Sync {
+    /// Refresh the managed profile runtime independently of a chat turn.
+    fn configure_profile_runtime(&self, _config: &Config) -> Result<()> {
+        Ok(())
+    }
+
     /// Called before binding a new chat. Existing chats retain their stored binding.
     fn binding_for_new_session(&self, summary: &SessionSummary) -> Result<Option<CaptureBinding>>;
     fn projects_changed(&self, projects: &[Project]) -> bool;
@@ -35,7 +40,7 @@ pub trait MemoryStore: Send + Sync {
         &self,
         capture: &PendingMemoryCapture,
         turn: &Turn,
-        previous: Option<&CaptureReceipt>,
+        previous: Option<[u8; 32]>,
     ) -> Result<CaptureReceipt>;
     fn ensure_processing(
         &self,
@@ -45,8 +50,26 @@ pub trait MemoryStore: Send + Sync {
         config: &Config,
     ) -> Result<bool>;
     fn stop_processing(&self);
-    fn reconcile_tombstones(&self, summaries: &[SessionSummary]) -> Result<()>;
-    fn terminal_source(&self, session_id: &str) -> Result<()>;
+    /// Release a superseded host archive fence only when the accepted Core copy is still live.
+    fn release_legacy_archive_fence(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        initial_proof: Option<(&CaptureReceipt, &str)>,
+    ) -> Result<bool>;
+    /// True after Core has acknowledged the deletion, or if no copy exists.
+    fn terminal_source(&self, session_id: &str, config: &Config) -> Result<bool>;
+    /// Chats whose copy is fenced and whose removal Core has not acknowledged.
+    fn unfinished_removals(&self) -> Result<Vec<String>>;
+    fn rewind_source(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        event_id: &str,
+        preceding_head: [u8; 32],
+        last_surviving_message_uid: Option<&str>,
+        config: &Config,
+    ) -> Result<[u8; 32]>;
     fn search_user_archive(
         &self,
         sources: &dyn MemorySources,
@@ -80,10 +103,6 @@ pub struct MemoryTurn {
 /// The host verifies current access and receipts against its own conversation log.
 pub trait MemorySources: Send + Sync {
     fn check_session(&self, session_id: &str, binding: &CaptureBinding) -> Result<()>;
-    fn copied_message_receipt(
-        &self,
-        session_id: &str,
-        binding: &CaptureBinding,
-        message_uid: &str,
-    ) -> Result<Option<CaptureReceipt>>;
+    /// Local outbox barrier while a committed source change awaits Core.
+    fn copied_source_change_pending(&self, session_id: &str) -> Result<bool>;
 }

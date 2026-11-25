@@ -335,7 +335,10 @@ mod tests {
         assert!(!compress(&mut history, 6, &provider, 8_000, false).await.unwrap());
         assert_eq!(seen.lock().unwrap().len(), calls);
         // A chat rewound to before the summary's end uses its real turns again.
-        history.turns.truncate(1);
+        history.rewind(1);
+        assert!(history.active_summary().is_none());
+        // It does not come back when the chat grows past the turns it covered.
+        for n in 0..7 { history.turns.push(turn(&format!("later {n}"), "ok")); }
         assert!(history.active_summary().is_none());
     }
 

@@ -1,5 +1,5 @@
 //! Explicit read-only model queries against one admitted native conversation.
-use super::memory::EmbeddedMemory;
+use super::memory::{EmbeddedMemory, hex};
 use anyhow::{Context, Result, ensure};
 use hermes_engine::{
     Config,
@@ -14,7 +14,10 @@ use reliquary_memory::{
     OwnerId, ProductErrorKind, RetrievalPreview, SourceAvailability, TemporalBasis,
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::Semaphore;
 
 // A timed-out provider can still run within its transport deadline.
@@ -52,7 +55,9 @@ impl GatewayMemoryQuery {
 
     fn check_disclosure(&self, preview: Option<&RetrievalPreview>) -> Result<()> {
         self.check_session()?;
-        if let Some(preview) = preview.filter(|preview| !preview.memories.is_empty()) {
+        if let Some(preview) = preview
+            .filter(|preview| !preview.memories.is_empty() || !preview.observations.is_empty())
+        {
             let (owner, instance) = self.memory.route(&self.binding)?;
             check_provenance(
                 preview,
@@ -235,12 +240,32 @@ impl MemoryQuery for GatewayMemoryQuery {
             .flat_map(|preview| &preview.memories)
             .map(|row| row.memory_id.clone())
             .collect();
-        let content =
+        let observations = result
+            .preview
+            .iter()
+            .flat_map(|preview| &preview.observations);
+        let citations: Vec<_> = observations.clone().map(|row| row.claim.citation).collect();
+        let mut content =
             json!({"memories":hits,"search_id":result.search_id,"result_id":result.result_id});
+        if !citations.is_empty() {
+            content["observations"] = Value::Array(
+                observations
+                    .map(|row| {
+                        json!({
+                            "citation": row.claim.citation,
+                            "content": row.claim.proposition,
+                            "status": row.claim.status,
+                            "time_scope": row.claim.time_scope,
+                            "evidence": row.claim.support,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         check_payload(&content, config)?;
         let backend = self.clone();
         Ok(MemorySelection::Result {
-            count: ids.len(),
+            count: ids.len() + citations.len(),
             content,
             check_disclosure: Box::new(move || {
                 backend.check_disclosure(result.preview.as_ref())?;
@@ -251,7 +276,7 @@ impl MemoryQuery for GatewayMemoryQuery {
                 state
                     .as_mut()
                     .context("Memory turn unavailable")?
-                    .accept_memory_result(&result.result_id, &ids)?;
+                    .accept_typed_memory_result(&result.result_id, &ids, &citations)?;
                 Ok(())
             }),
         })
@@ -267,13 +292,11 @@ impl GatewayMemoryQuery {
                 source.profile_id == self.binding.profile_id,
                 "Archive belongs to a different profile"
             );
-            let receipt = self
-                .sources
-                .copied_message_receipt(&source.session_id, &self.binding, &source.message_uid)?
-                .context("Archive no longer has a committed source")?;
             ensure!(
-                receipt.source_sha256 == source.source_sha256,
-                "Archive source digest changed"
+                !self
+                    .memory
+                    .source_change_pending(self.sources.as_ref(), &source.session_id)?,
+                "Archive source removal is still syncing"
             );
             ensure!(
                 !contains_inline_data(&row.archive.content)
@@ -320,27 +343,15 @@ fn check_provenance(
     profile_id: &str,
 ) -> Result<()> {
     ensure!(
-        !preview.truncated && !preview.memories.is_empty() && preview.memories.len() <= 10,
+        !preview.truncated && preview.memories.len() <= 10,
         "invalid or incomplete retrieval selection"
     );
     let management = instance.workspace_management(owner)?;
-    for entry in &preview.memories {
-        ensure!(
-            !entry.truncated
-                && !contains_inline_data(&entry.content)
-                && redact_text(&entry.content) == entry.content,
-            "retrieval contains incomplete or excluded content"
-        );
-        if entry.source.episode_id.is_none()
-            && entry.source.content_conversation_id.is_none()
-            && entry.source.grounding_conversation_id.is_none()
-        {
-            continue;
-        }
+    let check_memory = |id: MemoryId, display_id: &str, revision: u64, body: &str| -> Result<()> {
         let page = management.inspect(
             &InspectionQuery::Provenance {
-                id: memory_id(&entry.memory_id)?,
-                revision: Some(entry.revision),
+                id,
+                revision: Some(revision),
             },
             None,
             1,
@@ -350,9 +361,9 @@ fn check_provenance(
         };
         ensure!(
             !page.truncated
-                && evidence.memory_id == entry.memory_id
-                && evidence.body_id == entry.body_id
-                && evidence.revision == entry.revision
+                && evidence.memory_id == display_id
+                && evidence.body_id == body
+                && evidence.revision == revision
                 && matches!(
                     evidence.availability,
                     SourceAvailability::Available | SourceAvailability::Direct
@@ -389,16 +400,49 @@ fn check_provenance(
                 )?;
                 ensure!(
                     scope.conversation_id() == turn.conversation_id
-                        && memory.source_available(
-                            &imported.conversation_id,
-                            &imported.message_id,
-                            owner,
-                            sources
-                        )?,
+                        && !memory.source_change_pending(sources, &imported.conversation_id)?,
                     "retrieval source is no longer eligible"
                 );
             }
         }
+        Ok(())
+    };
+    for entry in &preview.memories {
+        ensure!(
+            !entry.truncated
+                && !contains_inline_data(&entry.content)
+                && redact_text(&entry.content) == entry.content,
+            "retrieval contains incomplete or excluded content"
+        );
+        if entry.source.episode_id.is_some()
+            || entry.source.content_conversation_id.is_some()
+            || entry.source.grounding_conversation_id.is_some()
+        {
+            check_memory(
+                memory_id(&entry.memory_id)?,
+                &entry.memory_id,
+                entry.revision,
+                &entry.body_id,
+            )?;
+        }
+    }
+    let mut lineage = BTreeSet::new();
+    for row in &preview.observations {
+        let claim = &row.claim;
+        ensure!(
+            !contains_inline_data(&claim.proposition)
+                && redact_text(&claim.proposition) == claim.proposition,
+            "Observation is unavailable for this disclosure"
+        );
+        lineage.extend(claim.lineage.iter().copied());
+    }
+    for evidence in lineage {
+        check_memory(
+            MemoryId(evidence.memory_id),
+            &hex(&evidence.memory_id),
+            evidence.revision,
+            &hex(&evidence.body_id),
+        )?;
     }
     Ok(())
 }
