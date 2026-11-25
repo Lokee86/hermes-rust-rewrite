@@ -59,7 +59,7 @@ foundation3 = { package = "objc2-foundation", version = "0.3", default-features 
 objc2-speech = { version = "0.3.2", default-features = false, features = ["std", "SFSpeechRecognizer", "SFSpeechRecognitionRequest", "SFSpeechRecognitionResult", "SFSpeechRecognitionTask", "SFTranscription", "block2", "objc2-avf-audio"] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVAudioApplication", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioTime", "AVAudioTypes", "AVSpeechSynthesis", "block2"] }
 dispatch = "0.2"
-objc2-foundation = { version = "0.2", features = ["NSString", "NSURL","NSBundle"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL","NSBundle"] }
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSOpenPanel", "NSPanel", "NSResponder", "NSScreen", "NSSavePanel", "NSWindow"] }
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-user-notifications]
