@@ -224,6 +224,13 @@ struct CopiedSource {
     tombstoned: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum SourceFence {
+    CommittedDelete { session_id: String },
+    LegacyArchive(String),
+}
+
 impl EmbeddedMemory {
     fn source_dir(&self) -> PathBuf {
         self.directory.join("native-capture-sources-v1")
@@ -583,13 +590,84 @@ impl MemoryStore for EmbeddedMemory {
         jobs.clear();
     }
 
+    fn release_legacy_archive_fence(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        initial_proof: Option<(&CaptureReceipt, &str)>,
+    ) -> Result<bool> {
+        let _guard = self.source_index.lock().expect("memory source index lock");
+        let path = self.source_path(session_id)?;
+        let marker = path.with_extension("terminal");
+        let fenced = match regular_file(&marker)?.map(read_state).transpose()? {
+            Some(SourceFence::CommittedDelete { .. }) => return Ok(false),
+            Some(SourceFence::LegacyArchive(id)) => {
+                ensure!(id == session_id, "invalid copied source fence");
+                true
+            }
+            None => false,
+        };
+        if let Some(file) = regular_file(&path)? {
+            let mut source: CopiedSource = read_state(file)?;
+            ensure!(
+                &source.binding == binding && source.session_id == session_id,
+                "invalid copied source record"
+            );
+            if fenced || source.terminal {
+                let (owner, instance) = self.route(binding)?;
+                if let Some(status) = instance.native_import_status(owner, &source.import_id)? {
+                    ensure!(
+                        status.source_key == hex(&source.source_sha256),
+                        "invalid copied source receipt"
+                    );
+                    if let Some(digest) = status.receipt_digest {
+                        let Some((proof, uid)) = initial_proof else {
+                            return Ok(false);
+                        };
+                        if proof.source_sha256 != source.source_sha256
+                            || proof.receipt_digest != digest
+                        {
+                            return Ok(false);
+                        }
+                        let scope =
+                            HermesCopyScope::new(self.profile_id.clone(), session_id.to_owned())?;
+                        if instance
+                            .read_hermes_copy_source(owner, &scope, proof.source_sha256, uid, uid)?
+                            .is_none()
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
+                source.terminal = false;
+                source.tombstoned = false;
+                save_state(&path, &source, true)?;
+            }
+        }
+        if fenced {
+            fs::remove_file(marker)?;
+        }
+        Ok(true)
+    }
+
     fn terminal_source(&self, session_id: &str, config: &Config) -> Result<bool> {
         let _guard = self.source_index.lock().expect("memory source index lock");
         let path = self.source_path(session_id)?;
         ensure_directory(&self.source_dir())?;
         let fence = path.with_extension("terminal");
-        if regular_file(&fence)?.is_none() {
-            save_new_state(&fence, &session_id)?;
+        let existing = regular_file(&fence)?
+            .map(read_state::<SourceFence>)
+            .transpose()?;
+        if let Some(SourceFence::CommittedDelete { session_id: id }) = &existing {
+            ensure!(id == session_id, "invalid copied source fence");
+        } else {
+            save_state(
+                &fence,
+                &SourceFence::CommittedDelete {
+                    session_id: session_id.to_owned(),
+                },
+                existing.is_some(),
+            )?;
         }
         if let Some(file) = regular_file(&path)? {
             let mut source: CopiedSource = read_state(file)?;

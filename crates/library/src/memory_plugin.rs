@@ -47,6 +47,13 @@ pub trait MemoryStore: Send + Sync {
         config: &Config,
     ) -> Result<bool>;
     fn stop_processing(&self);
+    /// Release a superseded host archive fence only when the accepted Core copy is still live.
+    fn release_legacy_archive_fence(
+        &self,
+        binding: &CaptureBinding,
+        session_id: &str,
+        initial_proof: Option<(&CaptureReceipt, &str)>,
+    ) -> Result<bool>;
     /// True after Core has acknowledged the deletion, or if no copy exists.
     fn terminal_source(&self, session_id: &str, config: &Config) -> Result<bool>;
     fn rewind_source(

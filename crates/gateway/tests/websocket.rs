@@ -894,6 +894,21 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     drop(client);
     gateway.shutdown().await;
 
+    // Reproduce an older archive intent that reached the adapter but never
+    // committed a Core tombstone. Recovery must prove the accepted source is live.
+    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    fs::write(&old_fence, b"").unwrap();
+    let (sidecar, mut saved) = fs::read_dir(state.join("native-capture-sources-v1")).unwrap()
+        .filter_map(|item| {
+            let path = item.ok()?.path();
+            let data: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            (data["session_id"] == source_id).then_some((path, data))
+        })
+        .next().expect("source receipt sidecar is missing");
+    saved["terminal"] = json!(true);
+    fs::write(&sidecar, serde_json::to_vec(&saved).unwrap()).unwrap();
+    fs::write(sidecar.with_extension("terminal"), serde_json::to_vec(source_id).unwrap()).unwrap();
+
     assert_eq!(hermes_gateway::stock_plugins::rename_profile(&profiles, "work", "office").unwrap(), None);
     assert!(!state.exists());
     let state = store.join("office");
@@ -914,6 +929,12 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let record_path = library.session(source_id).unwrap().directory.join("conversation.json");
     let restarted = PortableGateway::start(&binary, library.root(), &provider.config()).await;
     let mut next = restarted.client().await;
+    let old_fence = record_path.parent().unwrap().join("gateway-memory-ended");
+    timeout(Duration::from_secs(15), async {
+        while old_fence.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.expect("an old archive-only fence did not release after Core proved the source live");
     next.ok("session.resume", json!({"session_id":source_id})).await;
     assert_eq!(next.ok("prompt.submit", submit).await["admission_id"], admission["admission_id"]);
     let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();

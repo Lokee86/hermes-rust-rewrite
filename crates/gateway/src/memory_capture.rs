@@ -393,9 +393,7 @@ impl Shared {
 }
 
 pub(super) fn read_committed(summary: &SessionSummary) -> Result<Option<CommittedRecord>> {
-    if source_ended(&summary.directory)
-        || Settings::read(&summary.directory)?.memory_binding.is_none()
-    {
+    if Settings::read(&summary.directory)?.memory_binding.is_none() {
         return Ok(None);
     }
     let path = summary.directory.join("conversation.json");
@@ -419,6 +417,16 @@ fn stage_next(
     let Some(binding) = Settings::read(&summary.directory)?.memory_binding else {
         return Ok(None);
     };
+    if source_ended(&summary.directory) {
+        if !release_legacy_archive_fence(memory, &binding, summary, history, authority)? {
+            return Ok(None);
+        }
+        match fs::remove_file(summary.directory.join(ENDED)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let latest_rewind = authority
         .source_rewinds
         .iter()
@@ -483,8 +491,15 @@ fn stage_next(
             previous = Some(receipt.source_sha256);
         } else {
             if !marker.staging {
-                return Ok((!summary.archived)
-                    .then(|| SourceUpdate::Capture(marker.clone(), CaptureUpdate::Staging)));
+                if summary.archived
+                    || !release_legacy_archive_fence(memory, &binding, summary, history, authority)?
+                {
+                    return Ok(None);
+                }
+                return Ok(Some(SourceUpdate::Capture(
+                    marker.clone(),
+                    CaptureUpdate::Staging,
+                )));
             }
             let receipt = memory.stage(marker, turn, previous)?;
             return Ok(Some(SourceUpdate::Capture(
@@ -494,6 +509,34 @@ fn stage_next(
         }
     }
     Ok(None)
+}
+
+fn release_legacy_archive_fence(
+    memory: &dyn MemoryStore,
+    binding: &CaptureBinding,
+    summary: &SessionSummary,
+    history: &History,
+    authority: &Authority,
+) -> Result<bool> {
+    for capture in authority
+        .receipts
+        .iter()
+        .filter_map(|row| row.capture.as_ref())
+    {
+        if let Some(receipt) = &capture.receipt {
+            let turn = history
+                .turns
+                .get(capture.turn_index)
+                .context("copied turn is unavailable")?;
+            let rows = capture.verified_rows(turn)?;
+            return memory.release_legacy_archive_fence(
+                binding,
+                &summary.id,
+                rows.first().map(|row| (receipt, row.message_uid.as_str())),
+            );
+        }
+    }
+    memory.release_legacy_archive_fence(binding, &summary.id, None)
 }
 
 enum SourceUpdate {
