@@ -127,6 +127,10 @@ pub struct Store {
 impl Store {
     pub fn default_dir() -> Result<PathBuf> {
         if let Some(path) = std::env::var_os("HERMES_RUST_DATA_DIR") { return Ok(path.into()); }
+        Self::application_dir()
+    }
+
+    pub(crate) fn application_dir() -> Result<PathBuf> {
         let dirs = ProjectDirs::from("org", "HermesRust", "Hermes Rust Desktop")
             .context("Could not locate the application data directory")?;
         Ok(dirs.data_local_dir().to_path_buf())
