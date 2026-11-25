@@ -1181,11 +1181,19 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }).await.expect("committed deletion never reached REL");
-    let terminal = query_observation(&mut next, pending_id, "terminal-source", REQUEST_OBSERVATION).await;
-    assert!(terminal["memories"].as_array().is_some_and(|memories|
-        memories.iter().any(|row| row["content"] == PROJECT_CONTROL)), "{terminal}");
-    assert!(!terminal.to_string().contains(PROJECT_FACT), "{terminal}");
-    assert_eq!(terminal.get("observations"), None, "{terminal}");
+    // A result is withheld while the memory it came from is changing, as it is just after a removal.
+    timeout(Duration::from_secs(60), async {
+        for attempt in 0.. {
+            let terminal = query_observation(&mut next, pending_id, &format!("terminal-source-{attempt}"), REQUEST_OBSERVATION).await;
+            assert!(!terminal.to_string().contains(PROJECT_FACT), "{terminal}");
+            assert_eq!(terminal.get("observations"), None, "{terminal}");
+            if let Some(memories) = terminal["memories"].as_array() {
+                assert!(memories.iter().any(|row| row["content"] == PROJECT_CONTROL), "{terminal}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }).await.expect("the independent Memory was withheld after the removal settled");
     drop(next);
     assert!(hermes_gateway::stock_plugins::delete_profile(&profiles, "office").is_err());
     assert!(state.is_dir());
