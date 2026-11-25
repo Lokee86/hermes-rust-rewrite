@@ -2,6 +2,7 @@
 name = "hermes-telegram"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 fs2 = "0.4"

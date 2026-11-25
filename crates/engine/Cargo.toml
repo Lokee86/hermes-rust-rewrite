@@ -2,6 +2,7 @@
 name = "hermes-engine"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [features]
 embedded-herdr = ["dep:herdr-core"]

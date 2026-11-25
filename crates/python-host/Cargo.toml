@@ -2,6 +2,7 @@
 name = "hermes-python-host"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 pyo3 = "0.30"

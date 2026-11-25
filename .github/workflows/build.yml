@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup update stable && rustup component add clippy
       - run: >
           sudo apt-get update && sudo apt-get install -y
@@ -35,9 +37,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          persist-credentials: false
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
+          use-cache: false # a cache written elsewhere must not reach a release build
       - run: rustup update stable
       # Iced (winit, wgpu), the OS webview (wry → WebKitGTK), global-hotkey (X11) and audio.
       - if: runner.os == 'Linux'
