@@ -55,22 +55,34 @@ fn purge_managed(home: &Path, name: &str, location: &mut Location) -> Result<()>
         finish_enrollment(location)?;
         finish_profile_rename(home, name, location)?;
     }
-    let detached = location
-        .root
-        .join(format!(".delete-{}", location.profile_id()));
+    let directory = location.profile_directory();
+    let profile_id = location.profile_id();
+    let detached = location.root.join(format!(".delete-{profile_id}"));
+    let detached_exists = directory_present(&detached)?;
+    if location.deletion == Some(Progress::Purge)
+        && directory_present(&directory)?
+        && Topology::read(&directory)?.profile_id == profile_id
+    {
+        // A crash can leave the original directory in place even when the
+        // purge marker was saved. Verify its identity again before moving it.
+        ensure!(
+            !detached_exists,
+            "Both copies of the Reliquary profile are present during deletion"
+        );
+        location.deletion = Some(Progress::Detach);
+    }
     if location.deletion != Some(Progress::Purge) {
-        if directory_present(&detached)? {
+        if detached_exists {
             ensure!(
                 location.deletion == Some(Progress::Detach),
                 "Unexpected Reliquary deletion directory"
             );
-            Topology::load(&detached, &location.profile_id(), true)?;
+            Topology::load(&detached, &profile_id, true)?;
         } else {
-            let directory = location.profile_directory();
             if !directory_present(&directory)? {
                 return Ok(());
             }
-            Topology::load(&directory, &location.profile_id(), true)?;
+            Topology::load(&directory, &profile_id, true)?;
             // The root lock fences new mounts. Close the lease before moving the
             // directory so Windows can rename it.
             drop(lease(&directory, "service.lock")?);

@@ -76,16 +76,22 @@ pub(super) struct RegisteredOwner {
 }
 
 impl Topology {
-    fn load(directory: &Path, profile_id: &str, managed: bool) -> Result<Self> {
+    fn read(directory: &Path) -> Result<Self> {
         let topology: Self = read_state(
             regular_file(&directory.join(TOPOLOGY))?
                 .context("Reliquary profile has no owner topology")?,
         )?;
         ensure!(
-            topology.version == 2
-                && !topology.principal_id.is_empty()
-                && topology.profile_id == profile_id
-                && topology.managed == managed,
+            topology.version == 2 && !topology.principal_id.is_empty(),
+            "Invalid Reliquary owner topology"
+        );
+        Ok(topology)
+    }
+
+    fn load(directory: &Path, profile_id: &str, managed: bool) -> Result<Self> {
+        let topology = Self::read(directory)?;
+        ensure!(
+            topology.profile_id == profile_id && topology.managed == managed,
             "Reliquary topology belongs to a different profile or format"
         );
         Ok(topology)

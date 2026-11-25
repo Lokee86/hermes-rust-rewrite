@@ -339,6 +339,29 @@ fn profile_deletion_resumes_after_detach_and_partial_purge() {
 }
 
 #[test]
+fn profile_deletion_recovers_a_move_lost_after_purge_was_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = Library::open(temp.path()).unwrap();
+    let profile = Library::open(catalog.create_profile("work").unwrap().path).unwrap();
+    drop(open(&profile, "work", true).unwrap().unwrap());
+    let home = profile.root();
+    let mut location = Location::load(home).unwrap().unwrap();
+    let directory = location.profile_directory();
+    location.deletion = Some(deletion::Progress::Purge);
+    save_state(&location_path(home), &location, true).unwrap();
+
+    purge_profile_data(home, "work").unwrap();
+    assert!(!directory.exists());
+
+    let replacement = Library::open(catalog.create_profile("replacement").unwrap().path).unwrap();
+    drop(open(&replacement, "work", true).unwrap().unwrap());
+    let replacement_location = Location::load(replacement.root()).unwrap().unwrap();
+    assert_eq!(replacement_location.profile_directory(), directory);
+    purge_profile_data(home, "work").unwrap();
+    assert!(directory.join("general.rel").is_file());
+}
+
+#[test]
 fn profile_deletion_requires_the_registered_identity_and_respects_a_mount() {
     let temp = tempfile::tempdir().unwrap();
     let catalog = Library::open(temp.path()).unwrap();
