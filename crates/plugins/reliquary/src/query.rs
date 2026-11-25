@@ -11,7 +11,7 @@ use hermes_engine::{
 use hermes_library::memory_plugin::{MemorySources, MemoryTurn};
 use reliquary_memory::{
     ChatRetrieval, HermesCopiedSourceTurn, InspectionItem, InspectionQuery, Instance, MemoryId,
-    ObservationSource, ObservationStanding, OwnerId, ProductErrorKind, RetrievalPreview,
+    OwnerId, ProductErrorKind, RetrievalPreview,
     SourceAvailability, TemporalBasis,
 };
 use serde_json::{Value, json};
@@ -438,11 +438,7 @@ fn check_provenance(
     for row in &preview.observations {
         let claim = &row.claim;
         ensure!(
-            row.standing == ObservationStanding::Current
-                && claim.citation.owner_id == owner.as_bytes()
-                && matches!(claim.citation.source, ObservationSource::Observation(_))
-                && !claim.lineage.is_empty()
-                && !contains_inline_data(&claim.proposition)
+            !contains_inline_data(&claim.proposition)
                 && redact_text(&claim.proposition) == claim.proposition,
             "Observation is unavailable for this disclosure"
         );

@@ -525,7 +525,9 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
         "decision_response" => {
             let payload: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let approved = payload["state"]["candidates"].as_array().into_iter().flatten()
-                .filter(|candidate| candidate["content"].as_str().is_some_and(|text| text.contains(PROJECT_FACT)))
+                .filter(|candidate| candidate["content"].as_str().is_some_and(|text| {
+                    text.contains(PROJECT_FACT) || text == OBSERVATION_FACT
+                }))
                 .map(|candidate| candidate["memory"].clone()).collect::<Vec<_>>();
             json!({"version":1,"approved":approved})
         }
