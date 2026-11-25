@@ -24,7 +24,7 @@ impl ReadError {
         match self {
             Self::File(error) => error.to_string(),
             Self::Unreadable(error) => format!(
-                "Saved gateway sign-ins could not be read. {error}. If the storage key is lost, reset the saved sign-ins in Settings › Gateways."
+                "Saved gateway sign-ins could not be read. {error}. Unlock your system's keychain and restart Hermes, or reset the saved sign-ins in Settings › Gateways if the key is lost."
             ),
         }
     }
@@ -73,6 +73,7 @@ pub(super) fn status(root: &Path, base: &str) -> Status {
 }
 
 pub(super) fn sign_out(root: &Path, base: &str) -> Result<(), String> {
+    secret::prepare(root);
     let _lock = credential_files::lock(&store(root))?;
     let mut all = read(root).map_err(ReadError::message)?;
     all.remove(&key(base));
@@ -115,6 +116,7 @@ async fn sign_in_with(root: PathBuf, base: String, open: impl Fn(&str) -> Result
     if !response.status().is_success() { return Err(format!("{base} refused the sign-in code ({}).", response.status())); }
     let body: Value = response.json().await.map_err(|e| e.to_string())?;
     let tokens = parse(&body)?;
+    secret::prepare(&root);
     let _lock = credential_files::lock(&store(&root))?;
     let mut all = read(&root).map_err(ReadError::message)?;
     all.insert(base, tokens);
@@ -140,6 +142,7 @@ fn get_access(tokens: &Value) -> Result<String, String> {
 }
 
 fn finish_refresh(root: &Path, base: &str, previous: &Value, fresh: Option<Value>) -> Result<(), String> {
+    secret::prepare(root);
     let _lock = credential_files::lock(&store(root))?;
     let mut all = read(root).map_err(ReadError::message)?;
     if all.get(base) != Some(previous) {

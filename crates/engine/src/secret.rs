@@ -90,6 +90,14 @@ fn load_or_create() -> Result<Key> {
     }
 }
 
+/// Ask for the storage key now if `dir` uses it. The system may wait for the user, and nobody else
+/// should have to wait for a lock held meanwhile.
+pub fn prepare(dir: &Path) {
+    if own_directory(dir) {
+        key();
+    }
+}
+
 /// Encrypt text that will be stored in `dir`, where that is possible.
 pub fn seal(dir: &Path, text: &str) -> Result<String> {
     if text.is_empty() || !own_directory(dir) {

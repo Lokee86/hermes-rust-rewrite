@@ -41,7 +41,10 @@ type Secrets = BTreeMap<String, BTreeMap<String, String>>;
 
 fn read_json<T: Default + DeserializeOwned>(path: &Path) -> Result<T, String> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| format!(
+            "{} is damaged, so nothing was saved. Move it out of the Hermes data folder and enter these settings again.",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(error) => Err(error.to_string()),
     }
@@ -67,6 +70,9 @@ fn seal_secrets(root: &Path, secrets: &mut Secrets) -> Result<bool, String> {
 
 fn migrate_secrets(root: &Path) -> Result<Secrets, String> {
     let path = secrets_path(root);
+    if read_json::<Secrets>(&path).is_ok_and(|saved| saved.values().flat_map(BTreeMap::values).any(|value| !secret::is_sealed(value))) {
+        secret::prepare(root);
+    }
     let _lock = credential_files::lock(&path)?;
     let mut secrets = read_json(&path)?;
     if seal_secrets(root, &mut secrets)? {
@@ -96,6 +102,9 @@ impl State {
         let Some(root) = self.root.as_deref() else { return Err("The chat library is unavailable.".into()) };
         let Some(platform) = self.platform() else { return Ok(()) };
         let path = secrets_path(root);
+        if platform.fields.iter().any(|field| field.secret && self.draft.get(&field.name).is_some_and(|value| !value.trim().is_empty())) {
+            secret::prepare(root);
+        }
         let _lock = credential_files::lock(&path)?;
         let mut secrets: Secrets = read_json(&path)?;
         let mut saved: Saved = read_json(&values_path(root))?;
@@ -234,6 +243,19 @@ mod tests {
         thread.join().unwrap();
         assert!(!secrets.contains_key("discord"));
         assert!(secrets["slack"].contains("SLACK_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn a_damaged_settings_file_is_named_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(values_path(dir.path()), b"{").unwrap();
+        let mut state = State::default();
+        state.load(dir.path());
+        state.update(Action::Select("discord".into()));
+        state.update(Action::Save);
+        let error = state.note.clone().unwrap().unwrap_err();
+        assert!(error.contains("messaging-platforms.json is damaged"), "{error}");
+        assert_eq!(std::fs::read(values_path(dir.path())).unwrap(), b"{");
     }
 
     #[test]

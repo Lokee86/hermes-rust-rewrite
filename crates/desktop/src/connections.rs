@@ -30,7 +30,7 @@ pub(super) struct Config { pub mode: Mode, pub url: String, pub ssh: Ssh, pub sa
 pub(super) enum Action {
     Mode(Mode), Url(String), Token(String), Host(String), User(String), Port(String), Key(String), HermesPath(String),
     Save, TestRemote, TestSsh, ConnectSsh, SshConnected(u64, Result<super::ssh_tunnel::Tunnel, String>), DisconnectSsh, Tested(u64, Result<String, String>), SaveAs(String), SaveNamed, UseSaved(usize), RemoveSaved(usize), OpenLogs,
-    GatewaySignIn(String), GatewaySignedIn(String, Result<(), String>), GatewaySignOut, ResetUnreadableGatewaySignIns,
+    GatewaySignIn(String), GatewaySignedIn(String, Result<(), String>), GatewaySignOut, AskResetGatewaySignIns(bool), ResetUnreadableGatewaySignIns,
     CloudDiscover(Option<String>), CloudLoaded(u64, Result<hermes_engine::portal::CloudDiscovery, String>), CloudConnect(String),
 }
 
@@ -40,7 +40,7 @@ pub(super) struct State {
     testing: bool, revision: u64, result: Option<Result<String, String>>, aliases: Vec<String>,
     /// The live SSH tunnel; chats run through it while it is up.
     pub tunnel: Option<super::ssh_tunnel::Tunnel>, connecting: bool,
-    signing_in: bool,
+    signing_in: bool, confirm_reset: bool,
     cloud: Option<Result<hermes_engine::portal::CloudDiscovery, String>>, cloud_loading: bool, cloud_org: Option<String>,
 }
 
@@ -57,6 +57,7 @@ pub(super) fn saved_token(root: &Path) -> Result<String, String> {
 }
 fn save_token(root: &Path, token: &str) -> Result<(), String> {
     let path = token_path(root);
+    secret::prepare(root);
     let _lock = credential_files::lock(&path)?;
     let sealed = secret::seal(root, token).map_err(|e| format!("{e:#}"))?;
     credential_files::replace(&path, sealed.as_bytes())
@@ -70,6 +71,9 @@ fn delete_token(root: &Path) -> Result<(), String> {
 
 fn migrate_token(root: &Path) -> Result<(), String> {
     let path = token_path(root);
+    if std::fs::read_to_string(&path).is_ok_and(|token| !token.trim().is_empty() && !secret::is_sealed(token.trim())) {
+        secret::prepare(root);
+    }
     let _lock = credential_files::lock(&path)?;
     let token = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -215,8 +219,10 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             changed = false;
             state.result = Some(gateway_oauth::sign_out(&root, &state.config.url).map(|_| "Signed out of this gateway.".into()));
         }
+        Action::AskResetGatewaySignIns(ask) => { state.confirm_reset = ask; changed = false; }
         Action::ResetUnreadableGatewaySignIns => {
             changed = false;
+            state.confirm_reset = false;
             state.result = Some(gateway_oauth::reset_unreadable(&root)
                 .map(|_| "Saved gateway sign-ins were reset. Sign in again with your browser.".into()));
         }
@@ -340,13 +346,16 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
                     .then(|| Message::Connection(Action::GatewaySignIn(url.clone())))));
             body = body.push(Space::new().height(6)).push(oauth);
             if status == Status::ResetAvailable {
-                body = body.push(settings::card(vec![settings::card_row(
-                    "Saved browser sign-ins are unreadable",
-                    "If the storage key is lost, reset all browser sign-ins for this profile. You will need to sign in to each gateway again.",
-                    button(text("Reset all gateway sign-ins").size(12)).padding([5, 10]).style(ui::quiet_button)
-                        .on_press_maybe((!state.signing_in).then_some(Message::Connection(Action::ResetUnreadableGatewaySignIns))).into(),
-                    dark,
-                )], dark));
+                let ask = |label, action| button(text(label).size(12)).padding([5, 10]).style(ui::quiet_button)
+                    .on_press_maybe((!state.signing_in).then_some(Message::Connection(action)));
+                let (about, controls) = if state.confirm_reset {
+                    ("This deletes the sign-ins of every gateway in this profile and cannot be undone. Reset them?",
+                        row![ask("Cancel", Action::AskResetGatewaySignIns(false)), ask("Reset all gateway sign-ins", Action::ResetUnreadableGatewaySignIns)].spacing(8))
+                } else {
+                    ("Hermes could not open them. If your system's keychain is locked or Hermes was refused access, unlock it and restart Hermes. Reset them only if the key is lost.",
+                        row![ask("Reset…", Action::AskResetGatewaySignIns(true))])
+                };
+                body = body.push(settings::card(vec![settings::card_row("Saved browser sign-ins are unreadable", about, controls.into(), dark)], dark));
             }
         }
         Mode::Cloud => {
