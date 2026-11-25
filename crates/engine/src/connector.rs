@@ -42,7 +42,8 @@ pub fn save(root:&Path,url:&str,new_key:&str,clear_key:bool)->Result<Summary>{
     let url=if url.trim().is_empty(){String::new()}else{validated(url)?.to_string()};
     ensure!(url.len()<8192&&new_key.len()<8192&&!new_key.chars().any(char::is_control),"Endpoint URL or credential is invalid");
     let same=validated(&old.url).is_ok_and(|old|old.as_str()==url);
-    let token=if clear_key||url.is_empty(){None}else if !new_key.is_empty(){Some(new_key.into())}else if same{old.token}else{None};
+    let token=if clear_key||url.is_empty(){None}else if !new_key.is_empty(){Some(new_key.to_owned())}else if same{old.token}else{None};
+    let token=token.map(|token|if crate::secret::is_sealed(&token){Ok(token)}else{crate::secret::seal(root,&token)}).transpose()?;
     let endpoint=Endpoint{url,token};
     let mut temp=tempfile::NamedTempFile::new_in(root)?;
     serde_json::to_writer_pretty(&mut temp,&endpoint)?;temp.flush()?;temp.as_file().sync_all()?;
@@ -52,10 +53,34 @@ pub fn save(root:&Path,url:&str,new_key:&str,clear_key:bool)->Result<Summary>{
 pub(crate) async fn connect(root:&Path)->Result<Option<Mcp>>{
     let (endpoint,_)=effective(root)?;
     if endpoint.url.trim().is_empty(){return Ok(None)}
-    Ok(Some(Mcp::connect(&endpoint.url,endpoint.token).await?))
+    let token=endpoint.token.as_deref().map(crate::secret::unseal).transpose()?;
+    Ok(Some(Mcp::connect(&endpoint.url,token).await?))
 }
 pub async fn discover(root:&Path)->Result<Vec<String>>{
     let mut server=connect(root).await?.context("Configure an MCP server first")?;
     let names=server.specs().iter().filter_map(|s|s["function"]["name"].as_str().map(str::to_owned)).collect();
     server.close().await;Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_saved_token_is_encrypted_and_kept_until_the_server_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".sealed-in-tests"), "").unwrap();
+        // Saved as text by an earlier version.
+        fs::write(dir.path().join("mcp-endpoint.json"), r#"{"url":"https://mcp.example/mcp","token":"fixture-token"}"#).unwrap();
+        assert!(summary(dir.path()).unwrap().has_token);
+        assert!(save(dir.path(), "https://mcp.example/mcp", "", false).unwrap().has_token);
+        for _ in 0..2 {
+            let text = fs::read_to_string(dir.path().join("mcp-endpoint.json")).unwrap();
+            assert!(!text.contains("fixture-token"), "{text}");
+            let token = effective(dir.path()).unwrap().0.token.unwrap();
+            assert_eq!(crate::secret::unseal(&token).unwrap(), "fixture-token");
+            save(dir.path(), "https://mcp.example/mcp", "", false).unwrap();
+        }
+        assert!(!save(dir.path(), "https://other.example/mcp", "", false).unwrap().has_token);
+    }
 }

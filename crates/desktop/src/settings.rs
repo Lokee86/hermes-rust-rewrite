@@ -566,7 +566,7 @@ fn about(app:&Hermes)->Element<'_,Message>{
     if state.update.is_some()&&state.saved.is_none() {buttons=buttons.push(button(text("Download update").size(12)).padding([5,10]).on_press_maybe((!state.busy).then(||act(super::updates::Action::Download))));}
     if state.saved.is_some() {buttons=buttons.push(button(text(if cfg!(target_os="linux") {"Show in folder"} else {"Quit and install"}).size(12)).padding([5,10]).on_press_maybe((!state.busy).then(||act(super::updates::Action::Install))));}
     buttons=buttons.push(button(text(if state.busy {"Working…"} else {"Check for updates"}).size(12)).padding([5,10]).style(ui::quiet_button).on_press_maybe((!state.busy).then(||act(super::updates::Action::Check))))
-        .push(button(text("Release notes").size(12)).padding([5,10]).style(ui::quiet_button).on_press(Message::Link("https://github.com/itsflownium/hermes-rust-rewrite/releases".into())));
+        .push(button(text("Release notes").size(12)).padding([5,10]).style(ui::quiet_button).on_press(Message::Link(super::updates::RELEASES.into())));
     let updates=card(column![
         row![text(state.note.clone().unwrap_or_else(||"Hermes asks GitHub for a newer release only when you check.".into())).size(13).width(Fill),buttons].spacing(12).align_y(Alignment::Center),
         iced::widget::checkbox(state.at_startup).label("Check when Hermes starts").on_toggle(move|on|act(super::updates::Action::AtStartup(on))).size(14).text_size(12),

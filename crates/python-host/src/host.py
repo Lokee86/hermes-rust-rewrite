@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 import types
 from contextlib import nullcontext, suppress
 
@@ -39,15 +40,42 @@ def _accepted(fn, args, kwargs):
     return {k: v for k, v in kwargs.items() if k not in bound and (any_keyword or k in names)}
 
 
-def call(fn, args, kwargs):
+def call(fn, args, kwargs, running=None):
     result = fn(*args, **_accepted(fn, args, kwargs))
     if inspect.isawaitable(result):
-        result = asyncio.run(_wait(result))
+        result = asyncio.run(_wait(result, running))
     return result
 
 
-async def _wait(awaitable):
+async def _wait(awaitable, running=None):
+    if running is not None:
+        running.attach(asyncio.get_running_loop(), asyncio.current_task())
     return await awaitable
+
+
+class _Running:
+    """A tool call that can be cancelled while it awaits. Python cannot stop one that blocks."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._task = None
+        self._cancelled = False
+
+    def attach(self, loop, task):
+        with self._lock:
+            self._task = (loop, task)
+            if self._cancelled:
+                task.cancel()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            if self._task is not None:
+                loop, task = self._task
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    pass  # It has just finished.
 
 
 def dumps(value):
@@ -121,6 +149,7 @@ class PluginHost:
         self._register = None
         self._commands = {}
         self._tools = {}
+        self._running = {}
         self._hooks = []
         self._unloads = []
         self._unsupported = set()
@@ -230,18 +259,20 @@ class PluginHost:
                               "inputSchema": parameters if isinstance(parameters, dict) else {"type": "object"}})
         return {"tools": tools}
 
-    def _call_tool(self, params):
+    def _call_tool(self, params, running=None):
         name = params.get("name", "")
         entry = self._tools.get(name)
         if entry is None or not self._tool_available(entry):
             raise ValueError(f"Unknown tool: {name}")
         try:
-            text = dumps(call(entry[1], (params.get("arguments", {}),), {}))
+            text = dumps(call(entry[1], (params.get("arguments", {}),), {}, running))
             try:
                 decoded = json.loads(text)
             except ValueError:
                 decoded = None
             failed = isinstance(decoded, dict) and "error" in decoded
+        except asyncio.CancelledError:
+            text, failed = json.dumps({"error": "Cancelled"}), True
         except Exception as exc:
             text, failed = json.dumps({"error": str(exc)}), True
         return {"content": [{"type": "text", "text": text}], "isError": failed}
@@ -391,6 +422,17 @@ class PluginHost:
         if method == "hermes/unload":
             return self.close()
         raise ValueError(f"Unsupported method: {method}")
+
+    def call_tool_json(self, request_id, encoded):
+        running = self._running.setdefault(request_id, _Running())
+        try:
+            return json.dumps(self._call_tool(json.loads(encoded), running), default=str, allow_nan=False)
+        finally:
+            self._running.pop(request_id, None)
+
+    def cancel_tool(self, request_id):
+        # The call itself may still be waiting for its thread.
+        self._running.setdefault(request_id, _Running()).cancel()
 
     def dispatch_json(self, method, encoded):
         return json.dumps(self._dispatch(method, json.loads(encoded)), default=str, allow_nan=False)

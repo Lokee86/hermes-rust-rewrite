@@ -27,14 +27,16 @@ pub struct Wire {
 }
 
 impl Wire {
-    pub fn read_requests(self: &Arc<Self>) -> Receiver<Value> {
+    /// Requests, and the ids of tool calls nobody waits for any more.
+    pub fn read_requests(self: &Arc<Self>) -> (Receiver<Value>, Receiver<Value>) {
         let (send, requests) = mpsc::sync_channel(64);
+        let (cancel, cancelled) = mpsc::channel();
         let wire = self.clone();
-        std::thread::spawn(move || wire.read(send));
-        requests
+        std::thread::spawn(move || wire.read(send, cancel));
+        (requests, cancelled)
     }
 
-    fn read(&self, requests: SyncSender<Value>) {
+    fn read(&self, requests: SyncSender<Value>, cancelled: mpsc::Sender<Value>) {
         let mut input = std::io::stdin().lock();
         let mut line = Vec::new();
         loop {
@@ -44,7 +46,13 @@ impl Wire {
                 _ => break,
             }
             let Ok(message) = serde_json::from_slice::<Value>(&line) else { continue };
-            if message["jsonrpc"] != "2.0" || message.get("id").is_none() {
+            if message["jsonrpc"] != "2.0" {
+                continue;
+            }
+            if message.get("id").is_none() {
+                if message["method"] == "notifications/cancelled" {
+                    let _ = cancelled.send(message["params"]["requestId"].clone());
+                }
                 continue;
             }
             if message.get("method").is_none() {

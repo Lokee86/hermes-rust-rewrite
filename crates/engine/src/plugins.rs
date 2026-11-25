@@ -328,8 +328,15 @@ pub fn config_schema(root: &Path, name: &str) -> Vec<Field> {
     }).collect()).unwrap_or_default()
 }
 fn config_path(root: &Path, name: &str) -> PathBuf { root.join("plugin-data").join(name).join("config.json") }
-pub fn config(root: &Path, name: &str) -> serde_json::Map<String, Value> {
+fn saved_config(root: &Path, name: &str) -> serde_json::Map<String, Value> {
     fs::read(config_path(root, name)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+/// A secret that cannot be opened right now is left out.
+pub fn config(root: &Path, name: &str) -> serde_json::Map<String, Value> {
+    saved_config(root, name).into_iter().filter_map(|(key, value)| match value.as_str() {
+        Some(text) if crate::secret::is_sealed(text) => Some((key, crate::secret::unseal(text).ok()?.into())),
+        _ => Some((key, value)),
+    }).collect()
 }
 pub fn set_config(root: &Path, name: &str, values: &serde_json::Map<String, Value>) -> Result<()> {
     ensure!(valid_name(name), "That plugin name is not valid");
@@ -340,9 +347,26 @@ pub fn set_config(root: &Path, name: &str, values: &serde_json::Map<String, Valu
     fs::create_dir_all(path.parent().context("No data directory")?)?;
     let temp = tempfile::NamedTempFile::new_in(path.parent().context("No data directory")?)?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o600))?; }
-    serde_json::to_writer_pretty(temp.as_file(), values)?;
+    serde_json::to_writer_pretty(temp.as_file(), &sealed_config(root, name, values)?)?;
     temp.persist(path)?;
     Ok(())
+}
+/// `values` with the plugin's secrets encrypted. One that could not be opened is kept as it is.
+fn sealed_config(root: &Path, name: &str, values: &serde_json::Map<String, Value>) -> Result<serde_json::Map<String, Value>> {
+    let mut sealed = values.clone();
+    let before = saved_config(root, name);
+    for field in config_schema(root, name).into_iter().filter(|field| field.secret) {
+        match sealed.get(&field.key).and_then(Value::as_str).filter(|text| !text.is_empty()) {
+            Some(text) => {
+                let text = crate::secret::seal(root, text)?;
+                sealed.insert(field.key, text.into());
+            }
+            None => if let Some(kept) = before.get(&field.key).filter(|value| value.as_str().is_some_and(|text| crate::secret::is_sealed(text) && crate::secret::unseal(text).is_err())) {
+                sealed.insert(field.key, kept.clone());
+            }
+        }
+    }
+    Ok(sealed)
 }
 /// The pinned commit the catalog now offers differs from the installed one.
 pub fn update_available(installed: &Installed, catalog_sha: &str) -> bool { !catalog_sha.is_empty() && installed.sha != catalog_sha }
@@ -841,6 +865,26 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", _no_secrets)
     ctx.register_hook("transform_tool_result", _tag)
 "#;
+
+    #[test]
+    fn plugin_secrets_are_encrypted_and_other_settings_are_not() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".sealed-in-tests"), "").unwrap();
+        let package = dir(root.path()).join("kit");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("plugin.json"), r#"{"name":"kit","extensions":{"com.nousresearch.hermes":{"config_schema":{"api_key":{"type":"str"},"volume":{"type":"str"}}}}}"#).unwrap();
+        let values = serde_json::json!({"api_key":"fixture-value","volume":"loud"});
+        set_config(root.path(), "kit", values.as_object().unwrap()).unwrap();
+        let text = fs::read_to_string(config_path(root.path(), "kit")).unwrap();
+        assert!(!text.contains("fixture-value") && text.contains("loud"), "{text}");
+        assert_eq!(Value::Object(config(root.path(), "kit")), values);
+        // A secret that cannot be opened is not lost when another setting is saved.
+        let damaged = text.replace("hermes-sealed:1:", "hermes-sealed:1:AAAA");
+        fs::write(config_path(root.path(), "kit"), &damaged).unwrap();
+        assert!(!config(root.path(), "kit").contains_key("api_key"));
+        set_config(root.path(), "kit", serde_json::json!({"volume":"quiet"}).as_object().unwrap()).unwrap();
+        assert_eq!(saved_config(root.path(), "kit")["api_key"], serde_json::from_str::<Value>(&damaged).unwrap()["api_key"]);
+    }
 
     fn shout_plugin(root: &Path, requirements: &str) {
         let pkg = root.join("plugins/shout");

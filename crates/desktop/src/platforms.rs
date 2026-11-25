@@ -6,6 +6,7 @@
 use super::messaging::Message;
 use crate::appearance::text;
 use iced::{Alignment, Border, Color, Element, Fill, Padding, widget::{Space, button, column, container, row, rule, scrollable, text_input}};
+use hermes_engine::secret;
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::LazyLock};
 
@@ -36,11 +37,26 @@ pub(super) struct State {
 fn values_path(root: &Path) -> PathBuf { root.join("messaging-platforms.json") }
 fn secrets_path(root: &Path) -> PathBuf { root.join("messaging-secrets.json") }
 
+/// Encrypts the values that are not yet, and saves them.
+fn save_secrets(root: &Path, secrets: &mut BTreeMap<String, BTreeMap<String, String>>) -> Result<(), String> {
+    for value in secrets.values_mut().flat_map(BTreeMap::values_mut).filter(|value| !secret::is_sealed(value)) {
+        *value = secret::seal(root, value).map_err(|e| format!("{e:#}"))?;
+    }
+    let temp = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?; }
+    serde_json::to_writer(temp.as_file(), secrets).map_err(|e| e.to_string())?;
+    temp.persist(secrets_path(root)).map(|_| ()).map_err(|e| e.to_string())
+}
+
 impl State {
     pub fn load(&mut self, root: &Path) {
         self.root = Some(root.to_owned());
         self.saved = std::fs::read(values_path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        let secrets: BTreeMap<String, BTreeMap<String, String>> = std::fs::read(secrets_path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut secrets: BTreeMap<String, BTreeMap<String, String>> = std::fs::read(secrets_path(root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // Protect values saved by a version that stored them as text.
+        if secrets.values().flat_map(BTreeMap::values).any(|value| !secret::is_sealed(value)) {
+            let _ = save_secrets(root, &mut secrets);
+        }
         self.secrets = secrets.into_iter().map(|(p, m)| (p, m.into_keys().collect())).collect();
     }
     fn platform(&self) -> Option<&'static Platform> { let id = self.selected.as_deref()?; CATALOG.iter().find(|p| p.id == id) }
@@ -66,9 +82,7 @@ impl State {
             }
         }
         std::fs::write(values_path(&root), serde_json::to_vec_pretty(&self.saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let file = secrets_path(&root);
-        std::fs::write(&file, serde_json::to_vec(&secrets).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)); }
+        save_secrets(&root, &mut secrets)?;
         self.secrets = secrets.into_iter().map(|(p, m)| (p, m.into_keys().collect())).collect();
         self.draft.clear(); self.dirty = false;
         Ok(())
