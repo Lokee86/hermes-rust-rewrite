@@ -62,7 +62,8 @@ async fn reply(
 ) -> impl IntoResponse {
     lock(&fixture.requests).push(request.clone());
     let latest = request["messages"].as_array().unwrap().last().unwrap();
-    let prompt = latest["content"].as_str().unwrap_or_default();
+    // Recall follows the prompt in the same message.
+    let prompt = latest["content"].as_str().unwrap_or_default().split("\n\n[Recalled memory").next().unwrap_or_default();
     if prompt == "Pause until the provider changes." {
         fixture.waiting.notify_one();
         fixture.release.notified().await;

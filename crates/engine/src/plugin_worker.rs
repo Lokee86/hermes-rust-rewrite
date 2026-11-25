@@ -34,16 +34,27 @@ struct Request {
 }
 
 struct Pending {
-    limit: Duration,
+    tool: bool,
+    /// When the host started on it. Tools start at once; other requests run one at a time in
+    /// order, and those waiting must not use up their own time.
+    since: Option<Instant>,
     reply: oneshot::Sender<Result<Value>>,
 }
 
-impl Pending {
-    /// A callback whose caller is gone gets only the ordinary limit, so a cancelled turn
-    /// cannot leave the worker blocked.
-    fn expired(&self, running: Duration) -> bool {
-        running >= if self.reply.is_closed() { REQUEST_TIMEOUT.min(self.limit) } else { self.limit }
+/// Whether the worker is stuck and has to be replaced.
+fn stuck(pending: &mut BTreeMap<u64, Pending>, now: Instant) -> bool {
+    if let Some(head) = pending.values_mut().find(|request| !request.tool) {
+        let since = *head.since.get_or_insert(now);
+        if now - since >= REQUEST_TIMEOUT {
+            return true;
+        }
     }
+    // A tool nobody waits for any more is ended only when that interrupts no one else.
+    let waiting = pending.values().any(|request| !request.reply.is_closed());
+    pending.values().filter(|request| request.tool).any(|request| {
+        let running = request.since.map_or(Duration::ZERO, |since| now - since);
+        running >= TOOL_TIMEOUT || (!waiting && running >= REQUEST_TIMEOUT)
+    })
 }
 
 impl Worker {
@@ -123,24 +134,15 @@ async fn exchange(
 ) -> Result<()> {
     let mut output = BufReader::new(output);
     let mut bytes = Vec::new();
-    // The host runs requests one at a time in order, so only the oldest one is running. Those
-    // behind it are waiting and must not use up their own time.
     let mut pending = BTreeMap::<u64, Pending>::new();
-    let mut running: Option<(u64, Instant)> = None;
     let mut next_id = 0_u64;
     let mut services = JoinSet::new();
     let mut check = tokio::time::interval(DEADLINE_CHECK);
     loop {
-        let head = pending.keys().next().copied();
-        if running.map(|(id, _)| id) != head {
-            running = head.map(|id| (id, Instant::now()));
-        }
         tokio::select! {
             _ = stop.cancelled() => return Ok(()),
-            _ = check.tick(), if running.is_some() => {
-                if let Some((id, since)) = running {
-                    ensure!(!pending[&id].expired(since.elapsed()), "A Python plugin callback exceeded its deadline");
-                }
+            _ = check.tick(), if !pending.is_empty() => {
+                ensure!(!stuck(&mut pending, Instant::now()), "A Python plugin callback exceeded its deadline");
             }
             request = inbox.recv(), if pending.len() < MAX_REQUESTS => {
                 let Some(request) = request else { return Ok(()) };
@@ -148,8 +150,8 @@ async fn exchange(
                 let frame = json!({
                     "jsonrpc":"2.0", "id":next_id, "method":request.method, "params":request.params
                 });
-                let limit = if request.method == "tools/call" { TOOL_TIMEOUT } else { REQUEST_TIMEOUT };
-                pending.insert(next_id, Pending { limit, reply: request.reply });
+                let tool = request.method == "tools/call";
+                pending.insert(next_id, Pending { tool, since: tool.then(Instant::now), reply: request.reply });
                 send(&mut input, frame, stop).await?;
             }
             message = receive(&mut output, &mut bytes) => {
@@ -234,15 +236,26 @@ mod tests {
     use fs2::FileExt;
     use std::{fs::OpenOptions, thread};
 
-    #[test]
-    fn a_slow_tool_outlives_the_ordinary_limit_only_while_someone_waits() {
-        let (reply, waiting) = oneshot::channel();
-        let tool = Pending { limit: TOOL_TIMEOUT, reply };
-        assert!(!tool.expired(REQUEST_TIMEOUT * 2));
-        assert!(tool.expired(TOOL_TIMEOUT));
-        drop(waiting);
-        assert!(!tool.expired(REQUEST_TIMEOUT / 2));
-        assert!(tool.expired(REQUEST_TIMEOUT));
+    #[tokio::test]
+    async fn deadlines_follow_what_is_running_and_who_is_waiting() {
+        let now = Instant::now();
+        let mut pending = BTreeMap::new();
+        let (reply, tool_caller) = oneshot::channel();
+        pending.insert(1, Pending { tool: true, since: Some(now), reply });
+        let (reply, _first) = oneshot::channel();
+        pending.insert(2, Pending { tool: false, since: None, reply });
+        let (reply, _second) = oneshot::channel();
+        pending.insert(3, Pending { tool: false, since: None, reply });
+        assert!(!stuck(&mut pending, now));
+        // The second ordinary request has not started, so only the first one's time counts.
+        pending.remove(&2);
+        assert!(!stuck(&mut pending, now + REQUEST_TIMEOUT));
+        assert!(stuck(&mut pending, now + REQUEST_TIMEOUT * 2));
+        pending.remove(&3);
+        // A slow tool may go on while its caller waits, and ends soon after everyone left.
+        assert!(!stuck(&mut pending, now + REQUEST_TIMEOUT * 3));
+        drop(tool_caller);
+        assert!(stuck(&mut pending, now + REQUEST_TIMEOUT * 3));
     }
 
     #[tokio::test]

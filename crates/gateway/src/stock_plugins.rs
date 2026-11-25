@@ -24,8 +24,11 @@ pub fn delete_profile(library: &Library, name: &str) -> Result<()> {
     // Startup takes the parent fence, so the owner file can be closed before
     // recursively deleting the profile on Windows.
     drop(active_check);
-    purge_profile_data(&home, name)?;
-    library.delete_profile(name)
+    library.delete_profile_with_cleanup(name, |home| purge_profile_data(home, name))
+}
+
+pub(crate) fn delete_bot(library: &Library, name: &str) -> Result<hermes_library::BotDeletion> {
+    library.delete_bot_with_cleanup(name, |home| purge_profile_data(home, name))
 }
 
 pub(crate) fn purge_profile_data(home: &std::path::Path, name: &str) -> Result<()> {

@@ -59,6 +59,92 @@ fn user_messages() -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn streamed_and_structured_responses_share_selected_reasoning() {
+    let router = Router::new().route("/responses", post(|Json(body): Json<Value>| async move {
+        assert!(body.get("reasoning_effort").is_none());
+        let effort = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        if effort == "default" {
+            assert!(body.get("reasoning").is_none());
+        } else {
+            assert_eq!(body["reasoning"], json!({"effort": effort}));
+        }
+        sse(concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"ok\\\":true}\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        ))
+    }));
+    let (base, server) = serve(router).await;
+    for (selected, wire) in [(None, "default"), (Some("low"), "low"), (Some("high"), "high"),
+        (Some("none"), "none"), (Some("ultra"), "max")]
+    {
+        let mut provider = Provider::new_with_options(config(&base), crate::models::GenerationOptions {
+            reasoning_effort: selected.map(str::to_owned),
+            ..Default::default()
+        }).unwrap();
+        provider.protocol = Protocol::Responses;
+        provider.endpoint = format!("{base}/responses").parse().unwrap();
+        let mut text = String::new();
+        provider.stream_with_tools(vec![json!({"role":"user","content":wire})], &[], |delta| {
+            text.push_str(delta);
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(text, "{\"ok\":true}");
+        assert_eq!(provider.complete_json("Output JSON.", wire, "fixture_schema", &json!({"type":"object"}))
+            .await.unwrap(), json!({"ok":true}));
+    }
+    server.abort();
+}
+
+#[test]
+fn catalog_requests_use_provider_routes_and_authentication() {
+    for (base, expected, anthropic, bearer) in [
+        (OPENAI, format!("{OPENAI}/models"), false, true),
+        (ANTHROPIC, format!("{ANTHROPIC}/models"), true, false),
+        ("http://127.0.0.1:12345/custom/chat/completions", "http://127.0.0.1:12345/custom/models".into(), false, true),
+    ] {
+        let provider = Provider::new(Config { api_key: "catalog-fixture-token".into(), ..config(base) }).unwrap();
+        let mut requests = provider.catalog_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = requests.remove(0).build().unwrap();
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert_eq!(request.url().as_str(), expected);
+        assert!(request.body().is_none());
+        assert_eq!(request.headers().get("authorization").map(|value| value.to_str().unwrap()),
+            bearer.then_some("Bearer catalog-fixture-token"));
+        assert_eq!(request.headers().get("x-api-key").map(|value| value.to_str().unwrap()),
+            anthropic.then_some("catalog-fixture-token"));
+        assert_eq!(request.headers().get("anthropic-version").map(|value| value.to_str().unwrap()),
+            anthropic.then_some("2023-06-01"));
+    }
+    let subscription = crate::accounts::CATALOG.iter().find(|account| {
+        Url::parse(account.base_url).unwrap().host_str() == Some("chatgpt.com")
+    }).unwrap();
+    let expected_path = format!("{}/models", Url::parse(subscription.base_url).unwrap().path());
+    for base in [subscription.base_url.to_owned(), format!("{}/responses", subscription.base_url)] {
+        let provider = Provider::new(Config { api_key: "subscription-fixture-token".into(), ..config(base) }).unwrap();
+        let requests = provider.catalog_requests().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, version) in requests.into_iter().zip(["99.0.0", "0.0.0"]) {
+            let request = request.build().unwrap();
+            assert_eq!(request.url().path(), expected_path);
+            assert_eq!(request.url().query(), Some(format!("client_version={version}").as_str()));
+            assert_eq!(request.headers()["originator"], "hermes-agent");
+            assert_eq!(request.headers()["authorization"], "Bearer subscription-fixture-token");
+        }
+    }
+    let gateway = crate::accounts::CATALOG.iter().find(|account| {
+        Url::parse(account.base_url).unwrap().path().ends_with("/anthropic")
+    }).unwrap();
+    let expected_path = format!("{}/v1/models", Url::parse(gateway.base_url).unwrap().path());
+    for base in [gateway.base_url.to_owned(), format!("{}/v1/messages", gateway.base_url)] {
+        let provider = Provider::new(Config { api_key: "gateway-fixture-token".into(), ..config(base) }).unwrap();
+        let request = provider.catalog_requests().unwrap().remove(0).build().unwrap();
+        assert_eq!(request.url().path(), expected_path);
+        assert_eq!(request.headers()["authorization"], "Bearer gateway-fixture-token");
+    }
+}
+
+#[tokio::test]
 async fn structured_completion_uses_the_native_provider_request() {
     let router = Router::new()
         .route(
@@ -670,4 +756,58 @@ fn codex_subscription_uses_the_responses_protocol() {
     use base64::Engine;
     let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}"#);
     assert_eq!(codex_account_headers(&format!("h.{claims}.s")), vec![("ChatGPT-Account-ID", "acct_1".to_owned())]);
+}
+
+#[test]
+fn a_stopped_reply_stays_in_the_conversation_with_every_tool_call_answered() {
+    let call = |id: &str, arguments: &str| ToolCall { id: id.into(), name: "read_file".into(), arguments: arguments.into() };
+    let turn = |status: Status, entries: Vec<Entry>| crate::Turn {
+        attachments: vec![], prompt: "look".into(), context: String::new(), model: "m".into(), entries, status,
+    };
+    let mut history = History::default();
+    history.turns.push(turn(Status::Interrupted, vec![
+        Entry::Assistant { text: "Reading both.".into(), calls: vec![call("a", "{}"), call("b", "{}")] },
+        Entry::Tool { id: "a".into(), name: "read_file".into(), approved: true, result: "contents".into() },
+    ]));
+    history.turns.push(turn(Status::Failed("secret detail".into()), vec![
+        Entry::Assistant { text: "Half a".into(), calls: vec![call("c", "{\"pa")] },
+    ]));
+    history.turns.push(turn(Status::Interrupted, vec![Entry::Assistant { text: String::new(), calls: vec![] }]));
+    history.turns.push(turn(Status::Running, vec![]));
+    let sent = messages(&history, std::path::Path::new(".")).unwrap();
+    let roles: Vec<_> = sent.iter().map(|message| message["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool", "tool", "assistant", "user", "assistant", "user", "assistant", "user"]);
+    assert_eq!(sent[3]["content"], "contents");
+    assert!(sent[4]["content"].as_str().unwrap().contains("stopped before this tool ran"));
+    assert!(sent[7]["content"].as_str().unwrap().starts_with("Half a") && sent[7].get("tool_calls").is_none());
+    assert!(!serde_json::to_string(&sent).unwrap().contains("secret detail"));
+    anthropic_body("claude-fixture", sent, &[]).unwrap();
+}
+
+#[test]
+fn requests_mark_the_stable_prefix_for_caching() {
+    let tools = [json!({"type":"function","function":{"name":"t","parameters":{"type":"object"}}})];
+    let conversation = vec![
+        json!({"role":"system","content":"System"}),
+        json!({"role":"user","content":"one"}),
+        json!({"role":"assistant","content":"two"}),
+        json!({"role":"user","content":"three"}),
+        json!({"role":"assistant","content":"four"}),
+        json!({"role":"user","content":"five"}),
+    ];
+    let mut body = anthropic_body("claude-fixture", conversation.clone(), &tools).unwrap();
+    cache_anthropic_prefix(&mut body);
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    let marked: Vec<_> = body["messages"].as_array().unwrap().iter().map(|m| m["content"][0].get("cache_control").is_some()).collect();
+    assert_eq!(marked, [false, false, true, false, true]);
+
+    let mut routed = json!({"model":"anthropic/claude-fixture","messages":conversation});
+    cache_openrouter_prefix(&"https://openrouter.ai/api/v1/chat/completions".parse().unwrap(), &mut routed);
+    assert_eq!(routed["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(routed["messages"][5]["content"][0]["text"], "five");
+    let plain = json!({"model":"anthropic/claude-fixture","messages":conversation});
+    let mut other = plain.clone();
+    cache_openrouter_prefix(&"https://example.com/v1/chat/completions".parse().unwrap(), &mut other);
+    assert_eq!(other, plain);
 }

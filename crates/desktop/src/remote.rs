@@ -6,7 +6,7 @@ use iced::{Task, futures::SinkExt};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
     time::Duration,
 };
 
@@ -46,9 +46,12 @@ impl Route {
 pub(super) struct Connection {
     pub route: Route,
     root: PathBuf,
-    provider: Config,
+    provider: Mutex<Config>,
     client: GatewayClient,
     connecting: tokio::sync::Mutex<()>,
+    configuration: tokio::sync::Mutex<()>,
+    owner_instance: Mutex<Option<String>>,
+    selection: AtomicU64,
 }
 
 impl Connection {
@@ -56,13 +59,28 @@ impl Connection {
         Arc::new(Self {
             root,
             route,
-            provider,
+            provider: Mutex::new(provider),
             client: GatewayClient::new(Default::default()),
             connecting: Default::default(),
+            configuration: Default::default(),
+            owner_instance: Mutex::new(None),
+            selection: AtomicU64::new(0),
         })
     }
     pub fn matches(&self, root: &Path, route: &Route) -> bool {
         self.root == root && self.route == *route
+    }
+    #[cfg(test)]
+    pub fn has_startup_provider(&self, provider: &Config) -> bool {
+        let captured = self.provider.lock().unwrap();
+        captured.base_url == provider.base_url && captured.api_key == provider.api_key && captured.model == provider.model
+    }
+    pub fn select_settings(&self) -> u64 {
+        self.selection.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    fn selection_is_current(&self, selection: u64) -> Result<(), String> {
+        if self.selection.load(Ordering::SeqCst) == selection { Ok(()) }
+        else { Err("The selected settings changed before they were applied".into()) }
     }
     async fn connect(&self) -> Result<(), String> {
         let _guard = self.connecting.lock().await;
@@ -71,13 +89,16 @@ impl Connection {
         }
         match &self.route {
             Route::Local => {
-                let owner = hermes_gateway::owner::ensure_local(&self.root, &self.provider)
+                let provider = self.provider.lock().unwrap().clone();
+                let owner = hermes_gateway::owner::ensure_local(&self.root, &provider)
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 owner
                     .connect(&self.client)
                     .await
-                    .map_err(|e| format!("Could not attach to the local gateway: {e}"))
+                    .map_err(|e| format!("Could not attach to the local gateway: {e}"))?;
+                *self.owner_instance.lock().unwrap() = Some(owner.instance_id().to_owned());
+                Ok(())
             }
             Route::Remote { origin, token } => {
                 let bearer = if token.is_empty() {
@@ -98,6 +119,79 @@ impl Connection {
             .request(method, params)
             .await
             .map_err(|e| format!("{method}: {e}"))
+    }
+    async fn selected_settings(
+        &self, sid: &str, provider: &Config, options: &hermes_engine::models::GenerationOptions, selection: u64,
+    ) -> Result<Value, String> {
+        self.selection_is_current(selection)?;
+        let owner = hermes_gateway::owner::ensure_configured(&self.root, provider)
+            .await.map_err(|e| format!("Could not apply provider settings: {e:#}"))?;
+        self.selection_is_current(selection)?;
+        let same_owner = self.owner_instance.lock().unwrap().as_deref() == Some(owner.instance_id());
+        if !same_owner || self.client.connection_state() != ConnectionState::Open {
+            owner.connect(&self.client).await.map_err(|e| e.to_string())?;
+            *self.owner_instance.lock().unwrap() = Some(owner.instance_id().to_owned());
+        }
+        *self.provider.lock().unwrap() = provider.clone();
+        let desired = json!({"model":provider.model,"generation_options":options});
+        for _ in 0..3 {
+            let mut snapshot = self.resume(sid).await?;
+            self.selection_is_current(selection)?;
+            if snapshot["info"]["model"] != desired["model"]
+                || snapshot["info"]["generation_options"] != desired["generation_options"] {
+                let mutation = json!({"session_id":sid,"operation":"model","payload":desired,
+                    "request_id":uuid::Uuid::new_v4().to_string(),
+                    "expected_revision":snapshot["revision"],"expected_generation":snapshot["execution_generation"]});
+                match self.client.request("session.mutate", mutation).await {
+                    Ok(receipt) => {
+                        snapshot["revision"] = receipt["revision"].clone();
+                        snapshot["execution_generation"] = receipt["execution_generation"].clone();
+                        snapshot["info"]["model"] = desired["model"].clone();
+                        snapshot["info"]["generation_options"] = desired["generation_options"].clone();
+                    }
+                    Err(error) if matches!(error.reason(), Some("revision_conflict" | "stale_generation")) => continue,
+                    Err(error) => return Err(format!("Could not apply session model settings: {error}")),
+                }
+            }
+            snapshot["expected_instance_id"] = json!(owner.instance_id());
+            self.selection_is_current(selection)?;
+            return Ok(snapshot);
+        }
+        Err("Session settings changed in another client; retry your selection".into())
+    }
+    pub async fn configure_session(
+        &self, sid: &str, provider: &Config, options: &hermes_engine::models::GenerationOptions, selection: u64,
+    ) -> Result<Value, String> {
+        let _configuration = self.configuration.lock().await;
+        let _connecting = self.connecting.lock().await;
+        self.selected_settings(sid, provider, options, selection).await
+    }
+    pub async fn submit_selected(
+        &self, sid: &str, mut params: Value, provider: &Config, options: &hermes_engine::models::GenerationOptions, selection: u64,
+        explicit: bool,
+    ) -> Result<Value, String> {
+        let _configuration = self.configuration.lock().await;
+        let _connecting = self.connecting.lock().await;
+        self.selection_is_current(selection)?;
+        let owner = hermes_gateway::owner::ensure_local(&self.root, provider).await.map_err(|e| format!("{e:#}"))?;
+        if !owner.is_native() {
+            if explicit { return Err("Apply model and provider changes through this gateway's own controls".into()); }
+            let same_owner = self.owner_instance.lock().unwrap().as_deref() == Some(owner.instance_id());
+            if !same_owner || self.client.connection_state() != ConnectionState::Open {
+                owner.connect(&self.client).await.map_err(|e| e.to_string())?;
+                *self.owner_instance.lock().unwrap() = Some(owner.instance_id().to_owned());
+            }
+            self.selection_is_current(selection)?;
+            self.resume(sid).await?;
+            return self.client.request("prompt.submit", params).await.map_err(|e| format!("prompt.submit: {e}"));
+        }
+        let snapshot = self.selected_settings(sid, provider, options, selection).await?;
+        params["expected_instance_id"] = snapshot["expected_instance_id"].clone();
+        params["expected_revision"] = snapshot["revision"].clone();
+        params["expected_generation"] = snapshot["execution_generation"].clone();
+        // No reconnect between the acknowledged settings and admission. The
+        // server also fences this request against another client's mutation.
+        self.client.request("prompt.submit", params).await.map_err(|e| format!("prompt.submit: {e}"))
     }
     async fn resume(&self, sid: &str) -> Result<Value, String> {
         if let Some(barrier) = self.client.session_replay_barrier(sid)
@@ -226,6 +320,7 @@ pub(super) enum Update {
     Renamed(Result<String, String>),
     Controlled(Result<Value, String>),
     Listed(Result<Value, String>),
+    Configured(u64, Result<Value, String>),
 }
 
 // Only UI state lives under this directory. Remote strings never become literal paths.

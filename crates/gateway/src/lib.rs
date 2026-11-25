@@ -12,6 +12,7 @@ mod profile_memory;
 mod python_history;
 mod python_memory;
 mod slash_commands;
+mod methods;
 
 mod auth;
 mod rest;
@@ -245,6 +246,7 @@ impl Gateway {
             telegram,
             creates: Mutex::new(HashMap::new()),
             catalog_edits: Mutex::new(()),
+            admissions: StdMutex::new(()),
             turns: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
             gateway_tasks: tokio_util::task::TaskTracker::new(),
@@ -358,6 +360,8 @@ struct Shared {
     telegram: Arc<telegram_host::Host>,
     creates: Mutex<HashMap<String, (String, String)>>,
     catalog_edits: Mutex<()>,
+    // Serialize the final admission commit with an idle provider restart.
+    admissions: StdMutex<()>,
     turns: Mutex<Vec<JoinHandle<()>>>,
     connections: AtomicUsize,
     gateway_tasks: tokio_util::task::TaskTracker,
@@ -549,6 +553,23 @@ impl Shared {
         for runtime in profiles {
             let _ = runtime.close().await;
         }
+    }
+
+    /// Stop plugins of bots that were deleted, so their folders can be removed, and disabled ones.
+    async fn retire_other_plugin_profiles(&self) {
+        let roster = self.library.bots().ok().map(|bots| {
+            bots.iter().filter_map(|bot| self.library.bot_profile(&bot.name).ok()).collect::<std::collections::HashSet<_>>()
+        });
+        let mut live = Vec::new();
+        let mut gone = Vec::new();
+        // An unreadable roster says nothing about which bots exist.
+        self.other_plugin_profiles.lock().await.retain(|path, runtime| {
+            let keep = roster.as_ref().is_none_or(|roster| roster.contains(path));
+            if keep { live.push(runtime.clone()) } else { gone.push(runtime.clone()) }
+            keep
+        });
+        for runtime in gone { runtime.unload().await; }
+        for runtime in live { runtime.retire_stale().await; }
     }
 
     async fn plugin_runtime(&self, profile: &Path) -> Arc<hermes_engine::plugins::PluginRuntime> {
@@ -779,7 +800,7 @@ impl Shared {
                 json!({"instance_id":self.instance_id,"profile_id":self.profile_id,"authority_epoch":self.authority_epoch,"capabilities":RUNTIME_CAPABILITIES,"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
             ),
             "rpc.discover" => Ok(
-                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS,"limitations":["one running turn per session","steer and redirect are not implemented","event replay is bounded to the current process"]}),
+                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).collect::<Vec<_>>(),"limitations":["one running turn per session","steer and redirect are not implemented","event replay is bounded to the current process"]}),
             ),
             "gateway.capabilities" => Ok(json!({"per_session_exclusive_submit":true})),
             "client.capabilities" => Ok(
@@ -798,7 +819,11 @@ impl Shared {
                 if !peer.canonical { return Err(RpcError::unsupported("A native session is required")); }
                 let id = required_string(params, "job_id")?;
                 let request_id = required_string(params, "request_id")?;
-                let claim = self.scheduler.claim_gateway_now(id, request_id, chrono::Utc::now()).map_err(RpcError::internal)?;
+                let claim = {
+                    let _admissions = lock(&self.admissions);
+                    if self.shutdown.is_cancelled() { return Err(RpcError::new(4001, "shutdown", "Gateway is shutting down")); }
+                    self.scheduler.claim_gateway_now(id, request_id, chrono::Utc::now()).map_err(RpcError::internal)?
+                };
                 self.scheduler_notify.notify_one();
                 let run = tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
@@ -950,11 +975,7 @@ impl Shared {
                 }
                 Ok(json!({"closed":true}))
             }
-            _ => Err(RpcError::new(
-                -32601,
-                "method_not_found",
-                format!("Method not implemented by the Rust gateway: {method}"),
-            )),
+            _ => self.profile_method(method, params, peer).await,
         }
     }
 
@@ -1477,6 +1498,8 @@ impl Shared {
             return Err(RpcError::invalid("request_id must contain 1-256 bytes"));
         }
         let fingerprint=json!({"operation":operation,"payload":payload,"expected_revision":params["expected_revision"],"expected_generation":params["expected_generation"]}).to_string();
+        let _admissions = lock(&self.admissions);
+        if self.shutdown.is_cancelled() { return Err(RpcError::new(4001, "shutdown", "Gateway is shutting down")); }
         // The lock order is shared with info(): summary, settings, config, view.
         let mut summary = lock(&session.summary);
         let mut settings = lock(&session.settings);
@@ -1923,19 +1946,15 @@ fn tool_names() -> Vec<String> {
 fn shorten(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
-#[derive(Default, Deserialize)]
 struct StoredConversation {
-    #[serde(flatten)]
     history: History,
     authority: Option<Authority>,
 }
 
 fn read_record(dir: &Path) -> Result<StoredConversation> {
-    match fs::read(dir.join("conversation.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("Could not read conversation history"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoredConversation::default()),
-        Err(e) => Err(e.into()),
-    }
+    let (history, authority) = hermes_engine::read_conversation(dir)?;
+    let authority = authority.map(serde_json::from_value).transpose().context("Could not read conversation state")?;
+    Ok(StoredConversation { history, authority })
 }
 
 fn read_history(dir: &Path) -> Result<History> {
@@ -2118,6 +2137,17 @@ async fn upgrade(
         .into_response()
 }
 
+const SOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn close_websocket<S, Item>(sink: &mut S)
+where
+    S: futures_util::Sink<Item> + Unpin,
+{
+    // Closing flushes buffered output too, including a write that already
+    // timed out. A stalled peer must not keep the owner alive during teardown.
+    let _ = tokio::time::timeout(SOCKET_CLOSE_TIMEOUT, sink.close()).await;
+}
+
 async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool, local_native: bool, revoked: CancellationToken) {
     let (mut sink, mut source) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Value>(256);
@@ -2139,13 +2169,20 @@ async fn serve_socket(shared: Arc<Shared>, socket: WebSocket, canonical: bool, l
             tokio::select! {
                 _=writer_stop.cancelled()=>break,
                 frame=rx.recv()=>match frame {
-                    Some(frame)=>if !matches!(tokio::time::timeout(Duration::from_secs(10),sink.send(Message::Text(frame.to_string().into()))).await,Ok(Ok(()))) {break;},
+                    Some(frame) => {
+                        let sent = tokio::select! {
+                            _ = writer_stop.cancelled() => false,
+                            result = tokio::time::timeout(Duration::from_secs(10), sink.send(Message::Text(frame.to_string().into()))) => matches!(result, Ok(Ok(()))),
+                        };
+                        if !sent { break; }
+                    }
                     None=>break,
                 },
             }
         }
-        let _ = sink.close().await;
+        rx.close();
         writer_stop.cancel();
+        close_websocket(&mut sink).await;
     });
     // Keep dispatch ordered while the reader continues polling WebSocket
     // control frames. The bounded queue applies backpressure during bursts.

@@ -50,7 +50,7 @@ pub(super) struct State {
     source: Option<String>, category: Option<String>, installed_only: bool, sort: Sort, limit: usize, hero: usize,
     status: skill_catalog::Status, installing: BTreeSet<String>, detail: Option<String>, document: Option<String>,
     sources: Vec<Facet>, categories: Vec<Facet>, plugin_category: Option<String>,
-    plugins_installed: Vec<hermes_engine::plugins::Installed>, plugin_busy: BTreeSet<String>, plugins_installed_only: bool,
+    plugins_installed: Vec<hermes_engine::plugins::Installed>, plugin_busy: BTreeSet<String>, plugins_installed_only: bool, plugin_pages: Vec<super::plugin_pages::Page>,
     plugin_detail: Option<String>, plugin_form: std::collections::BTreeMap<String, String>, gateway_plugins: Vec<Value>,
     local: Vec<Value>, url: String, token: String, has_token: bool, environment: bool, tools: Vec<String>, busy: bool, revision: u64,
 }
@@ -111,6 +111,11 @@ pub(super) fn open(app: &mut Hermes) -> Task<Message> {
     Task::batch(tasks)
 }
 
+fn load_plugins(state: &mut State, root: &std::path::Path) {
+    state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default();
+    state.plugin_pages = super::plugin_pages::discover(root, &state.plugins_installed);
+}
+
 fn reset_paging(state: &mut State) { state.limit = PAGE; state.detail = None; state.document = None; }
 
 fn refresh_runtime_plugins(app:&mut Hermes)->Task<Message>{
@@ -129,7 +134,7 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             reset_paging(state);
             if page == Page::Skills { return update(app, Action::DiscoverSkills); }
             if page == Page::Plugins {
-                if let Some(root) = &root { state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default(); }
+                if let Some(root) = &root { load_plugins(state, root); }
                 if let Some(conn)=status_conn {return Task::perform(async move{conn.request("commands.catalog",json!({})).await},|r|Message::Capability(Action::RuntimePlugins(r)));}
             }
         }
@@ -243,19 +248,24 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             state.plugin_busy.remove(&name);
             let succeeded=result.is_ok();
             match result { Ok(note) => { state.notice = Some(note); state.error = None; } Err(e) => { state.notice = None; state.error = Some(e); } }
-            if let Some(root) = &root { state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default(); }
+            if let Some(root) = &root { load_plugins(state, root); }
             if succeeded{return refresh_runtime_plugins(app);}
         }
         Action::PluginEnable(name, on) => if let Some(root) = &root {
             if let Err(e) = hermes_engine::plugins::set_enabled(root, &name, on) { state.error = Some(format!("{e:#}")); }
-            state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default();
+            load_plugins(state, root);
             return refresh_runtime_plugins(app);
         },
-        Action::PluginRemove(name) => if let Some(root) = &root {
-            match hermes_engine::plugins::uninstall(root, &name) { Ok(()) => state.notice = Some("Plugin removed.".into()), Err(e) => state.error = Some(format!("{e:#}")) }
-            state.plugins_installed = hermes_engine::plugins::installed(root).unwrap_or_default();
-            return refresh_runtime_plugins(app);
-        },
+        Action::PluginRemove(name) => {
+            let Some(root) = root else { return Task::none() };
+            if !state.plugin_busy.insert(name.clone()) { return Task::none(); }
+            state.error = None; state.notice = Some("Removing the plugin…".into());
+            let removed = name.clone();
+            // Windows may have to wait for the plugin to stop.
+            return Task::perform(async move {
+                tokio::task::spawn_blocking(move || hermes_engine::plugins::uninstall(&root, &removed).map(|()| "Plugin removed.".to_owned()).map_err(|e| format!("{e:#}"))).await.unwrap_or_else(|e| Err(e.to_string()))
+            }, move |result| pressed(Action::PluginInstalled(name.clone(), result)));
+        }
         Action::Toolset(key, on) => {
             let Some(root) = root else { return Task::none() };
             let mut changes = serde_json::Map::new(); changes.insert(key.into(), json!(on));
@@ -645,6 +655,14 @@ fn plugins(app: &Hermes) -> Element<'_, Message> {
             statuses=statuses.push(row![text(title.to_owned()).size(12).width(180),text(detail).size(12).color(if issue.is_some(){Color::from_rgb8(0xd1,0x43,0x43)}else{p.muted})].spacing(10));
         }
         col=col.push(container(statuses).padding(14).width(Fill).style(move |_|ui::panel(p.card,8.0,Some(p.border))));
+    }
+    if !state.plugin_pages.is_empty() {
+        let mut list = column![text("Plugin pages").size(13).font(ui::medium())].spacing(6);
+        for page in &state.plugin_pages {
+            list = list.push(row![text(page.id.clone()).size(12).width(Fill),
+                button(text("Open").size(12)).style(ui::quiet_button).on_press(Message::OpenPluginPage(page.clone()))].align_y(Alignment::Center));
+        }
+        col = col.push(container(list).padding(14).width(Fill).style(move |_| ui::panel(p.card, 8.0, Some(p.border))));
     }
     if let Some(name) = &state.plugin_detail { col = col.push(plugin_detail(app, name)); }
     let mut grid = column![].spacing(12);

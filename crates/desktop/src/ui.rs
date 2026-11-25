@@ -94,6 +94,20 @@ mod agent_pty_tests {
 }
 
 impl Hermes {
+    /// A plugin's own page. The webview covers the pane (webview.rs).
+    fn plugin_page_view(&self) -> Element<'_, Message> {
+        let p = palette(self.dark);
+        let title = self.plugin_page.as_ref().map_or("Plugin", |(id, _)| id.as_str());
+        let mut body = column![row![text(title).size(18).font(medium()), Space::new().width(Fill),
+            button(text("Back to plugins").size(12)).style(quiet_button).on_press(Message::Navigate(Screen::Tools))].align_y(Alignment::Center)].spacing(8).padding(16).height(Fill);
+        if let Some(link) = self.webview.offered_link() {
+            body = body.push(row![text("This page wants to open").size(12).color(p.muted), text(link.chars().take(80).collect::<String>()).size(12), Space::new().width(Fill),
+                button(text("Open in browser").size(12)).padding([4, 10]).on_press(Message::OpenPluginLink(link.clone()))].spacing(6).align_y(Alignment::Center));
+        }
+        body.push(container(Space::new().width(Fill).height(Fill)).id(super::webview::PANE).width(Fill).height(Fill)
+            .style(move |_| container::Style { background: Some(p.background.into()), ..Default::default() }))
+            .push(text("This page runs without network access or access to your chats and files.").size(11).color(p.muted)).into()
+    }
     pub(super) fn view_window(&self, window: iced::window::Id) -> Element<'_, Message> {
         if self.overlays.pet == Some(window) { return super::overlays::pet_view(self); }
         if self.overlays.wake == Some(window) { return super::overlays::wake_view(self); }
@@ -113,6 +127,7 @@ impl Hermes {
             Screen::Webhooks => column![page_title("Webhooks"), super::webhooks::view(self)].height(Fill).into(),
             Screen::Profiles => column![page_title("Profiles"), super::profiles::view(self)].height(Fill).into(),
             Screen::Starmap => column![page_title("Star map"), super::starmap::view(self)].height(Fill).into(),
+            Screen::PluginPage => self.plugin_page_view(),
             Screen::Pets => column![page_title("Pets"), super::pets::view(self)].height(Fill).into(),
             Screen::Artifacts => self.artifacts(),
             Screen::Bots => bots::view(self),
@@ -531,7 +546,7 @@ impl Hermes {
         content.push(self.composer_view()).into()
     }
 
-    fn banner_view<'a>(&self, banner: &'a Banner) -> Element<'a, Message> {
+    pub(super) fn banner_view<'a>(&self, banner: &'a Banner) -> Element<'a, Message> {
         let p = palette(self.dark);
         container(row![text(&banner.text).size(12).color(if banner.error { hex(0xcf222e) } else { p.muted }).width(Fill),
             icon_button("close", "Dismiss", Message::Dismiss, p)].spacing(10).align_y(Alignment::Center)).padding([8, 20]).width(Fill)

@@ -93,6 +93,34 @@ fn response(frame: Message) -> Value {
 }
 
 #[tokio::test]
+async fn closing_a_stalled_writer_has_a_deadline() {
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    struct StalledWriter(AtomicUsize);
+    impl futures_util::Sink<()> for StalledWriter {
+        type Error = Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
+        fn start_send(self: Pin<&mut Self>, _: ()) -> Result<(), Self::Error> { Ok(()) }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { Poll::Ready(Ok(())) }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+    }
+
+    let mut writer = StalledWriter(AtomicUsize::new(0));
+    timeout(super::SOCKET_CLOSE_TIMEOUT + Duration::from_secs(1), super::close_websocket(&mut writer))
+        .await.expect("a peer that stops reading must not stall teardown");
+    assert!(writer.0.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
 async fn keepalives_are_serviced_during_ordered_shell_capture() {
     let profile = tempfile::tempdir().unwrap();
     let cwd = profile.path().join("workspace");

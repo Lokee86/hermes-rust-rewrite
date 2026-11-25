@@ -16,7 +16,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
 };
 use tempfile::NamedTempFile;
 const MAX_FILE: usize = 1_048_576;
@@ -79,6 +79,28 @@ pub struct Summary {
 #[derive(Clone, Debug)]
 pub struct Token {
     pub id: String,
+    pending: Arc<PendingWrite>,
+}
+#[derive(Debug)]
+struct PendingWrite {
+    store: Store,
+    id: String,
+    lease: Option<File>,
+    applied: AtomicBool,
+}
+impl Token {
+    pub(crate) fn mark_applied(&self) {
+        self.pending.applied.store(true, Ordering::Release);
+    }
+}
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        let finished = self.store.finish_pending(&self.id, self.applied.load(Ordering::Acquire)).is_ok();
+        drop(self.lease.take());
+        if finished {
+            let _ = fs::remove_file(self.store.lease_path(&self.id));
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct RestorePlan {
@@ -169,7 +191,82 @@ impl Store {
         temp.write_all(&bytes)?;
         temp.as_file().sync_all()?;
         temp.persist(self.root.join("native-files.json"))?;
+        #[cfg(unix)]
+        File::open(&self.root)?.sync_all()?;
         Ok(value)
+    }
+    fn lease_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("native-write-{id}.lock"))
+    }
+    fn write_lease(&self, id: &str, exclusive: bool) -> Result<File> {
+        ensure!(
+            !id.is_empty() && id.len() <= 128
+                && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "Invalid checkpoint write identity"
+        );
+        let path = self.lease_path(id);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            ensure!(metadata.file_type().is_file(), "Checkpoint write lease must be a regular file");
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        if exclusive { options.create_new(true); } else { options.create(true).truncate(false); }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Ok(options.open(path)?)
+    }
+    fn reconcile_pending(&self, document: &mut Document) -> Result<Vec<PathBuf>> {
+        let mut released = Vec::new();
+        let mut index = 0;
+        while index < document.records.len() {
+            let record = &mut document.records[index];
+            if record.ready { index += 1; continue; }
+            let lease = self.write_lease(&record.id, false)?;
+            match lease.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                    index += 1;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            released.push(self.lease_path(&record.id));
+            // A free lease means the writer ended. An unchanged file needs no
+            // rollback; other outcomes retain the snapshot with restore checks.
+            if unchanged_before(record) {
+                document.records.remove(index);
+            } else {
+                record.ready = true;
+                index += 1;
+            }
+        }
+        Ok(released)
+    }
+    fn finish_pending(&self, id: &str, applied: bool) -> Result<()> {
+        self.transaction(|document| {
+            if let Some(index) = document.records.iter().position(|record| record.id == id) {
+                let record = &mut document.records[index];
+                if !record.ready {
+                    if !applied && unchanged_before(record) {
+                        document.records.remove(index);
+                    } else {
+                        record.ready = true;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+    fn records(&self) -> Result<Vec<Record>> {
+        let (records, released) = self.transaction(|document| {
+            let released = self.reconcile_pending(document)?;
+            Ok((document.records.clone(), released))
+        })?;
+        for path in released { let _ = fs::remove_file(path); }
+        Ok(records)
     }
     pub fn capture(
         &self,
@@ -233,10 +330,11 @@ impl Store {
             ready: false,
             restored_at: None,
         };
-        let token = Token {
-            id: record.id.clone(),
-        };
-        self.transaction(|document| {
+        let id = record.id.clone();
+        let lease = self.write_lease(&id, true)?;
+        lease.lock_exclusive()?;
+        let captured = self.transaction(|document| {
+            let released = self.reconcile_pending(document)?;
             document.records.push(record);
             while document.records.len() > self.max {
                 let index = document
@@ -246,9 +344,21 @@ impl Store {
                     .context("Checkpoint retention is full of pending writes")?;
                 document.records.remove(index);
             }
-            Ok(())
-        })?;
-        Ok(token)
+            Ok(released)
+        });
+        match captured {
+            Ok(released) => {
+                for path in released { let _ = fs::remove_file(path); }
+                Ok(Token { id: id.clone(), pending: Arc::new(PendingWrite {
+                    store: self.clone(), id, lease: Some(lease), applied: AtomicBool::new(false),
+                }) })
+            }
+            Err(error) => {
+                drop(lease);
+                let _ = fs::remove_file(self.lease_path(&id));
+                Err(error)
+            }
+        }
     }
     pub fn commit(&self, token: &Token) -> Result<()> {
         self.transaction(|document| {
@@ -264,14 +374,11 @@ impl Store {
         })
     }
     pub fn list(&self) -> Result<Vec<Summary>> {
-        let mut records = self.read()?.records;
+        let mut records = self.records()?;
         records.reverse();
         Ok(records
             .into_iter()
             .map(|record| {
-                let recovered = record.ready
-                    || open_workspace(&record)
-                        .is_ok_and(|directory| verify_after(&record, &directory).is_ok());
                 Summary {
                     id: record.id,
                     created_at: record.created_at,
@@ -280,7 +387,7 @@ impl Store {
                     path: record.path,
                     before_bytes: record.before.as_ref().map_or(0, String::len),
                     after_bytes: record.after_bytes,
-                    ready: recovered,
+                    ready: record.ready,
                     restored: record.restored_at.is_some(),
                 }
             })
@@ -288,11 +395,14 @@ impl Store {
     }
     pub fn prepare_restore(&self, id: &str) -> Result<RestorePlan> {
         let record = self
-            .read()?
-            .records
+            .records()?
             .into_iter()
             .find(|record| record.id == id)
             .context("Checkpoint not found")?;
+        ensure!(
+            record.ready,
+            "The checkpoint write is still in progress"
+        );
         ensure!(
             record.restored_at.is_none(),
             "This checkpoint was already restored"
@@ -339,11 +449,14 @@ impl Store {
             "Explicit confirmation is required before restoring files"
         );
         let record = self
-            .read()?
-            .records
+            .records()?
             .into_iter()
             .find(|record| record.id == plan.id)
             .context("Checkpoint not found")?;
+        ensure!(
+            record.ready,
+            "The checkpoint write is still in progress"
+        );
         ensure!(
             hash(&serde_json::to_vec(&record)?) == plan.fingerprint,
             "Checkpoint changed since the preview; review it again"
@@ -378,6 +491,7 @@ impl Store {
                 parent.remove_file(name)?;
             }
         }
+        undo.mark_applied();
         let restored = read_current(&directory, &record.path)?;
         ensure!(
             restored == record.before,
@@ -406,6 +520,11 @@ impl Store {
             restored: true,
         })
     }
+}
+fn unchanged_before(record: &Record) -> bool {
+    open_workspace(record)
+        .and_then(|directory| read_current(&directory, &record.path))
+        .is_ok_and(|current| current == record.before)
 }
 fn relative(path: &Path) -> Result<PathBuf> {
     let mut result = PathBuf::new();
@@ -556,4 +675,126 @@ fn atomic_write(
     })();
     let _ = parent.remove_file(&name);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, Store) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("note.txt"), "before").unwrap();
+        let store = Store::open(directory.path(), 1).unwrap();
+        (directory, workspace, store)
+    }
+
+    #[test]
+    fn failed_captures_release_retention_when_the_writer_ends() {
+        let (_directory, workspace, store) = fixture();
+        for _ in 0..3 {
+            let token = store.capture(&workspace, Path::new("note.txt"), Some("before"), Some("after")).unwrap();
+            assert!(!store.list().unwrap()[0].ready);
+            drop(token);
+            assert!(store.list().unwrap().is_empty());
+        }
+        let token = store.capture(&workspace, Path::new("other.txt"), None, Some("new")).unwrap();
+        fs::write(workspace.join("other.txt"), "new").unwrap();
+        token.mark_applied();
+        store.commit(&token).unwrap();
+        drop(token);
+        assert!(store.list().unwrap()[0].ready);
+    }
+
+    #[test]
+    fn live_writers_cannot_be_reconciled_restored_or_evicted() {
+        let (directory, workspace, store) = fixture();
+        let token = store.capture(&workspace, Path::new("note.txt"), Some("before"), Some("after")).unwrap();
+        fs::write(workspace.join("note.txt"), "after").unwrap();
+        let other = Store::open(directory.path(), 1).unwrap();
+        assert!(!other.list().unwrap()[0].ready);
+        assert!(other.prepare_restore(&token.id).is_err());
+        assert!(other.capture(&workspace, Path::new("other.txt"), None, Some("new")).is_err());
+        assert_eq!(other.list().unwrap()[0].id, token.id);
+        store.commit(&token).unwrap();
+        let next = other.capture(&workspace, Path::new("other.txt"), None, Some("new")).unwrap();
+        assert_eq!(other.list().unwrap()[0].id, next.id);
+    }
+
+    #[test]
+    fn an_applied_write_keeps_its_snapshot_when_later_edits_match_the_original() {
+        let (_directory, workspace, store) = fixture();
+        let token = store.capture(&workspace, Path::new("note.txt"), Some("before"), Some("after")).unwrap();
+        fs::write(workspace.join("note.txt"), "after").unwrap();
+        token.mark_applied();
+        fs::write(workspace.join("note.txt"), "before").unwrap();
+        let id = token.id.clone();
+        drop(token);
+        assert!(store.list().unwrap()[0].ready);
+        assert!(store.prepare_restore(&id).is_err());
+        assert_eq!(fs::read_to_string(workspace.join("note.txt")).unwrap(), "before");
+    }
+
+    // Run in a child test process so exit releases the kernel lease without
+    // running the capture guard's normal cleanup.
+    #[test]
+    fn interrupted_write_fixture() {
+        let Some(root) = std::env::var_os("HERMES_CHECKPOINT_TEST_ROOT") else { return; };
+        let root = PathBuf::from(root);
+        let workspace = root.join("workspace");
+        let store = Store::open(&root, 1).unwrap();
+        let _token = store.capture(&workspace, Path::new("note.txt"), Some("before"), Some("after")).unwrap();
+        if std::env::var("HERMES_CHECKPOINT_TEST_MODE").as_deref() == Ok("applied") {
+            fs::write(workspace.join("note.txt"), "after").unwrap();
+        }
+        std::process::exit(0);
+    }
+
+    fn interrupt(root: &Path, mode: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpoint::tests::interrupted_write_fixture"])
+            .env("HERMES_CHECKPOINT_TEST_ROOT", root)
+            .env("HERMES_CHECKPOINT_TEST_MODE", mode)
+            .stdout(std::process::Stdio::null())
+            .status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn interrupted_failed_writes_are_retired_after_restart() {
+        let (directory, workspace, _store) = fixture();
+        interrupt(directory.path(), "unwritten");
+        let reopened = Store::open(directory.path(), 1).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        assert!(reopened.capture(&workspace, Path::new("other.txt"), None, Some("new")).is_ok());
+    }
+
+    #[test]
+    fn interrupted_completed_writes_remain_restorable_after_restart() {
+        let (directory, workspace, _store) = fixture();
+        interrupt(directory.path(), "applied");
+        let reopened = Store::open(directory.path(), 1).unwrap();
+        let summary = reopened.list().unwrap().pop().unwrap();
+        assert!(summary.ready);
+        let plan = reopened.prepare_restore(&summary.id).unwrap();
+        reopened.restore(&plan, true).unwrap();
+        assert_eq!(fs::read_to_string(workspace.join("note.txt")).unwrap(), "before");
+        let undo = reopened.list().unwrap().pop().unwrap();
+        reopened.restore(&reopened.prepare_restore(&undo.id).unwrap(), true).unwrap();
+        assert_eq!(fs::read_to_string(workspace.join("note.txt")).unwrap(), "after");
+    }
+
+    #[test]
+    fn interrupted_writes_preserve_later_edits_without_blocking_retention() {
+        let (directory, workspace, _store) = fixture();
+        interrupt(directory.path(), "applied");
+        fs::write(workspace.join("note.txt"), "later edit").unwrap();
+        let reopened = Store::open(directory.path(), 1).unwrap();
+        let summary = reopened.list().unwrap().pop().unwrap();
+        assert!(summary.ready);
+        assert!(reopened.prepare_restore(&summary.id).is_err());
+        assert!(reopened.capture(&workspace, Path::new("other.txt"), None, Some("new")).is_ok());
+        assert_eq!(fs::read_to_string(workspace.join("note.txt")).unwrap(), "later edit");
+    }
 }

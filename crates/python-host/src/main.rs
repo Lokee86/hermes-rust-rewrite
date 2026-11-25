@@ -29,8 +29,9 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         Some("--version") => version(),
         Some("serve") if args.len() >= 2 => serve(Path::new(&args[1]), args.get(2).map(PathBuf::from)),
+        Some("run") if args.len() == 2 => run(Path::new(&args[1])),
         Some("install") if args.len() >= 3 => install(Path::new(&args[1]), &args[2..]),
-        _ => { eprintln!("usage: hermes-python-host serve <plugin dir> [<packages dir>] | install <packages dir> <requirement>..."); 2 }
+        _ => { eprintln!("usage: hermes-python-host serve <plugin dir> [<packages dir>] | install <packages dir> <requirement>... | run <script>"); 2 }
     };
     std::process::exit(code);
 }
@@ -100,6 +101,42 @@ impl Services {
     }
 }
 
+/// Run one script as `python <script>` would.
+fn run(script: &Path) -> i32 {
+    start();
+    let code = c"
+import os, runpy, sys, traceback
+def run(path):
+    sys.argv = [path]
+    sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
+    try:
+        runpy.run_path(path, run_name='__main__')
+        return 0
+    except SystemExit as stop:
+        if stop.code is None or isinstance(stop.code, int):
+            return stop.code or 0
+        print(stop.code, file=sys.stderr)
+        return 1
+    except BaseException:
+        traceback.print_exc()
+        return 1
+    finally:
+        sys.stdout.flush()
+";
+    Python::attach(|py| -> PyResult<i32> {
+        let module = PyModule::from_code(py, code, c"hermes_run.py", c"hermes_run")?;
+        module.getattr("run")?.call1((script.to_string_lossy(),))?.extract()
+    }).unwrap_or_else(|error| { eprintln!("{error}"); 1 })
+}
+
+fn dispatch(host: &Py<PyAny>, method: &str, request: &Value) -> Result<Value, String> {
+    let params = request.get("params").map(Value::to_string).unwrap_or_else(|| "{}".into());
+    Python::attach(|py| {
+        let encoded: String = host.call_method1(py, "dispatch_json", (method, params))?.extract(py)?;
+        serde_json::from_str::<Value>(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
+    }).map_err(|error: PyErr| error.to_string())
+}
+
 fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
     start();
     let Ok(plugin_dir) = plugin_dir.canonicalize() else {
@@ -136,15 +173,21 @@ fn serve(plugin_dir: &Path, packages: Option<PathBuf>) -> i32 {
             return 3;
         }
     };
+    let host = Arc::new(host);
     for request in incoming {
         let Some(id) = request.get("id") else { continue };
         let method = request["method"].as_str().unwrap_or_default();
-        let params = request.get("params").map(Value::to_string).unwrap_or_else(|| "{}".into());
-        let result = Python::attach(|py| {
-            let encoded: String = host.call_method1(py, "dispatch_json", (method, params))?.extract(py)?;
-            serde_json::from_str::<Value>(&encoded).map_err(|error| PyValueError::new_err(error.to_string()))
-        }).map_err(|error| error.to_string());
-        if wire.reply(id, result).is_err() || method == "hermes/unload" {
+        // Tools run beside each other, as in the Python agent, so a slow one in one chat does not
+        // hold up the rest. Hooks, commands and memory calls keep their order.
+        if method == "tools/call" {
+            let (host, wire, request) = (host.clone(), wire.clone(), request.clone());
+            std::thread::spawn(move || {
+                let result = dispatch(&host, "tools/call", &request);
+                let _ = wire.reply(&request["id"], result);
+            });
+            continue;
+        }
+        if wire.reply(id, dispatch(&host, method, &request)).is_err() || method == "hermes/unload" {
             break;
         }
     }

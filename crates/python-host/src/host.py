@@ -280,7 +280,7 @@ class PluginHost:
                         except ValueError:
                             results.append(text)
                 except Exception as exc:
-                    if name in _LIFECYCLE_HOOKS:
+                    if name == "pre_tool_call" or name in _LIFECYCLE_HOOKS:
                         raise
                     print(f"{self.plugin_id}: {name} hook failed: {exc}", file=sys.stderr)
         return {"results": results}

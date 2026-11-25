@@ -15,6 +15,7 @@ pub mod memory_capture;
 pub mod native_memory;
 mod python_memory;
 pub use python_memory::RecallStatus;
+pub use context::{compress_history, oneshot, window_for as context_window};
 pub mod settings;
 mod privacy;
 mod processes;
@@ -25,8 +26,11 @@ pub mod cron;
 pub mod checkpoint;
 mod provider;
 pub mod inference;
+mod context;
 pub mod models;
 pub mod credentials;
+mod secret;
+pub mod transcribe;
 pub mod portal;
 pub mod accounts;
 pub mod references;
@@ -34,7 +38,7 @@ pub mod starmap;
 pub mod subagents;
 pub mod petgen;
 
-pub use history::{Entry, History, Status, ToolCall, Turn};
+pub use history::{Entry, History, Status, ToolCall, Turn, read_conversation, read_history};
 pub use provider::{Config, DEFAULT_MODEL, OPENROUTER, OPENAI, ANTHROPIC};
 pub use history::Store as ConversationWriter;
 use history::Store;
@@ -276,6 +280,11 @@ impl Session {
                 || native_memory::MemoryTool::from_name(name).is_none())
         }));
         for round in 0..=self.settings.max_turns {
+            let size = context::conversation_size(&self.history, &specs);
+            let budget = context::budget(provider.config(), size).await;
+            if size > budget && context::compress(&mut self.history, index, provider, budget, self.settings.redact_secrets).await? {
+                self.publish(events)?;
+            }
             let mut messages = provider::messages(&self.history, &self.directory)?;
             let mut prompt=messages[0]["content"].as_str().context("Missing system prompt")?.to_owned();
             if let Some(style)=settings::PERSONALITIES.get(&self.settings.personality){prompt.push_str("\n\n");prompt.push_str(style);}
@@ -292,12 +301,18 @@ impl Session {
                 None
             };
             if let Some((memory, _)) = active_python {
-                memory.append_context(&mut prompt);
+                memory.append_prompt(&mut prompt);
                 if round == 0 && let Some(status) = &memory.recall_status {
                     let _ = events.try_send(Event::MemoryRecall(status.clone()));
                 }
             }
             messages[0]["content"]=Value::String(prompt);
+            // Recall differs every turn. It goes with the turn it is for, so the cached system
+            // prompt and earlier conversation stay the same.
+            if let Some((memory, _)) = active_python {
+                let entries = self.history.turns[index].entries.len();
+                memory.append_recall(&mut messages, entries);
+            }
             let notes = self.memory.as_ref().map(|store| store.frozen_context()).unwrap_or_default();
             if !notes.is_empty() {
                 let base = messages[0]["content"].as_str().context("Missing system prompt")?;
@@ -326,17 +341,41 @@ impl Session {
             let advertised: Vec<_> = specs.iter().cloned()
                 .chain(active_python.filter(|(_, enabled)| *enabled).into_iter().flat_map(|(memory, _)| memory.tools.iter().cloned()))
                 .chain(native_tools.iter().copied().map(native_memory::MemoryTool::spec)).collect();
-            let output = provider.stream_with_evidence(messages, &advertised, |delta| {
-                if let Some(Entry::Assistant { text, .. }) = self.history.turns[index].entries.last_mut() {
-                    text.push_str(delta);
+            let size = context::estimate(&messages, &advertised);
+            context::shorten_tool_results(&mut messages, &advertised, context::budget(provider.config(), size).await);
+            let mut retried = false;
+            let output = loop {
+                let mut streamed = false;
+                let reply = provider.stream_with_evidence(messages.clone(), &advertised, |delta| {
+                    streamed = true;
+                    if let Some(Entry::Assistant { text, .. }) = self.history.turns[index].entries.last_mut() {
+                        text.push_str(delta);
+                    }
+                    events.try_send(Event::Text(delta.to_owned())).context("Conversation window closed")?;
+                    if saved.elapsed() >= Duration::from_secs(1) {
+                        self.store.save(&self.history)?;
+                        saved = Instant::now();
+                    }
+                    Ok(())
+                }).await;
+                match reply {
+                    Err(error) if context::is_overflow(&error) && !streamed && !std::mem::replace(&mut retried, true) => {
+                        // The window is smaller than it was thought to be. Fit this request and send it again.
+                        let budget = context::note_overflow(provider.config(), context::estimate(&messages, &advertised));
+                        context::compress(&mut self.history, index, provider, budget, self.settings.redact_secrets).await?;
+                        let running = self.history.turns[index].entries.len();
+                        let mut earlier = provider::messages(&self.history, &self.directory)?;
+                        earlier.truncate(earlier.len() - running - 1);
+                        if self.settings.redact_secrets {privacy::redact_messages(&mut earlier);}
+                        // This round's own messages: the prompt and every entry but the reply now starting.
+                        let current = messages.split_off(messages.len() - running);
+                        earlier[0] = messages.swap_remove(0);
+                        messages = earlier.into_iter().chain(current).collect();
+                        context::shorten_tool_results(&mut messages, &advertised, budget);
+                    }
+                    reply => break reply?,
                 }
-                events.try_send(Event::Text(delta.to_owned())).context("Conversation window closed")?;
-                if saved.elapsed() >= Duration::from_secs(1) {
-                    self.store.save(&self.history)?;
-                    saved = Instant::now();
-                }
-                Ok(())
-            }).await?;
+            };
             let calls = output.calls;
             if selected == settings::MemoryProvider::Reliquary && self.native_enrolled
                 && !output.reasoning_summary.trim().is_empty()

@@ -12,7 +12,7 @@ mod lifecycle;
 mod native_backup;
 
 pub use import::{HermesArchive, HermesHistory, HermesMessage, HermesSession, ImportReport};
-pub use bots::{Bot, Group, BOT_CHAT_TITLE};
+pub use bots::{Bot, BotDeletion, Group, BOT_CHAT_TITLE};
 pub use lifecycle::{ArchiveFilter, SessionQuery};
 pub use native_backup::{NativeBackupPlan, NativeBackupSummary, NativeRestoreReport, inspect_native_backup};
 

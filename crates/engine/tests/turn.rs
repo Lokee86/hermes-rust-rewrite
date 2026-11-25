@@ -346,3 +346,42 @@ async fn delegation_runs_children_and_returns_their_answers() {
     assert!(requests.iter().any(|r| r["child"] == false && r["tools"].as_array().unwrap().iter().any(|t| t == "delegate_task")));
     assert_eq!(std::fs::read_dir(dir.path().join("subagents")).unwrap().count(), 2, "each child keeps its own session");
 }
+
+/// The endpoint reports no window and refuses long requests, as local model servers do.
+#[tokio::test]
+async fn a_chat_that_outgrows_the_model_is_compressed_and_goes_on() {
+    use axum::response::IntoResponse;
+    async fn model(State(requests): State<Requests>, Json(body): Json<Value>) -> axum::response::Response {
+        let size = body["messages"].to_string().len();
+        requests.lock().unwrap().push(body.clone());
+        if size > 60_000 {
+            return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"This model's maximum context length is 15000 tokens"}}))).into_response();
+        }
+        let summary = body["messages"][0]["content"].as_str().unwrap().starts_with("You compress");
+        let reply = if summary { "The code word is heron." } else { "ok" };
+        let events = [json!({"choices":[{"index":0,"delta":{"content":reply},"finish_reason":"stop"}]}).to_string(), "[DONE]".into()];
+        Sse::new(futures_util::stream::iter(events.map(|data| Ok::<_, Infallible>(SseEvent::default().data(data))))).into_response()
+    }
+    let seen = Requests::default();
+    let app = Router::new().route("/v1/chat/completions", post(model)).with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = Config { base_url: format!("http://{}/v1", listener.local_addr().unwrap()), model: "small-local-model".into(), api_key: String::new() };
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempdir().unwrap();
+    let mut session = Session::open(dir.path()).unwrap();
+    for n in 0..8 {
+        let (tx, rx) = async_channel::unbounded();
+        let prompt = format!("message {n} the code word is heron {}", "x".repeat(12_000));
+        session.turn(config.clone(), prompt, tx, CancellationToken::new()).await.unwrap();
+        drop(rx);
+        let turn = session.history().turns.last().unwrap();
+        assert_eq!(turn.status, Status::Complete, "message {n}");
+    }
+    assert_eq!(session.history().turns.len(), 8, "the transcript is kept");
+    let last = seen.lock().unwrap().last().unwrap()["messages"].to_string();
+    assert!(last.contains("The code word is heron.") && !last.contains("message 0"));
+    drop(session);
+    // The summary is part of the saved conversation.
+    let reopened = Session::open(dir.path()).unwrap();
+    assert!(reopened.history().active_summary().is_some());
+}

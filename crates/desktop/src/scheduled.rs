@@ -37,6 +37,9 @@ pub enum Action {
     EditorClose,
     Save,
     Name(String),
+    Script(String),
+    NoAgent(bool),
+    Monitor(String),
     Prompt(text_editor::Action),
     Schedule(String),
     Timezone(String),
@@ -46,7 +49,7 @@ pub enum Action {
     Pause(String),
     Resume(String),
     Trigger(String),
-    Triggered(String, String, Result<String, String>),
+    Triggered(String, String, Result<TriggerResult, String>),
     OpenedRoutine(Result<String, String>),
     OpenRunChat(String),
     Delete(String),
@@ -62,6 +65,25 @@ pub enum Action {
     Claimed(u64, bool, Result<Vec<Claim>, String>),
     Engine(u64, String, Event),
     Finished(u64, String, Result<Outcome, String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TriggerResult {
+    Chat(String),
+    Completed { run_id: String },
+}
+impl TriggerResult {
+    pub fn from_reply(reply: &serde_json::Value) -> Result<Self, String> {
+        if let Some(id) = reply["session_id"].as_str().filter(|id| !id.is_empty()) {
+            return Ok(Self::Chat(id.to_owned()));
+        }
+        if reply["status"] == "completed"
+            && let Some(id) = reply["run_id"].as_str().filter(|id| !id.is_empty())
+        {
+            return Ok(Self::Completed { run_id: id.to_owned() });
+        }
+        Err(reply["error"].as_str().unwrap_or("Scheduled run could not start").to_owned())
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Data {
@@ -242,6 +264,19 @@ impl Scheduled {
     pub fn clear_trigger_identity(&self, job: &str, request: &str) -> Result<(), String> {
         self.pending_trigger(job, Some(request)).map(|_| ())
     }
+    pub fn acknowledge_trigger(&mut self, job: &str, request: &str, result: Result<TriggerResult, String>) -> Result<TriggerResult, String> {
+        let result = result?;
+        self.clear_trigger_identity(job, request)?;
+        if let TriggerResult::Completed { run_id } = &result {
+            self.selected = Some(job.to_owned());
+            self.shown_run = Some(run_id.clone());
+            self.editor = None;
+            self.delete = None;
+            self.templates = false;
+            self.error = None;
+        }
+        Ok(result)
+    }
     fn pending_trigger(&self, job: &str, clear: Option<&str>) -> Result<String, String> {
         use fs2::FileExt;
         let root = self.profile.as_ref().ok_or("No active profile")?.join("cron");
@@ -411,6 +446,22 @@ impl Scheduled {
             Action::Name(value) => {
                 if let Some(editor) = &mut self.editor {
                     editor.draft.name = value;
+                }
+            }
+            Action::Script(value) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.draft.no_agent &= !value.trim().is_empty();
+                    editor.draft.script = value;
+                }
+            }
+            Action::NoAgent(value) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.draft.no_agent = value;
+                }
+            }
+            Action::Monitor(value) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.draft.monitor = value;
                 }
             }
             Action::Prompt(action) => {
@@ -1011,6 +1062,13 @@ impl Scheduled {
                     .size(12)
                     .padding(8),
             )
+            .push(text("Script (optional)").size(12))
+            .push(text_input("collect.py", &editor.draft.script).on_input(Action::Script).size(12).padding(8))
+            .push(text("A .py or .sh file in this profile’s scripts folder. Its output is added to the prompt.").size(11).style(muted))
+            .push(checkbox(editor.draft.no_agent).label("Run only the script, without the agent")
+                .on_toggle_maybe((!editor.draft.script.trim().is_empty()).then_some(Action::NoAgent)).size(14).text_size(12))
+            .push(text("Run only when this changes (optional)").size(12))
+            .push(text_input("https://example.com/status or check.sh", &editor.draft.monitor).on_input(Action::Monitor).size(12).padding(8))
             .push(text("If a run is missed").size(12))
             .push(
                 pick_list(
@@ -1133,4 +1191,60 @@ fn meta<'a>(label: &'a str, value: &'a str) -> Element<'a, Action> {
     ]
     .spacing(8)
     .into()
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::*;
+    use iced::futures::StreamExt;
+    use serde_json::json;
+
+    fn config() -> Config {
+        Config { base_url: "http://127.0.0.1:1/v1".into(), model: "fixture".into(), api_key: String::new() }
+    }
+
+    #[tokio::test]
+    async fn completed_script_trigger_clears_request_and_shows_saved_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_gateway(directory.path()).unwrap();
+        let now = Utc::now();
+        let job = store.create(Draft { name: "Script check".into(), script: "check.py".into(), no_agent: true, ..Draft::default() }, now).unwrap();
+        let mut scheduled = Scheduled::new();
+        scheduled.profile = Some(directory.path().to_owned());
+        scheduled.store = Some(Store::open_view(directory.path()).unwrap());
+        let request = scheduled.trigger_identity(&job.id).unwrap();
+        let claim = store.claim_gateway_now(&job.id, &request, now).unwrap();
+        store.finish(&claim, Outcome::Completed { output: "disk ok".into() }, now).unwrap();
+        let result = TriggerResult::from_reply(&json!({"run_id":claim.run.id,"session_id":null,"status":"completed","error":null})).unwrap();
+        assert_eq!(scheduled.acknowledge_trigger(&job.id, &request, Ok(result)).unwrap(), TriggerResult::Completed { run_id: claim.run.id.clone() });
+        assert_ne!(scheduled.trigger_identity(&job.id).unwrap(), request, "another click must start a new run");
+        let task = scheduled.update(Action::Refresh, config());
+        let mut actions = iced_runtime::task::into_stream(task).unwrap();
+        while let Some(action) = actions.next().await {
+            if let iced_runtime::Action::Output(action) = action { let _ = scheduled.update(action, config()); }
+        }
+        assert_eq!(scheduled.selected.as_deref(), Some(job.id.as_str()));
+        assert_eq!(scheduled.shown_run.as_deref(), Some(claim.run.id.as_str()));
+        let shown = scheduled.runs.iter().find(|run| Some(run.id.as_str()) == scheduled.shown_run.as_deref()).unwrap();
+        assert_eq!(shown.output, "disk ok");
+        assert!(shown.gateway_session.is_none());
+    }
+
+    #[test]
+    fn failed_trigger_keeps_retry_identity_and_chat_reply_keeps_its_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut scheduled = Scheduled::new();
+        scheduled.profile = Some(directory.path().to_owned());
+        let request = scheduled.trigger_identity("job").unwrap();
+        let failed = TriggerResult::from_reply(&json!({"run_id":"failed-run","session_id":null,"status":"failed","error":"script failed"}));
+        assert_eq!(scheduled.acknowledge_trigger("job", &request, failed), Err("script failed".into()));
+        assert_eq!(scheduled.trigger_identity("job").unwrap(), request);
+        assert!(scheduled.acknowledge_trigger("job", &request, Err("connection lost".into())).is_err());
+        assert_eq!(scheduled.trigger_identity("job").unwrap(), request);
+        let chat = TriggerResult::from_reply(&json!({"run_id":"chat-run","session_id":"run-chat","status":"running"})).unwrap();
+        assert_eq!(scheduled.acknowledge_trigger("job", &request, Ok(chat)).unwrap(), TriggerResult::Chat("run-chat".into()));
+        assert_ne!(scheduled.trigger_identity("job").unwrap(), request);
+        assert!(scheduled.shown_run.is_none());
+        assert!(TriggerResult::from_reply(&json!({"session_id":null,"status":"completed"})).is_err());
+    }
 }

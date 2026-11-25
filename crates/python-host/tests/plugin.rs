@@ -21,6 +21,8 @@ def _broken(args):
     raise RuntimeError("boom")
 
 def _guard(tool_name, args, **_):
+    if args.get("unavailable_policy"):
+        raise RuntimeError("Policy configuration is unavailable")
     if tool_name == "terminal" and "rm -rf" in args.get("command", ""):
         return {"action": "block", "message": "not on my watch"}
 
@@ -127,6 +129,10 @@ fn a_plugin_registers_tools_and_hooks_through_the_rust_ctx() {
     assert_eq!(blocked["result"]["results"], json!([{"action": "block", "message": "not on my watch"}]));
     let allowed = host.request("hermes/hook", json!({"name": "pre_tool_call", "kwargs": {"tool_name": "terminal", "args": {"command": "ls"}}}));
     assert_eq!(allowed["result"]["results"], json!([]));
+    let failed = host.request("hermes/hook", json!({"name": "pre_tool_call", "kwargs": {"tool_name": "terminal", "args": {"unavailable_policy": true}}}));
+    assert!(failed["error"]["message"].as_str().unwrap().contains("Policy configuration is unavailable"));
+    assert!(failed.get("result").is_none());
+    assert_eq!(host.request("ping", json!({}))["result"], json!({}));
 
     host.expect_exit();
 }

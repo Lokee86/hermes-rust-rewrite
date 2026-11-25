@@ -173,6 +173,45 @@ mod bot_deletion_tests {
         peer.local_native = true;
         gateway.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn legacy_bot_detach_preserves_profile_data_without_plugin_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let config = hermes_engine::Config {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: "fixture".into(),
+            api_key: String::new(),
+        };
+        let gateway = Gateway::start(GatewayConfig::new(home.path(), config)).await.unwrap();
+        let library = &gateway.shared.library;
+        let bot = library.create_bot("Legacy Helper", "", "", "").unwrap();
+        let chat = library.bot_chat(&bot.name).unwrap();
+        let profile = library.bot_profile(&bot.name).unwrap();
+        std::fs::remove_file(profile.join(".hermes-bot-owner.json")).unwrap();
+        let roster_path = library.root().join("bots.json");
+        let mut roster: Value = serde_json::from_slice(&std::fs::read(&roster_path).unwrap()).unwrap();
+        roster.as_object_mut().unwrap().remove("profile_owners");
+        std::fs::write(roster_path, serde_json::to_vec(&roster).unwrap()).unwrap();
+        let data = profile.join("plugin-data");
+        std::fs::create_dir(&data).unwrap();
+        let locator = data.join("reliquary-storage.json");
+        // An invalid locator would fail any attempted plugin purge.
+        std::fs::write(&locator, b"legacy data must be retained").unwrap();
+        std::fs::write(profile.join("important.txt"), b"ordinary profile data").unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let peer = Peer { id: "legacy-delete-test".into(), tx, stop: CancellationToken::new(), canonical: true, local_native: true };
+
+        let reply = gateway.shared.dispatch("catalog.bot.delete", &json!({"name":bot.name}), &peer).await.unwrap();
+        assert_eq!(reply["deleted"], true);
+        assert_eq!(reply["retained_profile"], json!(profile));
+        assert_eq!(std::fs::read(locator).unwrap(), b"legacy data must be retained");
+        assert_eq!(std::fs::read(profile.join("important.txt")).unwrap(), b"ordinary profile data");
+        assert!(library.bots().unwrap().is_empty());
+        assert!(library.session(&chat.id).unwrap().archived);
+        assert!(library.session(&chat.id).unwrap().bot.is_none());
+        assert!(!library.profiles().unwrap().into_iter().find(|entry| entry.name == bot.name).unwrap().is_bot);
+        gateway.shutdown().await.unwrap();
+    }
 }
 
 impl Shared {
@@ -186,7 +225,7 @@ impl Shared {
         let expected = library.bot_profile(name).map_err(RpcError::internal)?;
         let lock_path = expected.clone();
         let bot_name = name.to_owned();
-        let (rename_fence, install_fence, home, already_owned) =
+        let (rename_fence, install_fence, already_owned) =
             tokio::task::spawn_blocking(move || -> Result<_> {
                 let rename_fence = owner::lock_profile_renames(&lock_path)?;
                 let home = library.canonical_bot_profile(&bot_name)?;
@@ -197,7 +236,7 @@ impl Shared {
                     Some(path) => owner::try_local_owner_lock(path)?.is_none(),
                     None => false,
                 };
-                Ok((rename_fence, install_fence, home, already_owned))
+                Ok((rename_fence, install_fence, already_owned))
             })
             .await
             .map_err(RpcError::internal)?
@@ -276,14 +315,15 @@ impl Shared {
 
         let library_for_delete = self.library.clone();
         let name_for_delete = name.to_owned();
-        tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             let _fences = (bot_fence, rename_fence, install_fence);
-            if let Some(home) = home {
-                stock_plugins::purge_profile_data(&home, &name_for_delete)?;
-            }
-            library_for_delete.delete_bot(&name_for_delete)
+            stock_plugins::delete_bot(&library_for_delete, &name_for_delete)
         })
             .await.map_err(RpcError::internal)?.map_err(RpcError::internal)?;
-        Ok(json!({"deleted":true,"name":name}))
+        let mut reply = json!({"deleted":true,"name":name});
+        if let Some(profile) = outcome.retained_profile {
+            reply["retained_profile"] = json!(profile);
+        }
+        Ok(reply)
     }
 }

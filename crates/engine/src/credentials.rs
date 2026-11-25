@@ -70,7 +70,18 @@ impl EndpointStore {
     }
     pub fn list(&self) -> Result<Vec<EndpointProfile>> {
         let _guard = self.lock()?;
-        Ok(self.read()?.endpoints.iter().map(public).collect())
+        let mut doc = self.read()?;
+        // Protect keys saved by versions that stored them as text.
+        let mut changed = false;
+        for record in doc.endpoints.iter_mut().filter(|record| !crate::secret::is_sealed(&record.api_key)) {
+            let sealed = crate::secret::seal(&self.dir, &record.api_key)?;
+            changed |= sealed != record.api_key;
+            record.api_key = sealed;
+        }
+        if changed {
+            self.write(&doc)?;
+        }
+        Ok(doc.endpoints.iter().map(public).collect())
     }
     pub fn config(&self, id: &str) -> Result<Config> {
         let _guard = self.lock()?;
@@ -87,20 +98,20 @@ impl EndpointStore {
         Ok(Config {
             base_url: record.base_url.clone(),
             model: record.model.clone(),
-            api_key: record.api_key.clone(),
+            api_key: crate::secret::unseal(&record.api_key)?,
         })
     }
     pub fn credential(&self, base: &str) -> Result<Option<String>> {
         let wanted = scope(base)?;
         let _guard = self.lock()?;
-        Ok(self
-            .read()?
+        self.read()?
             .endpoints
             .into_iter()
             .find(|record| {
                 record.scope == wanted && scope(&record.base_url).is_ok_and(|s| s == wanted)
             })
-            .map(|record| record.api_key))
+            .map(|record| crate::secret::unseal(&record.api_key))
+            .transpose()
     }
     pub fn save(&self, id: Option<&str>, name: &str, config: &Config) -> Result<EndpointProfile> {
         config.validate()?;
@@ -127,7 +138,7 @@ impl EndpointStore {
             base_url: scope.clone(),
             model: config.model.trim().into(),
             scope,
-            api_key: config.api_key.trim().into(),
+            api_key: crate::secret::seal(&self.dir, config.api_key.trim())?,
         };
         let result = public(&record);
         if let Some(index) = doc.endpoints.iter().position(|existing| existing.id == id) {

@@ -220,13 +220,15 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             let Some(library) = library else { return Task::none() };
             if library.root() != root { return Task::none(); }
             match result {
-                Ok(_) => {
+                Ok(outcome) => {
                     state.error = None;
                     state.refresh(Some(&library));
                     if app.current.as_ref().is_some_and(|current| current.bot.as_deref() == Some(name.as_str())) {
+                        app.create_chat();
                         app.screen = Screen::Bots;
-                        let _ = app.update(Message::NewChat);
-                        app.screen = Screen::Bots;
+                    }
+                    if outcome["retained_profile"].is_string() {
+                        app.note(format!("Bot removed. Its files are available under {name} in Profiles."));
                     }
                 }
                 Err(error) => {
@@ -347,6 +349,8 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
     let mut body = column![].spacing(18).max_width(820);
     if let Some(error) = &state.error {
         body = body.push(container(text(error.as_str()).size(12)).padding([8, 12]).width(Fill).style(move |_| ui::panel(Color { a: 0.08, ..p.accent }, 6.0, Some(p.border))));
+    } else if let Some(banner) = &app.banner {
+        body = body.push(app.banner_view(banner));
     }
     if let Some((name, members)) = &state.group_form {
         body = body.push(text("New group chat").size(22).font(ui::medium()))
@@ -378,10 +382,15 @@ pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
     }
     if let Some(name) = &state.deleting {
         let label = state.bots.iter().find(|b| &b.name == name).map_or(name.clone(), |b| b.display_name.clone());
+        let (description, action) = if name.starts_with("group:") {
+            ("Its conversation moves to Archived sessions.", "Delete group")
+        } else {
+            ("Its chat moves to Archived sessions. Hermes deletes the profile files only when it can verify this bot owns them.", "Delete bot")
+        };
         body = body.push(text(format!("Delete {label}?")).size(20).font(ui::medium()))
-            .push(text("Its profile, personality, memory and settings are removed. Its chat is moved to Archived sessions.").size(13).color(p.muted))
+            .push(text(description).size(13).color(p.muted))
             .push(row![button(text("Cancel").size(13)).padding([7, 14]).style(ui::quiet_button).on_press(Message::Bot(Action::Cancel)),
-                button(text("Delete bot").size(13)).padding([7, 14]).on_press(Message::Bot(Action::ConfirmDelete))].spacing(8));
+                button(text(action).size(13)).padding([7, 14]).on_press(Message::Bot(Action::ConfirmDelete))].spacing(8));
         return container(body).padding([28, 40]).center_x(Fill).into();
     }
     body = body.push(row![column![text("Bots").size(40).font(crate::appearance::DISPLAY_FONT).line_height(1.1),

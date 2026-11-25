@@ -47,6 +47,8 @@ mod onboarding;
 mod slash;
 mod platforms;
 mod webview;
+mod plugin_pages;
+mod updates;
 mod remote;
 mod chat_view;
 mod ssh_tunnel;
@@ -144,7 +146,7 @@ fn window_settings() -> iced::window::Settings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen { Chat, Provider, Workspaces, Tools, Files, Git, Terminal, Import, Messaging, Artifacts, Cron, Bots, About, CommandCenter, Agents, Webhooks, Profiles, Starmap, Pets }
+enum Screen { Chat, Provider, Workspaces, Tools, Files, Git, Terminal, Import, Messaging, Artifacts, Cron, Bots, About, CommandCenter, Agents, Webhooks, Profiles, Starmap, Pets, PluginPage }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightPane { Files, Review, Terminal }
@@ -200,7 +202,7 @@ enum Message {
     PortalStart, PortalBegun(u64, Result<portal::DeviceLogin, String>), PortalFinished(u64, Result<(), String>), PortalCancel,
     WorkspacePath(String), AddWorkspace, SelectWorkspace(Option<String>), BrowseWorkspace, ProjectDiscovery(project_discovery::Action),
     RenameWorkspace(String), WorkspaceName(String), SaveWorkspaceName, CancelWorkspaceRename, WorkspaceMemorySynced(Result<serde_json::Value,String>),
-    ArchiveResults(ArchiveScope, Result<serde_json::Value, String>), DismissArchiveResults,
+    ArchiveResults(ArchiveScope, Result<serde_json::Value, String>), DismissArchiveResults, OpenPluginPage(plugin_pages::Page), OpenPluginLink(String), Updates(updates::Action),
     FolderChosen(Result<Option<PathBuf>, String>), Dismiss,
     RenameStart, RenameChanged(String), RenameSave, Copy(String), Link(String),
     Scrolled(bool), JumpToLatest, Shortcut(keyboard::Event),
@@ -248,7 +250,7 @@ impl fmt::Debug for Message {
             Self::WorkspacePath(_) => "WorkspacePath", Self::AddWorkspace => "AddWorkspace", Self::SelectWorkspace(_) => "SelectWorkspace",
             Self::RenameWorkspace(_) => "RenameWorkspace", Self::WorkspaceName(_) => "WorkspaceName", Self::SaveWorkspaceName => "SaveWorkspaceName",
             Self::CancelWorkspaceRename => "CancelWorkspaceRename", Self::WorkspaceMemorySynced(_) => "WorkspaceMemorySynced",
-            Self::ArchiveResults(..) => "ArchiveResults", Self::DismissArchiveResults => "DismissArchiveResults",
+            Self::Updates(_) => "Updates", Self::OpenPluginPage(_) => "OpenPluginPage", Self::OpenPluginLink(_) => "OpenPluginLink", Self::ArchiveResults(..) => "ArchiveResults", Self::DismissArchiveResults => "DismissArchiveResults",
             Self::BrowseWorkspace => "BrowseWorkspace", Self::FolderChosen(_) => "FolderChosen", Self::ProjectDiscovery(_) => "ProjectDiscovery",
             Self::Dismiss => "Dismiss", Self::RenameStart => "RenameStart", Self::RenameChanged(_) => "RenameChanged",
             Self::RenameSave => "RenameSave", Self::Copy(_) => "Copy", Self::Link(_) => "Link",
@@ -327,7 +329,7 @@ struct Hermes {
     overlays: overlays::State,
     pets: pets::State,
     cron_ui: CronSidebar,
-    statusbar: statusbar::State, bots: bots::State, artwork: Option<shell_art::Artwork>, connections: connections::State, onboarding: onboarding::State, slash: slash::State, webview: webview::Host,
+    statusbar: statusbar::State, bots: bots::State, artwork: Option<shell_art::Artwork>, connections: connections::State, onboarding: onboarding::State, slash: slash::State, webview: webview::Host, plugin_page: Option<(String, PathBuf)>, updates: updates::State,
     appearance: appearance::State, system_dark: bool,
     tabs: tabs::State,
     commands: commands::Commands, palette_open_folder: bool,
@@ -361,7 +363,7 @@ impl Hermes {
             queue: queue::PromptQueue::default(), draft_files: attachments::DraftFiles::default(), queue_edit: None, redirecting: false,
             session_menu: None, session_filter_menu: false, archive_filter: ArchiveFilter::Active, modifiers: keyboard::Modifiers::default(),
             command_search: String::new(), command_source: command_center::Source::All, command_sessions: Vec::new(), command_error: None,
-            reasoning:reasoning::State::default(), return_to_composer:false, group_round: None, hud: hud::State::default(), sync: sync::State::default(), secondary: false, accounts: accounts::State::default(), webhooks: webhooks::State::default(), profiles: profiles::State::default(), starmap: starmap::State::default(), subagents: Vec::new(), subagent_open: None, quick_entry: quick_entry::State::default(), overlays: overlays::State::default(), pets: pets::State::default(), cron_ui: CronSidebar { open: true, visible: 3, ..Default::default() }, statusbar: statusbar::State::default(), bots: bots::State::default(), artwork: None, connections: connections::State::default(), onboarding: onboarding::State::default(), slash: slash::State::default(), webview: webview::Host::default(),
+            reasoning:reasoning::State::default(), return_to_composer:false, group_round: None, hud: hud::State::default(), sync: sync::State::default(), secondary: false, accounts: accounts::State::default(), webhooks: webhooks::State::default(), profiles: profiles::State::default(), starmap: starmap::State::default(), subagents: Vec::new(), subagent_open: None, quick_entry: quick_entry::State::default(), overlays: overlays::State::default(), pets: pets::State::default(), cron_ui: CronSidebar { open: true, visible: 3, ..Default::default() }, statusbar: statusbar::State::default(), bots: bots::State::default(), artwork: None, connections: connections::State::default(), onboarding: onboarding::State::default(), slash: slash::State::default(), webview: webview::Host::default(), plugin_page: None, updates: updates::State::open(),
             appearance: appearance::State::default(), system_dark: false,
             tabs: tabs::State::default(),
             commands: commands::Commands::default(), palette_open_folder: false,
@@ -374,6 +376,9 @@ impl Hermes {
             backup: backup::State::default(),
             project_discovery: project_discovery::State::default(),
         };
+        // Restore private credentials and generation options before any chat
+        // connection captures its startup provider configuration.
+        app.models = models::State::open(&mut app.config);
         match Library::open_default() {
             Ok(library) => {
                 app.statusbar = statusbar::State::load(library.root());
@@ -404,13 +409,12 @@ impl Hermes {
             }
             Err(error) => app.error(format!("Could not open your chat library: {error:#}")),
         }
-        app.models=models::State::open(&mut app.config);
         let mut initial = vec![widget::operation::focus(COMPOSER_ID), iced::system::theme().map(Message::SystemTheme)];
         if app.profile_settings.saved.auto_archive { initial.push(Task::done(Message::ProfileSetting(profile_settings::Action::Maintain))); }
         let voice_events = iced::futures::stream::unfold(app.voice.events(), |receiver| async move { receiver.recv().await.ok().map(|event| (event, receiver)) });
         initial.push(Task::run(voice_events, |(epoch, signal)| Message::Voice(voice::Action::Signal(epoch, signal))));
         if app.ready() {initial.push(Task::done(Message::Models(models::Action::Refresh)));}
-        if !app.secondary { app.quick_entry.register(); }
+        if !app.secondary { app.quick_entry.register(); initial.push(updates::at_startup(&mut app)); }
         let (main_window, open) = iced::window::open(window_settings());
         app.webview.window = Some(main_window);
         initial.insert(0, open.map(|id| Message::WindowId(Some(id))));
@@ -702,7 +706,7 @@ impl Hermes {
                 } else {
                     if self.running { self.note("Stop the current response before switching session tabs."); return Task::none(); }
                     if self.draft_files.pending > 0 { self.note("Wait for the attachment to finish before switching tabs."); return Task::none(); }
-                    let summary = self.library.as_ref().and_then(|library| library.session(&id).ok());
+                    let summary = self.find_chat(&id);
                     if let Some(summary) = summary { self.open_chat(summary); } else { self.error("This session is no longer in the local library."); return Task::none(); }
                 }
                 if pressed { self.tabs.dragging = Some(id.clone()); }
@@ -720,7 +724,7 @@ impl Hermes {
                 let next = self.tabs.close(&id);
                 if current {
                     if let Some(next) = next {
-                        if let Some(summary) = self.library.as_ref().and_then(|library| library.session(&next).ok()) {
+                        if let Some(summary) = self.find_chat(&next) {
                             self.open_chat(summary);
                             if self.current.as_ref().is_none_or(|current| current.id != next) { self.tabs = previous; return Task::none(); }
                         } else { self.tabs = previous; self.error("Could not open the next session tab."); return Task::none(); }
@@ -763,7 +767,7 @@ impl Hermes {
             Action::Reopen => {
                 if self.running { self.note("Stop the current response before reopening a session tab."); return Task::none(); }
                 while let Some(id) = self.tabs.reopen() {
-                    if let Some(summary) = self.library.as_ref().and_then(|library| library.session(&id).ok()) { self.open_chat(summary); break; }
+                    if let Some(summary) = self.find_chat(&id) { self.open_chat(summary); break; }
                 }
                 self.save_tabs();
             }
@@ -853,7 +857,12 @@ impl Hermes {
         // Hidden unless the Artifacts preview is on screen and nothing covers it.
         let covered = self.commands.is_open() || self.models.picker || self.onboarding.open || self.statusbar.menu.is_some()
             || self.layout_menu || self.attach_menu || self.reasoning.anchor.is_some();
-        let file = (self.screen == Screen::Artifacts && !covered).then(|| self.artifacts.html_preview()).flatten();
+        let file = match self.screen {
+            _ if covered => None,
+            Screen::Artifacts => self.artifacts.html_preview(),
+            Screen::PluginPage => self.plugin_page.as_ref().map(|(_, file)| file.clone()),
+            _ => None,
+        };
         #[cfg(debug_assertions)]
         if std::env::var_os("HERMES_RUST_WEBVIEW_TRACE").is_some() {
             eprintln!("cover: screen={:?} commands={} picker={} onboarding={} statusbar={} layout={} attach={} reasoning={} html={:?}", self.screen, self.commands.is_open(), self.models.picker,
@@ -864,12 +873,28 @@ impl Hermes {
         self.webview.sync(file, background, scale, Message::WebviewBounds)
     }
     fn update(&mut self, message: Message) -> Task<Message> {
+        let edits_settings = matches!(&message,
+            Message::ChoosePortal(_) | Message::BaseUrl(_) | Message::Model(_) | Message::ApiKey(_)
+            | Message::Models(models::Action::Select(_) | models::Action::Preset(_) | models::Action::UseEndpoint(_)
+                | models::Action::SaveEndpoint | models::Action::ApplyProvider(_) | models::Action::SaveOptions | models::Action::ResetOptions)
+            | Message::Reasoning(reasoning::Action::Pick(_) | reasoning::Action::Fast | reasoning::Action::Toggle)
+            | Message::Account(accounts::Action::Use(_)) | Message::SaveProvider);
+        if self.chat.submitting && edits_settings {
+            self.note("Wait for the message to be acknowledged before changing chat settings.");
+            return Task::none();
+        }
+        let before = (self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone(), serde_json::json!(self.models.options));
+        let draft_edit = matches!(&message, Message::BaseUrl(_) | Message::Model(_) | Message::ApiKey(_));
+        let commit = matches!(&message, Message::SaveProvider | Message::Models(models::Action::SaveEndpoint | models::Action::ApplyProvider(_)));
         let alert=notifications::on_event(self,&message);
         if self.hud.on && matches!(&message, Message::Edit(_) | Message::Send | Message::Engine(..)) { self.hud.touch(); }
         if matches!(&message,Message::Models(models::Action::Disconnected(_))|Message::PortalStart){self.billing.clear();}
         let work = self.update_inner(message);
+        let changed = before != (self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone(), serde_json::json!(self.models.options));
+        if changed { self.chat.settings_explicit = true; }
+        let settings = if (changed && !draft_edit) || commit { self.sync_selected_settings() } else { Task::none() };
         let queued = std::mem::take(&mut self.chat.tasks);
-        Task::batch([alert, work, Task::batch(queued)])
+        Task::batch([alert, work, settings, Task::batch(queued)])
     }
     fn update_inner(&mut self, message: Message) -> Task<Message> {
         let task = self.update_message(message);
@@ -1289,6 +1314,17 @@ impl Hermes {
                 }
             }
             Message::DismissArchiveResults => self.archive_results = None,
+            Message::OpenPluginPage(page) => {
+                let p = ui::palette(self.dark);
+                match Session::default_dir().map_err(|error| error.to_string())
+                    .and_then(|data| plugin_pages::build(&data, &page, [p.background, p.foreground, p.muted, p.border]))
+                {
+                    Ok(file) => { self.plugin_page = Some((page.id, file)); self.screen = Screen::PluginPage; }
+                    Err(error) => self.error(error),
+                }
+            }
+            Message::Updates(action) => return updates::update(self, action),
+            Message::OpenPluginLink(link) => { self.webview.clear_offer(); return self.update(Message::Link(link)); }
             Message::BrowseWorkspace if !self.running && !self.browsing => {
                 self.browsing = true;
                 return Task::perform(async { tokio::task::spawn_blocking(choose_folder).await.map_err(|e| e.to_string()).and_then(|r| r) }, Message::FolderChosen);
@@ -1406,12 +1442,19 @@ impl Hermes {
                 let task_job = id.clone(); let task_request = request_id.clone();
                 return Task::perform(async move {
                     let reply = connection.request("cron.trigger", serde_json::json!({"job_id":id,"request_id":request_id})).await?;
-                    reply["session_id"].as_str().map(str::to_owned).ok_or_else(|| reply["error"].as_str().unwrap_or("Scheduled run could not start").to_owned())
+                    scheduled::TriggerResult::from_reply(&reply)
                 }, move |result| Message::Scheduled(scheduled::Action::Triggered(task_job.clone(), task_request.clone(), result)));
             }
             Message::Scheduled(scheduled::Action::Triggered(job, request, result)) => {
-                if result.is_ok() && let Err(error) = self.scheduled.clear_trigger_identity(&job, &request) { self.error(error); }
-                return self.update(Message::Scheduled(scheduled::Action::OpenedRoutine(result)));
+                match self.scheduled.acknowledge_trigger(&job, &request, result) {
+                    Ok(scheduled::TriggerResult::Chat(id)) => return self.update(Message::Scheduled(scheduled::Action::OpenedRoutine(Ok(id)))),
+                    Ok(scheduled::TriggerResult::Completed { .. }) => {
+                        self.screen = Screen::Cron;
+                        self.note("Scheduled script completed. Its output is shown in the run details.");
+                    }
+                    Err(error) => self.error(error),
+                }
+                return self.scheduled.update(scheduled::Action::Refresh, self.config.clone()).map(Message::Scheduled);
             }
             Message::Scheduled(scheduled::Action::OpenedRoutine(result)) => {
                 match result {

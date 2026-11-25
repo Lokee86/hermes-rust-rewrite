@@ -1,6 +1,6 @@
 //! Profile-owned activations of the embedded Python plugin host.
 use super::{
-    Installed, config, config_schema, connect_mcp, connect_python_bridge, dir, installed,
+    InstallationLock, Installed, config, config_schema, connect_mcp, connect_python_bridge, dir, installed,
     lock_plugin_startup, prefix, python_host, python_packages, valid_name, yaml_field,
 };
 use crate::{
@@ -378,7 +378,7 @@ impl Activation {
         result.as_ref().map_err(|error| anyhow::anyhow!("{error}"))
     }
 
-    fn lock_packages(&self, root: &Path) -> Result<(fs::File, PathBuf)> {
+    fn lock_packages(&self, root: &Path) -> Result<(InstallationLock, PathBuf)> {
         ensure!(self.active.load(Ordering::Acquire), "Plugin activation has ended");
         let lock = lock_plugin_startup(root)?;
         // The checkout is mutable across installs. Read the selected revision
