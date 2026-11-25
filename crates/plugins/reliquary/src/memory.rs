@@ -345,14 +345,13 @@ impl EmbeddedMemory {
         sources: &dyn MemorySources,
         session_id: &str,
     ) -> Result<bool> {
+        // Without the source lock, which is held across embedding requests. The fence is written
+        // before its removal starts, and each record is replaced as a whole.
+        let path = self.source_path(session_id)?;
+        if let Some(file) = regular_file(&path)?
+            && self.removal_pending(&path, &read_state(file)?)?
         {
-            let _guard = self.source_index.lock().expect("memory source index lock");
-            let path = self.source_path(session_id)?;
-            if let Some(file) = regular_file(&path)?
-                && self.removal_pending(&path, &read_state(file)?)?
-            {
-                return Ok(true);
-            }
+            return Ok(true);
         }
         sources.copied_source_change_pending(session_id)
     }
