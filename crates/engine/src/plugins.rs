@@ -6,9 +6,9 @@
 //! stdio) are connected for every turn while the plugin is enabled. Python
 //! (`plugin.yaml` + `__init__.py`) plugins run in hermes-python-host, which
 //! embeds the CPython runtime shipped with the app and implements PluginHost;
-//! their `python_dependencies` are installed (wheels only) into the plugin's
-//! data folder. A plugin that imports Hermes internals falls back to an
-//! installed Hermes Python agent: assets/python_plugin_bridge.py loads it with
+//! their `python_dependencies` are installed (wheels only) into a per-install
+//! package generation in the plugin's data folder. Plugins that import Hermes
+//! internals fall back to the installed Hermes Python agent. The bridge loads them with
 //! Hermes's own PluginManager.
 use crate::mcp::{Mcp, Stdio};
 use anyhow::{Context, Result, bail, ensure};
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs, path::{Component, Path, PathBuf}, process::Command};
 
+mod python_packages;
 mod runtime;
 pub use runtime::{PluginCommand, PluginRuntime, PluginStatus, PythonMemory, PythonPlugin};
 
@@ -32,6 +33,8 @@ pub struct Installed {
     pub enabled: bool, pub servers: Vec<String>, pub skills: Vec<String>,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_package_generation: Option<String>,
 }
 
 fn dir(root: &Path) -> PathBuf { root.join("plugins") }
@@ -43,6 +46,24 @@ pub fn installed(root: &Path) -> Result<Vec<Installed>> {
         Err(e) => Err(e.into()),
     }
 }
+fn open_install_lock(root: &Path) -> Result<fs::File> {
+    fs::create_dir_all(dir(root))?;
+    Ok(fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(dir(root).join(".install.lock"))?)
+}
+
+fn lock_installation(root: &Path) -> Result<fs::File> {
+    let lock = open_install_lock(root)?;
+    lock.try_lock().context("Another plugin operation is using the installed packages")?;
+    Ok(lock)
+}
+
+fn lock_plugin_startup(root: &Path) -> Result<fs::File> {
+    let lock = open_install_lock(root)?;
+    lock.try_lock_shared().context("The plugin is being installed or changed")?;
+    Ok(lock)
+}
+
 fn save(root: &Path, list: &[Installed]) -> Result<()> {
     fs::create_dir_all(dir(root))?;
     let temp = tempfile::NamedTempFile::new_in(dir(root))?;
@@ -82,14 +103,49 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
     if package.servers.contains_key("python") && python_host().is_none() && python_hermes().is_none() {
         bail!("This is a Python Hermes plugin, and this build of Hermes has no Python runtime (hermes-python-host is missing next to the app).");
     }
+    install_checkout(root, entry, &source, package, install_python_dependencies)
+}
+
+fn install_python_dependencies(target: &Path, requirements: &[String]) -> Result<()> {
+    let host = python_host().context("This plugin needs Python packages, and this build of Hermes has no Python runtime")?;
+    let output = Command::new(host)
+        .arg("install")
+        .arg(target)
+        .args(requirements)
+        .output()
+        .context("Could not start hermes-python-host")?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = stderr.lines().chain(stdout.lines())
+            .filter(|line| line.contains("ERROR") || line.contains("rror:"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bail!("Could not install the plugin's Python packages ({}): {}", requirements.join(", "), details.trim());
+    }
+    Ok(())
+}
+
+fn install_checkout(
+    root: &Path,
+    entry: &CatalogEntry,
+    source: &Path,
+    package: Package,
+    install_dependencies: impl FnOnce(&Path, &[String]) -> Result<()>,
+) -> Result<Installed> {
     let data = root.join("plugin-data").join(&entry.name);
     fs::create_dir_all(&data)?;
-    if !package.python_dependencies.is_empty() {
-        let host = python_host().context("This plugin needs Python packages, and this build of Hermes has no Python runtime")?;
-        let out = Command::new(host).arg("install").arg(data.join(PACKAGES)).args(&package.python_dependencies).output().context("Could not start hermes-python-host")?;
-        ensure!(out.status.success(), "Could not install the plugin's Python packages ({}): {}", package.python_dependencies.join(", "),
-            String::from_utf8_lossy(&out.stderr).lines().chain(String::from_utf8_lossy(&out.stdout).lines()).filter(|l| l.contains("ERROR") || l.contains("rror:")).collect::<Vec<_>>().join(" ").trim());
-    }
+    let staged = if package.servers.contains_key("python") {
+        let staged = python_packages::stage(&data)?;
+        if !package.python_dependencies.is_empty() {
+            install_dependencies(staged.path(), &package.python_dependencies)?;
+        }
+        Some(staged)
+    } else {
+        None
+    };
+    let python_package_generation = staged.as_ref().map(python_packages::selector).transpose()?;
+    let _lock = lock_installation(root)?;
     let mut list = installed(root)?;
     let revision = list.iter().find(|plugin| plugin.name == entry.name).map_or(0, |plugin| plugin.revision);
     if list.iter().any(|plugin| plugin.name == entry.name) {
@@ -97,20 +153,26 @@ pub fn install(root: &Path, entry: &CatalogEntry) -> Result<Installed> {
     }
     let target = dir(root).join(&entry.name);
     if target.exists() { fs::remove_dir_all(&target)?; }
-    copy_tree(&source, &target)?;
+    copy_tree(source, &target)?;
     let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
     crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
     let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
         version: package.version, description: package.description, sha: entry.sha.clone(), enabled: true,
         servers: package.servers.keys().cloned().collect(), skills: package.skills.into_iter().map(|(s, _)| s).collect(),
-        revision: revision.saturating_add(1) };
+        revision: revision.saturating_add(1), python_package_generation };
     list.retain(|p| p.name != entry.name);
     list.push(record.clone());
     save(root, &list)?;
+    if let Some(staged) = staged {
+        // Published generations may be mapped in another process. Only
+        // unpublished generations are automatically removed by TempDir.
+        let _ = staged.keep();
+    }
     Ok(record)
 }
 
 pub fn set_enabled(root: &Path, name: &str, on: bool) -> Result<()> {
+    let _lock = lock_installation(root)?;
     let mut list = installed(root)?;
     let plugin = list.iter_mut().find(|p| p.name == name).context("That plugin is not installed")?;
     if plugin.enabled != on {
@@ -179,6 +241,7 @@ pub fn update_available(installed: &Installed, catalog_sha: &str) -> bool { !cat
 
 pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     ensure!(valid_name(name), "That plugin name is not valid");
+    let _lock = lock_installation(root)?;
     let mut list = installed(root)?;
     let before = list.len();
     list.retain(|p| p.name != name);
@@ -207,8 +270,6 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 enum Server { Http { url: String, headers: Vec<(String, String)> }, Stdio { command: String, args: Vec<String>, env: Vec<(String, String)>, cwd: Option<String> }, Python }
 
 const BRIDGE: &str = include_str!("../assets/python_plugin_bridge.py");
-/// Where a Python plugin's `python_dependencies` are installed, inside its data folder.
-const PACKAGES: &str = "python-packages";
 
 /// hermes-python-host, next to the running executable (Hermes.app/Contents/MacOS, the Linux
 /// bin directory, the Windows install folder); for tests, the profile directory above the
@@ -391,14 +452,14 @@ async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
 }
 
 /// The installed-agent compatibility path serves legacy tools.
-async fn connect_python_bridge(plugin_root: &Path, data: &Path, config_env: &[(String, String)], prefix: &str) -> Result<Mcp> {
+async fn connect_python_bridge(plugin_root: &Path, data: &Path, packages: &Path, config_env: &[(String, String)], prefix: &str) -> Result<Mcp> {
     let mut env = config_env.to_vec();
     env.push(("PLUGIN_ROOT".into(), plugin_root.to_string_lossy().into_owned()));
     env.push(("PLUGIN_DATA".into(), data.to_string_lossy().into_owned()));
     let (python, agent) = python_hermes().context("The installed Hermes agent is unavailable")?;
     let bridge = data.join("python_plugin_bridge.py");
     if fs::read_to_string(&bridge).ok().as_deref() != Some(BRIDGE) { fs::create_dir_all(data)?; fs::write(&bridge, BRIDGE)?; }
-    let args = vec!["-I".to_owned(), bridge.to_string_lossy().into_owned(), agent.to_string_lossy().into_owned(), plugin_root.to_string_lossy().into_owned()];
+    let args = vec!["-I".to_owned(), bridge.to_string_lossy().into_owned(), agent.to_string_lossy().into_owned(), plugin_root.to_string_lossy().into_owned(), packages.to_string_lossy().into_owned()];
     Mcp::connect_stdio(Stdio { command: python.to_string_lossy().into_owned(), args, env, cwd: plugin_root.to_path_buf() }, prefix).await
         .context("Installed Hermes agent tool bridge failed")
 }
@@ -406,6 +467,90 @@ async fn connect_python_bridge(plugin_root: &Path, data: &Path, config_env: &[(S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn python_updates_stage_a_new_package_generation_without_touching_loaded_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("profile");
+        let source = fixture.path().join("checkout");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("plugin.yaml"), "name: fixture\npython_dependencies: [local-fixture]\n").unwrap();
+        fs::write(source.join("__init__.py"), "new checkout").unwrap();
+
+        let data = root.join("plugin-data/fixture");
+        let legacy = data.join(python_packages::LEGACY);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(data.join("config.json"), r#"{"keep":true}"#).unwrap();
+        let native = legacy.join("native.pyd");
+        fs::write(&native, "old native image").unwrap();
+        let installed_checkout = dir(&root).join("fixture");
+        fs::create_dir_all(&installed_checkout).unwrap();
+        fs::write(installed_checkout.join("__init__.py"), "old checkout").unwrap();
+        let old = Installed {
+            name: "fixture".into(),
+            enabled: true,
+            servers: vec!["python".into()],
+            revision: 3,
+            ..Default::default()
+        };
+        save(&root, &[old.clone()]).unwrap();
+        let reopened = installed(&root).unwrap().remove(0);
+        assert_eq!(reopened.python_package_generation, None);
+        assert_eq!(python_packages::selected(&data, None).unwrap(), legacy);
+
+        // Windows denies writes and deletion while this synthetic native
+        // image is open, like a .pyd mapped by another process.
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let held = options.open(&native).unwrap();
+        #[cfg(windows)]
+        assert!(fs::OpenOptions::new().write(true).open(&native).is_err());
+
+        let entry = CatalogEntry { name: "fixture".into(), sha: "a".repeat(40), ..Default::default() };
+        let mut failed_stage = PathBuf::new();
+        let result = install_checkout(&root, &entry, &source, read_package(&source).unwrap(), |stage, _| {
+            failed_stage = stage.to_owned();
+            fs::write(stage.join("native.pyd"), "partial install")?;
+            bail!("synthetic dependency failure")
+        });
+        assert!(result.is_err());
+        assert!(!failed_stage.exists());
+        assert_eq!(installed(&root).unwrap(), vec![old]);
+        assert_eq!(fs::read_to_string(installed_checkout.join("__init__.py")).unwrap(), "old checkout");
+
+        let first = install_checkout(&root, &entry, &source, read_package(&source).unwrap(), |stage, requirements| {
+            assert_eq!(requirements, ["local-fixture"]);
+            assert_ne!(stage, legacy);
+            fs::write(stage.join("native.pyd"), "new native image")?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(first.revision, 4);
+        assert_eq!(installed(&root).unwrap(), vec![first.clone()]);
+        let first_path = python_packages::selected(&data, first.python_package_generation.as_deref()).unwrap();
+        assert_eq!(fs::read_to_string(first_path.join("native.pyd")).unwrap(), "new native image");
+        drop(held);
+        assert_eq!(fs::read_to_string(&native).unwrap(), "old native image");
+
+        let held = options.open(first_path.join("native.pyd")).unwrap();
+        fs::write(source.join("plugin.yaml"), "name: fixture\n").unwrap();
+        let second = install_checkout(&root, &entry, &source, read_package(&source).unwrap(), |_, _| {
+            panic!("a plugin without dependencies does not run the package installer")
+        }).unwrap();
+        let second_path = python_packages::selected(&data, second.python_package_generation.as_deref()).unwrap();
+        assert_ne!(second_path, first_path);
+        assert_eq!(fs::read_dir(second_path).unwrap().count(), 0);
+        assert!(first_path.is_dir());
+        assert_eq!(config(&root, "fixture")["keep"], true);
+        drop(held);
+        assert_eq!(fs::read_to_string(first_path.join("native.pyd")).unwrap(), "new native image");
+        assert!(python_packages::selected(&data, Some("../python-packages")).is_err());
+        assert!(python_packages::selected(&data, Some("generation-0000000000000000")).is_err());
+    }
+
     #[test]
     fn reads_agent_plugin_packages_and_python_ones() {
         let dir = tempfile::tempdir().unwrap();
@@ -506,6 +651,21 @@ def register(ctx):
         assert!(python_host().is_some(), "build hermes-python-host first (cargo test --workspace builds it)");
         let root = tempfile::tempdir().unwrap();
         shout_plugin(root.path(), "");
+        let data = root.path().join("plugin-data/shout");
+        let legacy = data.join(python_packages::LEGACY);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("mercury_fixture_marker.py"), "SUFFIX = '?'").unwrap();
+        let packages = python_packages::stage(&data).unwrap();
+        fs::write(packages.path().join("mercury_fixture_marker.py"), "SUFFIX = '!'").unwrap();
+        let mut list = installed(root.path()).unwrap();
+        list[0].python_package_generation = Some(python_packages::selector(&packages).unwrap());
+        save(root.path(), &list).unwrap();
+        let _ = packages.keep();
+        let code = SHOUT.replace("+ \"!\"", "+ SUFFIX");
+        fs::write(
+            root.path().join("plugins/shout/__init__.py"),
+            format!("from mercury_fixture_marker import SUFFIX\n{code}"),
+        ).unwrap();
         let (mut live, errors) = connect_all(root.path()).await;
         assert!(errors.is_empty(), "{errors:?}");
         assert!(live[0].contains("mcp_shout__shout_text"), "{:?}", live[0].specs());
@@ -565,9 +725,9 @@ def register(ctx):
     fn python_dependencies_install_into_the_plugin_data_folder() {
         let host = python_host().expect("build hermes-python-host first");
         let data = tempfile::tempdir().unwrap();
-        let out = Command::new(host).arg("install").arg(data.path().join(PACKAGES)).arg("six==1.17.0").output().unwrap();
+        let out = Command::new(host).arg("install").arg(data.path().join(python_packages::LEGACY)).arg("six==1.17.0").output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert!(data.path().join(PACKAGES).join("six.py").is_file());
+        assert!(data.path().join(python_packages::LEGACY).join("six.py").is_file());
     }
 
     /// A plugin that imports Hermes internals falls back to the installed Hermes Python agent.

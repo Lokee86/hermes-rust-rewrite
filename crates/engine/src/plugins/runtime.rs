@@ -1,7 +1,7 @@
 //! Profile-owned activations of the embedded Python plugin host.
 use super::{
-    PACKAGES, Installed, config, config_schema, connect_mcp, connect_python_bridge, dir, installed,
-    prefix, python_host, valid_name, yaml_field,
+    Installed, config, config_schema, connect_mcp, connect_python_bridge, dir, installed,
+    lock_plugin_startup, prefix, python_host, python_packages, valid_name, yaml_field,
 };
 use crate::{
     Config,
@@ -88,6 +88,7 @@ pub struct PluginRuntime {
 struct Revision {
     sha: String,
     revision: u64,
+    python_package_generation: Option<String>,
     env: Vec<(String, String)>,
 }
 
@@ -167,6 +168,7 @@ impl PluginRuntime {
                 let key = Revision {
                     sha: installed.sha.clone(),
                     revision: installed.revision,
+                    python_package_generation: installed.python_package_generation.clone(),
                     env: python_env(&self.root, &id),
                 };
                 let reusable = active.get(&id).filter(|slot| slot.key == key && slot.reusable()).cloned();
@@ -266,7 +268,11 @@ impl PluginRuntime {
                 }
                 Err(error) if !candidate.exclusive => {
                     let data = self.root.join("plugin-data").join(&slot.id);
-                    match connect_python_bridge(&dir(&self.root).join(&slot.id), &data, &slot.key.env, &prefix(&slot.id)).await {
+                    let bridge = async {
+                        let (_installation, packages) = slot.lock_packages(&self.root)?;
+                        connect_python_bridge(&dir(&self.root).join(&slot.id), &data, &packages, &slot.key.env, &prefix(&slot.id)).await
+                    }.await;
+                    match bridge {
                         Ok(bridge) => live.push(bridge),
                         Err(bridge) => errors.push(format!("{}: {error}; {bridge}", candidate.installed.title)),
                     }
@@ -304,8 +310,26 @@ impl Activation {
         result.as_ref().map_err(|error| anyhow::anyhow!("{error}"))
     }
 
-    async fn start(&self, runtime: &PluginRuntime) -> Result<Running> {
+    fn lock_packages(&self, root: &Path) -> Result<(fs::File, PathBuf)> {
         ensure!(self.active.load(Ordering::Acquire), "Plugin activation has ended");
+        let lock = lock_plugin_startup(root)?;
+        // The checkout is mutable across installs. Read the selected revision
+        // again under the publication lock before either Python host loads it.
+        ensure!(
+            installed(root)?.iter().any(|plugin| plugin.name == self.id
+                && plugin.enabled
+                && plugin.sha == self.key.sha
+                && plugin.revision == self.key.revision
+                && plugin.python_package_generation == self.key.python_package_generation),
+            "Plugin installation changed before activation"
+        );
+        let data = root.join("plugin-data").join(&self.id);
+        let packages = python_packages::selected(&data, self.key.python_package_generation.as_deref())?;
+        Ok((lock, packages))
+    }
+
+    async fn start(&self, runtime: &PluginRuntime) -> Result<Running> {
+        let (_installation, packages) = self.lock_packages(&runtime.root)?;
         let path = python_host().context("The bundled Python host is unavailable")?;
         let plugin = dir(&runtime.root).join(&self.id);
         let data = runtime.root.join("plugin-data").join(&self.id);
@@ -322,7 +346,7 @@ impl Activation {
         }
         let worker = Worker::start(Stdio {
             command: path.to_string_lossy().into_owned(),
-            args: vec!["serve".into(), plugin.to_string_lossy().into_owned(), data.join(PACKAGES).to_string_lossy().into_owned()],
+            args: vec!["serve".into(), plugin.to_string_lossy().into_owned(), packages.to_string_lossy().into_owned()],
             env,
             // Windows cannot replace or remove a folder that a running process works in, and
             // this worker outlives the turn: updating the plugin must be able to.
