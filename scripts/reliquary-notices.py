@@ -33,15 +33,18 @@ def notices():
     def root(name):
         return Path(package(name)["manifest_path"]).parent
 
-    return source_url, {
+    sources = {
         "Hermes-Rust-LICENSE": Path("LICENSE"),
         "Hermes-LICENSE": Path("LICENSE-HERMES-AGENT"),
         "Reliquary-NOTICE": notice,
         "Reliquary-MPL-2.0": root("reliquary-memory") / "LICENSE",
         "Lodestone-MIT": root("lodestone-core").parents[1] / "LICENSE.md",
-        "glib-MIT": Path("vendor/glib/LICENSE"),
-        "glib-COPYRIGHT": Path("vendor/glib/COPYRIGHT"),
     }
+    if "linux" in host.split("-"):
+        glib = root("glib")
+        sources["glib-MIT"] = glib / "LICENSE"
+        sources["glib-COPYRIGHT"] = glib / "COPYRIGHT"
+    return source_url, sources
 
 
 def verify(archive, sources):
