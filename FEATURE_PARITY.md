@@ -40,9 +40,9 @@ Evidence levels below: **verified live** means driven against real services or t
 
 ## Gateway contract inventory
 
-_Counted on 25 November 2026 from the method tables in `crates/gateway/src`._
+_Counted against Mercury `1ac307f` and stock Hermes v0.23.3 from the method tables in `crates/gateway/src`._
 
-The published OpenRPC file declares **264 unique method names**. The Rust gateway advertises **82** methods, **60** of which appear in that file. **204** published names are absent from the Rust method table. A matching name establishes dispatch coverage only. It does not certify complete request schemas or behavior, and the count is not a desktop feature percentage. [Published OpenRPC registry](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/apps/shared/src/gateway-contract.openrpc.json) · [Native handlers](crates/gateway/src/lib.rs) · [Gateway wire and tests](crates/gateway/README.md)
+The published OpenRPC file declares **263 unique method names**. The Rust gateway advertises **84** methods, **61** of which appear in that file. **202** published names are absent from the Rust method table. A matching name establishes dispatch coverage only. It does not certify complete request schemas or behavior, and the count is not a desktop feature percentage. [Published OpenRPC registry](https://github.com/NousResearch/hermes-agent/blob/caafe5389ae585ef77387a962aee05b1bcf17029/apps/shared/src/gateway-contract.openrpc.json) · [Native handlers](crates/gateway/src/lib.rs) · [Gateway wire and tests](crates/gateway/README.md) · [API parity report](API_PARITY_REPORT.md)
 
 | Published namespace | Advertised names in the Rust gateway | Outstanding published names |
 | --- | --- | --- |
@@ -71,7 +71,7 @@ The published OpenRPC file declares **264 unique method names**. The Rust gatewa
 | gateway | `gateway.capabilities` | — |
 | groups | — | `groups.approve`, `groups.attachment.download`, `groups.attachment.upload`, `groups.capabilities`, `groups.context`, `groups.continue`, `groups.create`, `groups.demote`, `groups.disband`, `groups.discard`, `groups.list`, `groups.log`, `groups.peer.invite`, `groups.peer.register`, `groups.peer.revoke`, `groups.promote`, `groups.rename`, `groups.replica_state`, `groups.replicate`, `groups.retry`, `groups.send`, `groups.state`, `groups.stop` |
 | handoff | — | `handoff.fail`, `handoff.request`, `handoff.state` |
-| i18n | — | `i18n.catalog`, `i18n.languages` |
+| i18n | `i18n.languages` | `i18n.catalog` |
 | image | — | `image.attach`, `image.attach_bytes`, `image.detach`, `image.generate`, `image.render` |
 | input | — | `input.detect_drop` |
 | insights | `insights.get` | — |
@@ -98,7 +98,7 @@ The published OpenRPC file declares **264 unique method names**. The Rust gatewa
 | rollback | `rollback.diff`, `rollback.list`, `rollback.restore` | — |
 | session | `session.activate`, `session.active_list`, `session.archive`, `session.close`, `session.compress`, `session.context_breakdown`, `session.create`, `session.delete`, `session.events.since`, `session.history`, `session.interrupt`, `session.list`, `session.most_recent`, `session.resume`, `session.status`, `session.title`, `session.usage` | `session.branch`, `session.branch_stored`, `session.branch_whole`, `session.control`, `session.control.read`, `session.cwd.set`, `session.events.stats`, `session.foreign.import`, `session.foreign.list`, `session.foreign.preview`, `session.redirect`, `session.save`, `session.set_hidden`, `session.steer`, `session.undo`, `session.workspace.move` |
 | setup | `setup.runtime_check`, `setup.status` | — |
-| shared_metrics | — | `shared_metrics.desktop_daily`, `shared_metrics.desktop_dislike`, `shared_metrics.desktop_feature_use`, `shared_metrics.desktop_friction`, `shared_metrics.desktop_long_frames`, `shared_metrics.desktop_onboarding`, `shared_metrics.set`, `shared_metrics.slash_command`, `shared_metrics.startup_latency`, `shared_metrics.status`, `shared_metrics.update_run` |
+| shared_metrics | — | `shared_metrics.desktop_daily`, `shared_metrics.desktop_dislike`, `shared_metrics.desktop_feature_use`, `shared_metrics.desktop_friction`, `shared_metrics.desktop_onboarding`, `shared_metrics.set`, `shared_metrics.slash_command`, `shared_metrics.startup_latency`, `shared_metrics.status`, `shared_metrics.update_run` |
 | shell | `shell.exec` | — |
 | skills | `skills.reload` | `skills.manage` |
 | slash | `slash.exec` | — |
