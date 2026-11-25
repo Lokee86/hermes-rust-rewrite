@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::PathBuf, process::Stdio as Pipe, time::Du
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
     time::Instant,
 };
@@ -24,6 +24,7 @@ const MAX_SERVICES: usize = 4;
 pub(crate) struct Worker {
     requests: mpsc::Sender<Request>,
     stop: CancellationToken,
+    exited: watch::Receiver<Option<std::result::Result<(), String>>>,
 }
 
 struct Request {
@@ -62,12 +63,26 @@ impl Worker {
         let (requests, inbox) = mpsc::channel(MAX_REQUESTS);
         let stop = CancellationToken::new();
         let cancelled = stop.clone();
+        let (exit, exited) = watch::channel(None);
         tokio::spawn(async move {
-            let _child = child;
             let _ = exchange(input, output, inbox, root, config, &cancelled).await;
+            let exit_result = match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => match child.kill().await {
+                    Ok(()) => child.wait().await.map(|_| ()).context("Could not confirm embedded Python host exit"),
+                    Err(error) => match child.try_wait() {
+                        Ok(Some(_)) => Ok(()),
+                        Ok(None) => Err(error).context("Could not terminate the embedded Python host"),
+                        Err(wait_error) => Err(wait_error).context("Could not confirm embedded Python host exit"),
+                    },
+                },
+                Err(error) => Err(error).context("Could not inspect embedded Python host exit"),
+            };
             cancelled.cancel();
+            let result = exit_result.map_err(|error| format!("{error:#}"));
+            let _ = exit.send(Some(result));
         });
-        Ok(Self { requests, stop })
+        Ok(Self { requests, stop, exited })
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -76,6 +91,17 @@ impl Worker {
 
     pub(crate) fn stop(&self) {
         self.stop.cancel();
+    }
+
+    pub(crate) async fn stop_and_wait(&self) -> Result<()> {
+        self.stop();
+        let mut exited = self.exited.clone();
+        loop {
+            if let Some(result) = exited.borrow().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            exited.changed().await.context("Could not confirm embedded Python host exit")?;
+        }
     }
 
     pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -205,6 +231,8 @@ async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs2::FileExt;
+    use std::{fs::OpenOptions, thread};
 
     #[test]
     fn a_slow_tool_outlives_the_ordinary_limit_only_while_someone_waits() {
@@ -223,5 +251,61 @@ mod tests {
         plugin.write_all(b"Cloning into 'x'...\n42\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n").await.unwrap();
         let frame = receive(&mut BufReader::new(host), &mut Vec::new()).await.unwrap().unwrap();
         assert_eq!(frame["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_confirms_the_child_released_its_file_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("worker.lock");
+        let ready_path = directory.path().join("worker.ready");
+        let args = vec![
+            "--exact".into(),
+            "plugin_worker::tests::child_holds_file_lock_until_killed".into(),
+            "--nocapture".into(),
+        ];
+        let worker = Worker::start(
+            Stdio {
+                command: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+                args,
+                env: vec![
+                    ("HERMES_TEST_WORKER_LOCK".into(), lock_path.to_string_lossy().into_owned()),
+                    ("HERMES_TEST_WORKER_READY".into(), ready_path.to_string_lossy().into_owned()),
+                ],
+                cwd: directory.path().to_owned(),
+            },
+            directory.path().to_owned(),
+            None,
+        )
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let probe = OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
+        assert!(probe.try_lock_exclusive().is_err(), "child should still own the lock");
+
+        worker.stop_and_wait().await.unwrap();
+        probe.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn child_holds_file_lock_until_killed() {
+        let (Ok(lock_path), Ok(ready_path)) = (
+            std::env::var("HERMES_TEST_WORKER_LOCK"),
+            std::env::var("HERMES_TEST_WORKER_READY"),
+        ) else {
+            return;
+        };
+        let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
+            .open(lock_path).unwrap();
+        lock.lock_exclusive().unwrap();
+        std::fs::write(ready_path, b"ready").unwrap();
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
     }
 }
