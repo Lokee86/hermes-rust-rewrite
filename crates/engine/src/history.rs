@@ -41,10 +41,68 @@ pub struct Turn {
 pub struct History {
     version: u32,
     pub turns: Vec<Turn>,
+    /// Stands in for the oldest turns in model requests (context.rs). The turns themselves stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<Summary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Summary {
+    /// How many leading turns `text` covers.
+    pub through: usize,
+    pub text: String,
 }
 
 impl Default for History {
-    fn default() -> Self { Self { version: 1, turns: Vec::new() } }
+    fn default() -> Self { Self { version: 1, turns: Vec::new(), summary: None } }
+}
+
+impl History {
+    /// The summary, unless the chat was rewound to before the turns it covers.
+    pub fn active_summary(&self) -> Option<&Summary> {
+        self.summary.as_ref().filter(|summary| summary.through <= self.turns.len())
+    }
+}
+
+const CONVERSATION: &str = "conversation.json";
+/// The running turn between two full saves. A long chat is not rewritten for every streamed chunk.
+const CHECKPOINT: &str = "conversation.running.json";
+
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    /// The full save this belongs to; any other checkpoint is stale.
+    revision: u64,
+    index: usize,
+    turn: Turn,
+}
+
+/// The saved conversation with the running turn's latest checkpoint applied.
+pub fn read_history(dir: &Path) -> Result<History> {
+    Ok(read_record(dir)?.0.history)
+}
+
+/// The saved conversation and the gateway state stored beside it.
+pub fn read_conversation(dir: &Path) -> Result<(History, Option<serde_json::Value>)> {
+    let (record, _) = read_record(dir)?;
+    Ok((record.history, record.authority))
+}
+
+/// Also reports whether a saved file exists.
+fn read_record(dir: &Path) -> Result<(NativeRecord, bool)> {
+    let mut record: NativeRecord = match File::open(dir.join(CONVERSATION)) {
+        Ok(file) => serde_json::from_reader(std::io::BufReader::new(file)).context("Could not read the saved conversation")?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((NativeRecord::default(), false)),
+        Err(err) => return Err(err).context("Could not open the saved conversation"),
+    };
+    // A checkpoint is written whole or not at all; one that cannot be read loses only its turn's progress.
+    if let Ok(bytes) = fs::read(dir.join(CHECKPOINT))
+        && let Ok(saved) = serde_json::from_slice::<Checkpoint>(&bytes)
+        && saved.revision == record.revision
+        && saved.index + 1 == record.history.turns.len()
+    {
+        record.history.turns[saved.index] = saved.turn;
+    }
+    Ok((record, true))
 }
 
 /// Serialized alongside the transcript. Gateway participants coordinate through one
@@ -55,6 +113,9 @@ struct NativeRecord {
     history: History,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authority: Option<serde_json::Value>,
+    /// Counts full saves.
+    #[serde(default)]
+    revision: u64,
 }
 
 pub struct Store {
@@ -76,12 +137,7 @@ impl Store {
         let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true)
             .open(dir.join("session.lock")).context("Could not open the conversation lock")?;
         lock.try_lock_exclusive().context("This conversation is already open in another window or cannot be locked")?;
-        let path = dir.join("conversation.json");
-        let mut record: NativeRecord = match File::open(&path) {
-            Ok(file) => serde_json::from_reader(file).context("Could not read the saved conversation")?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => NativeRecord::default(),
-            Err(err) => return Err(err).context("Could not open the saved conversation"),
-        };
+        let (mut record, _) = read_record(dir)?;
         if record.history.version != 1 { bail!("Unsupported conversation format {}", record.history.version); }
         let mut recovered = false;
         // Only the gateway can resolve the disposition of a claimed admission.
@@ -113,20 +169,101 @@ impl Store {
 
     fn replace(&self, history: Option<&History>, authority: Option<&serde_json::Value>) -> Result<()> {
         let mut current = self.record.lock().expect("conversation writer poisoned");
+        if let (Some(history), None) = (history, authority)
+            && current.revision > 0
+            && let Some(index) = running_turn_only(&current.history, history)
+        {
+            let saved = Checkpoint { revision: current.revision, index, turn: history.turns[index].clone() };
+            let mut file = NamedTempFile::new_in(&self.dir)?;
+            serde_json::to_writer(&mut file, &saved)?;
+            file.as_file().sync_all()?;
+            persist_with_retry(file, &self.dir.join(CHECKPOINT)).context("Could not save the running reply")?;
+            current.history.turns[index] = saved.turn;
+            return Ok(());
+        }
         let next = NativeRecord {
             history: history.unwrap_or(&current.history).clone(),
             authority: authority.or(current.authority.as_ref()).cloned(),
+            revision: current.revision + 1,
         };
         let mut file = NamedTempFile::new_in(&self.dir)?;
-        serde_json::to_writer_pretty(&mut file, &next)?;
+        serde_json::to_writer(std::io::BufWriter::new(&mut file), &next)?;
         file.write_all(b"\n")?;
         file.as_file().sync_all()?;
-        persist_with_retry(file, &self.dir.join("conversation.json"))
+        persist_with_retry(file, &self.dir.join(CONVERSATION))
             .context("Could not replace the saved conversation")?;
         *current = next;
+        // Its revision no longer matches, so one that cannot be removed is ignored.
+        let _ = fs::remove_file(self.dir.join(CHECKPOINT));
         #[cfg(unix)]
         File::open(&self.dir)?.sync_all()?;
         Ok(())
+    }
+}
+
+/// The index of the last turn, if it is running and nothing before it changed.
+fn running_turn_only(current: &History, next: &History) -> Option<usize> {
+    let index = next.turns.len().checked_sub(1)?;
+    (current.turns.len() == next.turns.len()
+        && current.summary == next.summary
+        && current.turns[index].status == Status::Running
+        && next.turns[index].status == Status::Running
+        && current.turns[..index] == next.turns[..index])
+        .then_some(index)
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    fn running(text: &str) -> Turn {
+        Turn { attachments: vec![], prompt: "p".into(), context: String::new(), model: "m".into(),
+            entries: vec![Entry::Assistant { text: text.into(), calls: vec![] }], status: Status::Running }
+    }
+
+    #[test]
+    fn streaming_saves_rewrite_only_the_running_turn_and_survive_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut history) = Store::open(dir.path()).unwrap();
+        for n in 0..50 {
+            history.turns.push(Turn { status: Status::Complete, ..running(&format!("old {n}")) });
+        }
+        history.turns.push(running(""));
+        store.save(&history).unwrap();
+        let full = fs::read(dir.path().join(CONVERSATION)).unwrap();
+        history.turns[50] = running("partial reply");
+        store.save(&history).unwrap();
+        assert_eq!(fs::read(dir.path().join(CONVERSATION)).unwrap(), full);
+        assert!(fs::metadata(dir.path().join(CHECKPOINT)).unwrap().len() < 400);
+        assert_eq!(read_history(dir.path()).unwrap(), history);
+        drop(store);
+
+        // Reopening after a crash keeps what had streamed.
+        let (store, reopened) = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.turns[50].status, Status::Interrupted);
+        assert!(matches!(&reopened.turns[50].entries[0], Entry::Assistant { text, .. } if text == "partial reply"));
+        assert!(!dir.path().join(CHECKPOINT).exists());
+
+        // A checkpoint left from an earlier save is not applied to a later one.
+        let stale = Checkpoint { revision: 1, index: 50, turn: running("stale") };
+        fs::write(dir.path().join(CHECKPOINT), serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert_eq!(read_history(dir.path()).unwrap(), reopened);
+        drop(store);
+    }
+
+    #[test]
+    fn a_gateway_commit_is_always_a_full_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut history) = Store::open(dir.path()).unwrap();
+        history.turns.push(running("a"));
+        store.commit(Some(&history), &serde_json::json!({"receipts":[]})).unwrap();
+        history.turns[0] = running("ab");
+        store.save(&history).unwrap();
+        store.commit(None, &serde_json::json!({"receipts":[1]})).unwrap();
+        assert!(!dir.path().join(CHECKPOINT).exists());
+        let (saved, authority) = read_conversation(dir.path()).unwrap();
+        assert_eq!(saved, history);
+        assert_eq!(authority.unwrap()["receipts"][0], 1);
     }
 }
 

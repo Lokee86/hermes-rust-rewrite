@@ -786,10 +786,7 @@ impl Shared {
             }
             // A plugin the user turned off must not keep running until the next turn.
             self.plugins.retire_stale().await;
-            let others: Vec<_> = self.other_plugin_profiles.lock().await.values().cloned().collect();
-            for runtime in others {
-                runtime.retire_stale().await;
-            }
+            self.retire_other_plugin_profiles().await;
             let terminal = lock(&self.python_memory.terminal).clone();
             for id in terminal {
                 if self.shutdown.is_cancelled() {

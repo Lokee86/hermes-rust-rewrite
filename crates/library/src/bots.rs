@@ -41,7 +41,22 @@ struct ProfileOwner {
 
 const PROFILE_OWNER: &str = ".hermes-bot-owner.json";
 
+fn retry_profile_operation<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if cfg!(windows) { 20 } else { 0 });
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn remove_owned_profile(profile: &Path, name: &str, expected: &str) -> Result<()> {
+    retry_profile_operation(|| remove_owned_profile_once(profile, name, expected))
+}
+
+fn remove_owned_profile_once(profile: &Path, name: &str, expected: &str) -> Result<()> {
     let metadata = match fs::symlink_metadata(profile) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -258,8 +273,10 @@ impl Library {
                     atomic_json(&self.roster_path(), &roster)?;
                 }
                 if !staging.try_exists()? && fs::symlink_metadata(&profile).is_ok() {
-                    self.checked_bot_profile(&roster, name)?.context("The bot profile is unavailable")?;
-                    fs::rename(&profile, &staging).context("Could not prepare bot profile removal; retry deleting the bot")?;
+                    retry_profile_operation(|| {
+                        self.checked_bot_profile(&roster, name)?.context("The bot profile is unavailable")?;
+                        fs::rename(&profile, &staging).context("Could not prepare bot profile removal; retry deleting the bot")
+                    })?;
                 }
                 remove_owned_profile(&staging, name, &owner)
                     .context("Could not remove bot profile; retry deleting the bot")?;

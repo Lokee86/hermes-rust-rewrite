@@ -757,3 +757,57 @@ fn codex_subscription_uses_the_responses_protocol() {
     let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}"#);
     assert_eq!(codex_account_headers(&format!("h.{claims}.s")), vec![("ChatGPT-Account-ID", "acct_1".to_owned())]);
 }
+
+#[test]
+fn a_stopped_reply_stays_in_the_conversation_with_every_tool_call_answered() {
+    let call = |id: &str, arguments: &str| ToolCall { id: id.into(), name: "read_file".into(), arguments: arguments.into() };
+    let turn = |status: Status, entries: Vec<Entry>| crate::Turn {
+        attachments: vec![], prompt: "look".into(), context: String::new(), model: "m".into(), entries, status,
+    };
+    let mut history = History::default();
+    history.turns.push(turn(Status::Interrupted, vec![
+        Entry::Assistant { text: "Reading both.".into(), calls: vec![call("a", "{}"), call("b", "{}")] },
+        Entry::Tool { id: "a".into(), name: "read_file".into(), approved: true, result: "contents".into() },
+    ]));
+    history.turns.push(turn(Status::Failed("secret detail".into()), vec![
+        Entry::Assistant { text: "Half a".into(), calls: vec![call("c", "{\"pa")] },
+    ]));
+    history.turns.push(turn(Status::Interrupted, vec![Entry::Assistant { text: String::new(), calls: vec![] }]));
+    history.turns.push(turn(Status::Running, vec![]));
+    let sent = messages(&history, std::path::Path::new(".")).unwrap();
+    let roles: Vec<_> = sent.iter().map(|message| message["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool", "tool", "assistant", "user", "assistant", "user", "assistant", "user"]);
+    assert_eq!(sent[3]["content"], "contents");
+    assert!(sent[4]["content"].as_str().unwrap().contains("stopped before this tool ran"));
+    assert!(sent[7]["content"].as_str().unwrap().starts_with("Half a") && sent[7].get("tool_calls").is_none());
+    assert!(!serde_json::to_string(&sent).unwrap().contains("secret detail"));
+    anthropic_body("claude-fixture", sent, &[]).unwrap();
+}
+
+#[test]
+fn requests_mark_the_stable_prefix_for_caching() {
+    let tools = [json!({"type":"function","function":{"name":"t","parameters":{"type":"object"}}})];
+    let conversation = vec![
+        json!({"role":"system","content":"System"}),
+        json!({"role":"user","content":"one"}),
+        json!({"role":"assistant","content":"two"}),
+        json!({"role":"user","content":"three"}),
+        json!({"role":"assistant","content":"four"}),
+        json!({"role":"user","content":"five"}),
+    ];
+    let mut body = anthropic_body("claude-fixture", conversation.clone(), &tools).unwrap();
+    cache_anthropic_prefix(&mut body);
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    let marked: Vec<_> = body["messages"].as_array().unwrap().iter().map(|m| m["content"][0].get("cache_control").is_some()).collect();
+    assert_eq!(marked, [false, false, true, false, true]);
+
+    let mut routed = json!({"model":"anthropic/claude-fixture","messages":conversation});
+    cache_openrouter_prefix(&"https://openrouter.ai/api/v1/chat/completions".parse().unwrap(), &mut routed);
+    assert_eq!(routed["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(routed["messages"][5]["content"][0]["text"], "five");
+    let plain = json!({"model":"anthropic/claude-fixture","messages":conversation});
+    let mut other = plain.clone();
+    cache_openrouter_prefix(&"https://example.com/v1/chat/completions".parse().unwrap(), &mut other);
+    assert_eq!(other, plain);
+}

@@ -102,8 +102,7 @@ impl Library {
         let _lock = self.lock_profiles()?;
         let profile = self.profile_path_for_deletion(name)?;
         cleanup(&profile)?;
-        fs::remove_dir_all(profile)?;
-        Ok(())
+        hermes_engine::plugins::remove_dir(&profile)
     }
     pub fn profile_soul(&self, name: &str) -> Result<String> { Ok(fs::read_to_string(self.profile_path(name)?.join("SOUL.md")).unwrap_or_default()) }
     pub fn set_profile_soul(&self, name: &str, text: &str) -> Result<()> {

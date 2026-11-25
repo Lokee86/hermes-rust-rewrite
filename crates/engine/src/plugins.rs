@@ -51,6 +51,16 @@ fn open_install_lock(root: &Path) -> Result<fs::File> {
         .open(dir(root).join(".install.lock"))?)
 }
 
+struct InstallationLock(fs::File);
+
+impl Drop for InstallationLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can retain the open file description
+        // until exec. Release the lock before closing our own reference.
+        let _ = self.0.unlock();
+    }
+}
+
 fn profile_parent(home: &Path) -> Option<&Path> {
     home.parent().filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
 }
@@ -107,20 +117,20 @@ fn lock_profile_plugin_install(home: &Path) -> Result<Vec<fs::File>> {
     Ok(locks)
 }
 
-fn lock_installation(root: &Path) -> Result<fs::File> {
+fn lock_installation(root: &Path) -> Result<InstallationLock> {
     let lock = open_install_lock(root)?;
     lock.try_lock().context("Another plugin operation is using the installed packages")?;
-    Ok(lock)
+    Ok(InstallationLock(lock))
 }
 
-fn wait_for_installation(root: &Path) -> Result<fs::File> {
+fn wait_for_installation(root: &Path) -> Result<InstallationLock> {
     use std::time::{Duration, Instant};
 
     let lock = open_install_lock(root)?;
     let started = Instant::now();
     loop {
         match lock.try_lock() {
-            Ok(()) => return Ok(lock),
+            Ok(()) => return Ok(InstallationLock(lock)),
             Err(fs::TryLockError::WouldBlock) if started.elapsed() < Duration::from_secs(45) => {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -129,10 +139,10 @@ fn wait_for_installation(root: &Path) -> Result<fs::File> {
     }
 }
 
-fn lock_plugin_startup(root: &Path) -> Result<fs::File> {
+fn lock_plugin_startup(root: &Path) -> Result<InstallationLock> {
     let lock = open_install_lock(root)?;
     lock.try_lock_shared().context("The plugin is being installed or changed")?;
-    Ok(lock)
+    Ok(InstallationLock(lock))
 }
 
 fn save(root: &Path, list: &[Installed]) -> Result<()> {
@@ -233,11 +243,24 @@ fn install_checkout(
     }
     let mut list = installed(root)?;
     let revision = list.iter().find(|plugin| plugin.name == entry.name).map_or(0, |plugin| plugin.revision);
+    // A running copy holds its files open on Windows. The gateway ends a disabled plugin.
+    let was_enabled = list.iter().any(|plugin| plugin.name == entry.name && plugin.enabled);
+    if was_enabled {
+        for plugin in list.iter_mut().filter(|plugin| plugin.name == entry.name) { plugin.enabled = false; plugin.revision = plugin.revision.saturating_add(1); }
+        save(root, &list)?;
+    }
+    let target = dir(root).join(&entry.name);
+    // Package generations stay available to workers that already loaded them.
+    if let Err(error) = remove_dir(&target) {
+        if was_enabled {
+            for plugin in list.iter_mut().filter(|plugin| plugin.name == entry.name) { plugin.enabled = true; }
+            save(root, &list)?;
+        }
+        return Err(error);
+    }
     if list.iter().any(|plugin| plugin.name == entry.name) {
         crate::settings::ProfileSettings::invalidate_plugin_memory(root, &entry.name)?;
     }
-    let target = dir(root).join(&entry.name);
-    if target.exists() { fs::remove_dir_all(&target)?; }
     copy_tree(source, &target)?;
     let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
     crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
@@ -328,14 +351,29 @@ pub fn uninstall(root: &Path, name: &str) -> Result<()> {
     ensure!(valid_name(name), "That plugin name is not valid");
     let _lock = lock_installation(root)?;
     let mut list = installed(root)?;
-    let before = list.len();
-    list.retain(|p| p.name != name);
-    ensure!(list.len() < before, "That plugin is not installed");
+    let plugin = list.iter_mut().find(|p| p.name == name).context("That plugin is not installed")?;
+    plugin.enabled = false;
+    plugin.revision = plugin.revision.saturating_add(1);
     crate::settings::ProfileSettings::invalidate_plugin_memory(root, name)?;
+    save(root, &list)?;
     crate::skill_catalog::put_documents(root, &format!("plugin/{name}/"), vec![])?;
-    let target = dir(root).join(name);
-    if target.exists() { fs::remove_dir_all(target)?; }
+    remove_dir(&dir(root).join(name))?;
+    list.retain(|p| p.name != name);
     save(root, &list)
+}
+
+/// Remove a folder. Windows refuses while a program works in it or has a library from it loaded,
+/// so there this waits for the gateway to end the plugins it runs from the folder.
+pub fn remove_dir(path: &Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if cfg!(windows) { 20 } else { 0 });
+    loop {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Err(error) => return Err(error).with_context(|| format!("Could not remove {}. Close anything that uses it and try again", path.display())),
+        }
+    }
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -552,6 +590,28 @@ async fn connect_python_bridge(plugin_root: &Path, data: &Path, packages: &Path,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_guards_unlock_while_duplicate_file_references_remain_open() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::create_dir(dir(fixture.path())).unwrap();
+        let writer = lock_installation(fixture.path()).unwrap();
+        let _writer_reference = writer.0.try_clone().unwrap();
+        assert!(lock_plugin_startup(fixture.path()).is_err());
+        assert!(lock_installation(fixture.path()).is_err());
+        drop(writer);
+
+        let first = lock_plugin_startup(fixture.path()).unwrap();
+        let _reader_reference = first.0.try_clone().unwrap();
+        let second = lock_plugin_startup(fixture.path()).unwrap();
+        assert!(lock_installation(fixture.path()).is_err());
+        drop(first);
+        assert!(lock_installation(fixture.path()).is_err());
+        drop(second);
+        let _writer = lock_installation(fixture.path()).unwrap();
+    }
+
     #[test]
     fn profile_deletion_and_nested_bot_install_share_canonical_fences() {
         let fixture = tempfile::tempdir().unwrap();
@@ -821,6 +881,51 @@ def register(ctx):
         assert_eq!(crate::plugin_hooks::pre_tool_call(&mut live, &call(r#"{"command":"ls"}"#)).await, None);
         assert_eq!(crate::plugin_hooks::after_tool_call(&mut live, &call("{}"), "ok".into()).await, "ok [seen]");
         live[0].close().await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removing_a_folder_waits_for_a_program_that_still_uses_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("in-use");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("native.pyd"), "x").unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(folder.join("native.pyd")).unwrap();
+        let release = std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_secs(1)); drop(held); });
+        remove_dir(&folder).unwrap();
+        release.join().unwrap();
+        assert!(!folder.exists());
+    }
+
+    #[tokio::test]
+    async fn one_slow_tool_does_not_hold_up_the_plugin() {
+        let root = tempfile::tempdir().unwrap();
+        shout_plugin(root.path(), "");
+        fs::write(root.path().join("plugins/shout/__init__.py"), r#"
+import threading
+gate = threading.Event()
+def _slow(args, **_):
+    return "released" if gate.wait(20) else "timed out"
+def _open(args, **_):
+    gate.set()
+    return "opened"
+def register(ctx):
+    schema = lambda name: {"name": name, "description": name, "parameters": {"type": "object"}}
+    ctx.register_tool("slow", "shout", schema("slow"), _slow)
+    ctx.register_tool("open", "shout", schema("open"), _open)
+    ctx.register_hook("pre_tool_call", lambda **_: None)
+"#).unwrap();
+        let runtime = PluginRuntime::new(root.path().to_path_buf(), None);
+        let (mut first, _) = runtime.tool_connections().await;
+        let (mut second, _) = runtime.tool_connections().await;
+        let slow = tokio::spawn(async move { first[0].call("mcp_shout__slow", &serde_json::json!({})).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let call = crate::history::ToolCall { id: "c".into(), name: "terminal".into(), arguments: "{}".into() };
+        assert_eq!(crate::plugin_hooks::pre_tool_call(&mut second, &call).await, None);
+        second[0].call("mcp_shout__open", &serde_json::json!({})).await.unwrap();
+        assert_eq!(slow.await.unwrap().unwrap()["content"][0]["text"], "released");
+        runtime.unload().await;
     }
 
     #[tokio::test]

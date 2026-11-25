@@ -560,12 +560,17 @@ fn about(app:&Hermes)->Element<'_,Message>{
     let card=|content:Element<'static,Message>|container(content).padding([12,12]).width(Fill)
         .style(move|_|container::Style{background:Some(Color{a:0.35,..p.secondary}.into()),border:Border{radius:8.0.into(),width:1.0,color:Color{a:0.7,..p.border}},..Default::default()});
     let heading=|label:&'static str,glyph:&'static str|row![icon(glyph,16.0,p.muted),text(label).size(14).font(ui::medium())].spacing(8).align_y(Alignment::Center);
-    // Updates: this build has no self-updater, so say so and point to the source.
-    let updates=card(row![
-        column![text("This version of Hermes can’t update itself from inside the app.").size(13),
-            text("Rebuild from source to update this native build.").size(12).color(p.muted)].spacing(3).width(Fill),
-        button(text("Release notes").size(12)).padding([5,10]).style(ui::quiet_button).on_press(Message::Link("https://github.com/NousResearch/hermes-agent/releases".into())),
-    ].spacing(12).align_y(Alignment::Center).into());
+    let state=&app.updates;
+    let act=|action|Message::Updates(action);
+    let mut buttons=row![].spacing(8);
+    if state.update.is_some()&&state.saved.is_none() {buttons=buttons.push(button(text("Download update").size(12)).padding([5,10]).on_press_maybe((!state.busy).then(||act(super::updates::Action::Download))));}
+    if state.saved.is_some() {buttons=buttons.push(button(text(if cfg!(target_os="linux") {"Show in folder"} else {"Quit and install"}).size(12)).padding([5,10]).on_press_maybe((!state.busy).then(||act(super::updates::Action::Install))));}
+    buttons=buttons.push(button(text(if state.busy {"Working…"} else {"Check for updates"}).size(12)).padding([5,10]).style(ui::quiet_button).on_press_maybe((!state.busy).then(||act(super::updates::Action::Check))))
+        .push(button(text("Release notes").size(12)).padding([5,10]).style(ui::quiet_button).on_press(Message::Link("https://github.com/itsflownium/hermes-rust-rewrite/releases".into())));
+    let updates=card(column![
+        row![text(state.note.clone().unwrap_or_else(||"Hermes asks GitHub for a newer release only when you check.".into())).size(13).width(Fill),buttons].spacing(12).align_y(Alignment::Center),
+        iced::widget::checkbox(state.at_startup).label("Check when Hermes starts").on_toggle(move|on|act(super::updates::Action::AtStartup(on))).size(14).text_size(12),
+    ].spacing(10).into());
     let row_item=|label:&'static str,value:Element<'static,Message>|row![text(label).size(13).color(p.muted),Space::new().width(Fill),value].spacing(16).align_y(Alignment::Center);
     let plain=|value:String|->Element<'static,Message>{text(value).size(13).into()};
     let commit:Element<'static,Message>=button(text(revision[..revision.len().min(14)].to_owned()).size(12).font(iced::Font::MONOSPACE).color(p.accent))

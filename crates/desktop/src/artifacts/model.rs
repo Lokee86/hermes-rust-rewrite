@@ -609,7 +609,7 @@ pub fn load(library: &Library, live: Option<(SessionSummary, History)>) -> Resul
             {
                 history.clone()
             } else {
-                read_json(&directory.join("conversation.json"))?
+                hermes_engine::read_history(&directory).map_err(|error| format!("{error:#}"))?
             };
             let mut messages = if directory.join("hermes-source.json").is_file() {
                 archive_messages(&read_json(&directory.join("hermes-source.json"))?, &base)

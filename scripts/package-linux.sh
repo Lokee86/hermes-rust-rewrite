@@ -34,3 +34,27 @@ for notice in crates/desktop/assets/fonts/*NOTICE.txt crates/desktop/assets/font
   if [ -f "$notice" ]; then install -m644 "$notice" "$stage/share/licenses/hermes/"; fi
 done
 tar -C "$build" -czf "$destination/Hermes-linux-$(uname -m).tar.gz" Hermes
+# The same files as a Debian package, under /opt with a launcher on the path.
+if command -v dpkg-deb >/dev/null; then
+    version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+    deb="$build/deb"
+    install -d "$deb/DEBIAN" "$deb/opt" "$deb/usr/bin" "$deb/usr/share/applications" "$deb/usr/share/icons/hicolor/512x512/apps"
+    cp -a "$stage" "$deb/opt/hermes-rust"
+    ln -s /opt/hermes-rust/bin/hermes "$deb/usr/bin/hermes-rust"
+    cp "$stage"/share/icons/hicolor/512x512/apps/*.png "$deb/usr/share/icons/hicolor/512x512/apps/"
+    for entry in "$stage"/share/applications/*.desktop; do
+        sed 's|^Exec=[^ ]*|Exec=/opt/hermes-rust/bin/hermes|' "$entry" > "$deb/usr/share/applications/$(basename "$entry")"
+    done
+    cat > "$deb/DEBIAN/control" <<CONTROL
+Package: hermes-rust
+Version: $version
+Architecture: $(dpkg --print-architecture)
+Maintainer: itsflownium <157689911+itsflownium@users.noreply.github.com>
+Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, libasound2t64 | libasound2, libxdo3, libdbus-1-3, libxkbcommon-x11-0
+Section: utils
+Priority: optional
+Description: Hermes desktop, the community Rust rewrite
+CONTROL
+    chmod -R u+rwX,go+rX,go-w "$deb"
+    dpkg-deb --root-owner-group --build "$deb" "$destination/Hermes-linux-$(dpkg --print-architecture).deb" >/dev/null
+fi

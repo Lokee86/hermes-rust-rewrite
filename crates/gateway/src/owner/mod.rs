@@ -160,20 +160,22 @@ impl OwnerConnection {
             self.native,
             "Manage the stock gateway with its own service controls"
         );
-        self.request("rust.stop", self.identity()).await?;
-        self.wait_stopped().await
+        // An owner that is already on its way out can close the connection instead of answering.
+        // Whether it is gone decides the outcome.
+        let refused = self.request("rust.stop", self.identity()).await.err();
+        self.wait_stopped(refused).await
     }
-    async fn wait_stopped(&self) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(8);
+    async fn wait_stopped(&self, refused: Option<anyhow::Error>) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(if refused.is_some() { 2 } else { 8 });
         loop {
             // A draining owner can close a control connection without answering it (on Unix
             // the listener's backlog is dropped), which means it is not gone yet.
             match discover(Path::new(&self.profile)).await {
                 Ok(owner) if owner.as_ref().is_none_or(|o| o.instance != self.instance) => return Ok(()),
-                Err(e) if Instant::now() >= deadline => return Err(e.context("Gateway is still shutting down")),
+                Err(e) if Instant::now() >= deadline => return Err(refused.unwrap_or(e).context("Gateway is still shutting down")),
+                Ok(_) if Instant::now() >= deadline => return Err(refused.unwrap_or_else(|| anyhow::anyhow!("Gateway is still shutting down"))),
                 _ => {}
             }
-            ensure!(Instant::now() < deadline, "Gateway is still shutting down");
             sleep(Duration::from_millis(80)).await;
         }
     }
@@ -346,7 +348,7 @@ pub async fn ensure_configured(root: &Path, provider: &Config) -> Result<OwnerCo
         let reply = owner.request("rust.configure-provider", params).await?;
         if reply["configured"] == true { return Ok(owner); }
         ensure!(reply["stopping"] == true, "The gateway did not acknowledge provider configuration");
-        owner.wait_stopped().await?;
+        owner.wait_stopped(None).await?;
     }
     bail!("Another client changed the provider; retry your selection")
 }

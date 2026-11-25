@@ -535,7 +535,7 @@ fn spawn_tree(app: &Hermes) -> Element<'_, Message> {
             if !agent.preview.is_empty() && agent.status == "running" { card = card.push(text(short(&agent.preview, 220)).size(11).color(p.muted)); }
             if open {
                 if let Some(summary) = &agent.summary { card = card.push(container(text(summary.clone()).size(12)).padding(8).width(Fill).style(move |_| ui::panel(p.secondary, 4.0, None))); }
-                if let Ok(history) = std::fs::read(agent.session_dir.join("conversation.json")).map_err(|_| ()).and_then(|b| serde_json::from_slice::<hermes_engine::History>(&b).map_err(|_| ())) {
+                if let Ok(history) = hermes_engine::read_history(&agent.session_dir) {
                     for entry in history.turns.iter().flat_map(|t| &t.entries) {
                         let line = match entry {
                             Entry::Assistant { calls, .. } if !calls.is_empty() => calls.iter().map(|c| format!("→ {}", c.name)).collect::<Vec<_>>().join("  "),

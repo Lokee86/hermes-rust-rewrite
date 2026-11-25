@@ -915,15 +915,16 @@ mod publication_tests {
         library.create_bot("Grace", "", "", "").unwrap();
         let result = gateway.shared.resume_parked(&json!({"session_id":chat.id,"admission_id":id}), &peer).await.unwrap();
         assert_eq!(result["admission_id"], id);
-        let view = lock(&session.view);
-        assert_eq!(view.authority.receipts.len(), 3);
-        assert_eq!(view.authority.receipts[0].status, "unknown");
-        assert_eq!(view.authority.receipts[1].id, id);
-        assert_eq!(view.authority.receipts[1].group.as_ref().unwrap().name, "ada");
-        assert_eq!(view.authority.receipts[2].group.as_ref().unwrap().name, "grace");
-        assert_eq!(view.authority.receipts[2].group.as_ref().unwrap().round, id);
-        assert!(view.history.turns.is_empty());
-        drop(view);
+        {
+            let view = lock(&session.view);
+            assert_eq!(view.authority.receipts.len(), 3);
+            assert_eq!(view.authority.receipts[0].status, "unknown");
+            assert_eq!(view.authority.receipts[1].id, id);
+            assert_eq!(view.authority.receipts[1].group.as_ref().unwrap().name, "ada");
+            assert_eq!(view.authority.receipts[2].group.as_ref().unwrap().name, "grace");
+            assert_eq!(view.authority.receipts[2].group.as_ref().unwrap().round, id);
+            assert!(view.history.turns.is_empty());
+        }
         drop(session);
         gateway.shutdown().await.unwrap();
     }

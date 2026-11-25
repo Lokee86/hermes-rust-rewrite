@@ -57,6 +57,8 @@ impl Host {
     pub(crate) fn restore(host: &Arc<Self>) {
         let host = host.clone();
         tokio::spawn(async move {
+            // The previous owner's lease can outlive it by a moment; a network fault lasts longer.
+            let mut wait = Duration::from_millis(250);
             loop {
                 if host.shutdown.is_cancelled() {
                     return;
@@ -70,7 +72,7 @@ impl Host {
                     Err(_) => {
                         tokio::select! {
                             _ = host.shutdown.cancelled() => return,
-                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            _ = tokio::time::sleep(wait) => wait = (wait * 2).min(Duration::from_secs(5)),
                         }
                     }
                 }

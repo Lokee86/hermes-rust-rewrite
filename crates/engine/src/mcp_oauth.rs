@@ -34,7 +34,7 @@ fn save(path: &Path, state: &Value) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let temp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600))?; }
-    serde_json::to_writer(temp.as_file(), state)?;
+    std::io::Write::write_all(&mut temp.as_file(), crate::secret::seal(dir, &serde_json::to_string(state)?)?.as_bytes())?;
     temp.persist(path)?;
     Ok(())
 }
@@ -118,8 +118,8 @@ pub fn wait_for_code(listener: TcpListener, state: &str) -> Result<String> {
 /// A usable bearer token for this server, refreshed when close to expiry; None when never signed in.
 pub(crate) async fn token(data: &Path, server: &str) -> Result<Option<String>> {
     let path = token_path(data, server);
-    let Ok(bytes) = std::fs::read(&path) else { return Ok(None) };
-    let mut state: Value = serde_json::from_slice(&bytes)?;
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
+    let mut state: Value = serde_json::from_str(&crate::secret::unseal(text.trim())?)?;
     if state["expires_at"].as_i64().unwrap_or(0) > now() + 60 { return Ok(state["access_token"].as_str().map(str::to_owned)); }
     let Some(refresh) = state["refresh_token"].as_str().map(str::to_owned) else { return Ok(None) };
     let endpoint = https(state["token_endpoint"].as_str().context("No token endpoint")?)?;

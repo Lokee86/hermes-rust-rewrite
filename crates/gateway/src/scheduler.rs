@@ -173,6 +173,32 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
                 store.finish(&claim, Outcome::Cancelled { reason: "Stopped by the user".into() }, chrono::Utc::now())?;
                 return Ok(());
             }
+            let outside_agent = cron::has_preflight(&claim.job);
+            if outside_agent && claim.run.status != RunStatus::Claimed {
+                // A started script can have effects without an agent receipt.
+                // Preserve its run identity and never execute it again after recovery.
+                fail_unadmitted(&store, &claim, "Hermes restarted while this job's script was running")?;
+                return Ok(());
+            }
+            let mut prompt = claim.job.prompt.clone();
+            if outside_agent {
+                if let Err(error) = store.begin(&claim, chrono::Utc::now()) {
+                    fail_unadmitted(&store, &claim, format!("{error:#}"))?;
+                    return Ok(());
+                }
+                match cron::preflight_with_cancel(&store, &claim, &shared.shutdown).await {
+                    Ok(cron::Preflight::Agent(text)) => prompt = text,
+                    Ok(cron::Preflight::Done(output)) => {
+                        store.finish(&claim, Outcome::Completed { output }, chrono::Utc::now())?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        if shared.shutdown.is_cancelled() { return Ok(()); }
+                        fail_unadmitted(&store, &claim, format!("{error:#}"))?;
+                        return Ok(());
+                    }
+                }
+            }
             let mut config = shared.provider.clone();
             let workspace = match prepare_workspace(&store, &claim, &mut config) {
                 Ok(workspace) => workspace,
@@ -182,13 +208,13 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
                 Ok(session) => session,
                 Err(error) => { fail_unadmitted(&store, &claim, format!("{error:#}"))?; return Ok(()); }
             };
-            if claim.run.status == RunStatus::Claimed
+            if claim.run.status == RunStatus::Claimed && !outside_agent
                 && let Err(error) = store.begin(&claim, chrono::Utc::now())
             {
                 fail_unadmitted(&store, &claim, format!("{error:#}"))?;
                 return Ok(());
             }
-            if let Err(error) = shared.submit_background(session.clone(), claim.job.prompt.clone(), submission.clone(), !claim.run.manual).await {
+            if let Err(error) = shared.submit_background(session.clone(), prompt, submission.clone(), !claim.run.manual).await {
                 // A failed directory sync can follow a successful atomic write.
                 // Re-read the receipt before declaring that no work was admitted.
                 let record = read_record(&session.dir)?;
@@ -218,7 +244,7 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
     }
     let outcome = match turn {
         Some(turn) => match turn.status {
-            hermes_engine::Status::Complete => Outcome::Completed { output: turn.entries.iter().filter_map(|entry| if let hermes_engine::Entry::Assistant { text, .. } = entry { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\\n") },
+            hermes_engine::Status::Complete => Outcome::Completed { output: turn.entries.iter().filter_map(|entry| if let hermes_engine::Entry::Assistant { text, .. } = entry { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n") },
             hermes_engine::Status::Interrupted => Outcome::Cancelled { reason: "Stopped by the user".into() },
             hermes_engine::Status::Failed(error) => Outcome::Failed { error },
             hermes_engine::Status::Running => Outcome::Failed { error: "Run ended without a terminal status".into() },
@@ -263,8 +289,12 @@ mod tests {
     }
 
     async fn bound_claim(gateway: &RunningGateway) -> (Claim, Arc<LiveSession>) {
+        bound_claim_for(gateway, cron::Draft { prompt: "scheduled".into(), paused: true, ..Default::default() }).await
+    }
+
+    async fn bound_claim_for(gateway: &RunningGateway, draft: cron::Draft) -> (Claim, Arc<LiveSession>) {
         let store = &gateway.shared.scheduler;
-        let job = store.create(cron::Draft { prompt: "scheduled".into(), paused: true, ..Default::default() }, chrono::Utc::now()).unwrap();
+        let job = store.create(draft, chrono::Utc::now()).unwrap();
         let claim = store.claim_gateway_now(&job.id, "manual", chrono::Utc::now()).unwrap();
         let mut config = gateway.shared.provider.clone();
         let workspace = prepare_workspace(store, &claim, &mut config).unwrap();
@@ -449,5 +479,82 @@ mod tests {
         drop(routine);
         gateway.shutdown().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_script_only_job_finishes_without_the_model() {
+        use hermes_engine::cron::{Draft, RunStatus};
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("scripts")).unwrap();
+        fs::write(dir.path().join("scripts/report.py"), "print('disk ok')").unwrap();
+        let view = Store::open_view(dir.path()).unwrap();
+        let job = view.create(Draft { script: "report.py".into(), no_agent: true, paused: true, ..Draft::default() }, chrono::Utc::now()).unwrap();
+        assert_eq!(job.title(), "report.py");
+        let draft = job.draft();
+        assert!(draft.no_agent && draft.script == "report.py");
+        // Nothing listens here: a model request would fail the run.
+        let config = Config { base_url: "http://127.0.0.1:1/v1".into(), model: "fixture".into(), api_key: String::new() };
+        let gateway = Gateway::start(GatewayConfig::new(dir.path(), config)).await.unwrap();
+        gateway.shared.scheduler.claim_gateway_now(&job.id, "manual-script", chrono::Utc::now()).unwrap();
+        gateway.shared.scheduler_notify.notify_one();
+        let run = timeout(Duration::from_secs(30), async { loop {
+            let run = view.runs(&job.id).unwrap().remove(0);
+            if !run.status.live() { break run; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }}).await.unwrap();
+        assert_eq!(run.status, RunStatus::Completed, "{}", run.output);
+        assert_eq!(run.output, "disk ok");
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_admitted_script_job_recovers_without_repeating_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let (claim, session) = bound_claim_for(&gateway, cron::Draft {
+            prompt: "scheduled".into(), script: "missing-after-restart.py".into(), paused: true,
+            ..Default::default()
+        }).await;
+        let submission = format!("cron:{}", claim.run.id);
+        gateway.shared.submit_background(session.clone(), "scheduled".into(), submission.clone(), false).await.unwrap();
+        wait_for_receipt(&gateway.shared, &session, &submission, "terminal").await;
+        run(gateway.shared.clone(), gateway.shared.scheduler.clone(), claim.clone()).await.unwrap();
+        assert_eq!(gateway.shared.scheduler.runs(&claim.job.id).unwrap()[0].status, RunStatus::Completed);
+        assert_eq!(lock(&session.view).history.turns.len(), 1);
+        drop(session);
+        gateway.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_preflight_and_restart_does_not_repeat_its_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join("scripts");
+        fs::create_dir(&scripts).unwrap();
+        fs::write(scripts.join("slow.py"), "from pathlib import Path\nimport time\np = Path(__file__).with_name('starts')\np.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\ntime.sleep(30)\n").unwrap();
+        let view = Store::open_view(dir.path()).unwrap();
+        let job = view.create(cron::Draft {
+            script: "slow.py".into(), no_agent: true, paused: true, ..Default::default()
+        }, chrono::Utc::now()).unwrap();
+        let config = Config { base_url: "http://127.0.0.1:1/v1".into(), model: "fixture".into(), api_key: String::new() };
+        let gateway = Gateway::start(GatewayConfig::new(dir.path(), config.clone())).await.unwrap();
+        gateway.shared.scheduler.claim_gateway_now(&job.id, "manual-script", chrono::Utc::now()).unwrap();
+        gateway.shared.scheduler_notify.notify_one();
+        timeout(Duration::from_secs(10), async {
+            while fs::read_to_string(scripts.join("starts")).ok().as_deref() != Some("1") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        timeout(Duration::from_secs(5), gateway.shutdown()).await.unwrap().unwrap();
+        assert_eq!(view.runs(&job.id).unwrap()[0].status, RunStatus::Running);
+        let gateway = Gateway::start(GatewayConfig::new(dir.path(), config)).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while view.runs(&job.id).unwrap()[0].status.live() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(view.runs(&job.id).unwrap()[0].status, RunStatus::Failed);
+        assert_eq!(fs::read_to_string(scripts.join("starts")).unwrap(), "1");
+        gateway.shutdown().await.unwrap();
     }
 }

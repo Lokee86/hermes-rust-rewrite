@@ -1,11 +1,13 @@
 //! Profile-scoped, in-app scheduled prompts, ported from public Hermes cron.
 //! No daemon or system crontab is installed. Every run has an independent Session;
 //! unattended tools are denied by the caller and foreground calls require approval.
-//! Script/monitor execution and external-platform delivery are not implemented.
+//! External-platform delivery is not implemented.
 mod runner;
 mod schedule;
+mod script;
 mod store;
 pub use runner::{execute, prepare_job};
+pub use script::{Preflight, has_preflight, preflight, preflight_with_cancel};
 pub use schedule::{Schedule, instant, stamp};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -99,6 +101,9 @@ impl Job {
             catch_up: self.catch_up,
             grace_minutes: self.grace_minutes,
             paused: !self.enabled,
+            script: script::field(self, "script").unwrap_or_default().into(),
+            no_agent: script::no_agent(self),
+            monitor: script::field(self, "monitor_script").or(script::field(self, "monitor_url")).unwrap_or_default().into(),
         }
     }
 }
@@ -116,6 +121,12 @@ pub struct Draft {
     pub catch_up: Option<bool>,
     pub grace_minutes: Option<u32>,
     pub paused: bool,
+    /// A file in the profile's `scripts` folder, run before the agent.
+    pub script: String,
+    /// The script is the whole job.
+    pub no_agent: bool,
+    /// A script or web address watched for changes.
+    pub monitor: String,
 }
 impl Default for Draft {
     fn default() -> Self {
@@ -132,6 +143,9 @@ impl Default for Draft {
             catch_up: None,
             grace_minutes: None,
             paused: false,
+            script: String::new(),
+            no_agent: false,
+            monitor: String::new(),
         }
     }
 }

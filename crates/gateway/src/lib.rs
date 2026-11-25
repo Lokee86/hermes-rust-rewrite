@@ -12,6 +12,7 @@ mod profile_memory;
 mod python_history;
 mod python_memory;
 mod slash_commands;
+mod methods;
 
 mod auth;
 mod rest;
@@ -554,6 +555,23 @@ impl Shared {
         }
     }
 
+    /// Stop plugins of bots that were deleted, so their folders can be removed, and disabled ones.
+    async fn retire_other_plugin_profiles(&self) {
+        let roster = self.library.bots().ok().map(|bots| {
+            bots.iter().filter_map(|bot| self.library.bot_profile(&bot.name).ok()).collect::<std::collections::HashSet<_>>()
+        });
+        let mut live = Vec::new();
+        let mut gone = Vec::new();
+        // An unreadable roster says nothing about which bots exist.
+        self.other_plugin_profiles.lock().await.retain(|path, runtime| {
+            let keep = roster.as_ref().is_none_or(|roster| roster.contains(path));
+            if keep { live.push(runtime.clone()) } else { gone.push(runtime.clone()) }
+            keep
+        });
+        for runtime in gone { runtime.unload().await; }
+        for runtime in live { runtime.retire_stale().await; }
+    }
+
     async fn plugin_runtime(&self, profile: &Path) -> Arc<hermes_engine::plugins::PluginRuntime> {
         if profile == self.library.root() {
             return self.plugins.clone();
@@ -782,7 +800,7 @@ impl Shared {
                 json!({"instance_id":self.instance_id,"profile_id":self.profile_id,"authority_epoch":self.authority_epoch,"capabilities":RUNTIME_CAPABILITIES,"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
             ),
             "rpc.discover" => Ok(
-                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS,"limitations":["one running turn per session","steer and redirect are not implemented","event replay is bounded to the current process"]}),
+                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).collect::<Vec<_>>(),"limitations":["one running turn per session","steer and redirect are not implemented","event replay is bounded to the current process"]}),
             ),
             "gateway.capabilities" => Ok(json!({"per_session_exclusive_submit":true})),
             "client.capabilities" => Ok(
@@ -957,11 +975,7 @@ impl Shared {
                 }
                 Ok(json!({"closed":true}))
             }
-            _ => Err(RpcError::new(
-                -32601,
-                "method_not_found",
-                format!("Method not implemented by the Rust gateway: {method}"),
-            )),
+            _ => self.profile_method(method, params, peer).await,
         }
     }
 
@@ -1932,19 +1946,15 @@ fn tool_names() -> Vec<String> {
 fn shorten(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
 }
-#[derive(Default, Deserialize)]
 struct StoredConversation {
-    #[serde(flatten)]
     history: History,
     authority: Option<Authority>,
 }
 
 fn read_record(dir: &Path) -> Result<StoredConversation> {
-    match fs::read(dir.join("conversation.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("Could not read conversation history"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StoredConversation::default()),
-        Err(e) => Err(e.into()),
-    }
+    let (history, authority) = hermes_engine::read_conversation(dir)?;
+    let authority = authority.map(serde_json::from_value).transpose().context("Could not read conversation state")?;
+    Ok(StoredConversation { history, authority })
 }
 
 fn read_history(dir: &Path) -> Result<History> {
