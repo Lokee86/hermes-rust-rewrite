@@ -64,6 +64,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 17. Implement QQ Bot and verify the official QQ Gateway, four authorized conversation shapes, keyboard controls, reply quotas and native media. [QQ Bot spec](crates/gateway/QQBOT_ADAPTER_SPEC.md)
 18. Implement LINE and verify signed webhook batches, reply-token and slow-result workflows, bounded media serving and metered push. [LINE spec](crates/gateway/LINE_ADAPTER_SPEC.md)
 19. Implement SimpleX and verify the private daemon, direct and group scopes, durable missed-item recovery and XFTP transfers. [SimpleX spec](crates/gateway/SIMPLEX_ADAPTER_SPEC.md)
+20. Implement IRC and verify TLS network setup, plain-text channels and DMs, optional IRCv3 continuity and qualified send evidence. [IRC spec](crates/gateway/IRC_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 

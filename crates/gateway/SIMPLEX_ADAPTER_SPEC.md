@@ -1,6 +1,6 @@
 # SimpleX Chat stock plugin implementation spec
 
-Register SimpleX Chat as a bundled Rust adapter with platform key `simplex`. Start after LINE and the shared gate. A headless profile uses an operator-managed SimpleX daemon to serve approved contacts and groups, exchange native XFTP attachments, and send queued or scheduled results within the same protected chat. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [LINE spec](LINE_ADAPTER_SPEC.md) · [Hermes SimpleX guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/simplex.md)
+Register SimpleX Chat as a bundled Rust adapter with platform key `simplex`. Start after LINE and the shared gate. A headless profile uses an operator-managed SimpleX daemon to serve approved contacts and groups, exchange native XFTP attachments, and send queued or scheduled results within the same protected chat. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [LINE spec](LINE_ADAPTER_SPEC.md) · [Hermes SimpleX guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/simplex.md) · [Next adapter, IRC](IRC_ADAPTER_SPEC.md)
 
 ## Daemon ownership and intake
 
