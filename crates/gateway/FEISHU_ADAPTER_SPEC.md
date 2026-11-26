@@ -1,6 +1,6 @@
 # Feishu/Lark stock plugin implementation spec
 
-Register one bundled Rust adapter as `feishu` for Feishu and Lark. Start after Google Chat passes live acceptance and the expanded shared contract passes conformance. An installed bot can serve authorized chats and threads, respond to native cards and share rich posts and files. Optional provider document and meeting events use normal native authority with their own grants. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Google Chat spec](GOOGLE_CHAT_ADAPTER_SPEC.md) · [Hermes Feishu/Lark guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/feishu.md)
+Register one bundled Rust adapter as `feishu` for Feishu and Lark. Start after Google Chat passes live acceptance and the expanded shared contract passes conformance. An installed bot can serve authorized chats and threads, respond to native cards and share rich posts and files. Optional provider document and meeting events use normal native authority with their own grants. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Google Chat spec](GOOGLE_CHAT_ADAPTER_SPEC.md) · [Hermes Feishu/Lark guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/feishu.md) · [Next adapter, DingTalk](DINGTALK_ADAPTER_SPEC.md)
 
 ## Registration and intake
 
