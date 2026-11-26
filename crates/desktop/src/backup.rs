@@ -237,7 +237,7 @@ impl State {
 pub(super) fn view(app: &Hermes) -> Element<'_, Message> {
     let state = &app.backup;
     let p = ui::palette(app.dark);
-    let running = app.running || app.scheduled.has_running_jobs();
+    let running = app.running;
     let mut content=column![
         heading("archive","Back up this agent",app.dark),
         row![text("Save the native profile to one private file. Includes conversations, attachment snapshots, imported-history copies, saved drafts, project metadata, and recovery copies of native settings, memory and schedules.").size(12).color(p.muted).width(Fill),

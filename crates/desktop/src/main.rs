@@ -18,7 +18,6 @@ mod reasoning;
 mod voice;
 mod terminal;
 mod artifacts;
-mod queue;
 mod statusbar;
 mod appearance;
 mod tabs;
@@ -71,7 +70,7 @@ mod pets;
 mod routine_chats;
 mod gateway_oauth;
 
-use hermes_engine::{CancellationToken, Config, Entry, Event, History, Session, ToolCall, portal};
+use hermes_engine::{CancellationToken, Config, Entry, History, Session, ToolCall, portal};
 use hermes_library::{ArchiveFilter, Library, Project, SessionQuery, SessionSource, SessionSummary};
 use iced::{Element, Subscription, Task, Theme, keyboard, widget::{self, markdown, text_editor}};
 use serde::{Deserialize, Serialize};
@@ -195,7 +194,7 @@ impl Preferences {
 enum Message {
     Hud(hud::Action), SyncTick, #[cfg(feature = "ui-test")] HudTestInput, WindowClose(iced::window::Id), Account(accounts::Action), OpenInWindow(String), SubagentOpen(Option<String>), QuickEntry(quick_entry::Action), Overlay(overlays::Action), Pet(pets::Action), OpenRoutineChat(String), Cron(CronUi), Webhook(webhooks::Action), Profile(profiles::Action), Starmap(starmap::Action), WindowId(Option<iced::window::Id>), WebviewBounds(Option<iced::Rectangle>), WebviewTick, Slash(slash::Action), Onboarding(onboarding::Action), PortalAccent(shell_art::Accent), PortalArtwork(shell_art::Artwork), Connection(connections::Action), Bot(bots::Action), Reasoning(reasoning::Action), Notification(notifications::Action), Billing(billing::Action), Capability(capabilities::Action),
     Edit(text_editor::Action), Send, Stop,
-    Engine(u64, Event), Finished(u64, History, Result<(), String>), Approve(String, u64, bool), Gateway(u64, remote::Update),
+    Approve(String, u64, bool), Gateway(u64, remote::Update),
     NewChat, SelectChat(String), Search(String), Navigate(Screen), GatewayQueue(String, String, chat_view::QueueAction),
     ChoosePortal(bool), BaseUrl(String), Model(String), ApiKey(String), SaveProvider,
     Models(models::Action),
@@ -206,18 +205,16 @@ enum Message {
     ArchiveResults(ArchiveScope, Result<serde_json::Value, String>), DismissArchiveResults, OpenPluginPage(plugin_pages::Page), OpenPluginLink(String), Updates(updates::Action),
     FolderChosen(Result<Option<PathBuf>, String>), Dismiss,
     RenameStart, RenameChanged(String), RenameSave, Copy(String), Link(String),
-    Scrolled(bool), JumpToLatest, Shortcut(keyboard::Event),
+    Scrolled(bool), JumpToLatest,
     Files(files::Action), Git(git::GitMessage), Import(imports::Message), Close,
     SystemTheme(iced::theme::Mode), ToggleSidebar, FlipPanes, ToggleLayout, ToggleAttach, DragWindow,
     SettingsView(settings::View),
     SettingsSearch(String), ProfileSetting(profile_settings::Action), Checkpoint(checkpoint_ui::Action),
-    SettingsApply,
     Terminal(terminal::Action), OpenAgentTerminal(String), Artifacts(artifacts::Message), Scheduled(scheduled::Action), Messaging(messaging::Message), LocalGateway(local_gateway::Action), Backup(backup::Action),
     Attachment(attachments::Action),
     ToggleBackdrop, BackdropLoaded(Result<iced::widget::image::Handle,String>),
     DraftIdle(u64), IntroSize(iced::Size),
-    QueueCurrent, QueueRemove(u64), QueueSendNow(u64), QueueResume, QueuePause,
-    QueueEdit(u64), QueueEditChanged(String), QueueEditSave, QueueEditCancel,
+    QueueCurrent, QueueResume, QueuePause,
     SessionMenu(String), TogglePin(String), ArchiveSession(String, bool),
     CatalogPinned(String, bool, Result<serde_json::Value, String>),
     CatalogSessionChanged(String, bool, Result<serde_json::Value, String>),
@@ -241,7 +238,7 @@ impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ApiKey(_) => "ApiKey([redacted])", Self::SyncTick => "SyncTick", #[cfg(feature = "ui-test")] Self::HudTestInput => "HudTestInput", Self::Edit(_) => "Edit", Self::Send => "Send", Self::Stop => "Stop",
-            Self::Engine(..) => "Engine", Self::Finished(..) => "Finished", Self::Approve(..) => "Approve", Self::Gateway(..) => "Gateway",
+            Self::Approve(..) => "Approve", Self::Gateway(..) => "Gateway",
             Self::NewChat => "NewChat", Self::SelectChat(_) => "SelectChat", Self::Search(_) => "Search", Self::GatewayQueue(..) => "GatewayQueue",
             Self::Navigate(_) => "Navigate", Self::ChoosePortal(_) => "ChoosePortal", Self::BaseUrl(_) => "BaseUrl",
             Self::Model(_) => "Model", Self::SaveProvider => "SaveProvider", Self::PortalStart => "PortalStart",
@@ -255,15 +252,15 @@ impl fmt::Debug for Message {
             Self::BrowseWorkspace => "BrowseWorkspace", Self::FolderChosen(_) => "FolderChosen", Self::ProjectDiscovery(_) => "ProjectDiscovery",
             Self::Dismiss => "Dismiss", Self::RenameStart => "RenameStart", Self::RenameChanged(_) => "RenameChanged",
             Self::RenameSave => "RenameSave", Self::Copy(_) => "Copy", Self::Link(_) => "Link",
-            Self::Scrolled(_) => "Scrolled", Self::JumpToLatest => "JumpToLatest", Self::Shortcut(_) => "Shortcut",
+            Self::Scrolled(_) => "Scrolled", Self::JumpToLatest => "JumpToLatest",
             Self::Files(_) => "Files", Self::Git(_) => "Git", Self::Import(_) => "Import", Self::Close => "Close",
             Self::SystemTheme(_) => "SystemTheme", Self::ToggleSidebar => "ToggleSidebar", Self::FlipPanes => "FlipPanes",
-            Self::Hud(_)=>"Hud", Self::WindowClose(_)=>"WindowClose", Self::Account(_)=>"Account", Self::OpenInWindow(_)=>"OpenInWindow", Self::SubagentOpen(_)=>"SubagentOpen", Self::QuickEntry(_)=>"QuickEntry", Self::Overlay(_)=>"Overlay", Self::Pet(_)=>"Pet", Self::OpenRoutineChat(_)=>"OpenRoutineChat", Self::Cron(_)=>"Cron", Self::Webhook(_)=>"Webhook", Self::Profile(_)=>"Profile", Self::Starmap(_)=>"Starmap", Self::WindowId(_)=>"WindowId", Self::WebviewBounds(_)=>"WebviewBounds", Self::WebviewTick=>"WebviewTick", Self::Slash(_)=>"Slash", Self::Onboarding(_)=>"Onboarding", Self::PortalAccent(_)=>"PortalAccent", Self::PortalArtwork(_)=>"PortalArtwork", Self::Connection(_)=>"Connection", Self::Bot(_)=>"Bot", Self::Reasoning(_)=>"Reasoning", Self::Notification(_)=> "Notification", Self::Billing(_)=>"Billing", Self::Capability(_)=>"Capability", Self::ToggleLayout => "ToggleLayout", Self::ToggleAttach => "ToggleAttach", Self::DragWindow => "DragWindow", Self::SettingsView(_) => "SettingsView", Self::SettingsSearch(_) => "SettingsSearch", Self::ProfileSetting(_) => "ProfileSetting", Self::SettingsApply => "SettingsApply",
+            Self::Hud(_)=>"Hud", Self::WindowClose(_)=>"WindowClose", Self::Account(_)=>"Account", Self::OpenInWindow(_)=>"OpenInWindow", Self::SubagentOpen(_)=>"SubagentOpen", Self::QuickEntry(_)=>"QuickEntry", Self::Overlay(_)=>"Overlay", Self::Pet(_)=>"Pet", Self::OpenRoutineChat(_)=>"OpenRoutineChat", Self::Cron(_)=>"Cron", Self::Webhook(_)=>"Webhook", Self::Profile(_)=>"Profile", Self::Starmap(_)=>"Starmap", Self::WindowId(_)=>"WindowId", Self::WebviewBounds(_)=>"WebviewBounds", Self::WebviewTick=>"WebviewTick", Self::Slash(_)=>"Slash", Self::Onboarding(_)=>"Onboarding", Self::PortalAccent(_)=>"PortalAccent", Self::PortalArtwork(_)=>"PortalArtwork", Self::Connection(_)=>"Connection", Self::Bot(_)=>"Bot", Self::Reasoning(_)=>"Reasoning", Self::Notification(_)=> "Notification", Self::Billing(_)=>"Billing", Self::Capability(_)=>"Capability", Self::ToggleLayout => "ToggleLayout", Self::ToggleAttach => "ToggleAttach", Self::DragWindow => "DragWindow", Self::SettingsView(_) => "SettingsView", Self::SettingsSearch(_) => "SettingsSearch", Self::ProfileSetting(_) => "ProfileSetting",
             Self::Terminal(_) => "Terminal", Self::OpenAgentTerminal(_) => "OpenAgentTerminal", Self::Artifacts(_) => "Artifacts",
             Self::ToggleBackdrop => "ToggleBackdrop", Self::BackdropLoaded(_) => "BackdropLoaded", Self::DraftIdle(_) => "DraftIdle", Self::IntroSize(_) => "IntroSize",
             Self::Attachment(_) => "Attachment", Self::Scheduled(_) => "Scheduled", Self::Messaging(_) => "Messaging", Self::LocalGateway(_) => "LocalGateway", Self::Backup(_) => "Backup",
-            Self::QueueCurrent => "QueueCurrent", Self::QueueRemove(_) => "QueueRemove", Self::QueueSendNow(_) => "QueueSendNow", Self::QueueResume => "QueueResume", Self::QueuePause => "QueuePause",
-            Self::QueueEdit(_) => "QueueEdit", Self::QueueEditChanged(_) => "QueueEditChanged", Self::QueueEditSave => "QueueEditSave", Self::QueueEditCancel => "QueueEditCancel",
+            Self::QueueCurrent => "QueueCurrent", Self::QueueResume => "QueueResume", Self::QueuePause => "QueuePause",
+           
             Self::SessionMenu(_) => "SessionMenu", Self::TogglePin(_) => "TogglePin", Self::ArchiveSession(..) => "ArchiveSession",
             Self::CatalogPinned(..) => "CatalogPinned", Self::CatalogSessionChanged(..) => "CatalogSessionChanged", Self::RenameFor(_) => "RenameFor", Self::ToggleSessionFilter => "ToggleSessionFilter", Self::ArchiveFilter(_) => "ArchiveFilter",
             Self::CommandSearch(_) => "CommandSearch", Self::CommandSource(_) => "CommandSource", Self::CommandRefresh => "CommandRefresh", Self::CommandOpenSession(_) => "CommandOpenSession",
@@ -281,7 +278,7 @@ impl fmt::Debug for Message {
     }
 }
 
-struct Approval { call: ToolCall, generation: u64, answer: Option<async_channel::Sender<bool>> }
+struct Approval { call: ToolCall, generation: u64 }
 struct Banner { text: String, error: bool }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -300,21 +297,20 @@ struct Hermes {
     config: Config, screen: Screen, search: String, workspace_path: String,
     workspace_rename: Option<(String, String)>,
     archive_results: Option<(ArchiveScope, Vec<(String, String)>)>,
-    banner: Option<Banner>, approvals: Vec<Approval>, chat: chat_view::View, cancellation: Option<CancellationToken>,
+    banner: Option<Banner>, approvals: Vec<Approval>, chat: chat_view::View,
     run_id: u64, running: bool, stopping: bool, follow_stream: bool, rename: Option<String>, browsing: bool,
     portal_login: Option<portal::DeviceLogin>, portal_cancel: Option<CancellationToken>, portal_starting: bool, portal_id: u64,
-    files: files::Files, git: git::GitPanel, imports: imports::ImportPanel, terminal: terminal::TerminalPane, artifacts: artifacts::Artifacts, closing: bool,
+    files: files::Files, git: git::GitPanel, imports: imports::ImportPanel, terminal: terminal::TerminalPane, artifacts: artifacts::Artifacts,
     dark: bool, sidebar_open: bool, flipped: bool, right_pane: Option<RightPane>, layout_menu: bool, attach_menu: bool,
     capabilities:capabilities::State, billing:billing::State, notifications:notifications::State, profile_settings:profile_settings::State, settings_view: settings::View,
     settings_query: String, fresh_draft: bool,
     models: models::State,
     voice: voice::State,
-    queue: queue::PromptQueue, draft_files: attachments::DraftFiles, queue_edit: Option<(u64, String)>, redirecting: bool,
+    draft_files: attachments::DraftFiles,
     session_menu: Option<String>, session_filter_menu: bool, archive_filter: ArchiveFilter, modifiers: keyboard::Modifiers,
     command_search: String, command_source: command_center::Source, command_sessions: Vec<SessionSummary>, command_error: Option<String>,
     reasoning:reasoning::State, return_to_composer:bool,
     /// Group chat: the members still to reply to the current message, in order.
-    group_round: Option<std::collections::VecDeque<String>>,
     hud: hud::State,
     sync: sync::State,
     /// A window opened with `--open-session`: it keeps no tab list and runs no background services.
@@ -353,18 +349,18 @@ impl Hermes {
             config: Preferences::load(), screen: Screen::Chat, search: String::new(), workspace_path: String::new(),
             workspace_rename: None,
             archive_results: None,
-            banner: None, approvals: vec![], chat: chat_view::View::default(), cancellation: None, run_id: 0, running: false, stopping: false,
+            banner: None, approvals: vec![], chat: chat_view::View::default(), run_id: 0, running: false, stopping: false,
             follow_stream: true, rename: None, browsing: false, portal_login: None, portal_cancel: None, portal_starting: false, portal_id: 0,
-            files: files::Files::new(), git: git::GitPanel::new(PathBuf::new()), imports: imports::ImportPanel::default(), terminal: terminal::TerminalPane::new(), artifacts: artifacts::Artifacts::default(), closing: false,
+            files: files::Files::new(), git: git::GitPanel::new(PathBuf::new()), imports: imports::ImportPanel::default(), terminal: terminal::TerminalPane::new(), artifacts: artifacts::Artifacts::default(),
             dark: false, sidebar_open: true, flipped: false, right_pane: None, layout_menu: false, attach_menu: false,
             capabilities:capabilities::State::default(), billing:billing::State::default(), notifications:notifications::State::default(), profile_settings:profile_settings::State::default(), settings_view: settings::View::default(),
             settings_query: String::new(), fresh_draft: false,
             models: models::State::default(),
             voice: voice::State::open(),
-            queue: queue::PromptQueue::default(), draft_files: attachments::DraftFiles::default(), queue_edit: None, redirecting: false,
+            draft_files: attachments::DraftFiles::default(),
             session_menu: None, session_filter_menu: false, archive_filter: ArchiveFilter::Active, modifiers: keyboard::Modifiers::default(),
             command_search: String::new(), command_source: command_center::Source::All, command_sessions: Vec::new(), command_error: None,
-            reasoning:reasoning::State::default(), return_to_composer:false, group_round: None, hud: hud::State::default(), sync: sync::State::default(), secondary: false, accounts: accounts::State::default(), webhooks: webhooks::State::default(), profiles: profiles::State::default(), starmap: starmap::State::default(), subagents: Vec::new(), subagent_open: None, quick_entry: quick_entry::State::default(), overlays: overlays::State::default(), pets: pets::State::default(), cron_ui: CronSidebar { open: true, visible: 3, ..Default::default() }, statusbar: statusbar::State::default(), bots: bots::State::default(), artwork: None, connections: connections::State::default(), onboarding: onboarding::State::default(), slash: slash::State::default(), webview: webview::Host::default(), plugin_page: None, updates: updates::State::open(),
+            reasoning:reasoning::State::default(), return_to_composer:false, hud: hud::State::default(), sync: sync::State::default(), secondary: false, accounts: accounts::State::default(), webhooks: webhooks::State::default(), profiles: profiles::State::default(), starmap: starmap::State::default(), subagents: Vec::new(), subagent_open: None, quick_entry: quick_entry::State::default(), overlays: overlays::State::default(), pets: pets::State::default(), cron_ui: CronSidebar { open: true, visible: 3, ..Default::default() }, statusbar: statusbar::State::default(), bots: bots::State::default(), artwork: None, connections: connections::State::default(), onboarding: onboarding::State::default(), slash: slash::State::default(), webview: webview::Host::default(), plugin_page: None, updates: updates::State::open(),
             appearance: appearance::State::default(), system_dark: false,
             tabs: tabs::State::default(),
             commands: commands::Commands::default(), palette_open_folder: false,
@@ -461,13 +457,15 @@ impl Hermes {
         (app, Task::batch(initial))
     }
     fn subscription(&self) -> Subscription<Message> {
+        // A tab drag ends wherever the button is released.
+        let tab_drag=if self.tabs.dragging.is_some() {iced::event::listen_with(|event,_,_|matches!(event,iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))).then_some(Message::Tab(tabs::Action::Release)))} else {Subscription::none()};
         let maintain=if self.profile_settings.saved.auto_archive {iced::time::every(std::time::Duration::from_secs(3600)).map(|_|Message::ProfileSetting(profile_settings::Action::Maintain))}else{Subscription::none()};
         let memory=if self.statusbar.preferences.visible && self.statusbar.shows("system-resources") {iced::time::every(std::time::Duration::from_secs(3)).map(|_|Message::Statusbar(statusbar::Action::Memory(None)))}else{Subscription::none()};
         let clock=if self.statusbar.preferences.visible && ((self.running && self.statusbar.shows("running-timer")) || self.statusbar.shows("session-timer")) {iced::time::every(std::time::Duration::from_secs(1)).map(|_|Message::Statusbar(statusbar::Action::Tick))}else{Subscription::none()};
         let preview=if self.screen==Screen::Artifacts && self.artifacts.html_preview().is_some() {iced::time::every(std::time::Duration::from_millis(500)).map(|_|Message::WebviewTick)}else{Subscription::none()};
         // The main window's id, for the native preview webview (window::latest can run before it opens).
         let window=iced::window::open_events().map(|id|Message::WindowId(Some(id)));
-        Subscription::batch([maintain,memory,clock,preview,window,iced::event::listen_with(notifications::focus),iced::event::listen_with(attachments::drop_event), iced::event::listen_with(palette_keyboard_event), iced::window::close_requests().map(Message::WindowClose), self.quick_entry.subscription(), if self.voice.preferences.wake_word && !self.voice.wake_listening { iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::Voice(voice::Action::WakeArm)) } else { Subscription::none() }, overlays::subscription(self), iced::event::listen_with(quick_entry_window_event), iced::system::theme_changes().map(Message::SystemTheme), self.scheduled.subscription().map(Message::Scheduled), sync::subscription(), self.hud.subscription().map(Message::Hud)])
+        Subscription::batch([tab_drag,maintain,memory,clock,preview,window,iced::event::listen_with(notifications::focus),iced::event::listen_with(attachments::drop_event), iced::event::listen_with(palette_keyboard_event), iced::window::close_requests().map(Message::WindowClose), self.quick_entry.subscription(), if self.voice.preferences.wake_word && !self.voice.wake_listening { iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::Voice(voice::Action::WakeArm)) } else { Subscription::none() }, overlays::subscription(self), iced::event::listen_with(quick_entry_window_event), iced::system::theme_changes().map(Message::SystemTheme), self.scheduled.subscription().map(Message::Scheduled), sync::subscription(), self.hud.subscription().map(Message::Hud)])
     }
     fn error(&mut self, text: impl Into<String>) { self.banner = Some(Banner { text: text.into(), error: true }); }
     fn note(&mut self, text: impl Into<String>) { self.banner = Some(Banner { text: text.into(), error: false }); }
@@ -523,9 +521,15 @@ impl Hermes {
         }
         Ok(())
     }
-    fn save_queue(&self) -> Result<(), String> {
-        if self.group_round.is_none() { return Ok(()); }
-        self.current.as_ref().map_or(Ok(()), |current| self.queue.save(&current.directory))
+    /// Read a finished reply aloud when the user asked for that (auto-read or a voice conversation).
+    fn read_finished_reply(&mut self) -> Task<Message> {
+        if (self.voice.preferences.auto_read || self.voice.conversation) && self.voice.speech_unavailable().is_none() && !self.voice.recording && !self.voice.authorizing && !self.voice.finishing
+            && let Some((turn_index, turn))=self.history.turns.iter().enumerate().next_back()
+            && turn.status==hermes_engine::Status::Complete
+            && let Some((entry_index,Entry::Assistant{text,..}))=turn.entries.iter().enumerate().rev().find(|(_,entry)|matches!(entry,Entry::Assistant{text,..} if !text.trim().is_empty())) {
+            return self.voice_update(voice::Action::Speak(format!("{turn_index}:{entry_index}"),text.clone()));
+        }
+        Task::none()
     }
     fn save_tabs(&mut self) {
         if self.secondary { return; }
@@ -535,23 +539,6 @@ impl Hermes {
     fn clear_draft_files(&mut self) {
         if !self.draft_files.files.is_empty() && let Some(current) = &self.current
             && let Err(error) = self.draft_files.replace(&current.directory, vec![]) { self.error(error); }
-    }
-    fn queue_from_composer(&mut self, front: bool) -> bool {
-        let prompt = self.composer.text().trim().to_owned();
-        if self.draft_files.pending > 0 { return false; }
-        let id = match self.queue.push(prompt, self.draft_files.files.clone(), front) { Ok(id) => id, Err(error) => { self.error(error); return false; } };
-        if let Err(error) = self.save_queue() {
-            self.queue.entries.retain(|entry| entry.id != id); self.error(format!("Could not save queued message: {error}")); return false;
-        }
-        self.clear_draft_files();
-        self.composer = text_editor::Content::new();
-        if let Err(error) = self.save_draft() { self.error(format!("Message queued, but draft could not be cleared: {error}")); }
-        true
-    }
-    fn cancel_response(&mut self) {
-        if let Some(cancel) = &self.cancellation { cancel.cancel(); }
-        for approval in self.approvals.drain(..) { if let Some(answer) = approval.answer { let _ = answer.try_send(false); } }
-        self.stopping = self.running;
     }
     fn rebuild_markdown(&mut self) {
         self.rendered = self.history.turns.iter().map(|turn| turn.entries.iter().map(|entry| match entry {
@@ -618,7 +605,7 @@ impl Hermes {
         self.voice.stop_all();
         if self.current.as_ref().is_some_and(|summary| draft_surface(summary, &self.history))
             && self.composer.text().trim().is_empty() && self.draft_files.files.is_empty()
-            && self.draft_files.pending == 0 && self.queue.entries.is_empty()
+            && self.draft_files.pending == 0
             && self.current.as_ref().is_some_and(|current| current.project_id.as_deref() == self.project.as_ref().map(|project| project.id.as_str())) {
             self.fresh_draft = true; self.screen = Screen::Chat;
             if let Some(current) = &self.current { self.tabs.activate(current, true); } self.save_tabs(); return;
@@ -647,19 +634,10 @@ impl Hermes {
         let prompt = self.composer.text().trim().to_owned();
         if let Some(task) = slash::run(self, &prompt) { return task; }
         if self.draft_files.pending>0 || (prompt.is_empty() && self.draft_files.files.is_empty()) { return Task::none(); }
-        if self.running && self.group_round.is_none() { return self.submit_gateway(prompt); }
-        if self.running {
-            if self.queue_from_composer(true) {
-                self.queue.parked = false; self.redirecting = true;
-                if let Err(error) = self.save_queue() { self.queue.parked = true; self.redirecting = false; self.error(error); return Task::none(); }
-                self.cancel_response();
-            }
-            return Task::none();
-        }
         self.submit_gateway(prompt)
     }
     fn palette_context(&self) -> commands::Context {
-        commands::Context { running: self.running, composer_has_text: !self.composer.text().trim().is_empty(), queued: !self.queue.entries.is_empty(), terminal_visible: self.right_pane == Some(RightPane::Terminal) }
+        commands::Context { running: self.running, composer_has_text: !self.composer.text().trim().is_empty(), queued: self.chat.pending_queue.iter().any(|entry| entry.status == "parked"), terminal_visible: self.right_pane == Some(RightPane::Terminal) }
     }
     fn refresh_palette_context(&mut self) {
         let context = self.palette_context();
@@ -720,7 +698,7 @@ impl Hermes {
             Action::Close(id) => {
                 let current = self.current.as_ref().is_some_and(|current| current.id == id);
                 if current && (self.running || self.draft_files.pending > 0) { self.note("This session is still working. Stop the response before closing its tab."); return Task::none(); }
-                if current && let Err(error) = self.save_draft().and_then(|_| self.save_queue()) { self.error(error); return Task::none(); }
+                if current && let Err(error) = self.save_draft() { self.error(error); return Task::none(); }
                 let previous = self.tabs.clone();
                 let next = self.tabs.close(&id);
                 if current {
@@ -731,7 +709,7 @@ impl Hermes {
                         } else { self.tabs = previous; self.error("Could not open the next session tab."); return Task::none(); }
                     } else {
                         self.current = None; self.session = None; self.history = History::default(); self.rebuild_markdown();
-                        self.composer = text_editor::Content::new(); self.queue = queue::PromptQueue::default(); self.queue_edit = None;
+                        self.composer = text_editor::Content::new();
                         self.create_chat();
                     }
                 }
@@ -758,11 +736,11 @@ impl Hermes {
             }
             Action::CloseAll => {
                 if self.running || self.draft_files.pending > 0 { self.note("Stop the current response before closing all session tabs."); return Task::none(); }
-                if let Err(error) = self.save_draft().and_then(|_| self.save_queue()) { self.error(error); return Task::none(); }
+                if let Err(error) = self.save_draft() { self.error(error); return Task::none(); }
                 let ids: Vec<_> = self.tabs.entries.iter().map(|tab| tab.id.clone()).collect();
                 for id in ids { self.tabs.close(&id); }
                 self.current = None; self.session = None; self.history = History::default(); self.rebuild_markdown();
-                self.composer = text_editor::Content::new(); self.queue = queue::PromptQueue::default(); self.queue_edit = None;
+                self.composer = text_editor::Content::new();
                 self.create_chat(); self.save_tabs();
             }
             Action::Reopen => {
@@ -888,7 +866,7 @@ impl Hermes {
         let draft_edit = matches!(&message, Message::BaseUrl(_) | Message::Model(_) | Message::ApiKey(_));
         let commit = matches!(&message, Message::SaveProvider | Message::Models(models::Action::SaveEndpoint | models::Action::ApplyProvider(_)));
         let alert=notifications::on_event(self,&message);
-        if self.hud.on && matches!(&message, Message::Edit(_) | Message::Send | Message::Engine(..)) { self.hud.touch(); }
+        if self.hud.on && matches!(&message, Message::Edit(_) | Message::Send | Message::Gateway(..)) { self.hud.touch(); }
         if matches!(&message,Message::Models(models::Action::Disconnected(_))|Message::PortalStart){self.billing.clear();}
         let work = self.update_inner(message);
         let changed = before != (self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone(), serde_json::json!(self.models.options));
@@ -956,73 +934,9 @@ impl Hermes {
             Message::Send => return self.send(),
             Message::Gateway(epoch, update) => { if epoch == self.run_id { return self.gateway_update(update); } }
             Message::GatewayQueue(sid, id, resume) => return self.change_pending(sid, id, resume),
-            Message::Stop => {
-                if self.group_round.is_none() { return self.interrupt_gateway(); }
-                self.queue.parked = true; self.redirecting = false;
-                if let Err(error) = self.save_queue() { self.error(error); }
-                self.cancel_response();
-            }
-            Message::Engine(id, event) if id == self.run_id && self.running => {
-                match event {
-                    Event::Snapshot(history) => {
-                        self.approvals.retain(|a|a.answer.as_ref().is_none_or(|tx| !tx.is_closed()));
-                        self.accept_snapshot(history);
-                        if self.queue.admitted(&self.history) && let Err(error) = self.save_queue() { self.error(error); }
-                    }
-                    Event::Text(delta) => {
-                        self.statusbar.streamed(delta.len());
-                        if let Some(turn) = self.history.turns.last_mut()
-                            && let Some(Entry::Assistant { text, .. }) = turn.entries.last_mut() {
-                            text.push_str(&delta);
-                            if let Some(items) = self.rendered.last_mut()
-                                && let Some(Some(content)) = items.last_mut() { content.push_str(&delta); }
-                        }
-                    }
-                    Event::Approval { call, answer } => self.approvals.push(Approval { call, generation: id, answer: Some(answer) }),
-                    Event::MemoryRecall(status) => self.show_memory_recall(status),
-                    Event::Clarification { .. } | Event::Correction { .. } => {}
-                    Event::Subagent(progress) => {
-                        let list = &mut self.subagents;
-                        match list.iter_mut().find(|p| p.id == progress.id) { Some(slot) => *slot = progress, None => list.push(progress) }
-                        return Task::none();
-                    }
-                }
-                if self.follow_stream { return widget::operation::snap_to_end(SCROLL_ID); }
-            }
-            Message::Finished(id, history, result) if id == self.run_id => {
-                self.accept_snapshot(history); self.running = false; self.stopping = false; self.statusbar.turn_finished();
-                self.cancellation = None; self.approvals.clear();
-                if let Err(error) = result { self.error(error); }
-                self.queue.settle(&self.history);
-                if self.history.turns.last().is_some_and(|turn| matches!(turn.status, hermes_engine::Status::Failed(_))) ||
-                    (!self.redirecting && self.history.turns.last().is_some_and(|turn| turn.status == hermes_engine::Status::Interrupted)) {
-                    self.queue.parked = true;
-                }
-                self.redirecting = false;
-                if let Err(error) = self.save_queue() { self.queue.parked = true; self.error(error); }
-                if let Some(library) = &self.library && let Some(current) = &self.current {
-                    match library.touch_session(&current.id) {
-                        Ok(updated) => self.current = Some(updated),
-                        Err(error) => self.error(format!("Could not update the chat library: {error:#}")),
-                    }
-                }
-                self.refresh_sessions();
-                if self.closing && !self.scheduled.has_running_jobs() { return iced::exit(); }
-
-                if (self.voice.preferences.auto_read || self.voice.conversation) && self.voice.speech_unavailable().is_none() && !self.voice.recording && !self.voice.authorizing && !self.voice.finishing
-                    && let Some((turn_index, turn))=self.history.turns.iter().enumerate().next_back()
-                    && turn.status==hermes_engine::Status::Complete
-                    && let Some((entry_index,Entry::Assistant{text,..}))=turn.entries.iter().enumerate().rev().find(|(_,entry)|matches!(entry,Entry::Assistant{text,..} if !text.trim().is_empty())) {
-                    let speech=self.voice_update(voice::Action::Speak(format!("{turn_index}:{entry_index}"),text.clone()));
-                    return Task::batch([speech,if self.follow_stream {widget::operation::snap_to_end(SCROLL_ID)} else {Task::none()}]);
-                }
-                if self.follow_stream { return widget::operation::snap_to_end(SCROLL_ID); }
-            }
-            Message::Engine(..) | Message::Finished(..) => {},
+            Message::Stop => return self.interrupt_gateway(),
             Message::Approve(prompt, generation, approved) => {
-                if self.group_round.is_none() { return self.answer_gateway(prompt, generation, approved); }
-                if let Some(index) = self.approvals.iter().position(|a| a.call.id == prompt && a.generation == generation)
-                    && let Some(answer) = self.approvals.remove(index).answer { let _ = answer.try_send(approved); }
+                return self.answer_gateway(prompt, generation, approved);
             }
             Message::NewChat if !self.running => { self.banner = None; self.create_chat(); return widget::operation::focus(COMPOSER_ID); }
             Message::SelectChat(id) => {
@@ -1033,7 +947,7 @@ impl Hermes {
                     self.screen = Screen::Chat;
                     self.fresh_draft = self.current.as_ref().is_some_and(|summary| draft_surface(summary, &self.history));
                 }
-                else if self.group_round.is_none() && let Some(summary) = self.find_chat(&id) {
+                else if let Some(summary) = self.find_chat(&id) {
                     self.banner = None; self.open_chat(summary);
                 }
                 return widget::operation::snap_to_end(SCROLL_ID);
@@ -1088,7 +1002,7 @@ impl Hermes {
             Message::ArchiveSession(id, archived) => {
                 let is_current = self.current.as_ref().is_some_and(|current| current.id == id);
                 if self.running && is_current { self.note("Stop the current response before archiving this session."); return Task::none(); }
-                if is_current && let Err(error) = self.save_draft().and_then(|_| self.save_queue()) { self.error(error); return Task::none(); }
+                if is_current && let Err(error) = self.save_draft() { self.error(error); return Task::none(); }
                 let summary = self.find_chat(&id).or_else(|| self.library.as_ref().and_then(|library| library.session(&id).ok()));
                 if summary.as_ref().is_some_and(|summary| summary.source == SessionSource::Native) {
                     match self.set_gateway_archive(id.clone(), archived) {
@@ -1103,7 +1017,7 @@ impl Hermes {
                             self.session_menu = None;
                             if archived && is_current {
                                 self.current = None; self.session = None; self.history = History::default(); self.rebuild_markdown();
-                                self.queue = queue::PromptQueue::default(); self.queue_edit = None; self.composer = text_editor::Content::new();
+                                self.composer = text_editor::Content::new();
                                 self.archive_filter = ArchiveFilter::Active; self.search.clear(); self.create_chat();
                             }
                             self.refresh_sessions();
@@ -1118,7 +1032,7 @@ impl Hermes {
                     self.session_menu = None;
                     if archived && is_current {
                         self.current = None; self.session = None; self.history = History::default(); self.rebuild_markdown();
-                        self.queue = queue::PromptQueue::default(); self.queue_edit = None; self.composer = text_editor::Content::new();
+                        self.composer = text_editor::Content::new();
                         self.archive_filter = ArchiveFilter::Active; self.search.clear(); self.create_chat();
                     } else if !archived && is_current {
                         if let Some(current) = &mut self.current { current.archived = false; }
@@ -1369,7 +1283,6 @@ impl Hermes {
             }
             Message::Scrolled(bottom) => self.follow_stream = bottom,
             Message::JumpToLatest => { self.follow_stream = true; return widget::operation::snap_to_end(SCROLL_ID); }
-            Message::Shortcut(event) => return self.dispatch_keyboard(event, iced::event::Status::Ignored),
             Message::Files(files::Action::OpenFolder) => { self.screen = Screen::Workspaces; return self.update(Message::BrowseWorkspace); }
             Message::Files(action) => return self.files.update(action).map(Message::Files),
             Message::Terminal(terminal::Action::AddToChat(selection)) => {
@@ -1471,15 +1384,11 @@ impl Hermes {
                 else if let Some(library) = &self.library && let Ok(summary) = library.session(&id) { self.open_chat(summary); self.screen = Screen::Chat; }
             }
             Message::Scheduled(action) => {
-                let task = self.scheduled.update(action, self.config.clone()).map(Message::Scheduled);
-                if self.closing && !self.scheduled.has_running_jobs() { return task.chain(iced::exit()); }
-                return task;
+                return self.scheduled.update(action, self.config.clone()).map(Message::Scheduled);
             }
             Message::LocalGateway(action) => {
                 let profile = self.library.as_ref().map(|library| library.root().to_path_buf());
-                let task = self.local_gateway.update(action, profile, self.config.clone()).map(Message::LocalGateway);
-                if self.closing && !self.scheduled.has_running_jobs() { return task.chain(iced::exit()); }
-                return task;
+                return self.local_gateway.update(action, profile, self.config.clone()).map(Message::LocalGateway);
             }
             Message::Git(action) => return self.git.update(action).map(Message::Git),
             Message::Import(action) => {
@@ -1498,9 +1407,9 @@ impl Hermes {
                 return Task::batch(tasks);
             }
             Message::Backup(action) => {
-                let running = self.running || self.scheduled.has_running_jobs();
+                let running = self.running;
                 if matches!(&action, backup::Action::Export | backup::Action::Import) && !running {
-                    if let Err(error) = self.save_draft().and_then(|_|self.save_queue()) { self.error(format!("Could not save current chat before backup: {error}")); return Task::none(); }
+                    if let Err(error) = self.save_draft() { self.error(format!("Could not save current chat before backup: {error}")); return Task::none(); }
                 }
                 let imported = matches!(&action, backup::Action::Imported(Ok(_)));
                 let task = self.backup.update(action, self.library.clone(), running).map(Message::Backup);
@@ -1530,8 +1439,6 @@ impl Hermes {
                 self.messaging.shutdown();
                 self.project_discovery.stop();
                 if let Some(cancel) = self.portal_cancel.take() { cancel.cancel(); }
-                if self.scheduled.has_running_jobs() { self.closing = true; self.scheduled.stop_all(); }
-                if self.scheduled.has_running_jobs() { return Task::none(); }
                 return iced::exit();
             }
             Message::SystemTheme(mode) => {
@@ -1633,11 +1540,6 @@ impl Hermes {
                 if view==settings::View::Memory{return profile_settings::load_memory_providers(self);}
                 if view==settings::View::Models && self.models.catalog.is_empty() && !self.models.loading && self.ready() {return self.update(Message::Models(models::Action::Refresh));} }
             Message::SettingsSearch(query) => self.settings_query = query,
-            Message::SettingsApply => {
-                if let Err(error) = self.config.validate() { self.error(error.to_string()); }
-                else if let Err(error) = Preferences::save(&self.config) { self.error(format!("Could not save settings: {error}")); }
-                else { self.note("Saved"); }
-            }
             Message::Statusbar(statusbar::Action::Memory(None)) if self.statusbar.shows("system-resources") => {
                 return Task::perform(async { tokio::task::spawn_blocking(statusbar::sample_memory).await.ok().flatten() },
                     |sample| Message::Statusbar(sample.map_or(statusbar::Action::Tick, |s| statusbar::Action::Memory(Some(s)))));
@@ -1663,66 +1565,30 @@ impl Hermes {
             }
             Message::QueueCurrent => {
                 if !self.running { return self.send(); }
-                if self.group_round.is_none() { return self.submit_gateway(self.composer.text().trim().to_owned()); }
-                self.queue_from_composer(false);
-            }
-            Message::QueueRemove(id) => {
-                self.queue.entries.retain(|entry| entry.id != id);
-                if self.queue_edit.as_ref().is_some_and(|edit| edit.0 == id) { self.queue_edit = None; }
-                if let Err(error) = self.save_queue() { self.error(error); }
-            }
-            Message::QueueSendNow(id) => {
-                if let Some(index) = self.queue.entries.iter().position(|entry| entry.id == id) {
-                    let entry = self.queue.entries.remove(index); self.queue.entries.insert(0, entry); self.queue.parked = false;
-                    if let Err(error) = self.save_queue() { self.queue.parked = true; self.error(error); return Task::none(); }
-                    if self.running { self.redirecting = true; self.cancel_response(); } else { return Task::none(); }
-                }
+                return self.submit_gateway(self.composer.text().trim().to_owned());
             }
             Message::QueueResume => {
-                if self.group_round.is_none() {
-                    let Some(current) = self.current.as_ref() else { return Task::none(); };
-                    let current_id = current.id.clone();
-                    let tasks: Vec<_> = self.chat.pending_queue.iter()
-                        .filter(|entry| entry.status == "parked")
-                        .map(|entry| self.change_pending(current_id.clone(), entry.id.clone(), chat_view::QueueAction::Resume))
-                        .collect();
-                    if tasks.is_empty() {
-                        self.note("No parked gateway messages to resume.");
-                        return Task::none();
-                    }
-                    return Task::batch(tasks);
+                let Some(current) = self.current.as_ref() else { return Task::none(); };
+                let current_id = current.id.clone();
+                let tasks: Vec<_> = self.chat.pending_queue.iter()
+                    .filter(|entry| entry.status == "parked")
+                    .map(|entry| self.change_pending(current_id.clone(), entry.id.clone(), chat_view::QueueAction::Resume))
+                    .collect();
+                if tasks.is_empty() {
+                    self.note("No parked gateway messages to resume.");
+                    return Task::none();
                 }
-                self.queue.parked = false;
-                if let Err(error) = self.save_queue() { self.queue.parked = true; self.error(error); }
-                else { return Task::none(); }
+                return Task::batch(tasks);
             }
             Message::QueuePause => {
-                if self.group_round.is_none() {
-                    if self.running {
-                        self.note("Paused. Gateway queued messages will wait until resumed.");
-                        return self.update(Message::Stop);
-                    }
-                    if self.chat.pending_queue.iter().any(|entry| entry.status == "parked") {
-                        self.note("Gateway queue is already paused.");
-                    } else {
-                        self.note("No active gateway turn to pause.");
-                    }
-                } else {
-                    self.queue.parked = true;
-                    if let Err(error) = self.save_queue() { self.error(error); }
-                    self.note("Paused. Queued messages wait until you resume.");
-                    if self.running { return self.update(Message::Stop); }
+                if self.running {
+                    self.note("Paused. Gateway queued messages will wait until resumed.");
+                    return self.update(Message::Stop);
                 }
-            }
-            Message::QueueEdit(id) => self.queue_edit = self.queue.entries.iter().find(|entry| entry.id == id).map(|entry| (id, entry.text.clone())),
-            Message::QueueEditChanged(text) => { if let Some(edit) = &mut self.queue_edit { edit.1 = text; } }
-            Message::QueueEditCancel => self.queue_edit = None,
-            Message::QueueEditSave => {
-                if let Some((id, text)) = &self.queue_edit {
-                    let text = text.trim();
-                    if text.is_empty() || text.len() > 128 * 1024 { self.error("Enter a queued message of at most 128 KiB."); return Task::none(); }
-                    if let Some(entry) = self.queue.entries.iter_mut().find(|entry| entry.id == *id) { entry.text = text.into(); }
-                    if let Err(error) = self.save_queue() { self.error(error); } else { self.queue_edit = None; }
+                if self.chat.pending_queue.iter().any(|entry| entry.status == "parked") {
+                    self.note("Gateway queue is already paused.");
+                } else {
+                    self.note("No active gateway turn to pause.");
                 }
             }
             Message::DragWindow => return iced::window::oldest().and_then(iced::window::drag),

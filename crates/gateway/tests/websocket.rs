@@ -587,16 +587,16 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             json!({"version":1,"approved":approved})
         }
         "dream_pair_classification" => json!({"relation":"none","direction":"none","evidence":[]}),
-        "memory_web_audit_v1" => {
+        "memory_web_audit_v2" => {
             let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let candidates = input["sources"].as_array().into_iter().flatten()
                 .find(|row| row["kind"] == "memory" && row["text"] == PROJECT_FACT)
-                .map(|row| perception_draft(OBSERVATION_FACT, json!([row["slot"]])))
+                .map(|row| json!({"proposition":OBSERVATION_FACT,"source_slots":[row["slot"]],"participant_slots":[]}))
                 .into_iter().collect::<Vec<_>>();
             json!({"ego":{"candidates":[],"lookups":[]},
                    "perception":{"candidates":candidates,"lookups":[]}})
         }
-        "observation_synthesis_v1" => {
+        "observation_synthesis_v2" => {
             let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             json!({"draft":perception_draft(OBSERVATION_FACT,input["proposal_sources"].clone()),
                    "duplicate_slot":null})

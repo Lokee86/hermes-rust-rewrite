@@ -214,7 +214,6 @@ pub enum Message {
     Query(String),
     Begin(Action),
     Capture(keyboard::Event),
-    Cancel,
     Clear(Action),
     Reset(Action),
     ResetAll,
@@ -226,7 +225,6 @@ impl fmt::Debug for Message {
             Self::Query(_) => "ShortcutSearch",
             Self::Begin(_) => "ShortcutCapture",
             Self::Capture(_) => "ShortcutKey",
-            Self::Cancel => "ShortcutCaptureCancelled",
             Self::Clear(_) => "ShortcutCleared",
             Self::Reset(_) => "ShortcutReset",
             Self::ResetAll => "ShortcutsReset",
@@ -379,7 +377,6 @@ impl State {
                 };
                 return widget::operation::focus("hermes-shortcut-capture");
             }
-            Message::Cancel => self.capture = None,
             Message::Capture(event) => {
                 let Some(action) = self.capture else {
                     return Task::none();

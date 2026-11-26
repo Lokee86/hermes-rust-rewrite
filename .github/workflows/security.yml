@@ -115,6 +115,12 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
+          # Test fixtures and the stock-compatibility checks talk to a local test gateway
+          # with made-up credentials. They never ship.
+          config: |
+            paths-ignore:
+              - crates/*/tests/**
+              - scripts/verify_stock_*
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}

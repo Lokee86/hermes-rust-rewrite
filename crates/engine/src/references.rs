@@ -22,6 +22,20 @@ pub fn parse(prompt: &str) -> Vec<Reference> {
         Reference { raw, kind, value }
     }).collect()
 }
+/// `text` with its references made inert, for text the user did not write (a webhook's payload):
+/// a word joiner after each `@` keeps the text readable and stops it reading files or links.
+pub fn inert(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for found in PATTERN.find_iter(text) {
+        let at = found.start() + found.as_str().find('@').expect("a reference starts with @") + 1;
+        out.push_str(&text[copied..at]);
+        out.push('\u{2060}');
+        copied = at;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
 fn trim_value(value: &str) -> String {
     let mut v = value.trim_end_matches([',', '.', ';', '!', '?']).to_owned();
     for (close, open) in [(')', '('), (']', '['), ('}', '{')] {
@@ -122,10 +136,26 @@ fn expand_git(r: &Reference, workspace: &Path) -> Result<String, String> {
     Ok(format!("🧾 git {} ({} tokens)\n```diff\n{text}\n```", args.join(" "), tokens(&text)))
 }
 
+/// Whether an address is not on the public internet. NAT64 addresses (64:ff9b::/96) are judged by
+/// the IPv4 address they carry.
 fn private(ip: std::net::IpAddr) -> bool {
     match ip.to_canonical() {
-        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.octets()[0] == 0 || ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64,
-        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+                || a == 0 || a >= 240 // this network; reserved
+                || (a == 100 && (b & 0xc0) == 64) // shared address space (carrier NAT)
+                || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+                || (a == 198 && (b & 0xfe) == 18) // benchmarking
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b, c, d] = ip.octets()[12..] else { unreachable!() };
+                return private(std::net::Ipv4Addr::new(a, b, c, d).into());
+            }
+            ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -219,6 +249,25 @@ mod tests {
         assert_eq!(file_value("\"my file.rs\":5"), ("my file.rs".into(), Some(5), None));
         assert_eq!(parse("@file:\"a b.txt\"")[0].value, "\"a b.txt\"");
         assert_eq!(parse("(see @file:x.rs)")[0].value, "x.rs");
+    }
+    #[test]
+    fn inert_text_keeps_its_words_and_reads_nothing() {
+        let text = "deploy @file:/etc/hosts and @diff, see @url:http://example.com/x; mail me@file:x or ops@example.com";
+        let safe = inert(text);
+        assert!(parse(&safe).is_empty(), "{safe}");
+        assert_eq!(safe.replace('\u{2060}', ""), text);
+        assert_eq!(inert("plain text"), "plain text");
+        assert_eq!(inert("@staged"), "@\u{2060}staged");
+    }
+    #[test]
+    fn addresses_off_the_public_internet_are_private() {
+        for address in ["127.0.0.1", "10.1.2.3", "100.64.0.1", "169.254.169.254", "192.0.0.8", "198.18.0.1", "224.0.0.251", "240.0.0.1",
+            "255.255.255.255", "0.0.0.0", "::1", "::", "fe80::1", "fd00::1", "ff02::1", "::ffff:127.0.0.1", "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe"] {
+            assert!(private(address.parse().unwrap()), "{address}");
+        }
+        for address in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "64:ff9b::101:101"] {
+            assert!(!private(address.parse().unwrap()), "{address}");
+        }
     }
     #[tokio::test]
     async fn expands_files_folders_and_ranges_inside_the_workspace() {

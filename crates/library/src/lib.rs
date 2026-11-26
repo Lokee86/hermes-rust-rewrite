@@ -251,16 +251,23 @@ impl Library {
         self.create_initialized(project_id, title, request_key, true, initialize)
     }
 
-    /// Durable named background work has its own workspace and leaves the foreground selection alone.
+    /// Create a durable, idempotent conversation for a background producer.
     pub fn create_background_session(
-        &self, title: &str, request_key: &str, initialize: impl FnOnce(&SessionSummary) -> Result<()>,
+        &self,
+        title: &str,
+        request_key: &str,
+        initialize: impl FnOnce(&SessionSummary) -> Result<()>,
     ) -> Result<SessionSummary> {
         self.create_initialized(None, Some(title), Some(request_key), false, |summary, _| initialize(summary))
     }
 
     fn create_initialized(
-        &self, project_id: Option<&str>, title: Option<&str>, request_key: Option<&str>,
-        activate: bool, initialize: impl FnOnce(&SessionSummary, Option<&Path>) -> Result<()>,
+        &self,
+        project_id: Option<&str>,
+        title: Option<&str>,
+        request_key: Option<&str>,
+        activate: bool,
+        initialize: impl FnOnce(&SessionSummary, Option<&Path>) -> Result<()>,
     ) -> Result<SessionSummary> {
         let default_project = if activate && project_id.is_none() { self.default_project()? } else { None };
         let project_id=project_id.or_else(||default_project.as_ref().map(|p|p.id.as_str()));
