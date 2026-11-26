@@ -1,6 +1,6 @@
 # Telegram stock plugin implementation spec
 
-Telegram is the second stock messaging plugin. Complete the shared gateway expansion and Discord's platform acceptance before starting Telegram's implementation. Telegram then gets its own integration and live acceptance gate. The reference is the bundled Telegram platform in Hermes v0.23.4 and Telegram's current Bot API. [Shared gateway contract](ADAPTER_CONTRACT.md) · [Discord spec](DISCORD_ADAPTER_SPEC.md) · [Hermes Telegram guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/telegram.md) · [Telegram Bot API](https://core.telegram.org/bots/api)
+Telegram is the second stock messaging plugin. Complete the shared gateway expansion and Discord's platform acceptance before starting Telegram's implementation. Telegram's integration and live acceptance gate comes before [Slack](SLACK_ADAPTER_SPEC.md). The reference is the bundled Telegram platform in Hermes v0.23.4 and Telegram's current Bot API. [Shared gateway contract](ADAPTER_CONTRACT.md) · [Discord spec](DISCORD_ADAPTER_SPEC.md) · [Hermes Telegram guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/telegram.md) · [Telegram Bot API](https://core.telegram.org/bots/api)
 
 ## Target architecture
 
