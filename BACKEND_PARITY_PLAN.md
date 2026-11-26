@@ -59,6 +59,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 12. Implement Google Chat and verify authenticated HTTP and Pub/Sub intake, space and thread routing, clarification and per-user file delivery. [Google Chat spec](crates/gateway/GOOGLE_CHAT_ADAPTER_SPEC.md)
 13. Implement Feishu/Lark and verify both regions and intake modes, chat and card actions, scoped document comments, meeting-invite handoff, media and recovery. [Feishu/Lark spec](crates/gateway/FEISHU_ADAPTER_SPEC.md)
 14. Implement DingTalk and verify Stream Mode, expiring reply grants, AI Card recovery and authorized scheduled delivery. [DingTalk spec](crates/gateway/DINGTALK_ADAPTER_SPEC.md)
+15. Implement WeCom and pass separate acceptance gates for AI Bot WebSocket and self-built app Callback, including multi-app isolation. [WeCom spec](crates/gateway/WECOM_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 

@@ -1,6 +1,6 @@
 # DingTalk stock plugin implementation spec
 
-Register DingTalk as a bundled Rust adapter with platform key `dingtalk`. Start after Feishu/Lark and the shared contract pass their gates. A headless installed enterprise robot serves authorized DMs and groups through DingTalk Stream Mode, processes attachments, and uses session Markdown or configured AI Cards for replies. Keep current approved scheduled delivery under the same gateway. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Feishu/Lark spec](FEISHU_ADAPTER_SPEC.md) · [Hermes DingTalk guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/dingtalk.md)
+Register DingTalk as a bundled Rust adapter with platform key `dingtalk`. Start after Feishu/Lark and the shared contract pass their gates. A headless installed enterprise robot serves authorized DMs and groups through DingTalk Stream Mode, processes attachments, and uses session Markdown or configured AI Cards for replies. Keep current approved scheduled delivery under the same gateway. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Feishu/Lark spec](FEISHU_ADAPTER_SPEC.md) · [Hermes DingTalk guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/dingtalk.md) · [Next adapter, WeCom](WECOM_ADAPTER_SPEC.md)
 
 ## Registration and durable Stream Mode
 
