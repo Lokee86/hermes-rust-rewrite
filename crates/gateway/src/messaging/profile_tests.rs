@@ -808,8 +808,10 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
     ));
     use_.actor = address.actor.clone();
     let expires = super::profile::time_ms() + 60_000;
-    let destination = ingress.verify_destination(room("device-destination"), expires).await.unwrap();
-    let home = ingress.verify_destination(room("device-home"), expires).await.unwrap();
+    let destination_room = self::room("device-destination");
+    let home_room = self::room("device-home");
+    let destination = ingress.verify_destination(destination_room.clone(), expires).await.unwrap();
+    let home = ingress.verify_destination(home_room.clone(), expires).await.unwrap();
     let source = message("device-message", principal("canonical"), address.room.clone().unwrap());
     let cursor = Advance { stream: "history".into(), previous: None, checkpoint: "token".into() };
     assert_eq!(ingress.submit(vec![source.clone()], Some(cursor.clone())).await.unwrap().receipts[0].disposition,
@@ -840,8 +842,8 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
     let ingress = ready(&queue).await;
     assert!(gateway.bind_messaging_conversation(&destination, &home).await.is_err());
     assert!(!ingress.store.allows_notification(&destination, super::profile::time_ms(), &ingress.transport_scope().unwrap()).unwrap());
-    assert_eq!(ingress.verify_destination(room("device-destination"), expires).await.unwrap(), destination);
-    assert_eq!(ingress.verify_destination(room("device-home"), expires).await.unwrap(), home);
+    assert_eq!(ingress.verify_destination(destination_room, expires).await.unwrap(), destination);
+    assert_eq!(ingress.verify_destination(home_room, expires).await.unwrap(), home);
     gateway.bind_messaging_conversation(&destination, &home).await.unwrap();
     assert!(matches!(
         ingress.transport_authority(&use_).await,
