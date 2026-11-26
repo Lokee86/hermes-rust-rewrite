@@ -8,6 +8,10 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+#[path = "conversation_history.rs"]
+mod history;
+pub use history::{HistoryCursor, HistoryTurn};
+
 #[path = "profile_models.rs"]
 mod profile_models;
 pub use profile_models::ModelPicker;
@@ -43,6 +47,7 @@ CREATE TABLE IF NOT EXISTS messaging_fetch_actions (
 pub enum Command {
     Status,
     Queue,
+    History,
     Reset,
     SelectModel { model: String },
     SelectProfileModel { model: String },
@@ -80,7 +85,7 @@ pub struct CommandDescriptor {
     pub audience: InvocationAudience,
 }
 
-pub(super) const COMMANDS: [CommandDescriptor; 7] = [
+pub(super) const COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         name: "status",
         arguments: &[],
@@ -89,6 +94,12 @@ pub(super) const COMMANDS: [CommandDescriptor; 7] = [
     },
     CommandDescriptor {
         name: "queue",
+        arguments: &[],
+        operator: false,
+        audience: InvocationAudience::Requester,
+    },
+    CommandDescriptor {
+        name: "history",
         arguments: &[],
         operator: false,
         audience: InvocationAudience::Requester,
@@ -173,6 +184,8 @@ pub enum InvocationOutcome {
     Ready,
     ModelPicker(ModelPicker),
     Queue { pending: usize, running: bool },
+    HistoryCursor(HistoryCursor),
+    History { turns: Vec<HistoryTurn> },
     Applied,
     PendingResult,
     Busy,
@@ -288,6 +301,9 @@ impl Ingress {
                 let outcome = db(scope.store.invocation(&route, &event.id, &event.sender.id))?;
                 if let Some(InvocationOutcome::ModelPicker(picker)) = &outcome {
                     return scope.current_model_picker(state, &route, &event.sender, picker);
+                }
+                if let Some(InvocationOutcome::HistoryCursor(cursor)) = &outcome {
+                    return history::resolve(&scope, &route, cursor).map(Some);
                 }
                 Ok(outcome)
             })
@@ -415,6 +431,7 @@ pub(super) fn execute(
                     });
                 Operation::Output(queue)
             }
+            Command::History => Operation::Output(history::snapshot(scope, &work.route)?),
             Command::Reset => Operation::Reset,
             Command::SelectModel { model } => Operation::SelectModel(model),
             Command::SetHome => Operation::Home(scope.transport_scope()?),

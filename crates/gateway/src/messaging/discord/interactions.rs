@@ -330,6 +330,7 @@ impl DiscordAdapter {
         let body = match name {
             "status" => command(Command::Status),
             "queue" => command(Command::Queue),
+            "history" => command(Command::History),
             "reset" => command(Command::Reset),
             "model" => command(match option("model") {
                 Some(model) => Command::SelectProfileModel { model },
@@ -754,6 +755,13 @@ fn outcome_text(outcome: InvocationOutcome) -> String {
                 "The conversation is idle."
             }
         ),
+        InvocationOutcome::History { turns } if turns.is_empty() => {
+            "This conversation has no delivered turns yet.".into()
+        }
+        InvocationOutcome::History { turns } => turns.into_iter().map(|turn| {
+            format!("You asked: {}\nMercury: {}", turn.prompt, turn.reply)
+        }).collect::<Vec<_>>().join("\n\n"),
+        InvocationOutcome::HistoryCursor(_) => "The history is unavailable.".into(),
         InvocationOutcome::Applied => "Applied.".into(),
         InvocationOutcome::PendingResult => "The result is still pending.".into(),
         InvocationOutcome::Busy => {

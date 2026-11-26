@@ -30,6 +30,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[path = "history_fixtures.rs"]
+mod history_fixtures;
+
 #[path = "command_fixtures.rs"]
 mod command_fixtures;
 
