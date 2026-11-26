@@ -150,19 +150,22 @@ impl DiscordAdapter {
         let recorded = db(
             ingress.store.read(|tx| store::intake_receipt(tx, &ingress.connection, &event_id))
         ).map_err(intake_failure)?;
-        let repeated_background = recorded.as_ref().is_some_and(|receipt| {
-            background || receipt.route.as_deref().is_some_and(store::Route::is_background_id)
-        });
-        let (sender, roles) = if repeated_background {
+        let (sender, allowed_command) = if recorded.is_some() {
             // A replay's role snapshot may predate a later membership change.
-            (Sender { id: user.id.clone(), roles: BTreeSet::new() }, BTreeSet::new())
+            let sender = Sender { id: user.id.clone(), roles: BTreeSet::new() };
+            let allowed = !self.settings.commands.has_explicit_grants() || ingress.checked(true, |state| {
+                Ok(ingress.effective_sender(&state.policy, &route.room, &sender)?
+                    .is_some_and(|(actor, _)| state.policy.requester_command_grant(&route.room, &actor).is_some()))
+            }).map_err(intake_failure)?;
+            (sender, allowed)
         } else {
             let Some(roles) = self.roles(&route, &user.id, membership).await? else {
                 return skip(ingress, advance).await;
             };
             let sender = self.record_sender(ingress, &route, &user, &roles)
                 .await.map_err(intake_failure)?;
-            (sender, roles)
+            let allowed = self.settings.allows_command(&user.id, route.guild.as_deref(), &roles);
+            (sender, allowed)
         };
         let mut event = InboundEvent {
             id: event_id.clone(),
@@ -172,9 +175,7 @@ impl DiscordAdapter {
             mentioned: true,
             body: InboundBody::Command(Command::Status),
         };
-        if !self.settings.commands.enabled
-            || !background && !self.settings.allows_command(&user.id, route.guild.as_deref(), &roles)
-        {
+        if !self.settings.commands.enabled || !background && !allowed_command {
             refuse(ingress, event, Disposition::Forbidden, advance).await?;
             self.respond(
                 ingress,

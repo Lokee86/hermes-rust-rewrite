@@ -1,9 +1,9 @@
 use super::{
     super::{
         Advance, ConnectionFailure, Disposition, GatewayError, InboundBody, InboundEvent, Message,
-        RoomKind,
+        Room, RoomKind, Sender,
         runtime::{blocking, db},
-        store::Candidate,
+        store::{self, Candidate},
     },
     DiscordAdapter, Ingress,
     channels::{ChannelRoute, Member, User, read_id, snowflake},
@@ -119,6 +119,36 @@ impl DiscordAdapter {
                         .map_err(intake_failure)?;
                 }
             }
+            "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
+                if let Some(chat) = read_id(&frame.data, "id") {
+                    if frame.data.get("type").and_then(Value::as_u64) == Some(1) {
+                        ingress.invalidate_actor_evidence(Some(Room {
+                            kind: RoomKind::Direct, chat: chat.to_owned(), thread: None,
+                        })).await.map_err(intake_failure)?;
+                    } else {
+                        ingress.withdraw_observed_destinations(vec![chat.to_owned()], None, false)
+                            .await.map_err(intake_failure)?;
+                    }
+                }
+            }
+            "THREAD_UPDATE" | "THREAD_DELETE" | "THREAD_MEMBERS_UPDATE" => {
+                if let Some(thread) = read_id(&frame.data, "id") {
+                    ingress.withdraw_observed_destinations(Vec::new(), Some(thread.to_owned()), false)
+                        .await.map_err(intake_failure)?;
+                }
+            }
+            "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" | "GUILD_DELETE" => {
+                let key = if frame.kind == "GUILD_DELETE" { "id" } else { "guild_id" };
+                if let Some(guild) = read_id(&frame.data, key) {
+                    let channels: Vec<_> = self.settings.guilds.get(guild).into_iter()
+                        .flat_map(|guild| guild.channels.keys().cloned()).collect();
+                    let direct = self.settings.dm_role_guild.as_deref() == Some(guild);
+                    if !channels.is_empty() || direct {
+                        ingress.withdraw_observed_destinations(channels, None, direct)
+                            .await.map_err(intake_failure)?;
+                    }
+                }
+            }
             _ => {}
         }
         skip(ingress, advance).await
@@ -155,16 +185,17 @@ impl DiscordAdapter {
         {
             return skip(ingress, advance).await;
         }
-        let Some(roles) = self
-            .roles(&route, &message.author.id, message.member)
-            .await?
-        else {
-            return skip(ingress, advance).await;
-        };
-        let sender = self
-            .record_sender(ingress, &route, &message.author, &roles)
-            .await
+        let event_id = format!("discord-message-{}", message.id);
+        let recorded = db(ingress.store.read(|tx| store::intake_receipt(tx, &ingress.connection, &event_id)))
             .map_err(intake_failure)?;
+        let sender = if recorded.is_some() {
+            Sender { id: message.author.id.clone(), roles: Default::default() }
+        } else {
+            let Some(roles) = self.roles(&route, &message.author.id, message.member).await? else {
+                return skip(ingress, advance).await;
+            };
+            self.record_sender(ingress, &route, &message.author, &roles).await.map_err(intake_failure)?
+        };
         let mention = format!("<@{}>", self.bot.bot_id);
         let nick_mention = format!("<@!{}>", self.bot.bot_id);
         let addressed = message
@@ -201,7 +232,7 @@ impl DiscordAdapter {
                 .participated(ingress, route.room.thread.as_deref())
                 .map_err(intake_failure)?;
         let event = InboundEvent {
-            id: format!("discord-message-{}", message.id),
+            id: event_id,
             room: route.room,
             sender,
             reply_anchor: Some(message.id.clone()),

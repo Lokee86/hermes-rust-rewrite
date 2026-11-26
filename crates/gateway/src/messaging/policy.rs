@@ -194,6 +194,12 @@ impl AccessPolicy {
             })
     }
 
+    pub(super) fn permits_membership_lookup(&self, room: &Room, actor: &str) -> bool {
+        self.room_policy(room).is_some()
+            && !self.scope.denied_users.contains(actor)
+            && self.rules(room).all(|rule| !rule.denied_users.contains(actor))
+    }
+
     pub(super) fn allows_background_command(&self, room: &Room, actor: &Sender) -> bool {
         !self.scope.background_commands_disabled
             && self.requester_commands_for(room).is_none_or(|grant| {

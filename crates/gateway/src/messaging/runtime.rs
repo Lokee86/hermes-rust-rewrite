@@ -76,11 +76,12 @@ struct Slot {
 pub(super) struct State {
     pub policy: AccessPolicy,
     pub(super) revision: i64,
+    pub(super) evidence_epoch: u64,
     generation: Option<String>,
     identity: Option<String>,
     installation: Option<VerifiedInstallation>,
     accepting: bool,
-    health: Health,
+    pub(super) health: Health,
     gap: bool,
 }
 
@@ -116,6 +117,19 @@ impl Ingress {
             return Err(GatewayError::StaleConnection);
         }
         action(&state)
+    }
+
+    pub(super) fn apply_evidence_invalidation(
+        &self,
+        invalidate: impl FnOnce() -> Result<(), GatewayError>,
+    ) -> Result<(), GatewayError> {
+        let mut state = lock(&self.slot.state);
+        if state.generation.as_deref() != Some(&self.generation) {
+            return Err(GatewayError::StaleConnection);
+        }
+        invalidate()?;
+        state.evidence_epoch = state.evidence_epoch.wrapping_add(1);
+        Ok(())
     }
 
     pub(super) fn acknowledgements(&self) -> Arc<Mutex<Acknowledgements>> {
@@ -738,6 +752,7 @@ impl Host {
             state: Mutex::new(State {
                 policy: saved.policy,
                 revision: saved.revision as i64,
+                evidence_epoch: 0,
                 generation: None,
                 accepting: false,
                 identity: None,

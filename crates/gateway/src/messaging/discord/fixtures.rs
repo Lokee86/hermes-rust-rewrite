@@ -26,7 +26,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::mpsc,
+    sync::{Notify, Semaphore, mpsc},
     time::{sleep, timeout},
 };
 
@@ -47,6 +47,8 @@ mod background_fixtures;
 mod manual_thread_fixtures;
 #[path = "voice_note_fixtures.rs"]
 mod voice_note_fixtures;
+#[path = "membership_fixtures.rs"]
+mod membership_fixtures;
 
 const LIMIT: Duration = Duration::from_secs(15);
 
@@ -66,6 +68,15 @@ struct Server {
     suppress_progress: Arc<AtomicBool>,
     feedbacks: Arc<Mutex<Vec<String>>>,
     cdn: Arc<Mutex<BTreeMap<String, Bytes>>>,
+    direct_recipient: Arc<Mutex<String>>,
+    direct_reads: Arc<AtomicU64>,
+    member_responses: Arc<Mutex<BTreeMap<(String, String), MemberResponse>>>,
+}
+
+#[derive(Clone)]
+struct MemberResponse {
+    roles: Vec<String>,
+    held: Option<(Arc<Notify>, Arc<Semaphore>)>,
 }
 
 struct Wire {
@@ -159,6 +170,9 @@ impl Fixtures {
             suppress_progress: Arc::default(),
             feedbacks: Arc::default(),
             cdn: Arc::default(),
+            direct_recipient: Arc::new(Mutex::new("7".into())),
+            direct_reads: Arc::default(),
+            member_responses: Arc::default(),
         };
         let endpoint = transport.clone();
         let router = Router::new()
@@ -370,12 +384,12 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         (Method::GET, ["guilds", "11", "members", "9"]) => {
             json!({"user":{"id":"9","bot":true},"roles":["80"]})
         }
-        (Method::GET, ["guilds", "11", "members", "7"]) => {
-            json!({"user":{"id":"7","bot":false},"roles":[]})
-        }
         (Method::GET, ["guilds", "11", "roles"]) => {
             let requester = crate::lock(&state.thread_requester_permissions).unwrap_or(8);
-            json!([{"id":"11","permissions":requester.to_string()},{"id":"80","permissions":"8"}])
+            json!([
+                {"id":"11","permissions":requester.to_string()},{"id":"80","permissions":"8"},
+                {"id":"31","permissions":"0"},{"id":"41","permissions":"0"}
+            ])
         }
         (Method::POST, ["channels", _, "typing"]) => {
             crate::lock(&state.feedbacks).push(path);
@@ -385,8 +399,29 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             crate::lock(&state.feedbacks).push(path);
             return StatusCode::BAD_GATEWAY.into_response();
         }
-        (Method::GET, ["channels", "20"]) => json!({"id":"20","type":1}),
-        (Method::GET, ["channels", "21"]) => json!({"id":"21","type":0,"guild_id":"11"}),
+        (Method::GET, ["guilds", guild, "members", actor]) => {
+            let found = crate::lock(&state.member_responses)
+                .get(&(guild.to_string(), actor.to_string())).cloned();
+            let Some(response) = found else {
+                return if *guild == "11" && *actor == "7" {
+                    Json(json!({"user":{"id":"7","bot":false},"roles":[]})).into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                };
+            };
+            if let Some((entered, release)) = response.held {
+                entered.notify_one();
+                release.acquire().await.unwrap().forget();
+            }
+            json!({"user":{"id":actor},"roles":response.roles})
+        }
+        (Method::GET, ["channels", "20"]) => {
+            state.direct_reads.fetch_add(1, Ordering::SeqCst);
+            json!({"id":"20","type":1,"recipients":[{"id":crate::lock(&state.direct_recipient).clone()}]})
+        }
+        (Method::GET, ["channels", "21"]) => json!({
+            "id":"21","type":0,"guild_id":"11","permission_overwrites":[]
+        }),
         (Method::GET, ["channels", "22"]) => {
             json!({"id":"22","type":11,"guild_id":"11","parent_id":"21"})
         }

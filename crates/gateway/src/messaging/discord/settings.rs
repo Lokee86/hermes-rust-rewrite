@@ -920,10 +920,12 @@ impl VerifiedBot {
 }
 
 #[derive(Deserialize)]
-struct RemoteUser {
-    id: String,
+pub(super) struct RemoteUser {
+    pub id: String,
     #[serde(default)]
-    bot: bool,
+    pub bot: bool,
+    #[serde(default)]
+    pub system: bool,
 }
 
 #[derive(Deserialize)]
@@ -1167,6 +1169,10 @@ impl DiscordFactory {
             .get(&["guilds", &target.guild, "roles"])
             .await
             .map_err(|error| home_failure(status, error))?;
+        if !member.user.bot {
+            status.issue = Some("default_destination_permissions_unverified");
+            return Err(ConnectionFailure::Configuration);
+        }
         let permissions = effective_permissions(
             &target.guild,
             bot,
@@ -1227,25 +1233,25 @@ struct RemoteChannel {
 }
 
 #[derive(Deserialize)]
-struct RemoteGuild {
+pub(super) struct RemoteGuild {
     id: String,
     owner_id: String,
 }
 
 #[derive(Deserialize)]
-struct RemoteMember {
-    user: RemoteUser,
-    roles: BTreeSet<String>,
+pub(super) struct RemoteMember {
+    pub user: RemoteUser,
+    pub roles: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
-struct RemoteRole {
+pub(super) struct RemoteRole {
     id: String,
     permissions: String,
 }
 
 #[derive(Deserialize)]
-struct PermissionOverwrite {
+pub(super) struct PermissionOverwrite {
     id: String,
     #[serde(rename = "type")]
     kind: u8,
@@ -1291,7 +1297,7 @@ pub(super) async fn thread_permissions(
         .then_some(requester.roles))
 }
 
-fn effective_permissions(
+pub(super) fn effective_permissions(
     guild: &str,
     actor: &str,
     bot: bool,

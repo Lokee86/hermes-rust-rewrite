@@ -7,6 +7,7 @@ mod dispatch;
 mod interactions;
 mod manual_thread;
 mod media;
+mod membership;
 mod messages;
 mod recovery;
 pub mod settings;
@@ -187,7 +188,11 @@ impl Adapter for DiscordAdapter {
     ) -> AdapterFuture<'_, ConnectionFailure> {
         Box::pin(async move {
             let _voice = ResetVoice(&self.voice);
-            socket::listen(self, ingress, cancel).await
+            tokio::select! {
+                biased;
+                failure = socket::listen(self, ingress.clone(), cancel.clone()) => failure,
+                () = self.refresh_pending_memberships(&ingress, &cancel) => ConnectionFailure::Stopped,
+            }
         })
     }
 

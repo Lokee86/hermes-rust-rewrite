@@ -1,10 +1,11 @@
 use super::{
     super::{
-        ActorEvidence, ActorKind, ConnectionFailure, GatewayError, MemberEvidence, Room, RoomKind,
-        Sender, profile::ActorObservation, runtime::now,
+        ActorKind, ConnectionFailure, GatewayError, MemberEvidence, Room, RoomKind,
+        Sender, runtime::now,
     },
     DiscordAdapter, Ingress,
     client::RestFailure,
+    membership::MEMBERSHIP_MS,
     settings::scoped_role,
 };
 use serde::Deserialize;
@@ -260,41 +261,11 @@ impl DiscordAdapter {
         } else {
             ActorKind::Person
         };
-        let previous = match ingress.actor_observation(&user.id)? {
-            ActorObservation::Verified(previous) => Some(previous),
-            _ => None,
-        };
-        if previous
-            .as_ref()
-            .is_some_and(|evidence| evidence.kind != kind)
-        {
-            return Err(GatewayError::Forbidden);
-        }
-        let mut evidence = previous.unwrap_or_else(|| ActorEvidence {
-            actor: user.id.clone(),
-            kind,
-            expires_at: 0,
-            revision: 0,
-            aliases: Vec::new(),
-            memberships: Vec::new(),
-        });
-        let clock = now();
-        if evidence.expires_at <= clock {
-            evidence.memberships.clear();
-            evidence.expires_at = clock + 300_000;
-        }
-        evidence
-            .memberships
-            .retain(|member| member.room != route.room);
-        if evidence.memberships.len() == 256 {
-            evidence.memberships.remove(0);
-        }
-        evidence.memberships.push(MemberEvidence {
-            room: route.room.clone(),
-            roles: roles.clone(),
-        });
-        evidence.revision = evidence.revision.saturating_add(1);
-        ingress.record_actor(evidence).await?;
+        ingress.observe_membership(
+            user.id.clone(), kind,
+            MemberEvidence { room: route.room.clone(), roles: roles.clone() },
+            now() + MEMBERSHIP_MS,
+        ).await?;
         Ok(Sender {
             id: user.id.clone(),
             roles,
@@ -307,22 +278,15 @@ impl DiscordAdapter {
         guild: &str,
         actor: &str,
     ) -> Result<(), GatewayError> {
-        let ActorObservation::Verified(mut evidence) = ingress.actor_observation(actor)? else {
-            return Ok(());
-        };
-        {
-            let known = crate::lock(&self.channels);
-            evidence.memberships.retain(|member| {
-                if member.room.kind == RoomKind::Direct {
-                    return self.settings.dm_role_guild.as_deref() != Some(guild);
-                }
-                known
-                    .get(&member.room.chat)
-                    .and_then(|channel| channel.guild_id.as_deref())
-                    .is_some_and(|verified| verified != guild)
-            });
-        }
-        evidence.revision = evidence.revision.saturating_add(1);
-        ingress.record_actor(evidence).await
+        let affected: BTreeSet<_> = self.settings.guilds.get(guild)
+            .into_iter().flat_map(|guild| guild.channels.keys().cloned()).collect();
+        let affects_direct = self.settings.dm_role_guild.as_deref() == Some(guild);
+        ingress.withdraw_observed_memberships(actor.to_owned(), move |member| {
+            if member.room.kind == RoomKind::Direct {
+                !affects_direct
+            } else {
+                !affected.contains(&member.room.chat)
+            }
+        }).await
     }
 }

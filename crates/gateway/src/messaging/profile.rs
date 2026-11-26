@@ -12,6 +12,9 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+#[path = "actor_refresh.rs"]
+mod actor_refresh;
+
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS messaging_configuration (
     name TEXT PRIMARY KEY, platform TEXT NOT NULL, enabled INTEGER NOT NULL,
@@ -234,7 +237,7 @@ pub struct ActorEvidence {
     pub memberships: Vec<MemberEvidence>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Serialize, Deserialize)]
 struct StoredActor {
     transport_scope: String,
     evidence: ActorEvidence,
@@ -879,7 +882,7 @@ impl Ingress {
         }
         let scope = self.clone();
         blocking(move || {
-            scope.checked(false, |_| {
+            scope.apply_evidence_invalidation(|| {
                 let transport = db(key("actor-transport", &scope.installation()))?;
                 db(scope.store.invalidate_actor_evidence(
                     &scope.connection, &transport, room.as_ref(),
