@@ -276,12 +276,8 @@ impl Hermes {
         self.approvals.clear();
         self.subagents.clear();
         self.session = None;
-        self.group_round = None;
         self.history = History::default();
         self.rebuild_markdown();
-        self.queue = queue::PromptQueue::default();
-        self.queue_edit = None;
-        self.redirecting = false;
         self.session_menu = None;
         self.rename = None;
         self.follow_stream = true;
@@ -687,7 +683,6 @@ impl Hermes {
                                     .unwrap_or_default()
                                     .into(),
                             },
-                            answer: None,
                         })
                     })
                     .collect();
