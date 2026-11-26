@@ -91,7 +91,7 @@ pub(in crate::messaging) struct OutboundPolicy {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct ProviderStatus {
+pub(in crate::messaging) struct ProviderStatus {
     pub recipient: Option<String>,
     pub state: ProviderDeliveryState,
     pub observed_at_ms: i64,
@@ -398,6 +398,9 @@ fn authorize_effect(
 ) -> Result<Result<AuthorizedEffect, &'static str>> {
     let id = &pending.intent.id;
     let effect = &part.effect;
+    if effect.write_only && !policy.submitted {
+        return Ok(Err("eligibility_write_only"));
+    }
     if effect.visibility.notify && !policy.visibility.notify
         || effect.visibility.mention && !policy.visibility.mention
     {
@@ -472,14 +475,42 @@ fn authorize_effect(
             let Some(receipt) = marker_receipt(tx, connection, &pending.route, marker)? else {
                 return Ok(Err("eligibility_marker_unavailable"));
             };
+            let original = json::<DeliveryPart>(tx.query_row(
+                "SELECT body FROM messaging_parts WHERE delivery = ?1 AND ordinal = ?2",
+                params![marker.delivery, marker.part],
+                |row| row.get(0),
+            )?)?;
+            if original
+                .effect
+                .protection
+                .as_deref()
+                .is_some_and(|required| protection.as_deref() != Some(required))
+            {
+                return Ok(Err("eligibility_protection"));
+            }
             Some(receipt)
         }
         EffectOperation::Present { marker, phase, .. } if *phase != PresentationPhase::Create => {
-            let initial = prior_presentation(tx, id, marker, ordinal, true)?;
-            let Some((_, receipt)) = initial else {
+            let Some((begin, _)) = prior_presentation(tx, id, marker, ordinal, true)? else {
                 return Ok(Err("eligibility_marker_unavailable"));
             };
-            Some(receipt)
+            let Some(marker_receipt) = marker_receipt(
+                tx,
+                connection,
+                &pending.route,
+                &MarkerRef {
+                    delivery: id.clone(),
+                    part: begin,
+                },
+            )?
+            else {
+                return Ok(Err("eligibility_marker_unavailable"));
+            };
+            let Some(previous) = prior_presentation(tx, id, marker, ordinal, false)? else {
+                return Ok(Err("eligibility_dependency_unconfirmed"));
+            };
+            dependencies.push(previous);
+            Some(marker_receipt)
         }
         _ => None,
     };
@@ -498,8 +529,8 @@ fn prior_presentation(
 ) -> Result<Option<(u32, EffectReceipt)>> {
     let mut query = tx.prepare(
         "SELECT p.ordinal,p.body,e.receipt FROM messaging_parts p
-         JOIN messaging_effect_parts e ON e.delivery=p.delivery AND e.ordinal=p.ordinal
-         WHERE p.delivery=?1 AND p.ordinal<?2 AND e.receipt IS NOT NULL
+         LEFT JOIN messaging_effect_parts e ON e.delivery=p.delivery AND e.ordinal=p.ordinal
+         WHERE p.delivery=?1 AND p.ordinal<?2
          ORDER BY p.ordinal DESC",
     )?;
     let mut rows = query.query(params![delivery, ordinal])?;
@@ -513,7 +544,9 @@ fn prior_presentation(
             && prior_marker == marker
             && (!creation || *phase == PresentationPhase::Create)
         {
-            return Ok(Some((row.get(0)?, json(row.get(2)?)?)));
+            let ordinal = row.get(0)?;
+            let receipt = row.get::<_, Option<String>>(2)?.map(json).transpose()?;
+            return Ok(receipt.map(|receipt| (ordinal, receipt)));
         }
     }
     Ok(None)
@@ -607,7 +640,12 @@ pub(super) fn claim(
          AND p.stage NOT IN ('sent','discarded','partial','submitted')
          AND NOT EXISTS(SELECT 1 FROM messaging_cooldowns c WHERE c.connection=d.connection AND c.until_ms>?3 AND (c.scope='' OR c.scope=d.destination))
          AND NOT EXISTS(SELECT 1 FROM messaging_deliveries earlier WHERE earlier.connection=d.connection AND earlier.destination=d.destination
-             AND earlier.position<d.position AND earlier.stage IN ('pending','planned'))
+             AND earlier.id!=d.id AND earlier.stage IN ('pending','planned')
+             AND (EXISTS(SELECT 1 FROM messaging_parts inflight WHERE inflight.delivery=earlier.id AND inflight.stage='sending')
+                  OR earlier.position<d.position AND (
+                      json_type(d.intent,'$.body.retire') IS NULL
+                      OR EXISTS(SELECT 1 FROM messaging_parts unknown WHERE unknown.delivery=earlier.id AND unknown.stage='uncertain')
+                  )))
          ORDER BY p.ordinal LIMIT 1",
         params![connection,id,policy.now], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
     ).optional()?;
@@ -634,10 +672,16 @@ pub(super) fn claim(
             return Ok(None);
         };
         let true_scope = replay_proof(tx, connection, generation)?;
-        let old_data = tx.query_row(
-            "SELECT base_request FROM messaging_effect_attempts WHERE delivery=?1 AND ordinal=?2 AND attempt=?3",
-            params![id,ordinal,old_attempt], |r| r.get::<_,String>(0),
-        ).optional()?;
+        // A fresh verified lease can retry this exact request once. A second
+        // ambiguous response must not trigger a tight retransmission loop.
+        let old_data = tx
+            .query_row(
+                "SELECT base_request FROM messaging_effect_attempts
+             WHERE delivery=?1 AND ordinal=?2 AND attempt=?3 AND lease!=?4",
+                params![id, ordinal, old_attempt, generation],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
         if !policy.retransmission
             || policy.now >= guarantee.expires_at_ms
             || true_scope.as_ref() != Some(&guarantee.scope)
@@ -726,18 +770,15 @@ pub(super) fn recheck(
     ).optional()?;
     let Some(body) = body else { return Ok(false) };
     let part = json::<DeliveryPart>(body)?;
-    if part != send.payload || send.effect.retransmission && !policy.retransmission {
+    if part != send.payload {
         return Ok(false);
     }
-    if send.effect.retransmission {
-        let Some(guarantee) = &part.effect.replay else {
-            return Ok(false);
-        };
-        if guarantee.expires_at_ms <= policy.now
-            || replay_proof(tx, connection, generation)?.as_ref() != Some(&guarantee.scope)
-        {
-            return Ok(false);
-        }
+    if let Some(guarantee) = &part.effect.replay
+        && (!policy.retransmission
+            || guarantee.expires_at_ms <= policy.now
+            || replay_proof(tx, connection, generation)?.as_ref() != Some(&guarantee.scope))
+    {
+        return Ok(false);
     }
     Ok(authorize_effect(
         tx, connection, generation, pending, send.part, &part, policy,
@@ -1330,13 +1371,20 @@ pub(super) fn record(
             if let EffectOperation::Present { marker, phase, .. } = &part.effect.operation {
                 if *phase == PresentationPhase::Create {
                     remember_marker(tx, id, ordinal, &receipt)?;
-                } else if *phase == PresentationPhase::Finalize
-                    && let Some((created, _)) = prior_presentation(tx, id, marker, ordinal, true)?
+                } else if let Some((created, _)) =
+                    prior_presentation(tx, id, marker, ordinal, true)?
                 {
-                    tx.execute(
-                        "UPDATE messaging_effect_markers SET retired=1 WHERE delivery=?1 AND ordinal=?2",
-                        params![id,created],
-                    )?;
+                    if *phase == PresentationPhase::Finalize {
+                        tx.execute(
+                            "UPDATE messaging_effect_markers SET retired=1 WHERE delivery=?1 AND ordinal=?2",
+                            params![id,created],
+                        )?;
+                    } else if *phase == PresentationPhase::Publish {
+                        tx.execute(
+                            "UPDATE messaging_effect_markers SET receipt=?3 WHERE delivery=?1 AND ordinal=?2",
+                            params![id,created,serde_json::to_string(&receipt)?],
+                        )?;
+                    }
                 }
             }
             remember_receipt(tx, id, ordinal, &receipt)?;
@@ -1363,7 +1411,8 @@ pub(super) fn record(
             )?
         }
         DeliveryResult::Submitted
-            if submitted.unwrap_or(false)
+            if part.effect.write_only
+                && submitted.unwrap_or(false)
                 && generation.is_some()
                 && !exact_replay
                 && matches!(part.effect.operation, EffectOperation::Message)

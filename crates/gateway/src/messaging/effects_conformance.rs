@@ -536,7 +536,15 @@ async fn write_only_completion_does_not_claim_remote_acceptance() {
                 submitted: true,
                 ..EffectCapabilities::default()
             },
-            |intent| vec![part(intent, Effect::default())],
+            |intent| {
+                vec![part(
+                    intent,
+                    Effect {
+                        write_only: true,
+                        ..Effect::default()
+                    },
+                )]
+            },
         )
     };
     let gateway = model.gateway(root.path(), vec![config()]).await;
@@ -721,4 +729,199 @@ async fn resource_receipts_resume_upload_and_publish_in_order() {
     publish.finish(confirmed("submitted-message"));
     phase(&reopened, id, 4, "sent").await;
     reopened.shutdown().await.unwrap();
+}
+
+fn presentation_plan(intent: &DeliveryIntent) -> Vec<DeliveryPart> {
+    if intent.room.chat != "presentation" {
+        return vec![part(intent, Effect::default())];
+    }
+    [
+        PresentationPhase::Create,
+        PresentationPhase::Publish,
+        PresentationPhase::Revise,
+        PresentationPhase::Finalize,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(revision, phase)| {
+        part(
+            intent,
+            Effect {
+                operation: EffectOperation::Present {
+                    marker: "draft".into(),
+                    revision: revision as u32,
+                    phase,
+                },
+                correlation_scope: Some("same-provider-ack".into()),
+                ..Effect::default()
+            },
+        )
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn verified_publication_precedes_stream_revisions_and_finalization() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "presentations", true);
+    let config = || {
+        stock(
+            &driver,
+            policy(),
+            EffectCapabilities {
+                durable_presentation: true,
+                ..EffectCapabilities::default()
+            },
+            presentation_plan,
+        )
+    };
+    let gateway = model.gateway(root.path(), vec![config()]).await;
+    let old_ingress = driver.ready().await;
+    driver.push(dm("present", "presentation", "hello")).await;
+    let first = driver.sent().await;
+    let id = first.attempt.delivery_id.clone();
+    first.finish(typed(ReceiptKind::Presentation, "created-draft"));
+    let publish = driver.sent().await;
+    assert_eq!(
+        publish.attempt.effect.marker.as_ref().unwrap().id,
+        "created-draft"
+    );
+    publish.finish(DeliveryResult::Uncertain);
+    phase(&gateway, &id, 1, "uncertain").await;
+    driver.push(dm("independent", "other", "hello")).await;
+    let independent = driver.sent().await;
+    assert_eq!(independent.attempt.payload.room.chat, "other");
+    independent.finish(confirmed("unrelated-send"));
+    gateway.shutdown().await.unwrap();
+
+    let reopened = model.gateway(root.path(), vec![config()]).await;
+    let ingress = driver.ready().await;
+    let old = ingress
+        .uncertain_deliveries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.delivery_id == id)
+        .unwrap();
+    assert_eq!(
+        old_ingress
+            .reconcile_delivery(
+                old.clone(),
+                typed(ReceiptKind::Presentation, "wrong-generation")
+            )
+            .await,
+        Err(GatewayError::StaleConnection)
+    );
+    assert!(
+        ingress
+            .reconcile_delivery(old, typed(ReceiptKind::Presentation, "published-draft"))
+            .await
+            .unwrap()
+    );
+    let revision = driver.sent().await;
+    assert_eq!(revision.attempt.part, 2);
+    assert_eq!(
+        revision.attempt.effect.marker.as_ref().unwrap().id,
+        "published-draft"
+    );
+    assert_eq!(
+        revision.attempt.effect.dependencies[0].1.id,
+        "published-draft"
+    );
+    revision.finish(typed(ReceiptKind::Presentation, "confirmed-revision"));
+    let finalization = driver.sent().await;
+    assert_eq!(
+        finalization.attempt.effect.dependencies[0].1.id,
+        "confirmed-revision"
+    );
+    finalization.finish(typed(ReceiptKind::Presentation, "confirmed-final"));
+    phase(&reopened, &id, 3, "sent").await;
+    assert!(
+        !ingress
+            .retire_marker(MarkerRef {
+                delivery: id,
+                part: 0
+            })
+            .await
+            .unwrap()
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn revoked_actor_can_only_leave_a_scoped_marker_retirement() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let mut driver = Driver::new(Transport::Push, "cleanup", true);
+    driver.fixture.capabilities.progress = true;
+    driver.fixture.capabilities.editing = true;
+    let config = stock(
+        &driver,
+        policy(),
+        EffectCapabilities {
+            durable_presentation: true,
+            ..EffectCapabilities::default()
+        },
+        |intent| {
+            let effect = match &intent.body {
+                DeliveryBody::Retire { marker } => Effect {
+                    operation: EffectOperation::Retire {
+                        marker: marker.clone(),
+                    },
+                    ..Effect::default()
+                },
+                _ => Effect::default(),
+            };
+            vec![part(intent, effect)]
+        },
+    );
+    let gateway = model.gateway(root.path(), vec![config]).await;
+    let ingress = driver.ready().await;
+    driver
+        .push(dm("cleanup-input", "cleanup-room", "steer wait"))
+        .await;
+    let working = driver.sent().await;
+    assert!(matches!(
+        working.attempt.payload.body,
+        DeliveryBody::Progress { .. }
+    ));
+    let marker = MarkerRef {
+        delivery: working.attempt.delivery_id.clone(),
+        part: 0,
+    };
+    working.finish(DeliveryResult::Confirmed {
+        receipt: "progress".into(),
+        editable_message: Some("exact-marker".into()),
+    });
+    phase(&gateway, &marker.delivery, 0, "sent").await;
+    gateway
+        .set_adapter_policy("fixture", AccessPolicy::default())
+        .await
+        .unwrap();
+    model.state.steer_release.add_permits(1);
+    assert!(ingress.retire_marker(marker.clone()).await.unwrap());
+    let cleanup = driver.sent().await;
+    assert!(matches!(
+        cleanup.attempt.payload.body,
+        DeliveryBody::Retire { .. }
+    ));
+    assert_eq!(
+        cleanup.attempt.payload.effect.visibility,
+        EffectVisibility::default()
+    );
+    assert_eq!(
+        cleanup.attempt.effect.marker.as_ref().unwrap().id,
+        "exact-marker"
+    );
+    let cleanup_id = cleanup.attempt.delivery_id.clone();
+    cleanup.finish(confirmed("retired-marker"));
+    phase(&gateway, &cleanup_id, 0, "sent").await;
+    assert!(!ingress.retire_marker(marker).await.unwrap());
+    assert!(
+        timeout(Duration::from_millis(250), driver.sent.recv())
+            .await
+            .is_err()
+    );
+    gateway.shutdown().await.unwrap();
 }

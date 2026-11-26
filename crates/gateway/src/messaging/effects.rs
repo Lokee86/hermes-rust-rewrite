@@ -21,6 +21,8 @@ pub struct Effect {
     /// Provider-issued eligibility registered against the source input.
     pub reply_grant: Option<String>,
     pub consent_required: bool,
+    /// The operation can finish with a local write and has no remote acceptance receipt.
+    pub write_only: bool,
     /// Required transport protection. The host also pins the owner policy at preparation.
     pub protection: Option<String>,
     pub recipients: BTreeSet<String>,
@@ -576,20 +578,43 @@ fn valid_operation(
     part: &DeliveryPart,
     previous: &[DeliveryPart],
 ) -> bool {
-    if !matches!(
+    if part.effect.write_only
+        && (!caps.effects.submitted
+            || !matches!(part.effect.operation, EffectOperation::Message)
+            || part.edit_target.is_some()
+            || !part.effect.recipients.is_empty()
+            || part.effect.replay.is_some()
+            || !matches!(part.body, DeliveryBody::Reply(_)))
+    {
+        return false;
+    }
+    let publish = matches!(
+        part.effect.operation,
+        EffectOperation::Message
+            | EffectOperation::Publish { .. }
+            | EffectOperation::Present {
+                phase: PresentationPhase::Publish | PresentationPhase::Finalize,
+                ..
+            }
+    );
+    let message_effect = matches!(
         part.effect.operation,
         EffectOperation::Message | EffectOperation::Publish { .. }
-    ) && (!part.effect.recipients.is_empty()
-        || part.effect.reply_grant.is_some()
-        || part.edit_target.is_some()
-        || part.effect.visibility != EffectVisibility::default())
+    );
+    if !message_effect
+        && (!part.effect.recipients.is_empty()
+            || part.effect.reply_grant.is_some()
+            || part.edit_target.is_some())
+        || !publish && part.effect.visibility != EffectVisibility::default()
     {
         return false;
     }
     match &part.effect.operation {
         EffectOperation::Message => !matches!(intent.body, DeliveryBody::Retire { .. }),
         EffectOperation::Provision { .. } => {
-            caps.effects.prepare_resources && matches!(intent.body, DeliveryBody::Reply(_))
+            caps.threads
+                && caps.effects.prepare_resources
+                && matches!(intent.body, DeliveryBody::Reply(_))
         }
         EffectOperation::Upload { artifact, step } => {
             caps.effects.prepare_resources

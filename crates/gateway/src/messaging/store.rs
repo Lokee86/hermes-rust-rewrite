@@ -542,14 +542,17 @@ impl Store {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
             "SELECT d.intent,d.route,d.sender,d.stage FROM messaging_deliveries d
-             WHERE d.position IN (
-                 SELECT MIN(position) FROM messaging_deliveries WHERE connection = ?1
-                 AND stage IN ('pending','planned') GROUP BY destination
+             WHERE d.connection = ?1 AND d.stage IN ('pending','planned') AND (
+                 d.position IN (
+                     SELECT MIN(position) FROM messaging_deliveries WHERE connection = ?1
+                     AND stage IN ('pending','planned') GROUP BY destination
+                 ) OR json_type(d.intent, '$.body.retire') IS NOT NULL
              )
              AND NOT EXISTS (SELECT 1 FROM messaging_cooldowns c WHERE c.connection = d.connection
                  AND c.until_ms > ?2 AND (c.scope = '' OR c.scope = d.destination))
              AND (d.stage = 'pending' OR EXISTS (
-                 SELECT 1 FROM messaging_parts p WHERE p.delivery = d.id AND p.stage IN ('pending','uncertain')
+                 SELECT 1 FROM messaging_parts p WHERE p.delivery = d.id AND (p.stage = 'pending'
+                   OR p.stage = 'uncertain' AND json_extract(p.body, '$.effect.replay.expires_at_ms') > ?2)
                  AND NOT EXISTS (SELECT 1 FROM messaging_parts preceding WHERE preceding.delivery = p.delivery
                      AND preceding.ordinal < p.ordinal AND preceding.stage NOT IN ('sent','discarded','partial','submitted'))
              ))
