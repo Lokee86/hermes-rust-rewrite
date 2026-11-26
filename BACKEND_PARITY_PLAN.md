@@ -57,6 +57,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 10. Implement Microsoft Teams and complete its installed chat and channel workflows, Adaptive Cards, authenticated files, proactive delivery and live checks. [Microsoft Teams spec](crates/gateway/TEAMS_ADAPTER_SPEC.md)
 11. Implement Mattermost and complete its authenticated channel and thread workflows, WebSocket recovery, commands, media and live checks. [Mattermost spec](crates/gateway/MATTERMOST_ADAPTER_SPEC.md)
 12. Implement Google Chat and verify authenticated HTTP and Pub/Sub intake, space and thread routing, clarification and per-user file delivery. [Google Chat spec](crates/gateway/GOOGLE_CHAT_ADAPTER_SPEC.md)
+13. Implement Feishu/Lark and verify both regions and intake modes, chat and card actions, scoped document comments, meeting-invite handoff, media and recovery. [Feishu/Lark spec](crates/gateway/FEISHU_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 
