@@ -476,6 +476,32 @@ impl Ingress {
         Opened: Future<Output = Result<R, GatewayError>>,
     {
         let bytes = self.read_media(grant, open).await?;
+        self.transcribe_bytes(grant, bytes).await
+    }
+
+    /// Decode an authorized platform audio format before invoking profile STT.
+    /// The source manifest is checked against the original bytes.
+    pub(super) async fn transcribe_encoded_voice<R, Open, Opened>(
+        &self,
+        grant: MediaRead,
+        open: Open,
+        decode: fn(Vec<u8>) -> Result<Vec<u8>, GatewayError>,
+    ) -> Result<String, GatewayError>
+    where
+        R: AsyncRead + Unpin,
+        Open: FnOnce() -> Opened,
+        Opened: Future<Output = Result<R, GatewayError>>,
+    {
+        if grant.purpose != MediaPurpose::VoiceNote {
+            return Err(GatewayError::Invalid);
+        }
+        let original = self.read_media(&grant, open).await?;
+        self.checked(true, |state| self.recheck_media(state, &grant))?;
+        let bytes = blocking(move || decode(original)).await?;
+        self.transcribe_bytes(&grant, bytes).await
+    }
+
+    async fn transcribe_bytes(&self, grant: &MediaRead, bytes: Vec<u8>) -> Result<String, GatewayError> {
         validate_wav(&bytes, Some(16_000))?;
         let audio = self.store.audio();
         let _guard = tokio::time::timeout(remaining(grant.expires_ms)?, audio.active.lock())
