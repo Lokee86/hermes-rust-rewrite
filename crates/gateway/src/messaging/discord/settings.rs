@@ -652,6 +652,7 @@ impl DiscordSettings {
             ..AccessPolicy::default()
         };
         policy.scope.require_actor_evidence = true;
+        policy.scope.background_commands_disabled = !self.commands.enabled;
         policy.scope.pair_direct = self.direct.pairing;
         policy
             .scope

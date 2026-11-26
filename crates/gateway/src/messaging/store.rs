@@ -956,6 +956,11 @@ pub(super) fn append(
                 "INSERT OR IGNORE INTO messaging_routes (id,connection,room) VALUES (?1,?2,?3)",
                 params![route.id, connection, serde_json::to_string(&route.room)?],
             )?;
+            if matches!(event.body, InboundBody::Command(super::Command::Background { .. })) {
+                super::commands::record_invocation(
+                    tx, &route, &event.id, &event.sender.id, super::InvocationOutcome::BackgroundQueued,
+                )?;
+            }
             (
                 Some(route.id),
                 if preparing { Disposition::Deferred } else { Disposition::Accepted },

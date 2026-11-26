@@ -21,6 +21,9 @@ pub(super) use profile_models::apply_profile_model;
 mod requester;
 pub(super) use requester::{RequesterCommand, RequesterInvocation};
 
+#[path = "background.rs"]
+mod background;
+
 pub(super) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_native_invocations (
     connection TEXT NOT NULL, event TEXT NOT NULL, route TEXT NOT NULL, actor TEXT NOT NULL,
@@ -54,6 +57,7 @@ pub enum Command {
     ModelPicker,
     ChooseProfileModel { picker: String, message: String, option: usize },
     UseSkill { skill: String, input: String },
+    Background { text: String },
     SetHome,
     FetchResult { action: String },
 }
@@ -135,6 +139,15 @@ pub(super) const COMMANDS: &[CommandDescriptor] = &[
         audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
+        name: "bg",
+        arguments: &[CommandArgument {
+            name: "text",
+            kind: ArgumentKind::Text,
+        }],
+        operator: false,
+        audience: InvocationAudience::Requester,
+    },
+    CommandDescriptor {
         name: "set-home",
         arguments: &[],
         operator: true,
@@ -172,6 +185,9 @@ impl Command {
                     && input.len() <= super::runtime::MAX_TEXT
                     && !input.trim().is_empty()
             }
+            Self::Background { text } => {
+                !text.trim().is_empty() && text.len() <= super::runtime::MAX_TEXT
+            }
             Self::FetchResult { action } => valid_id(action),
             _ => true,
         }
@@ -189,6 +205,7 @@ pub enum InvocationOutcome {
     Applied,
     PendingResult,
     Busy,
+    BackgroundQueued,
     ResultReady { delivery: String },
     AlreadyClaimed,
     Expired,
@@ -226,6 +243,7 @@ impl Ingress {
             let individual = self
                 .authorized_identity(&state.policy, &event.room, &event.sender)?
                 .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
+            let background = self.authorize_background(&state.policy, &event.room, &event.sender)?;
             let tools = state
                 .policy
                 .room_policy(&event.room)
@@ -242,6 +260,7 @@ impl Ingress {
                                     .skills
                                     .as_ref()
                                     .is_some_and(|skills| !skills.is_empty()))
+                        && (item.name != "bg" || background && self.capabilities().text_delivery)
                         && (item.name != "fetch-result" || self.capabilities().interactive_prompts)
                 })
                 .collect())
@@ -304,6 +323,9 @@ impl Ingress {
                 }
                 if let Some(InvocationOutcome::HistoryCursor(cursor)) = &outcome {
                     return history::resolve(&scope, &route, cursor).map(Some);
+                }
+                if outcome.is_none() {
+                    return scope.background_outcome(state, &event);
                 }
                 Ok(outcome)
             })
@@ -436,7 +458,7 @@ pub(super) fn execute(
             Command::SelectModel { model } => Operation::SelectModel(model),
             Command::SetHome => Operation::Home(scope.transport_scope()?),
             Command::FetchResult { action } => Operation::Fetch(action),
-            Command::UseSkill { .. } | Command::SelectProfileModel { .. }
+            Command::UseSkill { .. } | Command::Background { .. } | Command::SelectProfileModel { .. }
             | Command::ModelPicker | Command::ChooseProfileModel { .. } =>
                 Operation::Output(InvocationOutcome::Unsupported),
         }

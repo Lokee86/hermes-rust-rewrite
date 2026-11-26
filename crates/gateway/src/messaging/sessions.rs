@@ -21,7 +21,7 @@ pub(super) async fn advance(
         }
         match &input.event.body {
             InboundBody::Control(control) => apply_control(owner, scope, &input, control).await?,
-            InboundBody::Command(Command::UseSkill { .. })
+            InboundBody::Command(Command::UseSkill { .. } | Command::Background { .. })
             | InboundBody::Message(_) | InboundBody::Wake => advance_message(owner, scope, input).await?,
             InboundBody::Command(command) => apply_command(owner, scope, &input, command).await?,
         }
@@ -48,7 +48,11 @@ async fn session_for(
             let owner = owner.clone();
             let key = creation_key.clone();
             let route_id = route.id.clone();
-            let title = format!("{} conversation", scope.platform());
+            let title = if route.is_background() {
+                format!("{} background job", scope.platform())
+            } else {
+                format!("{} conversation", scope.platform())
+            };
             let created = tokio::task::spawn_blocking(move || {
                 let mut collision = false;
                 let result = owner
@@ -145,6 +149,7 @@ async fn advance_message(
     work: PendingInput,
 ) -> Result<(), GatewayError> {
     let wake = matches!(work.event.body, InboundBody::Wake);
+    let background = work.route.is_background();
     let unadmitted = matches!(work.stage.as_str(), "pending" | "admitting");
     let allowed = scope.checked(true, |state| authorized(scope, state, &work))?;
     let quote_revoked = !allowed
@@ -192,7 +197,7 @@ async fn advance_message(
                     })?;
                     &synthetic_message
                 }
-                InboundBody::Command(Command::UseSkill { input, .. }) => {
+                InboundBody::Command(Command::UseSkill { input, .. } | Command::Background { text: input }) => {
                     synthetic_message = Message::text(input);
                     &synthetic_message
                 }
@@ -290,8 +295,16 @@ async fn advance_message(
                     policy.prompt = None;
                     policy.skills = None;
                 }
+                let model_route = if background {
+                    let participant = state.policy.room_policy(&work.event.room)
+                        .filter(|room| room.per_participant)
+                        .map(|_| work.event.sender.id.as_str());
+                    db(Route::new(&scope.connection, work.event.room.clone(), participant))?.id
+                } else {
+                    work.route.id.clone()
+                };
                 let model = policy.model.or(db(scope.store.route_model(
-                    &work.route.id, &scope.model_provider_scope()?,
+                    &model_route, &scope.model_provider_scope()?,
                 ))?);
                 let selected_skill = match &work.event.body {
                     InboundBody::Command(Command::UseSkill { skill, .. }) => Some(skill.clone()),
@@ -307,9 +320,9 @@ async fn advance_message(
                     &native_id,
                     ChannelExecution {
                         tools,
-                        interactive: individual && scope.capabilities().interactive_prompts,
+                        interactive: individual && !background && scope.capabilities().interactive_prompts,
                         model,
-                        approval_context: (individual && !wake && tools).then(|| super::ToolApprovalContext {
+                        approval_context: (individual && !background && !wake && tools).then(|| super::ToolApprovalContext {
                             ingress: scope.clone(),
                             route: work.route.id.clone(),
                             room: work.event.room.clone(),
@@ -331,7 +344,7 @@ async fn advance_message(
                 owner.spawn_worker(session, claim).await;
             }
         }
-        Some("started") if allowed => {
+        Some("started") if allowed && !background => {
             scope.checked(true, |state| {
                 if !authorized(scope, state, &work)? {
                     return Ok(());

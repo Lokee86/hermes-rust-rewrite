@@ -13,6 +13,7 @@ pub struct ScopePolicy {
     pub rooms: BTreeMap<String, RoomRules>,
     pub threads: BTreeMap<String, BTreeMap<String, RoomRules>>,
     pub require_actor_evidence: bool,
+    pub background_commands_disabled: bool,
     pub pair_direct: bool,
     pub events: BTreeMap<String, ResourcePolicy>,
 }
@@ -193,10 +194,21 @@ impl AccessPolicy {
             })
     }
 
+    pub(super) fn allows_background_command(&self, room: &Room, actor: &Sender) -> bool {
+        !self.scope.background_commands_disabled
+            && self.requester_commands_for(room).is_none_or(|grant| {
+                grant.users.contains(&actor.id) || !grant.roles.is_disjoint(&actor.roles)
+            })
+    }
+
+    fn requester_commands_for(&self, room: &Room) -> Option<&RequesterCommandGrant> {
+        self.rules(room).filter_map(|rule| rule.requester_commands.as_ref()).last()
+    }
+
     pub(super) fn requester_command_grant(
         &self, room: &Room, actor: &Sender,
     ) -> Option<&RequesterCommandGrant> {
-        let grant = self.rules(room).filter_map(|rule| rule.requester_commands.as_ref()).last()?;
+        let grant = self.requester_commands_for(room)?;
         (self.room_policy(room).is_some()
             && !self.scope.denied_users.contains(&actor.id)
             && self.scope.denied_roles.is_disjoint(&actor.roles)

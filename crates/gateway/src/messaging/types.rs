@@ -261,7 +261,7 @@ impl InboundBody {
     pub(super) fn is_control(&self) -> bool {
         match self {
             Self::Control(_) => true,
-            Self::Command(super::Command::UseSkill { .. }) => false,
+            Self::Command(super::Command::UseSkill { .. } | super::Command::Background { .. }) => false,
             Self::Command(_) => true,
             _ => false,
         }

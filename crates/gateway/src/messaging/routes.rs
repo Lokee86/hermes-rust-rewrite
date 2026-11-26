@@ -155,6 +155,10 @@ pub(super) fn share_conversation(
         destination.connection == binding.connection && destination.id != binding.id,
         "Messaging session binding must stay within one verified account"
     );
+    ensure!(
+        !destination.is_background() && !binding.is_background(),
+        "A background job has its own session"
+    );
     let current = tx
         .query_row(
             "SELECT binding FROM messaging_route_bindings WHERE destination = ?1",

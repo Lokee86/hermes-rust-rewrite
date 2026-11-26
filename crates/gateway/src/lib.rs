@@ -2040,6 +2040,9 @@ impl Shared {
             Event::Subagent(progress) => self.emit(session, "subagent.progress", serde_json::to_value(&progress).unwrap_or_default()),
             Event::MemoryRecall(status) => self.emit(session, "memory.recall", serde_json::to_value(status).unwrap_or_default()),
             Event::Clarification { question, choices, answer } => {
+                if stream.unattended {
+                    return;
+                }
                 let request = new_id();
                 let mut view = lock(&session.view);
                 let payload = json!({"kind":"clarification","request_id":request,"execution_generation":view.generation,

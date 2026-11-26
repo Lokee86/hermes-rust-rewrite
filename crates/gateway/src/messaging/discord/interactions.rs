@@ -139,14 +139,26 @@ impl DiscordAdapter {
         else {
             return skip(ingress, advance).await;
         };
-        let Some(roles) = self.roles(&route, &user.id, membership).await? else {
-            return skip(ingress, advance).await;
-        };
-        let sender = self
-            .record_sender(ingress, &route, &user, &roles)
-            .await
-            .map_err(intake_failure)?;
         let event_id = format!("discord-interaction-{}", input.id);
+        let name = input.data.get("name").and_then(Value::as_str);
+        let background = input.kind == 2 && name == Some("bg");
+        let recorded = db(
+            ingress.store.read(|tx| store::intake_receipt(tx, &ingress.connection, &event_id))
+        ).map_err(intake_failure)?;
+        let repeated_background = recorded.as_ref().is_some_and(|receipt| {
+            background || receipt.route.as_deref().is_some_and(store::Route::is_background_id)
+        });
+        let (sender, roles) = if repeated_background {
+            // A replay's role snapshot may predate a later membership change.
+            (Sender { id: user.id.clone(), roles: BTreeSet::new() }, BTreeSet::new())
+        } else {
+            let Some(roles) = self.roles(&route, &user.id, membership).await? else {
+                return skip(ingress, advance).await;
+            };
+            let sender = self.record_sender(ingress, &route, &user, &roles)
+                .await.map_err(intake_failure)?;
+            (sender, roles)
+        };
         let mut event = InboundEvent {
             id: event_id.clone(),
             room: route.room.clone(),
@@ -155,9 +167,8 @@ impl DiscordAdapter {
             mentioned: true,
             body: InboundBody::Command(Command::Status),
         };
-        if !self
-            .settings
-            .allows_command(&user.id, route.guild.as_deref(), &roles)
+        if !self.settings.commands.enabled
+            || !background && !self.settings.allows_command(&user.id, route.guild.as_deref(), &roles)
         {
             refuse(ingress, event, Disposition::Forbidden, advance).await?;
             self.respond(
@@ -171,14 +182,9 @@ impl DiscordAdapter {
         }
         let expired = deadline(&input.id, ACK_MS).is_none_or(|until| until <= now());
         let can_finish_as_message =
-            input.kind == 2 && input.data.get("name").and_then(Value::as_str) == Some("skill");
+            input.kind == 2 && matches!(name, Some("skill" | "bg"));
         if expired && !can_finish_as_message {
-            let known = db(ingress
-                .store
-                .read(|tx| store::intake_receipt(tx, &ingress.connection, &event.id)))
-            .map_err(intake_failure)?
-            .is_some();
-            if known {
+            if recorded.is_some() {
                 skip(ingress, advance).await?;
             } else {
                 refuse(ingress, event, Disposition::Expired, advance).await?;
@@ -336,6 +342,13 @@ impl DiscordAdapter {
                 Some(model) => Command::SelectProfileModel { model },
                 None => Command::ModelPicker,
             }),
+            "bg" if room.thread.is_some()
+                || !crate::lock(&self.channels)
+                    .get(&room.chat)
+                    .is_some_and(|channel| matches!(channel.kind, 15 | 16)) =>
+            {
+                option("text").and_then(|text| command(Command::Background { text }))
+            }
             "skill" => option("skill")
                 .zip(option("input"))
                 .and_then(|(skill, input)| command(Command::UseSkill { skill, input })),
@@ -766,6 +779,9 @@ fn outcome_text(outcome: InvocationOutcome) -> String {
         InvocationOutcome::PendingResult => "The result is still pending.".into(),
         InvocationOutcome::Busy => {
             "The conversation still has work. Retry after it settles.".into()
+        }
+        InvocationOutcome::BackgroundQueued => {
+            "Background work queued. The result will arrive in this conversation.".into()
         }
         InvocationOutcome::ResultReady { .. } => "The result is ready.".into(),
         InvocationOutcome::AlreadyClaimed => "The result was already claimed.".into(),

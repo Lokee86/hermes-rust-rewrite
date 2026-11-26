@@ -371,6 +371,18 @@ impl Ingress {
                 Err(error) => return Err(error),
             }
         }
+        if matches!(event.body, InboundBody::Command(super::Command::Background { .. })) {
+            if !caps.text_delivery || preparing {
+                return Ok(Err(Disposition::Unsupported));
+            }
+            if event.reply_anchor.is_some() {
+                return Ok(Err(Disposition::Invalid));
+            }
+            if !policy.allows_background_command(&event.room, &sender) {
+                return Ok(Err(Disposition::Forbidden));
+            }
+            return self.background_route(&event.room, &sender.id, &event.id).map(Ok);
+        }
         let participant = room.per_participant.then_some(sender.id.as_str());
         let route = db(store::Route::new(
             &self.connection,
@@ -408,6 +420,9 @@ impl Ingress {
             let original = &pending.intent.room;
             if destination == *original {
                 return Ok(());
+            }
+            if store::Route::is_background_id(&pending.route) {
+                return Err(GatewayError::Forbidden);
             }
             let confirmed_thread = original.thread.is_none()
                 && destination.chat == original.chat
@@ -1198,7 +1213,7 @@ impl Host {
     pub fn manual_notification(&self, route: &str, request: &str, text: String) -> Result<String> {
         ensure!(valid_id(route) && valid_id(request), "Invalid messaging destination or request identity");
         let route = self.store.route(route)?.context("Unknown messaging destination")?;
-        ensure!(!route.blocked, "Messaging destination is blocked");
+        ensure!(!route.blocked && !route.is_background(), "Messaging destination is unavailable");
         let producer = store::key("manual", &(&route.id, request))?;
         self.store.notification(&route, &producer, text)
     }
@@ -1214,7 +1229,7 @@ impl Host {
     }
 
     pub(crate) fn authorized_route(&self, id: &str) -> Result<bool> {
-        Ok(self.store.route(id)?.is_some_and(|route| !route.blocked))
+        Ok(self.store.route(id)?.is_some_and(|route| !route.blocked && !route.is_background()))
     }
 
     pub(crate) fn notification_text(
@@ -1513,6 +1528,11 @@ async fn deliver(
                     scope.delivery_protection(&state.policy, &pending.intent.room, &pending.intent.id)
                 }).map_err(|_| PreparationFailure::Rejected)?;
                 for part in &mut parts {
+                    if store::Route::is_background_id(&pending.route)
+                        && matches!(part.effect.operation, super::EffectOperation::Provision { .. })
+                    {
+                        return Err(PreparationFailure::Unsupported);
+                    }
                     if let Some(required) = &protection {
                         if part.effect.protection.as_ref().is_some_and(|value| value != required) {
                             return Err(PreparationFailure::Rejected);
@@ -1623,6 +1643,9 @@ fn delivery_authorized(
         || !scope.thread_provision_allowed(state, &pending.intent, pending.sender.as_ref())?
     {
         return Ok(false);
+    }
+    if route.is_background() {
+        return scope.background_delivery_allowed(state, &route, pending);
     }
     if let Some(sender) = &pending.sender {
         let participant = policy.per_participant.then_some(sender.id.as_str());

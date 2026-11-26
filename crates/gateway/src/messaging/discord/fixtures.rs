@@ -38,6 +38,8 @@ mod history_fixtures;
 
 #[path = "command_fixtures.rs"]
 mod command_fixtures;
+#[path = "background_fixtures.rs"]
+mod background_fixtures;
 
 const LIMIT: Duration = Duration::from_secs(15);
 
