@@ -3,7 +3,7 @@ use crate::messaging::{
     AttachmentManifest, GatewayError, Ingress, MediaPurpose, MediaSource, Message, media::MAX_FILE,
 };
 use futures_util::TryStreamExt;
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashSet, io, time::Duration};
@@ -135,13 +135,6 @@ pub(super) async fn hydrate_attachments(
     body: Message,
     expected: &[AttachmentSource],
 ) -> Result<Message, GatewayError> {
-    let cdn = Client::builder()
-        .https_only(true)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(MEDIA_LIFETIME)
-        .build()
-        .map_err(|_| GatewayError::TemporarilyUnavailable)?;
     hydrate_with(
         client,
         ingress,
@@ -150,7 +143,7 @@ pub(super) async fn hydrate_attachments(
         message,
         body,
         expected,
-        |url, size| open_cdn(&cdn, url, size),
+        |url, size| open_cdn(client, url, size),
     )
     .await
 }
@@ -254,12 +247,13 @@ where
 }
 
 async fn open_cdn(
-    client: &Client,
+    client: &DiscordClient,
     url: Url,
     size: usize,
 ) -> Result<impl AsyncRead + Unpin, GatewayError> {
     let response = client
-        .get(url)
+        .public_get(url)
+        .timeout(MEDIA_LIFETIME)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await

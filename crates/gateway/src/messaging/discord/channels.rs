@@ -205,13 +205,13 @@ impl DiscordAdapter {
         route: &ChannelRoute,
         actor: &str,
         supplied: Option<Member>,
-    ) -> Result<Option<Vec<String>>, ConnectionFailure> {
+    ) -> Result<Option<BTreeSet<String>>, ConnectionFailure> {
         let Some(guild) = route
             .guild
             .as_deref()
             .or(self.settings.dm_role_guild.as_deref())
         else {
-            return Ok(Some(Vec::new()));
+            return Ok(Some(BTreeSet::new()));
         };
         let member = if route.guild.is_some() && supplied.is_some() {
             supplied
@@ -223,7 +223,7 @@ impl DiscordAdapter {
             {
                 Ok(member) => Some(member),
                 Err(RestFailure::Missing | RestFailure::Forbidden) if route.guild.is_none() => {
-                    return Ok(Some(Vec::new()));
+                    return Ok(Some(BTreeSet::new()));
                 }
                 Err(RestFailure::Missing | RestFailure::Forbidden) => return Ok(None),
                 Err(error) => return Err(rest_failure(error)),
@@ -233,7 +233,7 @@ impl DiscordAdapter {
             if member.roles.len() > 128 || member.roles.iter().any(|role| !snowflake(role)) {
                 return None;
             }
-            Some(member.roles)
+            Some(member.roles.into_iter().collect())
         }))
     }
 
@@ -242,7 +242,7 @@ impl DiscordAdapter {
         ingress: &Ingress,
         route: &ChannelRoute,
         user: &User,
-        roles: &[String],
+        roles: &BTreeSet<String>,
     ) -> Result<Sender, GatewayError> {
         if !snowflake(&user.id) {
             return Err(GatewayError::Invalid);

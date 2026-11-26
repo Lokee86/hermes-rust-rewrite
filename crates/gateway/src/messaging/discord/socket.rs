@@ -193,6 +193,7 @@ async fn run(
         ingress.report_gap().map_err(intake_failure)?;
         ingress
             .invalidate_actor_evidence(None)
+            .await
             .map_err(intake_failure)?;
         adapter
             .remember_recovery(&ingress)

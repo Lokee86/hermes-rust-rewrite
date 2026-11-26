@@ -14,8 +14,6 @@ mod voice;
 
 #[cfg(test)]
 mod fixtures;
-#[cfg(test)]
-mod settings_tests;
 
 pub use settings::{DiscordConnectionSettings, DiscordSettings};
 
@@ -39,7 +37,6 @@ use voice::Voice;
 pub(super) use messages::MESSAGE_TABLES;
 pub(super) use recovery::RECOVERY_TABLES;
 pub(super) use settings::DiscordFactory;
-pub(crate) use settings::{PLATFORM, TABLES};
 
 pub(super) struct DiscordAdapter {
     client: DiscordClient,

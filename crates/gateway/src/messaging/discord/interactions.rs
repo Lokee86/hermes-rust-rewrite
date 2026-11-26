@@ -163,7 +163,16 @@ impl DiscordAdapter {
         let can_finish_as_message =
             input.kind == 2 && input.data.get("name").and_then(Value::as_str) == Some("skill");
         if expired && !can_finish_as_message {
-            refuse(ingress, event, Disposition::Expired, advance).await?;
+            let known = db(ingress
+                .store
+                .read(|tx| store::intake_receipt(tx, &ingress.connection, &event.id)))
+            .map_err(intake_failure)?
+            .is_some();
+            if known {
+                skip(ingress, advance).await?;
+            } else {
+                refuse(ingress, event, Disposition::Expired, advance).await?;
+            }
             return Ok(());
         }
         let action = self

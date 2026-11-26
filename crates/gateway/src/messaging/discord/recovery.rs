@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 
-pub(super) const RECOVERY_TABLES: &str = "
+pub(in crate::messaging) const RECOVERY_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_discord_recovery (
     connection TEXT PRIMARY KEY, cutoff_ms INTEGER NOT NULL
 );

@@ -27,7 +27,7 @@ use std::{
 use tokio::{
     net::TcpListener,
     sync::mpsc,
-    time::{Instant, sleep, timeout},
+    time::{sleep, timeout},
 };
 
 const LIMIT: Duration = Duration::from_secs(15);

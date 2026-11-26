@@ -652,6 +652,13 @@ impl DiscordSettings {
                     true,
                 );
                 policy.scope.rooms.insert(channel_id.clone(), room);
+                if self.voice_enabled {
+                    policy
+                        .rooms
+                        .entry(channel_id.clone())
+                        .or_default()
+                        .spoken_replies = true;
+                }
                 let mut threads = BTreeMap::new();
                 for (thread_id, thread) in &channel.threads {
                     let mut rules =

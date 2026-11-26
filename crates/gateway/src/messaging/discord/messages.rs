@@ -26,7 +26,7 @@ const PREPARATION_TTL_MS: i64 = 10 * 60 * 1000;
 const MAX_WORKERS: usize = 12;
 const TOKEN_PREFIX: &str = "discord-preparation-";
 
-pub(super) const MESSAGE_TABLES: &str = "
+pub(in crate::messaging) const MESSAGE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_discord_preparation (
     connection TEXT NOT NULL, event TEXT NOT NULL, expires INTEGER NOT NULL, manifest TEXT NOT NULL,
     PRIMARY KEY(connection,event)
