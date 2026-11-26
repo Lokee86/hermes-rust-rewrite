@@ -708,6 +708,7 @@ impl Store {
 
     pub fn recover_sends(&self, connection: &str) -> Result<()> {
         self.write(|tx| {
+            effect_store::recover_recipients(tx,connection)?;
             tx.execute(
                 "UPDATE messaging_parts SET stage = 'uncertain',reason = 'send_interrupted',generation = NULL
                  WHERE stage = 'sending' AND delivery IN (SELECT id FROM messaging_deliveries WHERE connection = ?1)",

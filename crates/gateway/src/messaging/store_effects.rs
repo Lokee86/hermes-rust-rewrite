@@ -1,10 +1,10 @@
 use super::{PendingDelivery, Store, enqueue, key, read_route};
 use crate::messaging::{
     ConsentUpdate, DeliveryBody, DeliveryIntent, DeliveryPart, EffectDependency, EffectIdentity,
-    EffectObservation, EffectOperation, EffectReceipt, EffectVisibility, MarkerRef,
-    ObservationResult, PresentationPhase, ProviderDeliveryState, ReceiptKind, RecipientOutcome,
-    RecipientResults, ReplayScope, ReplyGrant, ReplyOperation, ResolvedEffect, RetryScope, Room,
-    SendAttempt,
+    EffectObservation, EffectOperation, EffectReceipt, EffectTransportPin, EffectTransportRef,
+    EffectVisibility, MarkerRef, ObservationResult, PresentationPhase, ProviderDeliveryState,
+    ReceiptKind, RecipientOutcome, RecipientResults, ReplayScope, ReplyGrant, ReplyOperation,
+    ResolvedEffect, RetryScope, Room, SendAttempt, Sender,
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS messaging_effect_attempts (
     started_at INTEGER NOT NULL, submitted INTEGER NOT NULL, subsets INTEGER NOT NULL,
     PRIMARY KEY(delivery,ordinal,attempt), FOREIGN KEY(delivery,ordinal) REFERENCES messaging_parts(delivery,ordinal)
 );
+CREATE TABLE IF NOT EXISTS messaging_effect_pins (
+    delivery TEXT NOT NULL, ordinal INTEGER NOT NULL, attempt INTEGER NOT NULL, receipt TEXT NOT NULL,
+    PRIMARY KEY(delivery,ordinal,attempt),
+    FOREIGN KEY(delivery,ordinal,attempt) REFERENCES messaging_effect_attempts(delivery,ordinal,attempt)
+);
 CREATE TABLE IF NOT EXISTS messaging_effect_identifiers (
     connection TEXT NOT NULL, destination TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL,
     recipient TEXT NOT NULL, delivery TEXT NOT NULL, ordinal INTEGER NOT NULL,
@@ -86,6 +91,7 @@ pub(in crate::messaging) struct OutboundPolicy {
     pub visibility: EffectVisibility,
     pub protection: Option<String>,
     pub submitted: bool,
+    pub transport: Option<EffectTransportPin>,
     pub subsets: bool,
     pub retransmission: bool,
 }
@@ -121,6 +127,47 @@ fn json<T: DeserializeOwned>(value: String) -> Result<T> {
 }
 
 impl Store {
+    pub fn next_transport(
+        &self,
+        connection: &str,
+        delivery: &str,
+    ) -> Result<Option<EffectTransportRef>> {
+        self.read(|db| {
+            let body: Option<String> = db.query_row(
+                "SELECT p.body FROM messaging_parts p JOIN messaging_deliveries d ON d.id=p.delivery
+                 WHERE d.connection=?1 AND p.delivery=?2 AND p.stage NOT IN ('sent','discarded','partial','submitted')
+                 ORDER BY p.ordinal LIMIT 1",
+                params![connection,delivery], |row| row.get(0),
+            ).optional()?;
+            Ok(body.map(json::<DeliveryPart>).transpose()?.and_then(|part| part.effect.transport))
+        })
+    }
+
+    pub fn dispatch_transport(
+        &self,
+        connection: &str,
+        generation: &str,
+        attempt: &SendAttempt,
+    ) -> Result<Option<(EffectTransportPin, Option<Sender>)>> {
+        self.read(|db| {
+            let row = db.query_row(
+                "SELECT t.receipt,d.sender,p.body FROM messaging_effect_pins t
+                 JOIN messaging_parts p ON p.delivery=t.delivery AND p.ordinal=t.ordinal AND p.attempt=t.attempt
+                 JOIN messaging_deliveries d ON d.id=p.delivery
+                 WHERE d.connection=?1 AND t.delivery=?2 AND t.ordinal=?3 AND t.attempt=?4
+                     AND p.generation=?5 AND p.stage='sending'",
+                params![connection,attempt.delivery_id,attempt.part,attempt.attempt,generation],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?)),
+            ).optional()?;
+            let Some((receipt,sender,body)) = row else { return Ok(None) };
+            let pin = json::<EffectTransportPin>(receipt)?;
+            if attempt.effect.transport.as_ref()!=Some(&pin) || json::<DeliveryPart>(body)?!=attempt.payload {
+                return Ok(None);
+            }
+            Ok(Some((pin,sender.map(json).transpose()?)))
+        })
+    }
+
     pub fn reply_grant(&self, connection: &str, grant: &ReplyGrant, refresh: bool) -> Result<bool> {
         self.write(|tx| {
             let source: Option<String> = tx.query_row(
@@ -387,6 +434,22 @@ struct AuthorizedEffect {
     marker: Option<EffectReceipt>,
 }
 
+fn recorded_transport(
+    tx: &Connection,
+    id: &str,
+    ordinal: u32,
+    attempt: u32,
+) -> Result<Option<EffectTransportPin>> {
+    tx.query_row(
+        "SELECT receipt FROM messaging_effect_pins WHERE delivery=?1 AND ordinal=?2 AND attempt=?3",
+        params![id, ordinal, attempt],
+        |row| row.get(0),
+    )
+    .optional()?
+    .map(json)
+    .transpose()
+}
+
 fn authorize_effect(
     tx: &Transaction<'_>,
     connection: &str,
@@ -398,6 +461,9 @@ fn authorize_effect(
 ) -> Result<Result<AuthorizedEffect, &'static str>> {
     let id = &pending.intent.id;
     let effect = &part.effect;
+    if effect.transport.as_ref() != policy.transport.as_ref().map(|pin| &pin.requirement) {
+        return Ok(Err("eligibility_transport_address"));
+    }
     if effect.write_only && !policy.submitted {
         return Ok(Err("eligibility_write_only"));
     }
@@ -686,6 +752,8 @@ pub(super) fn claim(
             || policy.now >= guarantee.expires_at_ms
             || true_scope.as_ref() != Some(&guarantee.scope)
             || old_data.as_deref() != Some(&data)
+            || recorded_transport(tx, id, ordinal, old_attempt)?.as_ref()
+                != policy.transport.as_ref()
         {
             return Ok(None);
         }
@@ -717,6 +785,10 @@ pub(super) fn claim(
     if !payload.effect.recipients.is_empty() && recipients.is_empty() {
         return Ok(None);
     }
+    if !policy.subsets && recipients != payload.effect.recipients {
+        block(tx, id, ordinal, "eligibility_recipient_subset")?;
+        return Ok(None);
+    }
     let attempt = if retransmission {
         old_attempt
     } else {
@@ -734,6 +806,12 @@ pub(super) fn claim(
          ON CONFLICT(delivery,ordinal,attempt) DO UPDATE SET lease=excluded.lease,retransmission=excluded.retransmission",
         params![id,ordinal,attempt,data,generation,retransmission,policy.now,policy.submitted,policy.subsets],
     )?;
+    if let Some(pin) = &policy.transport {
+        tx.execute(
+            "INSERT OR IGNORE INTO messaging_effect_pins (delivery,ordinal,attempt,receipt) VALUES (?1,?2,?3,?4)",
+            params![id,ordinal,attempt,serde_json::to_string(pin)?],
+        )?;
+    }
     if let Some(grant) = &payload.effect.reply_grant {
         tx.execute(
             "INSERT OR IGNORE INTO messaging_effect_reservations (connection,grant_id,delivery,part) VALUES (?1,?2,?3,?4)",
@@ -748,6 +826,7 @@ pub(super) fn claim(
         payload,
         effect: ResolvedEffect {
             retransmission,
+            transport: policy.transport.clone(),
             dependencies: authorized.dependencies,
             marker: authorized.marker,
             recipients,
@@ -770,7 +849,7 @@ pub(super) fn recheck(
     ).optional()?;
     let Some(body) = body else { return Ok(false) };
     let part = json::<DeliveryPart>(body)?;
-    if part != send.payload {
+    if part != send.payload || send.effect.transport.as_ref() != policy.transport.as_ref() {
         return Ok(false);
     }
     if let Some(guarantee) = &part.effect.replay
@@ -824,6 +903,38 @@ fn retry_recipients(
         .into_iter()
         .filter_map(|(key, value)| matches!(value, RecipientOutcome::NotAccepted).then_some(key))
         .collect())
+}
+
+fn mark_uncertain_recipients(
+    tx: &Transaction<'_>,
+    id: &str,
+    ordinal: u32,
+    part: &DeliveryPart,
+) -> Result<()> {
+    for recipient in retry_recipients(tx, id, ordinal, part)? {
+        put_outcome(tx, id, ordinal, &recipient, &RecipientOutcome::Uncertain)?;
+    }
+    Ok(())
+}
+
+pub(super) fn recover_recipients(tx: &Transaction<'_>, connection: &str) -> Result<()> {
+    let mut statement = tx.prepare(
+        "SELECT p.delivery,p.ordinal,p.body FROM messaging_parts p JOIN messaging_deliveries d ON d.id=p.delivery
+         WHERE d.connection=?1 AND p.stage='sending'",
+    )?;
+    let recovered = statement
+        .query_map([connection], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, ordinal, body) in recovered {
+        mark_uncertain_recipients(tx, &id, ordinal, &json::<DeliveryPart>(body)?)?;
+    }
+    Ok(())
 }
 
 fn put_outcome(
@@ -1422,6 +1533,13 @@ pub(super) fn record(
             RecordedEffect::with("submitted", None)
         }
         DeliveryResult::Retryable { after, scope } if !exact_replay => {
+            if generation.is_none() {
+                for (recipient, outcome) in &receipts {
+                    if matches!(outcome, RecipientOutcome::Uncertain) {
+                        put_outcome(tx, id, ordinal, recipient, &RecipientOutcome::NotAccepted)?;
+                    }
+                }
+            }
             cooldown(tx, id, scope, after, now)?;
             let mut classified = RecordedEffect::with("pending", Some("rate_limited"));
             classified.release_slot = receipts.is_empty();
@@ -1458,6 +1576,9 @@ pub(super) fn record(
         }
         _ => RecordedEffect::uncertain(),
     };
+    if stage.reason == Some("send_outcome_unknown") {
+        mark_uncertain_recipients(tx, id, ordinal, &part)?;
+    }
     if stage.release_slot {
         release_slot(tx, id, ordinal)?;
     }

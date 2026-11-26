@@ -20,6 +20,8 @@ pub struct Effect {
     pub visibility: EffectVisibility,
     /// Provider-issued eligibility registered against the source input.
     pub reply_grant: Option<String>,
+    /// An already verified provider address required by this delivery operation.
+    pub transport: Option<EffectTransportRef>,
     pub consent_required: bool,
     /// The operation can finish with a local write and has no remote acceptance receipt.
     pub write_only: bool,
@@ -135,10 +137,27 @@ pub struct EffectReceipt {
     pub id: String,
 }
 
+/// An immutable, credential-free selector for a verified address binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectTransportRef {
+    pub reference: String,
+    pub resource: String,
+    pub operation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectTransportPin {
+    pub(super) requirement: EffectTransportRef,
+    pub(super) fingerprint: String,
+    pub(super) revision: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedEffect {
     /// This flag is only set when the adapter affirmed an unchanged provider replay scope.
     pub retransmission: bool,
+    /// The address proof used by this attempt. It carries no endpoint or secret.
+    pub transport: Option<EffectTransportPin>,
     /// Earlier typed effects, all durably confirmed before this claim.
     pub dependencies: Vec<(u32, EffectReceipt)>,
     /// Exact confirmed gateway-owned marker to update or retire.
@@ -526,6 +545,15 @@ pub(super) fn valid_effect_plan(
             .into_iter()
             .flatten()
             .any(|id| !valid_id(id))
+            || effect.transport.as_ref().is_some_and(|transport| {
+                [
+                    &transport.reference,
+                    &transport.resource,
+                    &transport.operation,
+                ]
+                .into_iter()
+                .any(|id| !valid_id(id))
+            })
             || effect.recipients.len() > 256
             || effect.recipients.iter().any(|id| !valid_id(id))
             || effect.replay.as_ref().is_some_and(|replay| {
@@ -540,6 +568,7 @@ pub(super) fn valid_effect_plan(
             })
             || effect.publish_after_definite_edit_refusal
                 && (part.edit_target.is_none()
+                    || effect.transport.is_some()
                     || effect.provider_operation().is_some()
                     || !effect.recipients.is_empty()
                     || !matches!(effect.operation, EffectOperation::Message)

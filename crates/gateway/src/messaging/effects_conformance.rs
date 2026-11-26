@@ -1,5 +1,7 @@
 use super::*;
-use crate::messaging::{DeliveryPolicy, VerifiedInstallation};
+use crate::messaging::{
+    DeliveryPolicy, EnrollmentCredential, TransportAddress, VerifiedInstallation,
+};
 
 type Render = dyn Fn(&DeliveryIntent) -> Vec<DeliveryPart> + Send + Sync;
 
@@ -132,6 +134,7 @@ fn group_plan(intent: &DeliveryIntent) -> Vec<DeliveryPart> {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            operation_key: Some("group-attempt-key".into()),
             ..Effect::default()
         },
     )]
@@ -255,16 +258,40 @@ async fn group_partial_result_and_late_status_are_scoped_across_restart() {
         ["chris".to_owned()].into_iter().collect()
     );
     assert!(!second.attempt.effect.retransmission);
-    second.finish(DeliveryResult::Recipients(RecipientResults {
-        receipt: Some("group-retry".into()),
-        retry_after: None,
-        recipients: vec![RecipientReceipt {
-            recipient: "chris".into(),
-            outcome: RecipientOutcome::Accepted {
-                receipt: "c".into(),
-            },
-        }],
-    }));
+    second.finish(DeliveryResult::Uncertain);
+    phase(&reopened, &id, 0, "uncertain").await;
+    let unrelated = receipt_for(
+        "later-a",
+        &room,
+        EffectIdentity::ProviderId("a".into()),
+        Some("alice"),
+        "a",
+        ProviderDeliveryState::Played,
+    );
+    assert_eq!(
+        reopened_ingress.observe_delivery(unrelated).await.unwrap(),
+        ObservationResult::Applied
+    );
+    assert!(
+        timeout(Duration::from_millis(250), driver.sent.recv())
+            .await
+            .is_err()
+    );
+    let last_recipient = receipt_for(
+        "late-c",
+        &room,
+        EffectIdentity::OperationKey("group-attempt-key".into()),
+        Some("chris"),
+        "c",
+        ProviderDeliveryState::Accepted,
+    );
+    assert_eq!(
+        reopened_ingress
+            .observe_delivery(last_recipient)
+            .await
+            .unwrap(),
+        ObservationResult::Applied
+    );
     phase(&reopened, &id, 0, "sent").await;
     let failure = receipt_for(
         "failed",
@@ -923,5 +950,89 @@ async fn revoked_actor_can_only_leave_a_scoped_marker_retirement() {
             .await
             .is_err()
     );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delivery_address_is_verified_before_use_and_late_receipts_survive_revocation() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Poll, "address-bound", true);
+    let config = stock(&driver, policy(), EffectCapabilities::default(), |intent| {
+        vec![part(
+            intent,
+            Effect {
+                operation_key: Some("address-op".into()),
+                transport: Some(EffectTransportRef {
+                    reference: "provider-address".into(),
+                    resource: "provider-room".into(),
+                    operation: "send".into(),
+                }),
+                ..Effect::default()
+            },
+        )]
+    });
+    let gateway = model.gateway(root.path(), vec![config]).await;
+    let ingress = driver.ready().await;
+    let event = dm("address-input", "address-room", "hello");
+    let room = event.room.clone();
+    driver.push(event).await;
+    status(&gateway, |value| {
+        value["deliveries"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["part_state"] == "blocked" && row["error"] == "eligibility_transport_address"
+            })
+        })
+    })
+    .await;
+    let address = TransportAddress {
+        reference: "provider-address".into(),
+        endpoint: "https://fixture.example/send?query=private-url".into(),
+        resource: "provider-room".into(),
+        operation: "send".into(),
+        actor: None,
+        room: Some(room.clone()),
+        revision: 1,
+        expires_at: now() + 15_000,
+    };
+    ingress
+        .record_transport_address(
+            address,
+            Some(EnrollmentCredential::new("private-credential".into()).unwrap()),
+        )
+        .await
+        .unwrap();
+    let sent = driver.sent().await;
+    let id = sent.attempt.delivery_id.clone();
+    let authority = ingress.delivery_authority(&sent.attempt).await.unwrap();
+    assert_eq!(authority.credential(), Some("private-credential"));
+    assert_eq!(authority.endpoint.host_str(), Some("fixture.example"));
+    let debug = format!("{:?}", sent.attempt);
+    assert!(!debug.contains("private-credential") && !debug.contains("private-url"));
+    assert!(
+        ingress
+            .revoke_transport_address("provider-address", 2)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        ingress.delivery_authority(&sent.attempt).await,
+        Err(GatewayError::Forbidden)
+    ));
+    sent.finish(DeliveryResult::Uncertain);
+    phase(&gateway, &id, 0, "uncertain").await;
+    let late = receipt_for(
+        "address-reply",
+        &room,
+        EffectIdentity::OperationKey("address-op".into()),
+        None,
+        "recorded-message",
+        ProviderDeliveryState::Accepted,
+    );
+    assert_eq!(
+        ingress.observe_delivery(late).await.unwrap(),
+        ObservationResult::Applied
+    );
+    phase(&gateway, &id, 0, "sent").await;
     gateway.shutdown().await.unwrap();
 }

@@ -1249,6 +1249,7 @@ async fn reopens_durable_intake_queue_claim_and_committed_result() {
             visibility: EffectVisibility::default(),
             protection: None,
             submitted: false,
+            transport: None,
             subsets: false,
             retransmission: false,
         })

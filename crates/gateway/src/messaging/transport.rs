@@ -1,4 +1,5 @@
 use super::{
+    AccessPolicy, EffectTransportPin, EffectTransportRef, SendAttempt,
     profile::{ActorKind, ActorObservation, EnrollmentCredential, VerifiedInstallation, time_ms},
     runtime::{Ingress, blocking, db, valid_id},
     store::Store,
@@ -207,7 +208,111 @@ impl Store {
     }
 }
 
+struct CheckedEffectAddress {
+    pin: EffectTransportPin,
+    endpoint: reqwest::Url,
+    sealed_credential: Option<String>,
+}
+
 impl Ingress {
+    /// Called while the owner holds the connection lease. The pin is safe to
+    /// persist with an attempt because it contains no endpoint or credential.
+    pub(super) fn authorize_effect_transport(
+        &self,
+        policy: &AccessPolicy,
+        required: &EffectTransportRef,
+        room: &Room,
+        source_actor: Option<&Sender>,
+    ) -> Result<Option<EffectTransportPin>, GatewayError> {
+        Ok(self
+            .checked_effect_address(policy, required, room, source_actor)?
+            .map(|value| value.pin))
+    }
+
+    fn checked_effect_address(
+        &self,
+        policy: &AccessPolicy,
+        required: &EffectTransportRef,
+        room: &Room,
+        source_actor: Option<&Sender>,
+    ) -> Result<Option<CheckedEffectAddress>, GatewayError> {
+        let Some((address, scope, sealed_credential)) =
+            db(self.store.address(&self.connection, &required.reference))?
+        else {
+            return Ok(None);
+        };
+        let Some(installation) = self.installation() else {
+            return Ok(None);
+        };
+        let actor = source_actor.map(|sender| sender.id.as_str());
+        if !scope.matches(installation)
+            || address.expires_at <= time_ms()
+            || address.operation != required.operation
+            || address.resource != required.resource
+            || address.room.as_ref() != Some(room)
+            || address
+                .actor
+                .as_deref()
+                .is_some_and(|owner| Some(owner) != actor)
+            || !self.grant_current(policy, address.actor.as_deref(), Some(room))?
+        {
+            return Ok(None);
+        }
+        let Some(endpoint) = safe_endpoint(&address.endpoint, &scope.origin) else {
+            return Ok(None);
+        };
+        let pin = EffectTransportPin {
+            requirement: required.clone(),
+            fingerprint: db(super::store::key("effect-address", &(&address, &scope)))?,
+            revision: address.revision,
+        };
+        Ok(Some(CheckedEffectAddress {
+            pin,
+            endpoint,
+            sealed_credential,
+        }))
+    }
+
+    /// Resolve only the address pinned to the currently leased attempt. The
+    /// adapter must use the authority immediately and cannot follow redirects.
+    pub async fn delivery_authority(
+        &self,
+        attempt: &SendAttempt,
+    ) -> Result<TransportAuthority, GatewayError> {
+        let ingress = self.clone();
+        let attempt = attempt.clone();
+        blocking(move || {
+            ingress.checked(true, |state| {
+                let (stored, actor) = db(ingress.store.dispatch_transport(
+                    &ingress.connection,
+                    &ingress.generation,
+                    &attempt,
+                ))?
+                .ok_or(GatewayError::Forbidden)?;
+                let live = ingress
+                    .checked_effect_address(
+                        &state.policy,
+                        &stored.requirement,
+                        &attempt.payload.room,
+                        actor.as_ref(),
+                    )?
+                    .filter(|proof| proof.pin == stored)
+                    .ok_or(GatewayError::Forbidden)?;
+                let credential = live
+                    .sealed_credential
+                    .map(|value| {
+                        EnrollmentCredential::new(db(hermes_engine::secret::unseal(&value))?)
+                    })
+                    .transpose()?;
+                Ok(TransportAuthority {
+                    endpoint: live.endpoint,
+                    credential,
+                })
+            })
+        })
+        .await
+    }
+
     fn grant_current(
         &self,
         policy: &super::AccessPolicy,

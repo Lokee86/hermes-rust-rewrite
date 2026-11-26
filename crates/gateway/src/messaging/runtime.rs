@@ -1,5 +1,5 @@
 use super::{
-    EffectVisibility, effects::valid_effect_plan,
+    EffectTransportRef, EffectVisibility, effects::valid_effect_plan,
     profile::{
         AccountBinding, ConnectionSettings, EnrollmentCredential, EnrollmentLease,
         VerifiedInstallation,
@@ -1236,7 +1236,8 @@ async fn deliver(
             if !delivery_authorized(scope, state, &pending)? {
                 return Ok(None);
             }
-            let policy = outbound_policy(scope, state, &pending.intent.room);
+            let transport = db(scope.store.next_transport(&scope.connection,&pending.intent.id))?;
+            let policy = outbound_policy(scope, state, &pending, transport.as_ref())?;
             db(scope.store.claim(&scope.connection, &scope.generation, &pending, &policy))
         })?;
         let Some(attempt) = attempt else { continue };
@@ -1248,7 +1249,7 @@ async fn deliver(
                 if !state.accepting || !delivery_authorized(&scope, state, &pending)? {
                     return Ok(false);
                 }
-                let policy = outbound_policy(&scope, state, &pending.intent.room);
+                let policy = outbound_policy(&scope, state, &pending, attempt.payload.effect.transport.as_ref())?;
                 db(scope.store.recheck(&scope.connection, &scope.generation, &pending, &attempt, &policy))
             })?;
             if cancel.is_cancelled() || !authorized {
@@ -1326,10 +1327,20 @@ fn delivery_authorized(
     db(scope.store.allows_notification(&route.id, now()))
 }
 
-fn outbound_policy(scope: &Ingress, state: &State, room: &Room) -> OutboundPolicy {
+fn outbound_policy(
+    scope: &Ingress,
+    state: &State,
+    delivery: &PendingDelivery,
+    requirement: Option<&EffectTransportRef>,
+) -> Result<OutboundPolicy, GatewayError> {
+    let room = &delivery.intent.room;
     let policy = state.policy.delivery_policy(room);
     let caps = scope.capabilities().effects;
-    OutboundPolicy {
+    let transport = match requirement {
+        Some(address) => scope.authorize_effect_transport(&state.policy,address,room,delivery.sender.as_ref())?,
+        None => None,
+    };
+    Ok(OutboundPolicy {
         now: now(),
         visibility: EffectVisibility {
             notify: policy.notifications,
@@ -1337,9 +1348,10 @@ fn outbound_policy(scope: &Ingress, state: &State, room: &Room) -> OutboundPolic
         },
         protection: policy.protection,
         submitted: caps.submitted && policy.submitted,
+        transport,
         subsets: caps.recipient_subsets,
         retransmission: caps.retransmission,
-    }
+    })
 }
 
 fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]) -> bool {
