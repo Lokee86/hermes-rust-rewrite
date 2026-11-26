@@ -1,8 +1,11 @@
 use super::{
     policy::ResourcePolicy,
     runtime::{Ingress, blocking, db, valid_id},
-    store::{Store, decode, key},
-    types::{AccessPolicy, GatewayError, Room, RoomKind, Sender},
+    store::{self, Candidate, Route, Store, decode, key},
+    types::{
+        AccessPolicy, Advance, Disposition, GatewayError, InboundBody, InboundEvent, IntakeReceipt,
+        Room, RoomKind, Sender,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
@@ -24,6 +27,15 @@ CREATE TABLE IF NOT EXISTS messaging_enrollment (
 CREATE TABLE IF NOT EXISTS messaging_actor_evidence (
     connection TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, revision INTEGER NOT NULL,
     PRIMARY KEY(connection, actor)
+);
+CREATE TABLE IF NOT EXISTS messaging_resource_evidence (
+    connection TEXT NOT NULL, event TEXT NOT NULL, evidence TEXT NOT NULL,
+    PRIMARY KEY(connection, event)
+);
+CREATE TABLE IF NOT EXISTS messaging_resource_delivery (
+    delivery TEXT PRIMARY KEY REFERENCES messaging_deliveries(id), connection TEXT NOT NULL,
+    event TEXT NOT NULL,
+    FOREIGN KEY(connection,event) REFERENCES messaging_resource_evidence(connection,event)
 );
 CREATE TABLE IF NOT EXISTS messaging_actor_aliases (
     connection TEXT NOT NULL, alias TEXT NOT NULL, actor TEXT NOT NULL,
@@ -222,6 +234,37 @@ pub struct ActorEvidence {
     pub memberships: Vec<MemberEvidence>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredActor {
+    transport_scope: String,
+    evidence: ActorEvidence,
+}
+
+pub(super) enum ActorObservation {
+    Missing,
+    Stale,
+    Verified(ActorEvidence),
+}
+
+/// Scope of an authenticated provider event outside a chat stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceSource {
+    pub operation: String,
+    pub resource: String,
+}
+
+const RESOURCE_EVENT: &str = "resource-event";
+
+pub(super) fn resource_event_id(value: &str) -> bool {
+    value.starts_with("resource-event-")
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct ResourceEvidence {
+    source: ResourceSource,
+    provider_event: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PairingChallenge {
     pub code: String,
@@ -246,6 +289,27 @@ fn settings(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionSettings> {
         credential_ref: row.get(5)?,
         binding,
     })
+}
+
+impl ResourceSource {
+    pub(super) fn scope_route(&self, mut route: Route) -> Result<Route> {
+        route.id = key("resource-route", &(&route.id, self))?;
+        Ok(route)
+    }
+}
+
+pub(super) fn link_resource_delivery(
+    tx: &rusqlite::Transaction<'_>,
+    connection: &str,
+    event: &str,
+    delivery: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO messaging_resource_delivery (delivery,connection,event)
+         SELECT ?3,connection,event FROM messaging_resource_evidence WHERE connection=?1 AND event=?2",
+        params![connection,event,delivery],
+    )?;
+    Ok(())
 }
 
 impl Store {
@@ -468,14 +532,15 @@ impl Store {
             .transpose()
     }
 
-    pub(super) fn record_actor(&self, connection: &str, actor: &ActorEvidence) -> Result<bool> {
+    fn record_actor(&self, connection: &str, observation: StoredActor) -> Result<bool> {
+        let actor = &observation.evidence;
         let aliases = actor
             .aliases
             .iter()
             .map(ActorAlias::sender_id)
             .collect::<Result<Vec<_>, _>>()?;
         self.write(|tx| {
-            let old: Option<ActorEvidence> = tx
+            let old: Option<StoredActor> = tx
                 .query_row(
                     "SELECT data FROM messaging_actor_evidence WHERE connection=?1 AND actor=?2",
                     params![connection, actor.actor],
@@ -483,11 +548,13 @@ impl Store {
                 )
                 .optional()?;
             if let Some(old) = old {
-                if old.revision >= actor.revision {
-                    return Ok(&old == actor);
-                }
-                if old.kind != actor.kind {
+                if old.evidence.kind != actor.kind {
                     return Ok(false);
+                }
+                if old.transport_scope == observation.transport_scope
+                    && old.evidence.revision >= actor.revision
+                {
+                    return Ok(&old.evidence == actor);
                 }
             }
             let owner =
@@ -526,7 +593,7 @@ impl Store {
                 params![
                     connection,
                     actor.actor,
-                    serde_json::to_string(actor)?,
+                    serde_json::to_string(&observation)?,
                     i64::try_from(actor.revision)?
                 ],
             )?;
@@ -534,7 +601,7 @@ impl Store {
         })
     }
 
-    pub(super) fn actor(&self, connection: &str, id: &str) -> Result<Option<ActorEvidence>> {
+    fn actor(&self, connection: &str, id: &str) -> Result<Option<StoredActor>> {
         self.read(|db| {
             Ok(db.query_row(
                 "SELECT data FROM messaging_actor_evidence
@@ -542,6 +609,78 @@ impl Store {
                    (SELECT actor FROM messaging_actor_aliases WHERE connection=?1 AND alias=?2),?2)",
                 params![connection, id], |row| decode(row, 0),
             ).optional()?)
+        })
+    }
+
+    fn resource_evidence(&self, connection: &str, event: &str) -> Result<Option<ResourceEvidence>> {
+        self.read(|db| {
+            Ok(db.query_row(
+                "SELECT evidence FROM messaging_resource_evidence WHERE connection=?1 AND event=?2",
+                params![connection, event], |row| decode(row, 0),
+            ).optional()?)
+        })
+    }
+
+    fn delivery_resource(
+        &self,
+        connection: &str,
+        delivery: &str,
+    ) -> Result<Option<ResourceSource>> {
+        self.read(|db| {
+            let evidence: Option<ResourceEvidence> = db
+                .query_row(
+                    "SELECT r.evidence FROM messaging_resource_delivery d
+                 JOIN messaging_resource_evidence r ON r.connection=d.connection AND r.event=d.event
+                 WHERE d.connection=?1 AND d.delivery=?2",
+                    params![connection, delivery],
+                    |row| decode(row, 0),
+                )
+                .optional()?;
+            Ok(evidence.map(|record| record.source))
+        })
+    }
+
+    fn intake_resource(
+        &self,
+        connection: &str,
+        revision: i64,
+        candidate: Candidate,
+        evidence: &ResourceEvidence,
+        advance: Option<&Advance>,
+    ) -> Result<Result<IntakeReceipt, GatewayError>> {
+        self.write(|tx| {
+            if !store::check_advance(tx, connection, advance)? {
+                return Ok(Err(GatewayError::CheckpointChanged));
+            }
+            let id = &candidate.event.id;
+            let conflict = || Ok(Ok(IntakeReceipt {
+                id: id.clone(), route: None, disposition: Disposition::Conflict, repeated: false,
+            }));
+            let previous: Option<ResourceEvidence> = tx.query_row(
+                "SELECT evidence FROM messaging_resource_evidence WHERE connection=?1 AND event=?2",
+                params![connection, id], |row| decode(row, 0),
+            ).optional()?;
+            if previous.is_none() {
+                // A reserved resource identity cannot adopt an ordinary chat
+                // input staged under the wrong trust boundary.
+                let exists = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messaging_ingress WHERE connection=?1 AND event=?2)",
+                    params![connection, id], |row| row.get::<_, bool>(0),
+                )?;
+                if exists {
+                    return conflict();
+                }
+                tx.execute(
+                    "INSERT INTO messaging_resource_evidence (connection,event,evidence)
+                     VALUES (?1,?2,?3)",
+                    params![connection, id, serde_json::to_string(evidence)?],
+                )?;
+            } else if previous.as_ref() != Some(evidence) {
+                return conflict();
+            }
+            let receipt = store::append(tx, connection, revision, candidate, false)?;
+            store::write_advance(tx, connection, advance)?;
+            Ok(Ok(receipt))
         })
     }
 
@@ -642,7 +781,14 @@ impl Ingress {
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |_| {
-                if db(scope.store.record_actor(&scope.connection, &actor))? {
+                let transport_scope = db(key("actor-transport", &scope.installation()))?;
+                if db(scope.store.record_actor(
+                    &scope.connection,
+                    StoredActor {
+                        transport_scope,
+                        evidence: actor,
+                    },
+                ))? {
                     Ok(())
                 } else {
                     Err(GatewayError::Forbidden)
@@ -654,16 +800,31 @@ impl Ingress {
         Ok(())
     }
 
+    pub(super) fn actor_observation(&self, id: &str) -> Result<ActorObservation, GatewayError> {
+        let Some(stored) = db(self.store.actor(&self.connection, id))? else {
+            return Ok(ActorObservation::Missing);
+        };
+        let scope = db(key("actor-transport", &self.installation()))?;
+        Ok(if stored.transport_scope == scope {
+            ActorObservation::Verified(stored.evidence)
+        } else {
+            ActorObservation::Stale
+        })
+    }
+
     pub(super) fn effective_sender(
         &self,
         policy: &AccessPolicy,
         room: &Room,
         source: &Sender,
     ) -> Result<Option<(Sender, ActorKind)>, GatewayError> {
-        let Some(evidence) = db(self.store.actor(&self.connection, &source.id))? else {
-            return Ok(
-                (!policy.scope.require_actor_evidence).then(|| (source.clone(), ActorKind::Person))
-            );
+        let evidence = match self.actor_observation(&source.id)? {
+            ActorObservation::Verified(evidence) => evidence,
+            ActorObservation::Stale => return Ok(None),
+            ActorObservation::Missing => {
+                return Ok((!policy.scope.require_actor_evidence)
+                    .then(|| (source.clone(), ActorKind::Person)));
+            }
         };
         // If this alias was withdrawn, retain the reserved association but
         // reject the observation instead of falling back to an unbound identity.
@@ -694,7 +855,7 @@ impl Ingress {
         &self,
         event: &mut super::InboundEvent,
     ) -> Result<(), GatewayError> {
-        if let Some(evidence) = db(self.store.actor(&self.connection, &event.sender.id))?
+        if let ActorObservation::Verified(evidence) = self.actor_observation(&event.sender.id)?
             && (event.sender.id == evidence.actor
                 || evidence
                     .aliases
@@ -755,29 +916,142 @@ impl Ingress {
         sender: &Sender,
     ) -> Result<(), GatewayError> {
         self.checked(true, |state| {
-            let policy = &state.policy;
-            let Some(ResourcePolicy {
-                actors,
-                resources,
-                destinations,
-            }) = policy.scope.events.get(operation)
-            else {
-                return Err(GatewayError::Forbidden);
-            };
-            let Some((actor, ActorKind::Person)) = self.effective_sender(policy, room, sender)?
-            else {
-                return Err(GatewayError::Forbidden);
-            };
-            if actors.contains(&actor.id)
-                && resources.contains(resource)
-                && destinations.contains(room)
-                && self.authorize_sender(policy, room, sender)?
-            {
+            if self.resource_allowed(&state.policy, operation, resource, room, sender)? {
                 Ok(())
             } else {
                 Err(GatewayError::Forbidden)
             }
         })
+    }
+
+    fn resource_allowed(
+        &self,
+        policy: &AccessPolicy,
+        operation: &str,
+        resource: &str,
+        room: &Room,
+        sender: &Sender,
+    ) -> Result<bool, GatewayError> {
+        let Some(ResourcePolicy {
+            actors,
+            resources,
+            destinations,
+        }) = policy.scope.events.get(operation)
+        else {
+            return Ok(false);
+        };
+        if !resources.contains(resource)
+            || !destinations.contains(room)
+            || !matches!(
+                self.actor_observation(&sender.id)?,
+                ActorObservation::Verified(_)
+            )
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .authorized_identity(policy, room, sender)?
+            .is_some_and(|(actor, kind)| kind == ActorKind::Person && actors.contains(&actor.id)))
+    }
+
+    pub(super) fn recheck_resource(
+        &self,
+        policy: &AccessPolicy,
+        event: &InboundEvent,
+    ) -> Result<Option<ResourceSource>, GatewayError> {
+        if !resource_event_id(&event.id) {
+            return Ok(None);
+        }
+        let evidence = db(self.store.resource_evidence(&self.connection, &event.id))?
+            .ok_or(GatewayError::Forbidden)?;
+        if !matches!(event.body, InboundBody::Message(_))
+            || !self.resource_allowed(
+                policy,
+                &evidence.source.operation,
+                &evidence.source.resource,
+                &event.room,
+                &event.sender,
+            )?
+        {
+            return Err(GatewayError::Forbidden);
+        }
+        Ok(Some(evidence.source))
+    }
+
+    pub(super) fn recheck_resource_delivery(
+        &self,
+        policy: &AccessPolicy,
+        delivery: &str,
+        room: &Room,
+        sender: &Sender,
+    ) -> Result<Option<ResourceSource>, GatewayError> {
+        let source = db(self.store.delivery_resource(&self.connection, delivery))?;
+        if let Some(resource) = &source
+            && !self.resource_allowed(
+                policy,
+                &resource.operation,
+                &resource.resource,
+                room,
+                sender,
+            )?
+        {
+            return Err(GatewayError::Forbidden);
+        }
+        Ok(source)
+    }
+
+    /// Admit a non-chat event with its authenticated operation and resource
+    /// bound to the durable receipt. The returned identity is the native
+    /// resource-event key; the provider identifier remains in its evidence.
+    pub async fn submit_resource_event(
+        &self,
+        source: ResourceSource,
+        mut event: InboundEvent,
+        advance: Option<Advance>,
+    ) -> Result<IntakeReceipt, GatewayError> {
+        if !super::runtime::valid_input_id(&event.id)
+            || !valid_id(&source.operation)
+            || !valid_id(&source.resource)
+            || !matches!(event.body, InboundBody::Message(_))
+            || !super::runtime::valid_advance(advance.as_ref())
+        {
+            return Err(GatewayError::Invalid);
+        }
+        let scope = self.clone();
+        let result = blocking(move || {
+            scope.checked(true, |state| {
+                let decision = if scope.resource_allowed(
+                    &state.policy,
+                    &source.operation,
+                    &source.resource,
+                    &event.room,
+                    &event.sender,
+                )? {
+                    match scope.route_event(&state.policy, &event)? {
+                        Ok(route) => Ok(db(source.scope_route(route))?),
+                        Err(disposition) => Err(disposition),
+                    }
+                } else {
+                    Err(Disposition::Forbidden)
+                };
+                scope.normalize_event(&mut event)?;
+                let evidence = ResourceEvidence {
+                    source,
+                    provider_event: event.id.clone(),
+                };
+                event.id = db(key(RESOURCE_EVENT, &evidence))?;
+                db(scope.store.intake_resource(
+                    &scope.connection,
+                    state.revision,
+                    Candidate { event, decision },
+                    &evidence,
+                    advance.as_ref(),
+                ))?
+            })
+        })
+        .await?;
+        self.notify();
+        Ok(result)
     }
 
     pub async fn begin_pairing(

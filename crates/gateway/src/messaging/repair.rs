@@ -113,7 +113,7 @@ impl Ingress {
             || page.items.len() > MAX_BATCH
             || page.previous.as_deref().is_some_and(|id| !valid_id(id))
             || page.items.iter().any(|item| {
-                !valid_id(&item.event.id) || !matches!(&item.event.body, InboundBody::Message(message) if super::runtime::valid_message(message))
+                !super::runtime::valid_input_id(&item.event.id) || !matches!(&item.event.body, InboundBody::Message(message) if super::runtime::valid_message(message))
             })
         {
             return Err(GatewayError::Invalid);

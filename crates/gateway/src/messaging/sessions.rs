@@ -269,8 +269,13 @@ async fn advance_message(
                 }
                 let individual = wake || scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
                     .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
-                let tools = individual && state.policy.room_policy(&work.event.room).is_some_and(|room| room.tools);
-                let policy = state.policy.turn_policy(&work.event.room);
+                let resource = super::profile::resource_event_id(&work.event.id);
+                let tools = individual && !resource && state.policy.room_policy(&work.event.room).is_some_and(|room| room.tools);
+                let mut policy = state.policy.turn_policy(&work.event.room);
+                if !individual || resource {
+                    policy.prompt = None;
+                    policy.skills = None;
+                }
                 let model = policy.model.or(db(scope.store.route_model(&work.route.id))?);
                 let selected_skill = match &work.event.body {
                     InboundBody::Command(Command::UseSkill { skill, .. }) => Some(skill.clone()),

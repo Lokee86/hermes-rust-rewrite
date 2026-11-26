@@ -413,6 +413,7 @@ impl Store {
             )?;
             enqueue(tx, route, Some(&event.sender), intent)?;
             effect_store::source(tx, intent, &event.id)?;
+            super::profile::link_resource_delivery(tx, &route.connection, &event.id, &intent.id)?;
             set_input(tx, route, &event.id, "done", None)
         })
     }
@@ -435,7 +436,8 @@ impl Store {
         };
         self.write(|tx| {
             enqueue(tx, route, Some(&event.sender), &intent)?;
-            effect_store::source(tx, &intent, &event.id)
+            effect_store::source(tx, &intent, &event.id)?;
+            super::profile::link_resource_delivery(tx, &route.connection, &event.id, &intent.id)
         })
     }
 
@@ -502,7 +504,8 @@ impl Store {
                 body: DeliveryBody::Prompt { action_id: action.id.clone(), prompt },
             };
             enqueue(tx, route, Some(&event.sender), &intent)?;
-            effect_store::source(tx, &intent, &event.id)
+            effect_store::source(tx, &intent, &event.id)?;
+            super::profile::link_resource_delivery(tx, &route.connection, &event.id, &action.id)
         })
     }
 

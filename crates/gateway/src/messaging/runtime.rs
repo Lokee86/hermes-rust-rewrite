@@ -33,6 +33,10 @@ pub(crate) fn valid_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
 }
 
+pub(super) fn valid_input_id(value: &str) -> bool {
+    valid_id(value) && !super::profile::resource_event_id(value)
+}
+
 pub(super) fn valid_advance(advance: Option<&Advance>) -> bool {
     let token = |value: &str| !value.is_empty() && value.len() <= 64 * 1024 && !value.contains('\0');
     advance.is_none_or(|advance| {
@@ -176,9 +180,8 @@ impl Ingress {
         advance: Option<Advance>,
     ) -> Result<IntakeResult, GatewayError> {
         if events.len() > MAX_BATCH
-            || events.iter().any(|event| !valid_id(&event.id))
+            || events.iter().any(|event| !valid_input_id(&event.id) || matches!(event.body, InboundBody::Wake))
             || !valid_advance(advance.as_ref())
-            || events.iter().any(|event| matches!(event.body, InboundBody::Wake))
         {
             return Err(GatewayError::Invalid);
         }
@@ -228,6 +231,11 @@ impl Ingress {
         {
             return Ok(Err(Disposition::Invalid));
         }
+        let resource = match self.recheck_resource(policy, event) {
+            Ok(resource) => resource,
+            Err(GatewayError::Forbidden) => return Ok(Err(Disposition::Forbidden)),
+            Err(error) => return Err(error),
+        };
         let caps = self.capabilities();
         if event.room.thread.is_some() && !caps.threads {
             return Ok(Err(Disposition::Unsupported));
@@ -284,12 +292,15 @@ impl Ingress {
             InboundBody::Wake => return Ok(Err(Disposition::Unsupported)),
         }
         let participant = room.per_participant.then_some(sender.id.as_str());
-        db(store::Route::new(
+        let route = db(store::Route::new(
             &self.connection,
             event.room.clone(),
             participant,
-        ))
-        .map(Ok)
+        ))?;
+        match resource {
+            Some(source) => db(source.scope_route(route)).map(Ok),
+            None => Ok(Ok(route)),
+        }
     }
 
     /// List attempts from this authenticated account that need platform evidence.
@@ -1296,6 +1307,17 @@ fn delivery_authorized(
             route.room,
             participant,
         ))?;
+        let current = match scope.recheck_resource_delivery(
+            &state.policy,
+            &pending.intent.id,
+            &pending.intent.room,
+            sender,
+        ) {
+            Ok(Some(source)) => db(source.scope_route(current))?,
+            Ok(None) => current,
+            Err(GatewayError::Forbidden) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         return Ok(
             scope.authorize_sender(&state.policy, &pending.intent.room, sender)?
                 && current.id == route.id,

@@ -88,7 +88,7 @@ impl Ingress {
             || handoff.items.len() > MAX_BATCH
             || !valid_advance(handoff.advance.as_ref())
             || handoff.items.iter().any(|item| {
-                !valid_id(&item.event.id)
+                !super::runtime::valid_input_id(&item.event.id)
                     || matches!(item.event.body, InboundBody::Wake)
                     || item.preparation.as_ref().is_some_and(|p| {
                         !valid_id(&p.token)

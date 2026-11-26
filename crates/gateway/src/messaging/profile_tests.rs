@@ -705,6 +705,21 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
         ingress.transport_authority(&use_).await,
         Err(GatewayError::Forbidden)
     ));
+    let room = address.room.as_ref().unwrap();
+    assert!(
+        !ingress
+            .authorize_sender(&policy, room, &principal("canonical"))
+            .unwrap()
+    );
+    ingress
+        .record_actor(person("canonical", room.clone()))
+        .await
+        .unwrap();
+    assert!(
+        ingress
+            .authorize_sender(&policy, room, &principal("canonical"))
+            .unwrap()
+    );
     address.revision += 1;
     ingress
         .record_transport_address(address.clone(), Some(secret))
@@ -796,5 +811,125 @@ async fn replacing_a_local_store_fences_reused_actor_and_item_ids() {
             .count(),
         2
     );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn resource_events_reopen_in_their_own_binding_and_recheck_revoked_grants() {
+    let temp = TempDir::new().unwrap();
+    let (factory, queue) = fixture("resource-client", "tenant");
+    let route = room("resource-notifications");
+    let sender = principal("canonical");
+    let source = ResourceSource {
+        operation: "document.comment".into(),
+        resource: "doc-a".into(),
+    };
+    let mut policy = owner_policy();
+    policy.scope.events.insert(
+        source.operation.clone(),
+        ResourcePolicy {
+            actors: [sender.id.clone()].into(),
+            resources: [source.resource.clone()].into(),
+            destinations: vec![route.clone()],
+        },
+    );
+    let gateway = open(temp.path(), &[factory.clone()], &policy).await;
+    let ingress = ready(&queue).await;
+    ingress
+        .record_actor(person(&sender.id, route.clone()))
+        .await
+        .unwrap();
+
+    let input = message("external-42", sender.clone(), route.clone());
+    let first = ingress
+        .submit_resource_event(
+            source.clone(),
+            input.clone(),
+            Some(Advance {
+                stream: "documents".into(),
+                previous: None,
+                checkpoint: "seq1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.disposition, Disposition::Accepted);
+    assert_eq!(
+        ingress
+            .checkpoint("documents".into())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("seq1")
+    );
+    let repeat = ingress
+        .submit_resource_event(source.clone(), input.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(repeat.id, first.id);
+    assert!(repeat.repeated);
+    let other = ResourceSource {
+        resource: "another-document".into(),
+        ..source.clone()
+    };
+    let denied = ingress
+        .submit_resource_event(other, input.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(denied.disposition, Disposition::Forbidden);
+    let plain = ingress.submit(vec![input.clone()], None).await.unwrap();
+    assert_ne!(plain.receipts[0].route, first.route);
+    let forged = message("resource-event-fabricated", sender.clone(), route.clone());
+    assert!(matches!(
+        ingress.route_event(&policy, &forged).unwrap(),
+        Err(Disposition::Forbidden)
+    ));
+    assert_eq!(
+        ingress.submit(vec![forged], None).await.unwrap_err(),
+        GatewayError::Invalid
+    );
+
+    gateway.stop_adapter(&factory.name).await;
+    let saved = ingress
+        .store
+        .route(first.route.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    let event = InboundEvent {
+        id: first.id.clone(),
+        ..input
+    };
+    let intent = DeliveryIntent {
+        id: "resource-reply".into(),
+        room: route.clone(),
+        reply_anchor: None,
+        edit_target: None,
+        body: DeliveryBody::Reply(Message::text("resource result")),
+    };
+    ingress
+        .store
+        .publish_reply(&saved, &event, &intent)
+        .unwrap();
+    gateway.shutdown().await.unwrap();
+
+    let gateway = open(temp.path(), &[factory], &policy).await;
+    let ingress = ready(&queue).await;
+    let restored = ingress.route_event(&policy, &event).unwrap().unwrap();
+    assert_eq!(restored.id, saved.id);
+    assert_eq!(
+        ingress
+            .recheck_resource_delivery(&policy, &intent.id, &route, &sender)
+            .unwrap(),
+        Some(source),
+    );
+    policy.scope.events.clear();
+    assert!(matches!(
+        ingress.route_event(&policy, &event).unwrap(),
+        Err(Disposition::Forbidden)
+    ));
+    assert!(matches!(
+        ingress.recheck_resource_delivery(&policy, &intent.id, &route, &sender),
+        Err(GatewayError::Forbidden)
+    ));
     gateway.shutdown().await.unwrap();
 }

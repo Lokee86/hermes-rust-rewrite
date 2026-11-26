@@ -1,5 +1,5 @@
 use super::{
-    profile::{ActorKind, EnrollmentCredential, VerifiedInstallation, time_ms},
+    profile::{ActorKind, ActorObservation, EnrollmentCredential, VerifiedInstallation, time_ms},
     runtime::{Ingress, blocking, db, valid_id},
     store::Store,
     types::{GatewayError, Room, Sender},
@@ -218,9 +218,9 @@ impl Ingress {
             (Some(id), Some(room)) => {
                 // A delegated credential needs stronger authentication than
                 // an otherwise allowed basic/anonymous transport sender.
-                let evidence = db(self.store.actor(&self.connection, id))?;
-                if !evidence
-                    .is_some_and(|actor| actor.actor == id && actor.kind == ActorKind::Person)
+                let evidence = self.actor_observation(id)?;
+                if !matches!(evidence, ActorObservation::Verified(actor)
+                    if actor.actor == id && actor.kind == ActorKind::Person)
                 {
                     return Ok(false);
                 }
