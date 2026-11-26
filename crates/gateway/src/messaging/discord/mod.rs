@@ -34,6 +34,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use voice::Voice;
 
+pub(super) use delivery::DELIVERY_RATE_TABLES;
 pub(super) use messages::MESSAGE_TABLES;
 pub(super) use recovery::RECOVERY_TABLES;
 pub(super) use socket::SOCKET_TABLES;

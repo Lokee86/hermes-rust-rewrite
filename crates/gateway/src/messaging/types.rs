@@ -407,6 +407,9 @@ pub struct UncertainDelivery {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetryScope {
+    /// Defer this exact outbox part. The adapter can enforce its own
+    /// provider bucket across requests before dispatch.
+    Part,
     Destination,
     Account,
 }

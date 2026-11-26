@@ -211,6 +211,7 @@ impl Store {
         connection.execute_batch(super::discord::MESSAGE_TABLES)?;
         connection.execute_batch(super::discord::RECOVERY_TABLES)?;
         connection.execute_batch(super::discord::SOCKET_TABLES)?;
+        connection.execute_batch(super::discord::DELIVERY_RATE_TABLES)?;
         connection.execute_batch(effect_store::TABLES)?;
         connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
@@ -610,6 +611,8 @@ impl Store {
              AND (d.stage = 'pending' OR EXISTS (
                  SELECT 1 FROM messaging_parts p WHERE p.delivery = d.id AND (p.stage = 'pending'
                    OR p.stage = 'uncertain' AND json_extract(p.body, '$.effect.replay.expires_at_ms') > ?2)
+                 AND NOT EXISTS (SELECT 1 FROM messaging_effect_parts delay
+                     WHERE delay.delivery = p.delivery AND delay.ordinal = p.ordinal AND delay.retry_after_ms > ?2)
                  AND NOT EXISTS (SELECT 1 FROM messaging_parts preceding WHERE preceding.delivery = p.delivery
                      AND preceding.ordinal < p.ordinal AND preceding.stage NOT IN ('sent','discarded','partial','submitted'))
              ))

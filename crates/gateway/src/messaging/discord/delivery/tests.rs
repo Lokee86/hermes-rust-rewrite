@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hermes_engine::Config;
+use reqwest::header::HeaderMap;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -110,14 +111,21 @@ fn discord_retry_after_can_extend_but_not_broaden_a_channel_cooldown() {
     let mut headers = HeaderMap::new();
     headers.insert("x-ratelimit-bucket", "a-discord-bucket".parse().unwrap());
     headers.insert("retry-after", "1.25".parse().unwrap());
+    let local = buckets::Rejection::from_response(&headers, &json!({"retry_after":0.9}));
     assert_eq!(
-        rate_limit(&headers, &json!({"retry_after":0.9, "global":false})),
+        local.result(local.fallback_scope(), 1),
         retry(Duration::from_millis(1_250), RetryScope::Destination)
     );
     headers.insert("x-ratelimit-scope", "global".parse().unwrap());
+    let global = buckets::Rejection::from_response(&headers, &json!({"retry_after":2.1}));
     assert_eq!(
-        rate_limit(&headers, &json!({"retry_after":2.1})),
+        global.result(global.fallback_scope(), 1),
         retry(Duration::from_millis(2_100), RetryScope::Account)
+    );
+    let excessive = buckets::Rejection::from_response(&headers, &json!({"retry_after":1e30}));
+    assert_eq!(
+        excessive.result(excessive.fallback_scope(), 1),
+        DeliveryResult::Rejected
     );
 }
 
@@ -228,12 +236,19 @@ struct Preflight {
     release: oneshot::Receiver<()>,
 }
 
+struct ForcedLimit {
+    bucket: &'static str,
+    seconds: f64,
+    remaining: u32,
+}
+
 #[derive(Clone)]
 struct Wire {
     seen: async_channel::Sender<RequestSeen>,
     first_unknown: Arc<Mutex<bool>>,
     preflight: Arc<Mutex<Option<Preflight>>>,
     wrong_message_owner: Arc<AtomicBool>,
+    forced_limit: Arc<Mutex<Option<ForcedLimit>>>,
 }
 
 impl Wire {
@@ -256,6 +271,7 @@ impl Wire {
                 .await
                 .unwrap();
         }
+        let read = method == Method::GET;
         let reply = match (method, path.as_str()) {
             (Method::GET, "/channels/301") => {
                 let pause = state.preflight.lock().await.take();
@@ -265,6 +281,7 @@ impl Wire {
                 }
                 json!({"id":"301","type":1})
             }
+            (Method::GET, "/channels/302") => json!({"id":"302","type":1}),
             (Method::GET, "/channels/311") => json!({"id":"311","type":15}),
             (Method::GET, "/channels/400") => {
                 json!({"id":"400","type":11,"owner_id":BOT,"parent_id":"311"})
@@ -273,11 +290,25 @@ impl Wire {
                 json!({"id":"400","channel_id":"400","author":{"id":BOT}})
             }
             (Method::POST, "/channels/301/messages") => {
+                if let Some(limit) = state.forced_limit.lock().await.as_mut()
+                    && limit.remaining > 0
+                {
+                    limit.remaining -= 1;
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("x-ratelimit-bucket", limit.bucket)],
+                        Json(json!({"retry_after":limit.seconds,"global":false})),
+                    )
+                        .into_response();
+                }
                 let mut unknown = state.first_unknown.lock().await;
                 if std::mem::take(&mut *unknown) {
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
                 json!({"id":"902","channel_id":"301","author":{"id":BOT},"nonce":payload["nonce"]})
+            }
+            (Method::POST, "/channels/302/messages") => {
+                json!({"id":"903","channel_id":"302","author":{"id":BOT},"nonce":payload["nonce"]})
             }
             (Method::GET, "/channels/301/messages/902") => {
                 let author = if state.wrong_message_owner.load(Ordering::Relaxed) {
@@ -291,7 +322,11 @@ impl Wire {
                 json!({"id":"902","channel_id":"301","author":{"id":BOT}})
             }
             (Method::DELETE, "/channels/301/messages/902") => {
-                return StatusCode::NO_CONTENT.into_response();
+                return (
+                    StatusCode::NO_CONTENT,
+                    [("x-ratelimit-bucket", "delete-bucket")],
+                )
+                    .into_response();
             }
             (Method::POST, "/channels/311/threads") => {
                 json!({"id":"400","type":11,"owner_id":BOT,"parent_id":"311",
@@ -299,7 +334,8 @@ impl Wire {
             }
             _ => return StatusCode::NOT_FOUND.into_response(),
         };
-        Json(reply).into_response()
+        let bucket = if read { "reads" } else { "message-writes" };
+        ([("x-ratelimit-bucket", bucket)], Json(reply)).into_response()
     }
 }
 
@@ -309,6 +345,7 @@ struct RestFixture {
     sent: async_channel::Receiver<RequestSeen>,
     preflight: Arc<Mutex<Option<Preflight>>>,
     wrong_message_owner: Arc<AtomicBool>,
+    forced_limit: Arc<Mutex<Option<ForcedLimit>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -318,11 +355,13 @@ impl RestFixture {
         let (seen, sent) = async_channel::bounded(20);
         let preflight = Arc::new(Mutex::new(None));
         let wrong_message_owner = Arc::new(AtomicBool::new(false));
+        let forced_limit = Arc::new(Mutex::new(None));
         let state = Wire {
             seen,
             first_unknown: Arc::new(Mutex::new(first_unknown)),
             preflight: preflight.clone(),
             wrong_message_owner: wrong_message_owner.clone(),
+            forced_limit: forced_limit.clone(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = DiscordClient::for_fixture(
@@ -350,6 +389,7 @@ impl RestFixture {
             sent,
             preflight,
             wrong_message_owner,
+            forced_limit,
             task,
         }
     }
@@ -407,6 +447,166 @@ async fn status(gateway: &RunningGateway, expected: impl Fn(&Value) -> bool) -> 
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn deferred_write_bucket_survives_restart_and_other_operations_stay_eligible() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(PlanOptions::default(), false).await;
+    let (gateway, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let room = direct("301");
+    let expires = chrono::Utc::now().timestamp_millis() + 60_000;
+    let route = ingress
+        .verify_destination(room.clone(), expires)
+        .await
+        .unwrap();
+    let other = ingress
+        .verify_destination(direct("302"), expires)
+        .await
+        .unwrap();
+    let progress = DeliveryIntent {
+        id: "rate-progress".into(),
+        body: DeliveryBody::Progress {
+            text: "Working".into(),
+            reply_id: "unrelated-reply".into(),
+        },
+        ..intent(room, "Working")
+    };
+    ingress
+        .store
+        .enqueue(&ingress.store.route(&route).unwrap().unwrap(), &progress)
+        .unwrap();
+    fixture.sent().await;
+    status(&gateway, |row| {
+        row["id"] == progress.id && row["part_state"] == "sent"
+    })
+    .await;
+
+    let known_bucket = gateway
+        .send_messaging_notification(&other, "learn", "learn its bucket".into())
+        .unwrap();
+    assert_eq!(fixture.sent().await.path, "/channels/302/messages");
+    status(&gateway, |row| {
+        row["id"] == known_bucket && row["part_state"] == "sent"
+    })
+    .await;
+
+    *fixture.forced_limit.lock().await = Some(ForcedLimit {
+        bucket: "message-writes",
+        seconds: 4.0,
+        remaining: 1,
+    });
+    let id = gateway
+        .send_messaging_notification(&route, "limited", "limited delivery".into())
+        .unwrap();
+    let rejected = fixture.sent().await;
+    let first: Value = serde_json::from_slice(&rejected.bytes).unwrap();
+    status(&gateway, |row| {
+        row["id"] == id && row["part_state"] == "pending" && row["attempt"] == 1
+    })
+    .await;
+    gateway.shutdown().await.unwrap();
+
+    let (reopened, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let write = fixture
+        .adapter
+        .client
+        .bot(Method::POST, &["channels", "301", "messages"])
+        .build()
+        .unwrap();
+    let read = fixture
+        .adapter
+        .client
+        .bot(Method::GET, &["channels", "301"])
+        .build()
+        .unwrap();
+    let other_write = fixture
+        .adapter
+        .client
+        .bot(Method::POST, &["channels", "302", "messages"])
+        .build()
+        .unwrap();
+    for (request, limited) in [(write, true), (read, false), (other_write, false)] {
+        let route = buckets::Route::from_request(&request).unwrap();
+        let wait = buckets::wait(&ingress, Some(&route)).await.unwrap();
+        assert_eq!(
+            wait.map(|(_, scope)| scope),
+            limited.then_some(RetryScope::Part)
+        );
+    }
+
+    let marker = crate::messaging::MarkerRef {
+        delivery: progress.id,
+        part: 0,
+    };
+    assert!(ingress.retire_marker(marker).await.unwrap());
+    assert_eq!(fixture.sent().await.method, Method::DELETE);
+    let outside = reopened
+        .send_messaging_notification(&other, "untouched", "other channel".into())
+        .unwrap();
+    assert_eq!(fixture.sent().await.path, "/channels/302/messages");
+    status(&reopened, |row| {
+        row["id"] == outside && row["part_state"] == "sent"
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+
+    let retried = fixture.sent().await;
+    assert_eq!(retried.path, "/channels/301/messages");
+    let last: Value = serde_json::from_slice(&retried.bytes).unwrap();
+    assert_eq!(last["nonce"], first["nonce"]);
+    status(&reopened, |row| {
+        row["id"] == id && row["part_state"] == "sent" && row["attempt"] == 2
+    })
+    .await;
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_bucket_falls_back_to_a_finite_number_of_outbox_retries() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(PlanOptions::default(), false).await;
+    *fixture.forced_limit.lock().await = Some(ForcedLimit {
+        bucket: "not/a/discord/bucket",
+        seconds: 0.0,
+        remaining: 100,
+    });
+    let (gateway, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let route = ingress
+        .verify_destination(
+            direct("301"),
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        )
+        .await
+        .unwrap();
+    let id = gateway
+        .send_messaging_notification(&route, "malformed", "send".into())
+        .unwrap();
+    for _ in 0..8 {
+        assert_eq!(fixture.sent().await.path, "/channels/301/messages");
+    }
+    status(&gateway, |row| {
+        row["id"] == id && row["part_state"] == "rejected" && row["attempt"] == 8
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    let request = fixture
+        .adapter
+        .client
+        .bot(Method::POST, &["channels", "301", "messages"])
+        .build()
+        .unwrap();
+    let key = buckets::Route::from_request(&request).unwrap();
+    assert!(buckets::wait(&ingress, Some(&key)).await.unwrap().is_none());
+    gateway.shutdown().await.unwrap();
 }
 
 #[tokio::test]

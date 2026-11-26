@@ -767,7 +767,9 @@ pub(super) fn claim(
     let Some((ordinal, old_attempt, stage, data)) = row else {
         return Ok(None);
     };
-    if !matches!(stage.as_str(), "pending" | "uncertain") {
+    if !matches!(stage.as_str(), "pending" | "uncertain")
+        || part_retry_at(tx, id, ordinal)?.is_some_and(|until| until > policy.now)
+    {
         return Ok(None);
     }
     let payload = json::<DeliveryPart>(data.clone())?;
@@ -1051,14 +1053,7 @@ fn recipient_state(
             reason: Some("recipient_outcome_unknown"),
         });
     }
-    let retry_at: Option<i64> = tx
-        .query_row(
-            "SELECT retry_after_ms FROM messaging_effect_parts WHERE delivery=?1 AND ordinal=?2",
-            params![id, ordinal],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
+    let retry_at = part_retry_at(tx, id, ordinal)?;
     if outcomes
         .values()
         .any(|v| matches!(v, RecipientOutcome::NotAccepted))
@@ -1093,6 +1088,31 @@ fn recipient_state(
             reason: Some("recipient_rejected"),
         }
     })
+}
+
+fn part_retry_at(tx: &Connection, delivery: &str, ordinal: u32) -> Result<Option<i64>> {
+    Ok(tx.query_row(
+        "SELECT retry_after_ms FROM messaging_effect_parts WHERE delivery=?1 AND ordinal=?2",
+        params![delivery, ordinal], |row| row.get::<_, Option<i64>>(0),
+    ).optional()?.flatten())
+}
+
+fn defer_part(
+    tx: &Transaction<'_>,
+    delivery: &str,
+    ordinal: u32,
+    now: i64,
+    after: Duration,
+) -> Result<()> {
+    let millis = i64::try_from(after.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(i64::MAX)
+        .max(1);
+    tx.execute(
+        "INSERT INTO messaging_effect_parts (delivery,ordinal,retry_after_ms) VALUES (?1,?2,?3)
+         ON CONFLICT(delivery,ordinal) DO UPDATE SET retry_after_ms=MAX(COALESCE(retry_after_ms,0),excluded.retry_after_ms)",
+        params![delivery, ordinal, now.saturating_add(millis)],
+    )?;
+    Ok(())
 }
 
 pub(super) fn cooldown(
@@ -1620,7 +1640,11 @@ pub(super) fn record(
                     }
                 }
             }
-            cooldown(tx, id, scope, after, now)?;
+            if scope == RetryScope::Part {
+                defer_part(tx, id, ordinal, now, after)?;
+            } else {
+                cooldown(tx, id, scope, after, now)?;
+            }
             let mut classified = RecordedEffect::with("pending", Some("rate_limited"));
             classified.release_slot = receipts.is_empty();
             classified

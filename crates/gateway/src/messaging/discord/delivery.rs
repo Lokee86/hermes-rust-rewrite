@@ -1,5 +1,7 @@
+mod buckets;
 mod render;
 
+pub(in crate::messaging) use buckets::TABLES as DELIVERY_RATE_TABLES;
 pub use render::ReplyMode;
 #[cfg(test)]
 pub(crate) use render::prepare;
@@ -14,7 +16,7 @@ use crate::messaging::{
 use render::{
     CONTENT_LIMIT, is_nonce, limit, measure, nonce, prompt_payload, references_message, snowflake,
 };
-use reqwest::{Method, RequestBuilder, StatusCode, header::HeaderMap, multipart};
+use reqwest::{Method, RequestBuilder, StatusCode, multipart};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -87,6 +89,13 @@ async fn dispatch(
         return Err(DeliveryResult::Rejected);
     }
 
+    let destination = resolved_room(attempt)?;
+    let client = &Rest {
+        client,
+        ingress,
+        attempt,
+        destination: &destination,
+    };
     match &attempt.payload.effect.operation {
         EffectOperation::Provision { resource } => {
             return provision(client, bot_id, attempt, ingress, *resource).await;
@@ -96,7 +105,6 @@ async fn dispatch(
         | EffectOperation::Publish { .. } => {}
         _ => return Err(DeliveryResult::Rejected),
     }
-    let destination = resolved_room(attempt)?;
     let channel = destination.thread.as_deref().unwrap_or(&destination.chat);
     let verified = inspect_channel(client, channel).await?;
     if !matches_room(&verified, &destination) {
@@ -124,9 +132,9 @@ async fn dispatch(
         attempt.payload.effect.operation,
         EffectOperation::Retire { .. }
     ) {
-        return retire(client, bot_id, attempt, ingress, &destination, channel).await;
+        return retire(client, bot_id, attempt, channel).await;
     }
-    publish(client, bot_id, attempt, ingress, &destination, channel).await
+    publish(client, bot_id, attempt, ingress, channel).await
 }
 
 fn resolved_room(attempt: &SendAttempt) -> SendResult<Room> {
@@ -151,11 +159,10 @@ fn resolved_room(attempt: &SendAttempt) -> SendResult<Room> {
 }
 
 async fn publish(
-    client: &DiscordClient,
+    client: &Rest<'_>,
     bot_id: &str,
     attempt: &SendAttempt,
     ingress: &Ingress,
-    destination: &Room,
     channel: &str,
 ) -> SendResult<DeliveryResult> {
     let (mut payload, uploads) = render_message(attempt, ingress).await?;
@@ -176,8 +183,7 @@ async fn publish(
             payload,
             uploads,
         )?;
-        check_authority(ingress, attempt, destination).await?;
-        let edited = request_json(request, Call::Edit).await?;
+        let edited = client.json(request, Call::Edit).await?;
         return if own_message(&edited, bot_id, channel) == Some(target) {
             Ok(confirmed(target, false))
         } else {
@@ -211,8 +217,7 @@ async fn publish(
         payload,
         uploads,
     )?;
-    check_authority(ingress, attempt, destination).await?;
-    let created = request_json(request, Call::Mutation).await?;
+    let created = client.json(request, Call::Mutation).await?;
     if !created["nonce"].is_null() && created["nonce"].as_str() != Some(&key) {
         return Err(DeliveryResult::Uncertain);
     }
@@ -225,11 +230,9 @@ async fn publish(
 }
 
 async fn retire(
-    client: &DiscordClient,
+    client: &Rest<'_>,
     bot_id: &str,
     attempt: &SendAttempt,
-    ingress: &Ingress,
-    destination: &Room,
     channel: &str,
 ) -> SendResult<DeliveryResult> {
     let target = attempt
@@ -244,15 +247,15 @@ async fn retire(
         Err(DeliveryResult::EditNotPublished) => return Ok(confirmed(&target.id, false)),
         Err(error) => return Err(error),
     }
-    check_authority(ingress, attempt, destination).await?;
-    let reply = execute(
-        client.bot(
-            Method::DELETE,
-            &["channels", channel, "messages", &target.id],
-        ),
-        Call::Mutation,
-    )
-    .await?;
+    let reply = client
+        .execute(
+            client.bot(
+                Method::DELETE,
+                &["channels", channel, "messages", &target.id],
+            ),
+            Call::Mutation,
+        )
+        .await?;
     if reply.status == StatusCode::NO_CONTENT || reply.unknown_message() {
         Ok(confirmed(&target.id, false))
     } else if reply.status.is_success() {
@@ -263,7 +266,7 @@ async fn retire(
 }
 
 async fn provision(
-    client: &DiscordClient,
+    client: &Rest<'_>,
     bot_id: &str,
     attempt: &SendAttempt,
     ingress: &Ingress,
@@ -288,17 +291,17 @@ async fn provision(
             if let Some(exists) = known_thread(client, parent, anchor, bot_id).await? {
                 return Ok(destination_receipt(exists));
             }
-            check_authority(ingress, attempt, room).await?;
-            let created = execute(
-                client
-                    .bot(
-                        Method::POST,
-                        &["channels", parent, "messages", anchor, "threads"],
-                    )
-                    .json(&json!({"name":"Mercury discussion"})),
-                Call::Mutation,
-            )
-            .await?;
+            let created = client
+                .execute(
+                    client
+                        .bot(
+                            Method::POST,
+                            &["channels", parent, "messages", anchor, "threads"],
+                        )
+                        .json(&json!({"name":"Mercury discussion"})),
+                    Call::Mutation,
+                )
+                .await?;
             if created.body["code"].as_u64() == Some(THREAD_EXISTS) {
                 return match known_thread(client, parent, anchor, bot_id).await? {
                     Some(exists) => Ok(destination_receipt(exists)),
@@ -319,8 +322,7 @@ async fn provision(
                 json!({"name":"Mercury reply", "message":message}),
                 uploads,
             )?;
-            check_authority(ingress, attempt, room).await?;
-            let thread = request_json(request, Call::Mutation).await?;
+            let thread = client.json(request, Call::Mutation).await?;
             let id = thread["id"]
                 .as_str()
                 .filter(|value| snowflake(value))
@@ -346,12 +348,14 @@ fn destination_receipt(id: &str) -> DeliveryResult {
 }
 
 async fn known_thread<'a>(
-    client: &DiscordClient,
+    client: &Rest<'_>,
     parent: &str,
     id: &'a str,
     bot_id: &str,
 ) -> SendResult<Option<&'a str>> {
-    let response = execute(client.bot(Method::GET, &["channels", id]), Call::Read).await?;
+    let response = client
+        .execute(client.bot(Method::GET, &["channels", id]), Call::Read)
+        .await?;
     if response.status == StatusCode::NOT_FOUND
         && response.body["code"].as_u64() == Some(UNKNOWN_CHANNEL)
     {
@@ -387,16 +391,19 @@ fn matches_room(value: &Value, room: &Room) -> bool {
     }
 }
 
-async fn inspect_channel(client: &DiscordClient, channel: &str) -> SendResult<Value> {
-    request_json(client.bot(Method::GET, &["channels", channel]), Call::Read).await
+async fn inspect_channel(client: &Rest<'_>, channel: &str) -> SendResult<Value> {
+    client
+        .json(client.bot(Method::GET, &["channels", channel]), Call::Read)
+        .await
 }
 
-async fn read_message(client: &DiscordClient, channel: &str, id: &str) -> SendResult<Value> {
-    request_json(
-        client.bot(Method::GET, &["channels", channel, "messages", id]),
-        Call::ReadMessage,
-    )
-    .await
+async fn read_message(client: &Rest<'_>, channel: &str, id: &str) -> SendResult<Value> {
+    client
+        .json(
+            client.bot(Method::GET, &["channels", channel, "messages", id]),
+            Call::ReadMessage,
+        )
+        .await
 }
 
 async fn check_authority(ingress: &Ingress, attempt: &SendAttempt, room: &Room) -> SendResult<()> {
@@ -544,7 +551,6 @@ impl Call {
 
 struct HttpReply {
     status: StatusCode,
-    headers: HeaderMap,
     body: Value,
 }
 
@@ -564,9 +570,6 @@ impl HttpReply {
     }
 
     fn failure(&self, call: Call) -> DeliveryResult {
-        if self.status == StatusCode::TOO_MANY_REQUESTS {
-            return rate_limit(&self.headers, &self.body);
-        }
         if matches!(call, Call::ReadMessage | Call::Edit) && self.unknown_message() {
             return DeliveryResult::EditNotPublished;
         }
@@ -580,60 +583,69 @@ impl HttpReply {
     }
 }
 
-async fn execute(request: RequestBuilder, call: Call) -> SendResult<HttpReply> {
-    let mut response = request.send().await.map_err(|_| call.transport_failure())?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let mut data = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(None) => break,
-            Ok(Some(chunk)) if chunk.len().saturating_add(data.len()) <= MAX_JSON => {
-                data.extend_from_slice(&chunk);
-            }
-            _ => {
-                data.clear();
-                break;
+struct Rest<'a> {
+    client: &'a DiscordClient,
+    ingress: &'a Ingress,
+    attempt: &'a SendAttempt,
+    destination: &'a Room,
+}
+
+impl Rest<'_> {
+    fn bot(&self, method: Method, segments: &[&str]) -> RequestBuilder {
+        self.client.bot(method, segments)
+    }
+
+    async fn execute(&self, request: RequestBuilder, call: Call) -> SendResult<HttpReply> {
+        let (client, request) = request.build_split();
+        let request = request.map_err(|_| DeliveryResult::Rejected)?;
+        let route = buckets::Route::from_request(&request);
+        if let Some((delay, scope)) = buckets::wait(self.ingress, route.as_ref())
+            .await
+            .map_err(|_| retry(Duration::from_millis(500), RetryScope::Part))?
+        {
+            return Err(retry(delay, scope));
+        }
+        if matches!(call, Call::Edit | Call::Mutation) {
+            check_authority(self.ingress, self.attempt, self.destination).await?;
+        }
+        let mut response = client
+            .execute(request)
+            .await
+            .map_err(|_| call.transport_failure())?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut data = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(None) => break,
+                Ok(Some(chunk)) if chunk.len().saturating_add(data.len()) <= MAX_JSON => {
+                    data.extend_from_slice(&chunk);
+                }
+                _ => {
+                    data.clear();
+                    break;
+                }
             }
         }
+        let body = serde_json::from_slice(&data).unwrap_or(Value::Null);
+        if let Some(result) = buckets::observe(
+            self.ingress,
+            route.as_ref(),
+            status,
+            &headers,
+            &body,
+            self.attempt.attempt,
+        )
+        .await
+        {
+            return Err(result);
+        }
+        Ok(HttpReply { status, body })
     }
-    let body = serde_json::from_slice(&data).unwrap_or(Value::Null);
-    Ok(HttpReply {
-        status,
-        headers,
-        body,
-    })
-}
 
-async fn request_json(request: RequestBuilder, call: Call) -> SendResult<Value> {
-    execute(request, call).await?.into_json(call)
-}
-
-fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name)?.to_str().ok()
-}
-
-fn rate_limit(headers: &HeaderMap, body: &Value) -> DeliveryResult {
-    let wait =
-        |value: Option<f64>| value.and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-    let after = [
-        wait(body["retry_after"].as_f64()),
-        wait(header(headers, "retry-after").and_then(|value| value.parse().ok())),
-        wait(header(headers, "x-ratelimit-reset-after").and_then(|value| value.parse().ok())),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(Duration::from_secs(1));
-    let scope = if body["global"] == true
-        || header(headers, "x-ratelimit-global") == Some("true")
-        || header(headers, "x-ratelimit-scope") == Some("global")
-    {
-        RetryScope::Account
-    } else {
-        RetryScope::Destination
-    };
-    retry(after.max(Duration::from_millis(1)), scope)
+    async fn json(&self, request: RequestBuilder, call: Call) -> SendResult<Value> {
+        self.execute(request, call).await?.into_json(call)
+    }
 }
 
 fn retry(after: Duration, scope: RetryScope) -> DeliveryResult {
