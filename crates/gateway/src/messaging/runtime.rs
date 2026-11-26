@@ -372,6 +372,59 @@ impl Ingress {
         }
     }
 
+    /// Repeat the host's exact attempt checks after a provider preflight or
+    /// file read and immediately before dispatch.
+    pub async fn recheck_send(&self, attempt: &SendAttempt) -> Result<(), GatewayError> {
+        self.recheck_send_destination(attempt, &attempt.payload.room).await
+    }
+
+    pub(super) async fn recheck_send_destination(
+        &self,
+        attempt: &SendAttempt,
+        destination: &Room,
+    ) -> Result<(), GatewayError> {
+        let (scope, attempt, destination) = (self.clone(), attempt.clone(), destination.clone());
+        blocking(move || scope.checked(true, |state| {
+            let pending = db(scope.store.delivery_for_recheck(&scope.connection, &scope.generation, &attempt))?
+                .ok_or(GatewayError::Forbidden)?;
+            if !delivery_authorized(&scope, state, &pending)? {
+                return Err(GatewayError::Forbidden);
+            }
+            let policy = outbound_policy(&scope, state, &pending, attempt.payload.effect.transport.as_ref())?;
+            if !db(scope.store.recheck(&scope.connection, &scope.generation, &pending, &attempt, &policy))? {
+                return Err(GatewayError::Forbidden);
+            }
+            let original = &pending.intent.room;
+            if destination == *original {
+                return Ok(());
+            }
+            let confirmed_thread = original.thread.is_none()
+                && destination.chat == original.chat
+                && destination.kind == original.kind
+                && attempt.effect.dependencies.iter().any(|(_, receipt)| {
+                    receipt.kind == super::ReceiptKind::Destination
+                        && destination.thread.as_deref() == Some(&receipt.id)
+                });
+            if !confirmed_thread || state.policy.room_policy(&destination).is_none() {
+                return Err(GatewayError::Forbidden);
+            }
+            if let Some(sender) = &pending.sender
+                && !scope.authorize_sender(&state.policy, &destination, sender)?
+            {
+                return Err(GatewayError::Forbidden);
+            }
+            scope.check_delivery_protection(
+                &state.policy, &destination, &pending.intent.id, attempt.payload.effect.protection.as_deref(),
+            )?;
+            if !db(scope.store.read(|db| store::eligible_consent(
+                db, &scope.connection, &destination, attempt.payload.effect.consent_required,
+            )))? {
+                return Err(GatewayError::Forbidden);
+            }
+            Ok(())
+        })).await
+    }
+
     /// List attempts from this authenticated account that need platform evidence.
     pub async fn uncertain_deliveries(&self) -> Result<Vec<UncertainDelivery>, GatewayError> {
         let scope = self.clone();

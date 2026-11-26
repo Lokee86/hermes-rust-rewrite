@@ -570,6 +570,29 @@ impl Store {
         })
     }
 
+    pub(super) fn delivery_for_recheck(
+        &self,
+        connection: &str,
+        generation: &str,
+        attempt: &SendAttempt,
+    ) -> Result<Option<PendingDelivery>> {
+        self.read(|db| {
+            Ok(db.query_row(
+                "SELECT d.intent,d.route,d.sender FROM messaging_deliveries d
+                 JOIN messaging_parts p ON p.delivery=d.id
+                 WHERE d.connection=?1 AND d.id=?2 AND d.stage='planned' AND p.ordinal=?3
+                   AND p.attempt=?4 AND p.generation=?5 AND p.stage='sending'",
+                params![connection, attempt.delivery_id, attempt.part, attempt.attempt, generation],
+                |row| Ok(PendingDelivery {
+                    intent: decode(row, 0)?,
+                    route: row.get(1)?,
+                    sender: optional_decode(row, 2)?,
+                    planned: true,
+                }),
+            ).optional()?)
+        })
+    }
+
     pub fn ready_deliveries(&self, connection: &str, now: i64) -> Result<Vec<PendingDelivery>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(

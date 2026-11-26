@@ -904,14 +904,22 @@ pub(super) fn recheck(
     send: &SendAttempt,
     policy: &OutboundPolicy,
 ) -> Result<bool> {
-    let body: Option<String> = tx.query_row(
-        "SELECT p.body FROM messaging_parts p JOIN messaging_deliveries d ON d.id=p.delivery
-         WHERE d.connection=?1 AND p.delivery=?2 AND p.ordinal=?3 AND p.attempt=?4 AND p.generation=?5 AND p.stage='sending'",
-        params![connection,send.delivery_id,send.part,send.attempt,generation], |r| r.get(0),
+    let evidence: Option<(String, bool)> = tx.query_row(
+        "SELECT p.body,a.retransmission FROM messaging_parts p
+         JOIN messaging_deliveries d ON d.id=p.delivery
+         JOIN messaging_effect_attempts a ON a.delivery=p.delivery AND a.ordinal=p.ordinal AND a.attempt=p.attempt
+         WHERE d.connection=?1 AND p.delivery=?2 AND p.ordinal=?3 AND p.attempt=?4
+           AND p.generation=?5 AND a.lease=?5 AND p.stage='sending'",
+        params![connection,send.delivery_id,send.part,send.attempt,generation],
+        |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?;
-    let Some(body) = body else { return Ok(false) };
+    let Some((body, retransmission)) = evidence else { return Ok(false) };
     let part = json::<DeliveryPart>(body)?;
-    if part != send.payload || send.effect.transport.as_ref() != policy.transport.as_ref() {
+    if part != send.payload || send.reply_anchor != pending.intent.reply_anchor
+        || send.effect.retransmission != retransmission
+        || send.effect.transport.as_ref() != policy.transport.as_ref()
+        || recorded_transport(tx, &send.delivery_id, send.part, send.attempt)?.as_ref() != policy.transport.as_ref()
+    {
         return Ok(false);
     }
     if let Some(guarantee) = &part.effect.replay
@@ -927,10 +935,12 @@ pub(super) fn recheck(
             return Ok(false);
         }
     }
-    Ok(authorize_effect(
-        tx, connection, generation, pending, send.part, &part, policy,
-    )?
-    .is_ok())
+    let Ok(authorized) = authorize_effect(tx, connection, generation, pending, send.part, &part, policy)? else {
+        return Ok(false);
+    };
+    Ok(authorized.dependencies == send.effect.dependencies
+        && authorized.marker == send.effect.marker
+        && retry_recipients(tx, &send.delivery_id, send.part, &part)? == send.effect.recipients)
 }
 
 pub(super) fn release_slot(tx: &Transaction<'_>, id: &str, ordinal: u32) -> Result<()> {
