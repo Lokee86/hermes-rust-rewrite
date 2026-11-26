@@ -665,7 +665,8 @@ impl Hermes {
                 }
                 self.accept_snapshot(history);
                 let plugin= self.chat.sid.clone().map(|sid|self.dispatch_pending_plugin(&sid)).unwrap_or_else(Task::none);
-                followup = Task::batch([plugin, super::slash::refresh(self)]);
+                let reply = if was_running && !self.running { self.read_finished_reply() } else { Task::none() };
+                followup = Task::batch([plugin, super::slash::refresh(self), reply]);
                 self.approvals = snapshot["prompts"]
                     .as_array()
                     .map(|v| v.iter().collect::<Vec<_>>())

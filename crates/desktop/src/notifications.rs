@@ -1,6 +1,6 @@
 //! Device-local desktop alerts. Only event types emitted by the native runtime
 //! are offered in the preferences. Provider prompts and chat text stay private.
-use super::{Hermes, Message, ui};
+use super::{Hermes, Message, remote, ui};
 use iced::{Element, Task, widget::{button, column, container, text}};
 use serde::{Deserialize,Serialize};
 use std::{io::Write,path::Path};
@@ -40,16 +40,28 @@ pub(super) fn focus(event:iced::Event,_:iced::event::Status,_:iced::window::Id)-
 pub(super) fn on_event(app:&Hermes,event:&Message)->Task<Message>{
     let state=&app.notifications;
     if state.focused || !state.prefs.enabled {return Task::none();}
-    let body=match event {
-        Message::Engine(id,hermes_engine::Event::Approval{..}) if *id==app.run_id && state.prefs.approval => "Approval needed",
-        Message::Finished(id,history,_) if *id==app.run_id => match history.turns.last().map(|turn|&turn.status){
-            Some(hermes_engine::Status::Complete) if state.prefs.ready=>"Response ready",
-            Some(hermes_engine::Status::Failed(_)) if state.prefs.failed=>"Turn failed",
-            _=>return Task::none(),
+    let Message::Gateway(epoch,update)=event else {return Task::none()};
+    if *epoch!=app.run_id {return Task::none();}
+    let known:Vec<&str>=app.approvals.iter().map(|approval|approval.call.id.as_str()).collect();
+    match alert(&state.prefs,&known,update) { Some(body)=>send(body,state.prefs.mute,false), None=>Task::none() }
+}
+/// The alert a gateway update for the open chat calls for. Approvals arrive in snapshots; `known`
+/// are the ones already shown.
+fn alert(prefs:&Prefs,known:&[&str],update:&remote::Update)->Option<&'static str>{
+    match update {
+        remote::Update::Snapshot(snapshot) if prefs.approval => {
+            let prompts=snapshot["prompts"].as_array().map(|prompts|prompts.iter().collect::<Vec<_>>())
+                .unwrap_or_else(||snapshot.get("pending_approval").into_iter().collect());
+            prompts.iter().filter_map(|prompt|prompt["prompt_id"].as_str().or(prompt["request_id"].as_str()))
+                .any(|id|!known.contains(&id)).then_some("Approval needed")
+        }
+        remote::Update::Event(frame) if frame["type"]=="message.complete" => match remote::terminal_status(&frame["payload"])? {
+            hermes_engine::Status::Complete if prefs.ready=>Some("Response ready"),
+            hermes_engine::Status::Failed(_) if prefs.failed=>Some("Turn failed"),
+            _=>None,
         },
-        _=>return Task::none(),
-    };
-    send(body,state.prefs.mute,false)
+        _=>None,
+    }
 }
 fn send(body:&'static str,mute:bool,test:bool)->Task<Message>{
     Task::perform(deliver(body,mute),move|r|Message::Notification(Action::Receipt(r,test)))
@@ -176,4 +188,30 @@ async fn deliver(body:&str,mute:bool)->Result<(),String>{
         UNUserNotificationCenter::currentNotificationCenter().addNotificationRequest_withCompletionHandler(&request,Some(&callback));
     }
     delivered.recv().await.map_err(|_|"macOS did not acknowledge the notification")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gateway_approvals_and_finished_turns_raise_alerts() {
+        let prefs=Prefs::default();
+        let snapshot=|prompts:serde_json::Value|remote::Update::Snapshot(json!({"running":true,"prompts":prompts}));
+        assert_eq!(alert(&prefs,&[],&snapshot(json!([{"prompt_id":"a"}]))),Some("Approval needed"));
+        assert_eq!(alert(&prefs,&["a"],&snapshot(json!([{"prompt_id":"a"}]))),None,"an approval already shown is not announced again");
+        assert_eq!(alert(&prefs,&["a"],&snapshot(json!([{"prompt_id":"a"},{"request_id":"b"}]))),Some("Approval needed"));
+        assert_eq!(alert(&prefs,&[],&remote::Update::Snapshot(json!({"pending_approval":{"request_id":"c"}}))),Some("Approval needed"));
+        assert_eq!(alert(&prefs,&[],&snapshot(json!([]))),None);
+        let done=|status:&str|remote::Update::Event(json!({"type":"message.complete","payload":{"status":status,"error":"boom"}}));
+        assert_eq!(alert(&prefs,&[],&done("complete")),Some("Response ready"));
+        assert_eq!(alert(&prefs,&[],&done("failed")),Some("Turn failed"));
+        assert_eq!(alert(&prefs,&[],&done("interrupted")),None);
+        assert_eq!(alert(&prefs,&[],&remote::Update::Event(json!({"type":"message.delta","payload":{"text":"x"}}))),None);
+        let quiet=Prefs{approval:false,ready:false,failed:false,..Prefs::default()};
+        assert_eq!(alert(&quiet,&[],&snapshot(json!([{"prompt_id":"a"}]))),None);
+        assert_eq!(alert(&quiet,&[],&done("complete")),None);
+        assert_eq!(alert(&quiet,&[],&done("failed")),None);
+    }
 }
