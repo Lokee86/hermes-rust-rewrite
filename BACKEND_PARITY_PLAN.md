@@ -63,6 +63,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 16. Implement Weixin and verify iLink enrollment, durable polling, peer-scoped context, encrypted media and qualified delivery. [Weixin spec](crates/gateway/WEIXIN_ADAPTER_SPEC.md)
 17. Implement QQ Bot and verify the official QQ Gateway, four authorized conversation shapes, keyboard controls, reply quotas and native media. [QQ Bot spec](crates/gateway/QQBOT_ADAPTER_SPEC.md)
 18. Implement LINE and verify signed webhook batches, reply-token and slow-result workflows, bounded media serving and metered push. [LINE spec](crates/gateway/LINE_ADAPTER_SPEC.md)
+19. Implement SimpleX and verify the private daemon, direct and group scopes, durable missed-item recovery and XFTP transfers. [SimpleX spec](crates/gateway/SIMPLEX_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 

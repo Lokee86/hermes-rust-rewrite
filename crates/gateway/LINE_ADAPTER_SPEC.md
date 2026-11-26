@@ -1,6 +1,6 @@
 # LINE stock plugin implementation spec
 
-Register LINE as a bundled Rust adapter with platform key `line`. Start after QQ Bot and the shared gate. A headless profile serves a LINE Official Account in eligible 1:1 chats, groups and rooms, uses a reply token for timely results and exposes a durable fetch button for slow work. It stages native media and can push to approved destinations when the channel has the necessary allowance. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [QQ Bot spec](QQBOT_ADAPTER_SPEC.md) · [Hermes LINE guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/line.md)
+Register LINE as a bundled Rust adapter with platform key `line`. Start after QQ Bot and the shared gate. A headless profile serves a LINE Official Account in eligible 1:1 chats, groups and rooms, uses a reply token for timely results and exposes a durable fetch button for slow work. It stages native media and can push to approved destinations when the channel has the necessary allowance. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [QQ Bot spec](QQBOT_ADAPTER_SPEC.md) · [Hermes LINE guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/line.md) · [Next adapter, SimpleX](SIMPLEX_ADAPTER_SPEC.md)
 
 ## Registration and signed intake
 
