@@ -163,12 +163,13 @@ where
     Open: Fn(Url, usize) -> Opened,
     Opened: Future<Output = Result<S, GatewayError>>,
 {
-    if source.room.thread.as_deref().unwrap_or(&source.room.chat) != channel
-        || !snowflake(channel)
-        || !snowflake(message)
-        || !body.attachments.is_empty()
-    {
+    if !snowflake(channel) || !snowflake(message) || !body.attachments.is_empty() {
         return Err(GatewayError::Invalid);
+    }
+    if source.room.thread.as_deref().unwrap_or(&source.room.chat) != channel
+        && !ingress.thread_media_source_allowed(source, channel)?
+    {
+        return Err(GatewayError::Forbidden);
     }
     if expected.is_empty() {
         return Ok(body);

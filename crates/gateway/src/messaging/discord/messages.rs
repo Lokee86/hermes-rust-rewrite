@@ -1,8 +1,10 @@
 use super::{
     super::{
-        Advance, ConnectionFailure, DeferredInput, Disposition, GatewayError, Handoff, HandoffItem,
-        InboundBody, InboundEvent, MediaSource, Message, Preparation, PreparationPurpose,
-        QuoteHydration, QuoteLookup, QuoteReference,
+        Advance, ConnectionFailure, DeferredInput, DeliveryResult, Disposition, EffectReceipt,
+        GatewayError, Handoff, HandoffItem, InboundBody, InboundEvent, MediaSource, Message,
+        Preparation, PreparationPurpose, QuoteHydration, QuoteLookup, QuoteReference, ReceiptKind,
+        RoomKind,
+        prepared_threads::ThreadPreparation,
         runtime::{blocking, db, now},
         store,
     },
@@ -39,9 +41,37 @@ struct Manifest {
     message: String,
     attachments: Vec<AttachmentSource>,
     quote: Option<QuoteReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread: Option<AutoThread>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AutoThread {
+    guild: String,
+    inline_on_refusal: bool,
 }
 
 impl DiscordAdapter {
+    pub(super) fn is_auto_thread_echo(
+        &self,
+        ingress: &Ingress,
+        parent: &str,
+        message: &str,
+    ) -> Result<bool, GatewayError> {
+        db(ingress.store.read(|db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messaging_discord_preparation WHERE connection=?1
+                 AND event=?2 AND json_extract(manifest,'$.channel')=?3
+                 AND json_type(manifest,'$.thread')='object')",
+                params![
+                    ingress.connection,
+                    format!("discord-message-{message}"),
+                    parent
+                ],
+                |row| row.get(0),
+            )?)
+        }))
+    }
     pub(super) async fn accept_message(
         &self,
         ingress: &Ingress,
@@ -83,7 +113,23 @@ impl DiscordAdapter {
                 room: event.room.clone(),
                 message_id: message_id.to_owned(),
             });
-        if attachments.is_empty() && quote.is_none() {
+        let thread = if self.settings.auto_thread
+            && event.room.kind == RoomKind::Group
+            && event.room.thread.is_none()
+            && quote.is_none()
+            && raw.get("type").and_then(Value::as_u64).unwrap_or(0) == 0
+            && crate::lock(&self.channels)
+                .get(channel)
+                .is_some_and(|channel| matches!(channel.kind, 0 | 5))
+        {
+            read_id(&raw, "guild_id").map(|guild| AutoThread {
+                guild: guild.to_owned(),
+                inline_on_refusal: self.settings.auto_thread_inline_fallback,
+            })
+        } else {
+            None
+        };
+        if attachments.is_empty() && quote.is_none() && thread.is_none() {
             ingress
                 .submit(vec![event], Some(advance))
                 .await
@@ -108,6 +154,7 @@ impl DiscordAdapter {
             message: message.to_owned(),
             attachments,
             quote,
+            thread,
         };
         let id = event.id.clone();
         let scope = ingress.clone();
@@ -153,10 +200,17 @@ impl DiscordAdapter {
         let preparation = Preparation {
             token,
             expires_ms,
-            purpose: manifest
-                .quote
-                .clone()
-                .map_or(PreparationPurpose::Media, PreparationPurpose::Quote),
+            purpose: if let Some(thread) = &manifest.thread {
+                PreparationPurpose::Thread {
+                    id: manifest.message.clone(),
+                    inline_on_refusal: thread.inline_on_refusal,
+                }
+            } else {
+                manifest
+                    .quote
+                    .clone()
+                    .map_or(PreparationPurpose::Media, PreparationPurpose::Quote)
+            },
             protection: None,
         };
         let receipt = ingress
@@ -229,13 +283,14 @@ impl DiscordAdapter {
             event,
         };
         let client = self.client.clone();
+        let bot = self.bot.bot_id.clone();
         let ingress = ingress.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
             let _worker = lease;
             tokio::select! {
                 _ = cancel.cancelled() => {},
-                _ = hydrate(&client, &ingress, input, manifest) => {},
+                _ = hydrate(&client, &bot, &ingress, input, manifest) => {},
             }
         });
     }
@@ -254,10 +309,42 @@ impl Drop for PreparationWorker {
 
 async fn hydrate(
     client: &DiscordClient,
+    bot: &str,
     ingress: &Ingress,
-    input: DeferredInput,
+    mut input: DeferredInput,
     manifest: Manifest,
 ) -> Result<(), GatewayError> {
+    if let Some(thread) = &manifest.thread {
+        match ingress
+            .prepare_thread(input.event.id.clone(), input.preparation.token.clone())
+            .await?
+        {
+            ThreadPreparation::Ready(event) => input.event = event,
+            ThreadPreparation::Reconcile(attempt) => {
+                let thread_id = manifest.message.as_str();
+                let channel: Result<Value, _> = client.get(&["channels", thread_id]).await;
+                if let Ok(channel) = channel
+                    && read_id(&channel, "id") == Some(thread_id)
+                    && read_id(&channel, "parent_id") == Some(manifest.channel.as_str())
+                    && read_id(&channel, "guild_id") == Some(thread.guild.as_str())
+                    && read_id(&channel, "owner_id") == Some(bot)
+                    && matches!(channel["type"].as_u64(), Some(10 | 11))
+                {
+                    ingress
+                        .reconcile_delivery(
+                            attempt,
+                            DeliveryResult::EffectConfirmed(EffectReceipt {
+                                kind: ReceiptKind::Destination,
+                                id: thread_id.to_owned(),
+                            }),
+                        )
+                        .await?;
+                }
+                return Ok(());
+            }
+            ThreadPreparation::Waiting | ThreadPreparation::Closed => return Ok(()),
+        }
+    }
     let source = MediaSource::from(&input.event);
     let InboundBody::Message(body) = input.event.body else {
         return Err(GatewayError::Invalid);
@@ -305,6 +392,9 @@ async fn media_body(
     manifest: &Manifest,
     body: Message,
 ) -> Result<Message, GatewayError> {
+    if manifest.attachments.is_empty() {
+        return Ok(body);
+    }
     media::hydrate_attachments(
         client,
         ingress,

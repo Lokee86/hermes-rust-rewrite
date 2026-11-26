@@ -135,6 +135,7 @@ fn authorized(
     Ok(scope
         .route_event(&state.policy, &work.event)?
         .is_ok_and(|route| route.id == work.route.id)
+        && scope.thread_source_allowed(state, &work.event.room, &work.event.sender, &work.event.id)?
         && scope.recheck_quote(state, &work.event, &work.route)?)
 }
 

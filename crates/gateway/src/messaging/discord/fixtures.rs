@@ -40,6 +40,8 @@ struct Server {
     counter: Arc<AtomicU64>,
     messages: Arc<Mutex<BTreeMap<(String, String), Value>>>,
     history: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
+    threads: Arc<Mutex<BTreeMap<String, Value>>>,
+    thread_creates: Arc<AtomicU64>,
 }
 
 struct Wire {
@@ -85,6 +87,10 @@ enum Write {
     },
     Callback(Value),
     Followup(Value),
+    Thread {
+        parent: String,
+        starter: String,
+    },
 }
 
 struct Fixtures {
@@ -114,6 +120,8 @@ impl Fixtures {
             counter: Arc::new(AtomicU64::new(500)),
             messages: Arc::default(),
             history: Arc::default(),
+            threads: Arc::default(),
+            thread_creates: Arc::default(),
         };
         let endpoint = transport.clone();
         let router = Router::new()
@@ -311,6 +319,32 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             json!({"id":"22","type":11,"guild_id":"11","parent_id":"21"})
         }
         (Method::GET, ["channels", "23"]) => json!({"id":"23","type":0,"guild_id":"12"}),
+        (Method::GET, ["channels", id]) => {
+            let found = crate::lock(&state.threads).get(*id).cloned();
+            let Some(found) = found else {
+                return (StatusCode::NOT_FOUND, Json(json!({"code":10003}))).into_response();
+            };
+            found
+        }
+        (Method::POST, ["channels", parent, "messages", starter, "threads"]) => {
+            state.thread_creates.fetch_add(1, Ordering::SeqCst);
+            let _ = state
+                .writes
+                .send(Write::Thread {
+                    parent: parent.to_string(),
+                    starter: starter.to_string(),
+                })
+                .await;
+            match *starter {
+                "400" => return StatusCode::BAD_GATEWAY.into_response(),
+                "401" => return StatusCode::FORBIDDEN.into_response(),
+                _ => {
+                    let thread = json!({"id":starter,"type":11,"parent_id":parent,"owner_id":"9","guild_id":"11"});
+                    crate::lock(&state.threads).insert(starter.to_string(), thread.clone());
+                    thread
+                }
+            }
+        }
         (Method::GET, ["channels", channel, "messages"]) => {
             json!(
                 crate::lock(&state.history)
@@ -490,6 +524,142 @@ async fn discord_identifies_resumes_deduplicates_and_routes_threads_through_the_
     assert_eq!(payload["content"], "answer next");
     assert_eq!(model.requests().len(), 3);
     gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_auto_thread_converges_after_an_unknown_create_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let configure = |fixture: &Fixtures| {
+        fixture.configuration_with(
+            root.path(),
+            json!({
+                "grants":{"users":["7"]},
+                "guilds":{"11":{"channels":{"21":{}}}},
+                "auto_thread":true,
+                "auto_thread_inline_fallback":true,
+                "commands":{"enabled":true,"sync":false},
+            }),
+        )
+    };
+    let gateway = model.gateway(root.path(), vec![configure(&fixture)]).await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "thread-restart").await;
+    let starter = message("400", "21", "<@9> open a thread", true);
+    wire.dispatch(2, "MESSAGE_CREATE", starter.clone()).await;
+    let Write::Thread {
+        parent,
+        starter: requested,
+    } = fixture
+        .next_write("a thread provision attempt", |write| {
+            matches!(write, Write::Thread { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!((parent.as_str(), requested.as_str()), ("21", "400"));
+    wait_status(&gateway, |status| {
+        status["deliveries"].as_array().is_some_and(|deliveries| {
+            deliveries
+                .iter()
+                .any(|delivery| delivery["part_state"] == "uncertain")
+        })
+    })
+    .await;
+    assert!(model.requests().is_empty());
+    gateway.shutdown().await.unwrap();
+
+    let gateway = model.gateway(root.path(), vec![configure(&fixture)]).await;
+    let mut wire = fixture.wire().await;
+    assert_eq!(wire.authentication(6).await["d"]["seq"], 2);
+    wire.dispatch(3, "RESUMED", json!({})).await;
+    wire.dispatch(4, "MESSAGE_CREATE", starter).await;
+    crate::lock(&fixture.transport.threads).insert(
+        "400".into(),
+        json!({
+            "id":"400","type":11,"guild_id":"11","parent_id":"23","owner_id":"9",
+        }),
+    );
+    sleep(Duration::from_millis(2200)).await;
+    assert!(model.requests().is_empty());
+    let evidence = json!({"id":"400","type":11,"guild_id":"11","parent_id":"21","owner_id":"9"});
+    crate::lock(&fixture.transport.threads).insert("400".into(), evidence.clone());
+    wire.dispatch(5, "THREAD_CREATE", evidence).await;
+    wire.dispatch(
+        6,
+        "MESSAGE_CREATE",
+        message("400", "400", "<@9> open a thread", true),
+    )
+    .await;
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.reply().await
+    else {
+        unreachable!()
+    };
+    assert_eq!(channel, "400");
+    assert_eq!(payload["content"], "answer open a thread");
+    wait_reply(&gateway, "discord-message-400").await;
+    assert_eq!(model.requests().len(), 1);
+    assert_eq!(fixture.transport.thread_creates.load(Ordering::SeqCst), 1);
+    let status = gateway.messaging_status().await.unwrap();
+    assert_eq!(status["input"].as_array().unwrap().len(), 1);
+    assert_eq!(status["input"][0]["conflict"], false);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_auto_thread_uses_inline_only_for_a_definite_refusal() {
+    for fallback in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let model = Model::new().await;
+        let mut fixture = Fixtures::start().await;
+        let config = fixture.configuration_with(
+            root.path(),
+            json!({
+                "grants":{"users":["7"]},
+                "guilds":{"11":{"channels":{"21":{}}}},
+                "auto_thread":true,
+                "auto_thread_inline_fallback":fallback,
+                "commands":{"enabled":true,"sync":false},
+            }),
+        );
+        let gateway = model.gateway(root.path(), vec![config]).await;
+        fixture.activate(&gateway).await;
+        let mut wire = fixture.wire().await;
+        wire.authentication(2).await;
+        fixture.ready(&wire, "thread-refusal").await;
+        wire.dispatch(
+            2,
+            "MESSAGE_CREATE",
+            message("401", "21", "<@9> inline", true),
+        )
+        .await;
+        if fallback {
+            let Write::Message {
+                channel, payload, ..
+            } = fixture.reply().await
+            else {
+                unreachable!()
+            };
+            assert_eq!(channel, "21");
+            assert_eq!(payload["content"], "answer inline");
+            wait_reply(&gateway, "discord-message-401").await;
+            assert_eq!(model.requests().len(), 1);
+        } else {
+            wait_status(&gateway, |status| {
+                status["input"][0]["reason"] == "thread_provision_refused"
+            })
+            .await;
+            assert!(model.requests().is_empty());
+        }
+        assert_eq!(fixture.transport.thread_creates.load(Ordering::SeqCst), 1);
+        gateway.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -699,7 +869,10 @@ async fn discord_requester_commands_answer_privately_without_creating_a_turn() {
         "commands":{"sync":false,"guild_roles":{"11":["31"]}},
     });
     let gateway = model
-        .gateway(root.path(), vec![fixture.configuration_with(root.path(), settings)])
+        .gateway(
+            root.path(),
+            vec![fixture.configuration_with(root.path(), settings)],
+        )
         .await;
     fixture.activate(&gateway).await;
     let mut wire = fixture.wire().await;
@@ -862,6 +1035,7 @@ async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_c
                     replied = true;
                 }
             }
+            Write::Thread { .. } => panic!("approval unexpectedly provisioned a thread"),
         }
     }
     assert_eq!(model.requests().len(), 2);

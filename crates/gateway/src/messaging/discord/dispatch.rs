@@ -76,6 +76,13 @@ impl DiscordAdapter {
         let Some(route) = self.route_for_message(&message).await? else {
             return skip(ingress, advance).await;
         };
+        if route.room.thread.as_deref() == Some(message.id.as_str())
+            && self
+                .is_auto_thread_echo(ingress, &route.room.chat, &message.id)
+                .map_err(intake_failure)?
+        {
+            return skip(ingress, advance).await;
+        }
         if message.author.id == self.bot.bot_id {
             super::delivery::observe_create(ingress, &self.bot.bot_id, &route.room, &data)
                 .await

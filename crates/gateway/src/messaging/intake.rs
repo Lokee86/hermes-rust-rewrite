@@ -57,6 +57,7 @@ pub enum PreparationPurpose {
     Context,
     Burst,
     Quote(QuoteReference),
+    Thread { id: String, inline_on_refusal: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +76,9 @@ impl HandoffItem {
                     && preparation.protection.as_deref().is_none_or(valid_id)
                     && matches!(self.event.body, InboundBody::Message(_))
                     && !matches!(&preparation.purpose, PreparationPurpose::Quote(source) if !source.valid())
+                    && !matches!(&preparation.purpose, PreparationPurpose::Thread { id, .. }
+                        if !valid_id(id) || self.event.room.kind != RoomKind::Group
+                            || self.event.room.thread.is_some() || self.event.reply_anchor.as_ref() != Some(id))
             })
     }
 }
@@ -140,6 +144,12 @@ impl Ingress {
                     {
                         candidate.decision = Err(Disposition::Forbidden);
                     }
+                    if matches!(item.preparation.as_ref().map(|p| &p.purpose), Some(PreparationPurpose::Thread { .. }))
+                        && (!scope.capabilities().effects.prepare_resources || !scope.capabilities().threads
+                            || candidate.protection.is_some())
+                    {
+                        candidate.decision = candidate.decision.and(Err(Disposition::Unsupported));
+                    }
                     candidates.push((candidate, item.preparation));
                 }
                 db(scope.store.handoff(
@@ -187,6 +197,8 @@ impl Ingress {
                 if let Some(staged) = staged
                     && staged.token == token
                     && !matches!(staged.purpose, PreparationPurpose::Quote(_))
+                    && (!matches!(staged.purpose, PreparationPurpose::Thread { .. })
+                        || scope.prepared_thread_selected(&event)?)
                     && scope.pending_authorized(state, &staged)?
                     && let Some(event) = &staged.event
                 {
@@ -227,7 +239,8 @@ impl Ingress {
         }
         Ok(self
             .route_candidate(&state.policy, event, true)?
-            .is_ok_and(|current| current.id == route))
+            .is_ok_and(|current| current.id == route)
+            && self.thread_source_allowed(state, &event.room, &event.sender, &event.id)?)
     }
 
     /// Complete a durable staged input. The adapter supplies only hydrated
@@ -269,7 +282,15 @@ impl Ingress {
                         ..staged.receipt
                     });
                 }
+                if matches!(staged.purpose, PreparationPurpose::Thread { .. })
+                    && !scope.prepared_thread_selected(&event_id)?
+                {
+                    return Err(GatewayError::TemporarilyUnavailable);
+                }
                 let mut event = staged.event.ok_or(GatewayError::Invalid)?;
+                if !scope.thread_source_allowed(state, &event.room, &event.sender, &event_id)? {
+                    return Err(GatewayError::Forbidden);
+                }
                 let expired = staged.expires_ms <= chrono::Utc::now().timestamp_millis();
                 if !expired {
                     scope.check_input_protection(&state.policy, &event)?;
@@ -541,7 +562,7 @@ impl Store {
                    (SELECT event FROM messaging_preparation WHERE connection = ?1 AND expires <= ?2)",
                 params![connection, now, serde_json::to_string(&Disposition::Expired)?],
             )?;
-            Ok(())
+            super::prepared_threads::retire_unstarted(tx, connection)
         })
     }
 }

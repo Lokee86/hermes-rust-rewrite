@@ -216,6 +216,7 @@ impl Store {
         connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
+        connection.execute_batch(super::prepared_threads::TABLES)?;
         connection.execute_batch(super::quotes::TABLES)?;
         connection.execute_batch(super::receiver::TABLES)?;
         connection.execute_batch(super::timed::TABLES)?;

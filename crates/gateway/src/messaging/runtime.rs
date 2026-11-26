@@ -1611,6 +1611,7 @@ fn delivery_authorized(
     if route.blocked || route.connection != scope.connection || route.room != pending.intent.room
         || !db(scope.store.result_released(&scope.connection, &pending.intent.id))?
         || !scope.recheck_quote_delivery(state, &route, &pending.intent.id)?
+        || !scope.thread_provision_allowed(state, &pending.intent, pending.sender.as_ref())?
     {
         return Ok(false);
     }
@@ -1634,7 +1635,8 @@ fn delivery_authorized(
         };
         return Ok(
             scope.authorize_sender(&state.policy, &pending.intent.room, sender)?
-                && current.id == route.id,
+                && current.id == route.id
+                && scope.thread_reply_allowed(state, &pending.intent, sender)?,
         );
     }
     db(scope.store.allows_notification(&route.id, now(), &scope.transport_scope()?))

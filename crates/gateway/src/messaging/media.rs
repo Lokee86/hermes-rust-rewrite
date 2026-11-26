@@ -594,7 +594,9 @@ impl Ingress {
         if source.room.thread.is_some() && !self.capabilities().threads {
             return Err(GatewayError::Unsupported);
         }
-        if !self.authorize_sender(policy, &source.room, &source.sender)? {
+        if !self.authorize_sender(policy, &source.room, &source.sender)?
+            || !self.thread_source_allowed(state, &source.room, &source.sender, &source.event_id)?
+        {
             return Err(GatewayError::Forbidden);
         }
         if purpose == MediaPurpose::SpokenAddressing {

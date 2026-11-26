@@ -837,6 +837,37 @@ impl Ingress {
         Ok(())
     }
 
+    /// Public children inherit the proved parent audience. The caller must
+    /// hold the active slot and have a confirmed provider destination receipt.
+    pub(super) fn inherit_public_thread_membership(
+        &self,
+        parent: &Room,
+        child: &Room,
+        actor: &str,
+    ) -> Result<(), GatewayError> {
+        let ActorObservation::Verified(mut evidence) = self.actor_observation(actor)? else {
+            return Ok(());
+        };
+        if evidence.memberships.iter().any(|membership| membership.room == *child) {
+            return Ok(());
+        }
+        let membership = evidence.memberships.iter().find(|membership| membership.room == *parent)
+            .ok_or(GatewayError::Forbidden)?;
+        let roles = membership.roles.clone();
+        if evidence.memberships.len() == 256 {
+            let oldest = evidence.memberships.iter().position(|membership| membership.room != *parent)
+                .ok_or(GatewayError::Invalid)?;
+            evidence.memberships.remove(oldest);
+        }
+        evidence.memberships.push(MemberEvidence { room: child.clone(), roles });
+        evidence.revision = evidence.revision.saturating_add(1);
+        let transport_scope = db(key("actor-transport", &self.installation()))?;
+        if !db(self.store.record_actor(&self.connection, StoredActor { transport_scope, evidence }))? {
+            return Err(GatewayError::Forbidden);
+        }
+        Ok(())
+    }
+
     /// Withdraw stale membership evidence after a transport gap or an exact
     /// room authority change. Aliases and actor revisions keep their bindings.
     pub async fn invalidate_actor_evidence(&self, room: Option<Room>) -> Result<(), GatewayError> {

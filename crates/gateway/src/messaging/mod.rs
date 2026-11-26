@@ -9,6 +9,7 @@ mod intake;
 mod media;
 mod observations;
 mod policy;
+mod prepared_threads;
 mod producer_results;
 mod profile;
 mod protection;
