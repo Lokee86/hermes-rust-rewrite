@@ -109,6 +109,198 @@ async fn durable_preparation_orders_routes_and_reopens_before_hydration() {
 }
 
 #[tokio::test]
+async fn leased_acknowledgement_waits_for_preparation_and_uses_the_latest_token() {
+    use AcknowledgementOperation::{Acknowledge, Extend};
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "leased-intake", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    let item = HandoffItem {
+        event: dm("lease-event", "one", ""),
+        preparation: Some(Preparation {
+            token: "stable-source".into(),
+            purpose: PreparationPurpose::Body,
+            expires_ms: expires(),
+        }),
+    };
+    let lease = |token: &str, bytes| AcknowledgementLease {
+        token: token.into(),
+        expires_ms: expires(),
+        payload_bytes: bytes,
+    };
+    ingress
+        .submit(Vec::new(), Some(advance(None, "baseline")))
+        .await
+        .unwrap();
+    ingress
+        .begin_repair(RepairWindow {
+            id: "open-gap".into(),
+            stream: "inbox".into(),
+            room: item.event.room.clone(),
+            last_committed: "baseline".into(),
+            expires_ms: expires(),
+            limit: 8,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        ingress
+            .stage_leased_input(item.clone(), lease("precommit-token", 10))
+            .await,
+        Err(GatewayError::TemporarilyUnavailable)
+    ));
+    assert!(input(&gateway.messaging_status().await.unwrap(), "lease-event").is_none());
+    ingress
+        .finish_repair("open-gap".into(), None)
+        .await
+        .unwrap();
+
+    let first = ingress
+        .stage_leased_input(item.clone(), lease("first-token", 16 * 1024 * 1024))
+        .await
+        .unwrap();
+    assert_eq!(first.receipt.disposition, Disposition::Deferred);
+    assert_eq!(first.token_for(Acknowledge).await.unwrap(), None);
+    assert_eq!(first.token_for(Extend).await.unwrap(), Some("first-token"));
+    assert!(first.record_extension(expires() + 60_000).await.unwrap());
+    let other = HandoffItem {
+        event: dm("bounded", "two", "later"),
+        preparation: None,
+    };
+    assert!(matches!(
+        ingress
+            .stage_leased_input(other, lease("over-budget", 1))
+            .await,
+        Err(GatewayError::TemporarilyUnavailable)
+    ));
+    let latest = ingress
+        .stage_leased_input(item.clone(), lease("latest-token", 10))
+        .await
+        .unwrap();
+    assert!(latest.receipt.repeated);
+    assert_eq!(first.token_for(Extend).await.unwrap(), None);
+    assert_eq!(
+        ingress
+            .authorize_preparation("lease-event".into(), "forged".into())
+            .await,
+        Err(GatewayError::Forbidden)
+    );
+    ingress
+        .authorize_preparation("lease-event".into(), "stable-source".into())
+        .await
+        .unwrap();
+    ingress
+        .complete_preparation(
+            "lease-event".into(),
+            "stable-source".into(),
+            Message::text("ready"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.token_for(Extend).await.unwrap(), None);
+    assert_eq!(
+        latest.token_for(Acknowledge).await.unwrap(),
+        Some("latest-token")
+    );
+    let send = driver.sent().await;
+    status(&gateway, |state| {
+        delivery(state, &send.attempt.delivery_id, 0).is_some_and(|row| row["part_state"] == "sent")
+    })
+    .await;
+    gateway.shutdown().await.unwrap();
+
+    let driver = Driver::new(Transport::Push, "leased-intake", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    assert_eq!(
+        latest.token_for(Acknowledge).await,
+        Err(GatewayError::StaleConnection)
+    );
+    let repeat = ingress
+        .stage_leased_input(item, lease("after-restart", 10))
+        .await
+        .unwrap();
+    assert!(repeat.receipt.repeated);
+    assert_eq!(repeat.receipt.disposition, Disposition::Accepted);
+    assert_eq!(
+        repeat.token_for(Acknowledge).await.unwrap(),
+        Some("after-restart")
+    );
+    assert_eq!(model.requests().len(), 1);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compatible_burst_keeps_original_identities_and_separates_same_text_events() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "bursts", false);
+    let mut access = policy();
+    access.users.insert("bob".into());
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(access.clone())])
+        .await;
+    let ingress = driver.ready().await;
+    let mut first = dm("one", "chat", "line");
+    first.reply_anchor = None;
+    let mut second = dm("two", "chat", "line");
+    second.reply_anchor = None;
+    let group = handoff(
+        "two-items",
+        vec![first.clone(), second.clone()],
+        Some(advance(None, "observed")),
+    );
+    let mut different = second.clone();
+    different.sender.id = "bob".into();
+    assert_eq!(
+        ingress
+            .stage_text_burst(handoff("different-sender", vec![first, different], None))
+            .await
+            .unwrap_err(),
+        GatewayError::Invalid
+    );
+    let result = ingress.stage_text_burst(group.clone()).await.unwrap();
+    assert_eq!(result.receipts[0].disposition, Disposition::Accepted);
+    assert_eq!(result.receipts[1].disposition, Disposition::Coalesced);
+    let sent = driver.sent().await;
+    assert_eq!(reply(&sent.attempt), "answer line\nline");
+    status(&gateway, |state| {
+        delivery(state, &sent.attempt.delivery_id, 0).is_some_and(|row| row["part_state"] == "sent")
+    })
+    .await;
+    gateway.shutdown().await.unwrap();
+
+    let driver = Driver::new(Transport::Push, "bursts", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(access)])
+        .await;
+    let ingress = driver.ready().await;
+    let repeat = ingress.stage_text_burst(group).await.unwrap();
+    assert!(repeat.receipts.iter().all(|receipt| receipt.repeated));
+    assert_eq!(repeat.checkpoint.as_deref(), Some("observed"));
+    let mut separate = second.clone();
+    separate.id = "three".into();
+    let result = ingress
+        .submit(
+            vec![second, separate],
+            Some(advance(Some("observed"), "later")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.receipts[0].disposition, Disposition::Coalesced);
+    assert!(result.receipts[0].repeated);
+    assert_eq!(result.receipts[1].disposition, Disposition::Accepted);
+    assert_eq!(reply(&driver.sent().await.attempt), "answer line");
+    assert_eq!(model.requests().len(), 2);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn repair_merges_live_and_history_in_source_order_after_restart() {
     let root = TempDir::new().unwrap();
     let model = Model::new().await;
@@ -480,7 +672,8 @@ async fn prompt_decision_is_durable_and_reuse_checks_the_current_route_policy() 
     first.finish(confirmed("first-reply"));
     status(&gateway, |state| {
         delivery(state, &delivery_id, 0).is_some_and(|row| row["part_state"] == "sent")
-    }).await;
+    })
+    .await;
     gateway.shutdown().await.unwrap();
 
     let driver = Driver::new(Transport::Push, "approval-reuse", true);

@@ -1,5 +1,5 @@
 use super::{
-    runtime::{Ingress, MAX_BATCH, blocking, db, valid_advance, valid_id},
+    runtime::{Ingress, MAX_BATCH, State, blocking, db, now, valid_advance, valid_id},
     store::{self, Candidate, Store},
     types::*,
 };
@@ -60,6 +60,18 @@ pub struct DeferredInput {
     pub preparation: Preparation,
 }
 
+impl HandoffItem {
+    pub(super) fn valid(&self) -> bool {
+        super::runtime::valid_input_id(&self.event.id)
+            && !matches!(self.event.body, InboundBody::Wake)
+            && self.preparation.as_ref().is_none_or(|preparation| {
+                valid_id(&preparation.token)
+                    && preparation.expires_ms > 0
+                    && matches!(self.event.body, InboundBody::Message(_))
+            })
+    }
+}
+
 impl Ingress {
     /// Commit all dispositions before an acknowledgement or an SDK-owned
     /// checkpoint can advance. The bridge can replay this call after restart.
@@ -87,15 +99,7 @@ impl Ingress {
             || handoff.items.is_empty()
             || handoff.items.len() > MAX_BATCH
             || !valid_advance(handoff.advance.as_ref())
-            || handoff.items.iter().any(|item| {
-                !super::runtime::valid_input_id(&item.event.id)
-                    || matches!(item.event.body, InboundBody::Wake)
-                    || item.preparation.as_ref().is_some_and(|p| {
-                        !valid_id(&p.token)
-                            || p.expires_ms <= 0
-                            || !matches!(item.event.body, InboundBody::Message(_))
-                    })
-            })
+            || handoff.items.iter().any(|item| !item.valid())
         {
             return Err(GatewayError::Invalid);
         }
@@ -136,8 +140,68 @@ impl Ingress {
 
     pub async fn pending_preparations(&self) -> Result<Vec<DeferredInput>, GatewayError> {
         let scope = self.clone();
-        blocking(move || scope.checked(true, |_| db(scope.store.preparations(&scope.connection))))
-            .await
+        blocking(move || {
+            scope.checked(true, |state| {
+                let mut pending = Vec::new();
+                for (route, input) in db(scope.store.preparations(&scope.connection))? {
+                    if scope.allows_preparation(state, &input.event, &route)? {
+                        pending.push(input);
+                    }
+                }
+                Ok(pending)
+            })
+        })
+        .await
+    }
+
+    /// Recheck the staged header immediately before opening the protected body.
+    pub async fn authorize_preparation(
+        &self,
+        event: String,
+        token: String,
+    ) -> Result<(), GatewayError> {
+        let scope = self.clone();
+        blocking(move || {
+            scope.checked(true, |state| {
+                let staged = db(scope.store.preparation(&scope.connection, &event))?;
+                if let Some(staged) = staged
+                    && staged.token == token
+                    && scope.pending_authorized(state, &staged)?
+                {
+                    return Ok(());
+                }
+                Err(GatewayError::Forbidden)
+            })
+        })
+        .await
+    }
+
+    pub(super) fn can_prepare(&self, state: &State, event: &str) -> Result<bool, GatewayError> {
+        if let Some(staged) = db(self.store.preparation(&self.connection, event))? {
+            return self.pending_authorized(state, &staged);
+        }
+        Ok(false)
+    }
+
+    fn pending_authorized(&self, state: &State, staged: &Staged) -> Result<bool, GatewayError> {
+        if staged.expires_ms > now()
+            && staged.receipt.disposition == Disposition::Deferred
+            && let (Some(event), Some(route)) = (&staged.event, &staged.receipt.route)
+        {
+            return self.allows_preparation(state, event, route);
+        }
+        Ok(false)
+    }
+
+    fn allows_preparation(
+        &self,
+        state: &State,
+        event: &InboundEvent,
+        route: &str,
+    ) -> Result<bool, GatewayError> {
+        Ok(self
+            .route_candidate(&state.policy, event, true)?
+            .is_ok_and(|current| current.id == route))
     }
 
     /// Complete a durable staged input. The adapter supplies only hydrated
@@ -320,10 +384,10 @@ impl Store {
         })
     }
 
-    fn preparations(&self, connection: &str) -> Result<Vec<DeferredInput>> {
+    fn preparations(&self, connection: &str) -> Result<Vec<(String, DeferredInput)>> {
         self.read(|db| {
             let mut query = db.prepare(
-                "SELECT i.input,p.token,p.purpose,p.expires FROM messaging_preparation p
+                "SELECT i.input,p.token,p.purpose,p.expires,i.route FROM messaging_preparation p
                  JOIN messaging_ingress i USING(connection,event)
                  WHERE p.connection = ?1 AND i.stage = 'preparing' AND p.expires > ?2
                  ORDER BY i.position LIMIT ?3",
@@ -336,14 +400,17 @@ impl Store {
                         MAX_BATCH as i64
                     ],
                     |row| {
-                        Ok(DeferredInput {
-                            event: store::decode(row, 0)?,
-                            preparation: Preparation {
-                                token: row.get(1)?,
-                                purpose: store::decode(row, 2)?,
-                                expires_ms: row.get(3)?,
+                        Ok((
+                            row.get(4)?,
+                            DeferredInput {
+                                event: store::decode(row, 0)?,
+                                preparation: Preparation {
+                                    token: row.get(1)?,
+                                    purpose: store::decode(row, 2)?,
+                                    expires_ms: row.get(3)?,
+                                },
                             },
-                        })
+                        ))
                     },
                 )?
                 .collect::<rusqlite::Result<_>>()?)

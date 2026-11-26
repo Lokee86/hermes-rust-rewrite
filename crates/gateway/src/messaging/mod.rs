@@ -1,4 +1,5 @@
 //! Native gateway contract for messaging adapters.
+mod acknowledgements;
 mod approvals;
 mod commands;
 mod effects;
@@ -6,6 +7,7 @@ mod intake;
 mod media;
 mod policy;
 mod profile;
+mod receiver;
 mod repair;
 mod routes;
 mod runtime;
@@ -21,11 +23,13 @@ mod conformance;
 #[cfg(test)]
 mod profile_tests;
 
+pub use acknowledgements::{AcknowledgementLease, AcknowledgementOperation, LeasedAcknowledgement};
 pub(crate) use approvals::{ToolApprovalContext, tool_key};
 pub use commands::*;
 pub use intake::*;
 pub use policy::*;
 pub use profile::*;
+pub use receiver::ReceiverItem;
 pub use repair::*;
 pub use media::{ArtifactFetch, AttachmentManifest, AudioService, MediaPurpose, MediaRead, MediaSource};
 pub(super) use runtime::Host;

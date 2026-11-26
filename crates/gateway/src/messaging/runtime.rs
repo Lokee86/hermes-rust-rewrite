@@ -1,5 +1,5 @@
 use super::{
-    EffectTransportRef, EffectVisibility, effects::valid_effect_plan,
+    EffectTransportRef, EffectVisibility, acknowledgements::Acknowledgements, effects::valid_effect_plan,
     profile::{
         AccountBinding, ConnectionSettings, EnrollmentCredential, EnrollmentLease,
         VerifiedInstallation,
@@ -62,6 +62,7 @@ struct Slot {
     name: String,
     descriptor: Descriptor,
     state: Mutex<State>,
+    acknowledgements: Arc<Mutex<Acknowledgements>>,
     changed: Notify,
 }
 
@@ -108,6 +109,10 @@ impl Ingress {
             return Err(GatewayError::StaleConnection);
         }
         action(&state)
+    }
+
+    pub(super) fn acknowledgements(&self) -> Arc<Mutex<Acknowledgements>> {
+        self.slot.acknowledgements.clone()
     }
 
     pub(super) fn platform(&self) -> &str {
@@ -513,6 +518,7 @@ impl Host {
                 health: Health::Connecting,
                 gap: false,
             }),
+            acknowledgements: Arc::default(),
             changed: Notify::new(),
         });
         let task = tokio::spawn(supervise(
@@ -755,9 +761,10 @@ impl Host {
                 },
             ));
         }
-        let lease = account_lease(root, &store::key("receiver", &receiver)?)?
-            .context("Receiver already has an owner")?;
+        let identity = store::key("receiver", &receiver)?;
+        let lease = account_lease(root, &identity)?.context("Receiver already has an owner")?;
         Ok(SharedReceiver {
+            identity,
             routes,
             _lease: lease,
         })

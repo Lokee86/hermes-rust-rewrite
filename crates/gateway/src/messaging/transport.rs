@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS messaging_addresses (
 );
 ";
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct InstallationKey {
     pub installation: String,
     pub tenant: Option<String>,
@@ -39,24 +39,22 @@ impl From<&VerifiedInstallation> for InstallationKey {
 /// authenticates exactly one installation, using trusted transport evidence.
 /// Constructing an InstallationKey from unverified request fields is insufficient.
 pub struct SharedReceiver {
+    pub(super) identity: String,
     pub(super) routes: Vec<(InstallationKey, Ingress)>,
     pub(super) _lease: File,
 }
 
 impl SharedReceiver {
     pub fn route_verified(&self, matches: &[InstallationKey]) -> Result<Ingress, GatewayError> {
-        let [installation] = matches else {
-            return Err(GatewayError::Forbidden);
-        };
-        let mut matches = self.routes.iter().filter(|(key, _)| key == installation);
-        let Some((_, route)) = matches.next() else {
-            return Err(GatewayError::Forbidden);
-        };
-        if matches.next().is_some() {
-            return Err(GatewayError::Forbidden);
-        }
+        let route = self.match_installation(matches).ok_or(GatewayError::Forbidden)?;
         route.checked(true, |_| Ok(()))?;
         Ok(route.clone())
+    }
+
+    pub(super) fn match_installation(&self, matches: &[InstallationKey]) -> Option<&Ingress> {
+        let [installation] = matches else { return None };
+        // bind_receiver rejects duplicate verified installation keys.
+        self.routes.iter().find(|(key, _)| key == installation).map(|(_, route)| route)
     }
 }
 

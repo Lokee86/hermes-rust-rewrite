@@ -431,6 +431,80 @@ async fn receiver_routes_exactly_one_verified_installation_and_fences_old_routes
 }
 
 #[tokio::test]
+async fn receiver_replays_a_partially_committed_envelope_across_restart() {
+    let temp = TempDir::new().unwrap();
+    let (a, qa) = fixture("batch-a", "tenant-a");
+    let (b, qb) = fixture("batch-b", "tenant-a");
+    let policy = owner_policy();
+    let factories = [a.clone(), b.clone()];
+    let names = [a.name.clone(), b.name.clone()];
+    let ids = [InstallationKey::from(&a.proof), InstallationKey::from(&b.proof)];
+    let chat = room("same-chat");
+    let envelope = |text: &str| {
+        let entry = |matches, text: &str| {
+            let mut event = message("same-provider-id", principal("canonical"), chat.clone());
+            event.body = InboundBody::Message(Message::text(text));
+            ReceiverItem { matches, input: HandoffItem { event, preparation: None } }
+        };
+        vec![
+            entry(vec![ids[0].clone()], text),
+            entry(ids.to_vec(), "ambiguous item"),
+            entry(vec![ids[1].clone()], "second account"),
+        ]
+    };
+    let gateway = open(temp.path(), &factories, &policy).await;
+    let first = ready(&qa).await;
+    let second = ready(&qb).await;
+    for ingress in [&first, &second] {
+        ingress.record_actor(person("canonical", chat.clone())).await.unwrap();
+    }
+    let receiver = gateway.bind_adapter_receiver("public-receiver", &names).await.unwrap();
+    gateway.enable_adapter(&b.name, false).await.unwrap();
+    assert_eq!(
+        receiver.stage_envelope("frame".into(), envelope("first account")).await,
+        Err(GatewayError::StaleConnection)
+    );
+    assert_eq!(
+        receiver.stage_envelope("frame".into(), envelope("changed body")).await,
+        Err(GatewayError::Conflict)
+    );
+    let state = gateway.messaging_status().await.unwrap();
+    let inputs = state["input"].as_array().unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["connection"], first.connection);
+
+    drop(receiver);
+    gateway.shutdown().await.unwrap();
+    let gateway = open(temp.path(), &factories, &policy).await;
+    let first = ready(&qa).await;
+    gateway.enable_adapter(&b.name, true).await.unwrap();
+    let second = ready(&qb).await;
+    let receiver = gateway.bind_adapter_receiver("public-receiver", &names).await.unwrap();
+    let receipts = receiver
+        .stage_envelope("frame".into(), envelope("first account"))
+        .await
+        .unwrap();
+    assert_eq!(receipts[0].disposition, Disposition::Accepted);
+    assert!(receipts[0].repeated);
+    assert_eq!(receipts[1].disposition, Disposition::Forbidden);
+    assert!(receipts[1].route.is_none());
+    assert_eq!(receipts[2].disposition, Disposition::Accepted);
+    assert!(!receipts[2].repeated);
+    assert_ne!(receipts[0].route, receipts[2].route);
+    assert!(
+        receiver.stage_envelope("frame".into(), envelope("first account")).await
+            .unwrap().iter().all(|receipt| receipt.repeated)
+    );
+    let state = gateway.messaging_status().await.unwrap();
+    let inputs = state["input"].as_array().unwrap();
+    assert_eq!(inputs.len(), 2);
+    assert!(inputs.iter().any(|row| row["connection"] == first.connection));
+    assert!(inputs.iter().any(|row| row["connection"] == second.connection));
+    drop(receiver);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn verified_aliases_route_together_and_membership_changes_fence_access() {
     let temp = TempDir::new().unwrap();
     let (factory, queue) = fixture("alias", "tenant");

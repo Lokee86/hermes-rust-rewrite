@@ -209,6 +209,7 @@ impl Store {
         connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
+        connection.execute_batch(super::receiver::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
