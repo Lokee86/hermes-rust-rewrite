@@ -19,13 +19,22 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const MAX_TEXT: usize = 256 * 1024;
-const MAX_BATCH: usize = 100;
+pub(super) const MAX_BATCH: usize = 100;
 const MAX_PARTS: usize = 128;
 const MAX_FILE: usize = 4 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(100);
 
 pub(crate) fn valid_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
+}
+
+pub(super) fn valid_advance(advance: Option<&Advance>) -> bool {
+    let token = |value: &str| !value.is_empty() && value.len() <= 64 * 1024 && !value.contains('\0');
+    advance.is_none_or(|advance| {
+        valid_id(&advance.stream)
+            && token(&advance.checkpoint)
+            && advance.previous.as_deref().is_none_or(token)
+    })
 }
 
 pub(crate) struct Host {
@@ -48,7 +57,7 @@ struct Slot {
 
 pub(super) struct State {
     pub policy: AccessPolicy,
-    revision: i64,
+    pub(super) revision: i64,
     generation: Option<String>,
     identity: Option<String>,
     accepting: bool,
@@ -112,11 +121,8 @@ impl Ingress {
     ) -> Result<IntakeResult, GatewayError> {
         if events.len() > MAX_BATCH
             || events.iter().any(|event| !valid_id(&event.id))
-            || advance.as_ref().is_some_and(|a| {
-                !valid_id(&a.stream)
-                    || !valid_id(&a.checkpoint)
-                    || a.previous.as_ref().is_some_and(|p| !valid_id(p))
-            })
+            || !valid_advance(advance.as_ref())
+            || events.iter().any(|event| matches!(event.body, InboundBody::Wake))
         {
             return Err(GatewayError::Invalid);
         }
@@ -147,6 +153,15 @@ impl Ingress {
         policy: &AccessPolicy,
         event: &InboundEvent,
     ) -> Result<Result<store::Route, Disposition>, GatewayError> {
+        self.route_candidate(policy, event, false)
+    }
+
+    pub(super) fn route_candidate(
+        &self,
+        policy: &AccessPolicy,
+        event: &InboundEvent,
+        preparing: bool,
+    ) -> Result<Result<store::Route, Disposition>, GatewayError> {
         if !valid_id(&event.room.chat)
             || !valid_id(&event.sender.id)
             || event.room.thread.as_ref().is_some_and(|v| !valid_id(v))
@@ -168,7 +183,12 @@ impl Ingress {
         }
         match &event.body {
             InboundBody::Message(message) => {
-                if !valid_message(message) {
+                if !caps.text_intake {
+                    return Ok(Err(Disposition::Unsupported));
+                }
+                if !(valid_message(message)
+                    || preparing && message.text.is_empty() && message.attachments.is_empty())
+                {
                     return Ok(Err(Disposition::Invalid));
                 }
                 if !message.attachments.is_empty() && !caps.attachments {
@@ -185,6 +205,15 @@ impl Ingress {
                 return Ok(Err(Disposition::Invalid));
             }
             InboundBody::Control(_) => {}
+            InboundBody::Command(command) => {
+                if !caps.text_intake {
+                    return Ok(Err(Disposition::Unsupported));
+                }
+                if !command.valid() {
+                    return Ok(Err(Disposition::Invalid));
+                }
+            }
+            InboundBody::Wake => return Ok(Err(Disposition::Unsupported)),
         }
         let participant = room.per_participant.then_some(event.sender.id.as_str());
         db(store::Route::new(
@@ -372,8 +401,12 @@ impl Host {
             "Unsupported gateway adapter contract version"
         );
         ensure!(
-            descriptor.capabilities.text_intake && descriptor.capabilities.text_delivery,
-            "Gateway adapters require text intake and text delivery"
+            if descriptor.capabilities.wake {
+                !descriptor.capabilities.text_intake && !descriptor.capabilities.text_delivery
+            } else {
+                descriptor.capabilities.text_intake && descriptor.capabilities.text_delivery
+            },
+            "Gateway adapters require text intake and delivery or wake-only capability"
         );
         Ok(descriptor)
     }
@@ -490,6 +523,39 @@ impl Host {
             store.resolve(&connection, &delivery, part, attempt, outcome)
         })
         .await??)
+    }
+
+    pub async fn bind_conversation(&self, destination: &str, binding: &str) -> Result<()> {
+        let destination = self.store.route(destination)?.context("Unknown messaging destination")?;
+        let binding = self.store.route(binding)?.context("Unknown messaging conversation")?;
+        let slots = self.slots.lock().await;
+        let state = slots.values().find_map(|managed| {
+            let state = lock(&managed.slot.state);
+            (state.accepting && state.identity.as_deref() == Some(&destination.connection)).then_some(state)
+        }).context("Messaging connection is unavailable")?;
+        ensure!(
+            state.policy.room_policy(&destination.room).is_some()
+                && state.policy.room_policy(&binding.room).is_some(),
+            "Messaging conversation policy changed"
+        );
+        self.store.share_conversation(&destination, &binding)
+    }
+
+    pub async fn set_wake_target(&self, name: &str, target: super::WakeTarget) -> Result<()> {
+        let slots = self.slots.lock().await;
+        let slot = &slots.get(name).context("Unknown messaging connection")?.slot;
+        let state = lock(&slot.state);
+        ensure!(slot.descriptor.capabilities.wake && state.accepting, "Wake connection is unavailable");
+        let identity = state.identity.as_deref().context("Unverified wake connection")?;
+        self.store.set_wake_target(identity, &target)
+    }
+
+    pub fn manual_notification(&self, route: &str, request: &str, text: String) -> Result<String> {
+        ensure!(valid_id(route) && valid_id(request), "Invalid messaging destination or request identity");
+        let route = self.store.route(route)?.context("Unknown messaging destination")?;
+        ensure!(!route.blocked, "Messaging destination is blocked");
+        let producer = store::key("manual", &(&route.id, request))?;
+        self.store.notification(&route, &producer, text)
     }
 
     pub async fn restore_route(&self, route: String) -> Result<bool> {
@@ -839,7 +905,9 @@ fn delivery_authorized(
     let Some(route) = db(scope.store.route(&pending.route))? else {
         return Ok(false);
     };
-    if route.blocked || route.connection != scope.connection || route.room != pending.intent.room {
+    if route.blocked || route.connection != scope.connection || route.room != pending.intent.room
+        || !db(scope.store.result_released(&scope.connection, &pending.intent.id))?
+    {
         return Ok(false);
     }
     if let Some(sender) = &pending.sender {
@@ -851,7 +919,7 @@ fn delivery_authorized(
         ))?;
         return Ok(state.policy.allows(sender) && current.id == route.id);
     }
-    Ok(true)
+    db(scope.store.allows_notification(&route.id, now()))
 }
 
 fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]) -> bool {

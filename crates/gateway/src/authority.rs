@@ -10,10 +10,14 @@ pub(super) struct GroupMember {
     pub(super) first: bool,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct ChannelExecution {
     pub tools: bool,
     pub interactive: bool,
+    #[serde(skip)]
+    pub model: Option<String>,
+    #[serde(skip)]
+    pub policy: hermes_engine::ChannelTurnPolicy,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -641,6 +645,9 @@ impl Shared {
             };
             if head.status != "queued" || head.input_id.as_deref() != Some(key) {
                 return Ok(None);
+            }
+            if let Some(model) = &permissions.model {
+                head.model.clone_from(model);
             }
             head.channel = Some(permissions);
         }

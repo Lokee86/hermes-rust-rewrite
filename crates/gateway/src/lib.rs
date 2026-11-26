@@ -135,6 +135,9 @@ pub const METHODS: &[&str] = &[
     "messaging.status",
     "messaging.resolve_delivery",
     "messaging.restore_route",
+    "messaging.bind_conversation",
+    "messaging.wake_target",
+    "messaging.send",
 ];
 
 /// Gateway settings. The provider key stays in memory and is never sent to clients.
@@ -199,6 +202,15 @@ impl RunningGateway {
         resolution: messaging::DeliveryResolution,
     ) -> Result<bool> {
         self.shared.messaging.resolve(connection, delivery, part, attempt, resolution).await
+    }
+    pub async fn bind_messaging_conversation(&self, destination: &str, binding: &str) -> Result<()> {
+        self.shared.messaging.bind_conversation(destination,binding).await
+    }
+    pub async fn set_messaging_wake_target(&self, connection: &str, target: messaging::WakeTarget) -> Result<()> {
+        self.shared.messaging.set_wake_target(connection,target).await
+    }
+    pub fn send_messaging_notification(&self, route: &str, request: &str, text: String) -> Result<String> {
+        self.shared.messaging.manual_notification(route,request,text)
     }
     pub async fn restore_messaging_route(&self, route: String) -> Result<bool> {
         self.shared.messaging.restore_route(route).await
@@ -1019,10 +1031,29 @@ impl Shared {
                 Ok(json!({"acknowledged":lock(&session.view).approvals.contains_key(id)}))
             }
             "approval.respond" => self.respond(params, peer).await,
-            "messaging.status" | "messaging.resolve_delivery" | "messaging.restore_route" if !peer.local_native => {
+            "messaging.status" | "messaging.resolve_delivery" | "messaging.restore_route"
+            | "messaging.bind_conversation" | "messaging.wake_target" | "messaging.send" if !peer.local_native => {
                 Err(RpcError::new(4403, "permission_denied", "Messaging operations require the private profile client"))
             }
             "messaging.status" => self.messaging.status(&self.profile_id).await.map_err(RpcError::internal),
+            "messaging.bind_conversation" => {
+                self.messaging.bind_conversation(required_string(params,"destination")?, required_string(params,"binding")?)
+                    .await.map_err(RpcError::internal)?;
+                Ok(json!({"bound":true}))
+            }
+            "messaging.wake_target" => {
+                let target = serde_json::from_value(params["target"].clone())
+                    .map_err(|error| RpcError::invalid(error.to_string()))?;
+                self.messaging.set_wake_target(required_string(params,"connection")?, target)
+                    .await.map_err(RpcError::internal)?;
+                Ok(json!({"configured":true}))
+            }
+            "messaging.send" => {
+                let id = self.messaging.manual_notification(required_string(params,"route")?,
+                    required_string(params,"request_id")?, required_string(params,"text")?.to_owned())
+                    .map_err(RpcError::internal)?;
+                Ok(json!({"delivery_id":id}))
+            }
             "messaging.restore_route" => {
                 let route = required_string(params, "route")?.to_owned();
                 let restored = self.messaging.restore_route(route).await.map_err(RpcError::internal)?;
@@ -1702,11 +1733,12 @@ impl Shared {
         let id = lock(&session.summary).id.clone();
         let controls = hermes_engine::TurnControls {
             corrections: lock(&session.view).corrections.as_ref().map(|(_, receiver)| receiver.clone()),
-            clarify: admission.channel.is_some_and(|policy| policy.interactive),
-            channel_tools: admission.channel.is_some_and(|policy| policy.tools),
+            clarify: admission.channel.as_ref().is_some_and(|policy| policy.interactive),
+            channel_tools: admission.channel.as_ref().is_some_and(|policy| policy.tools),
+            channel_policy: admission.channel.as_ref().map(|channel| channel.policy.clone()).unwrap_or_default(),
         };
         let mut stream = TurnStream {
-            unattended: admission.unattended || admission.channel.is_some_and(|policy| !policy.interactive),
+            unattended: admission.unattended || admission.channel.as_ref().is_some_and(|policy| !policy.interactive),
             id: admission.id.clone(),
             segment: 0,
             offset: 0,

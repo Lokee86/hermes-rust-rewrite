@@ -1,4 +1,5 @@
 use super::{
+    commands::{self, Command},
     runtime::{Ingress, db},
     store::{self, Action, PendingInput, Route},
     types::*,
@@ -13,13 +14,16 @@ pub(super) async fn advance(
     scope: &Ingress,
     stop: &CancellationToken,
 ) -> Result<(), GatewayError> {
+    db(scope.store.expire_preparations(&scope.connection, chrono::Utc::now().timestamp_millis()))?;
     for input in db(scope.store.inputs(&scope.connection))? {
         if stop.is_cancelled() {
             return Ok(());
         }
         match &input.event.body {
             InboundBody::Control(control) => apply_control(owner, scope, &input, control).await?,
-            InboundBody::Message(_) => advance_message(owner, scope, input).await?,
+            InboundBody::Command(Command::UseSkill { .. })
+            | InboundBody::Message(_) | InboundBody::Wake => advance_message(owner, scope, input).await?,
+            InboundBody::Command(command) => apply_command(owner, scope, &input, command).await?,
         }
     }
     Ok(())
@@ -31,6 +35,11 @@ async fn session_for(
     route: &Route,
     create: bool,
 ) -> Result<Option<Arc<LiveSession>>, GatewayError> {
+    let binding = db(scope.store.conversation(route))?;
+    if binding.blocked {
+        return Ok(None);
+    }
+    let route = &binding;
     let creation_key = db(store::key("channel-session", &(&route.id, route.revision)))?;
     let session_id = match &route.session {
         Some(id) => id.clone(),
@@ -119,6 +128,10 @@ fn authorized(
     state: &super::runtime::State,
     work: &PendingInput,
 ) -> Result<bool, GatewayError> {
+    if matches!(work.event.body, InboundBody::Wake) {
+        let Some(target) = db(scope.store.wake_target(&scope.connection))? else { return Ok(false) };
+        return Ok(scope.capabilities().wake && db(target.route(&scope.connection))?.id == work.route.id);
+    }
     Ok(scope
         .route_event(&state.policy, &work.event)?
         .is_ok_and(|route| route.id == work.route.id))
@@ -129,12 +142,14 @@ async fn advance_message(
     scope: &Ingress,
     work: PendingInput,
 ) -> Result<(), GatewayError> {
+    let wake = matches!(work.event.body, InboundBody::Wake);
+    let unadmitted = matches!(work.stage.as_str(), "pending" | "admitting");
     let allowed = scope.checked(true, |state| authorized(scope, state, &work))?;
     let Some(session) = session_for(
         owner,
         scope,
         &work.route,
-        allowed && work.stage == "pending",
+        allowed && unadmitted,
     )
     .await?
     else {
@@ -143,7 +158,7 @@ async fn advance_message(
     let native_id = submission(&work.route, &work.event.id)?;
     let receipt = match owner.submission_receipt(&session, &native_id) {
         Some(receipt) => receipt,
-        None if work.stage != "pending" => {
+        None if !unadmitted => {
             db(scope.store.mark(
                 &work.route,
                 &work.event.id,
@@ -154,8 +169,26 @@ async fn advance_message(
         }
         None if !allowed => return Ok(()),
         None => {
-            let InboundBody::Message(message) = &work.event.body else {
-                return Err(GatewayError::Invalid);
+            let synthetic_message;
+            let message = match &work.event.body {
+                InboundBody::Message(message) => message,
+                InboundBody::Wake => {
+                    synthetic_message = scope.checked(true, |state| {
+                        if !authorized(scope, state, &work)? {
+                            return Err(GatewayError::Forbidden);
+                        }
+                        let target = db(scope.store.wake_target(&scope.connection))?
+                            .ok_or(GatewayError::Invalid)?;
+                        db(scope.store.reserve_wake(&work.route, &work.event.id))?;
+                        Ok(Message::text(target.instructions))
+                    })?;
+                    &synthetic_message
+                }
+                InboundBody::Command(Command::UseSkill { input, .. }) => {
+                    synthetic_message = Message::text(input);
+                    &synthetic_message
+                }
+                _ => return Err(GatewayError::Invalid),
             };
             let attachments = match capture(scope, &session.dir, &message.attachments) {
                 Ok(files) => files,
@@ -209,7 +242,7 @@ async fn advance_message(
         }
     };
 
-    if work.stage == "pending" {
+    if unadmitted {
         db(scope
             .store
             .mark(&work.route, &work.event.id, "admitted", None))?;
@@ -235,6 +268,8 @@ async fn advance_message(
                     ChannelExecution {
                         tools,
                         interactive: scope.capabilities().interactive_prompts,
+                        model: db(scope.store.route_model(&work.route.id))?,
+                        policy: hermes_engine::ChannelTurnPolicy::default(),
                     },
                 ))
             })?;
@@ -248,6 +283,13 @@ async fn advance_message(
                     return Ok(());
                 }
                 let caps = scope.capabilities();
+                if wake {
+                    let session_id = lock(&session.summary).id.clone();
+                    let _ = scope.store.wake_activity(
+                        &scope.connection, &work.event.id, &session_id, super::WakeStatus::Thinking,
+                    );
+                    return Ok(());
+                }
                 if caps.progress {
                     let reply = db(store::key("reply", &native_id))?;
                     db(scope
@@ -269,6 +311,16 @@ async fn advance_message(
             ))?;
         }
         Some("terminal") => {
+            if wake {
+                let session_id = lock(&session.summary).id.clone();
+                let status = if receipt["outcome"] == "complete" {
+                    super::WakeStatus::Complete
+                } else {
+                    super::WakeStatus::Error
+                };
+                let _ = scope.store.wake_activity(&scope.connection, &work.event.id, &session_id, status);
+                return db(scope.store.mark(&work.route, &work.event.id, "done", None));
+            }
             if receipt["outcome"] == "complete" {
                 let text = receipt["result"]["text"].as_str().unwrap_or_default();
                 let tools = scope.checked(true, |state| {
@@ -360,6 +412,21 @@ fn publish_prompts(
             .prompt(&work.route, &work.event, &action, prompt))?;
     }
     Ok(())
+}
+
+async fn apply_command(
+    owner: &Arc<Shared>,
+    scope: &Ingress,
+    work: &PendingInput,
+    command: &Command,
+) -> Result<(), GatewayError> {
+    let session = if matches!(command, Command::Queue) {
+        session_for(owner, scope, &work.route, false).await?
+    } else { None };
+    scope.checked(true, |state| commands::execute(
+        scope, work, command, session.as_deref(), authorized(scope, state, work)?,
+        state.policy.operator(&work.event.sender),
+    ))
 }
 
 async fn apply_control(

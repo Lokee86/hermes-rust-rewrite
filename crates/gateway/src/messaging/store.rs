@@ -156,7 +156,7 @@ pub(super) fn key(kind: &str, parts: &impl Serialize) -> Result<String> {
     Ok(id)
 }
 
-fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
+pub(super) fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
     let bytes = row.get_ref(index)?.as_str()?;
     serde_json::from_str(bytes).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -167,7 +167,7 @@ fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlit
     })
 }
 
-fn optional_decode<T: DeserializeOwned>(
+pub(super) fn optional_decode<T: DeserializeOwned>(
     row: &rusqlite::Row<'_>,
     index: usize,
 ) -> rusqlite::Result<Option<T>> {
@@ -181,15 +181,24 @@ impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         let connection = hermes_engine::db::open(root)?;
         connection.execute_batch(TABLES)?;
+        connection.execute_batch(super::commands::TABLES)?;
+        connection.execute_batch(super::intake::TABLES)?;
+        connection.execute_batch(super::repair::TABLES)?;
+        connection.execute_batch(super::routes::TABLES)?;
+        connection.execute_batch(super::wake::TABLES)?;
         Ok(Self(Mutex::new(connection)))
     }
 
-    fn write<T>(&self, change: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub(super) fn write<T>(&self, change: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut connection = crate::lock(&self.0);
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = change(&transaction)?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    pub(super) fn read<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        read(&crate::lock(&self.0))
     }
 
     pub fn checkpoint(&self, connection: &str, stream: &str) -> Result<Option<String>> {
@@ -224,25 +233,21 @@ impl Store {
         advance: Option<&Advance>,
     ) -> Result<Option<IntakeResult>> {
         self.write(|tx| {
-            if let Some(advance) = advance
-                && read_checkpoint(tx, connection, &advance.stream)? != advance.previous
-            {
+            if !check_advance(tx, connection, advance)? {
                 return Ok(None);
+            }
+            for candidate in &candidates {
+                if super::repair::blocks_intake(tx, connection, &candidate.event)? {
+                    return Ok(None);
+                }
             }
             let mut receipts = Vec::with_capacity(candidates.len());
             for candidate in candidates {
-                receipts.push(append(tx, connection, revision, candidate)?);
-            }
-            if let Some(advance) = advance {
-                tx.execute(
-                    "INSERT INTO messaging_checkpoints (connection,stream,value) VALUES (?1,?2,?3)
-                     ON CONFLICT(connection,stream) DO UPDATE SET value = excluded.value",
-                    params![connection, advance.stream, advance.checkpoint],
-                )?;
+                receipts.push(append(tx, connection, revision, candidate, false)?);
             }
             Ok(Some(IntakeResult {
                 receipts,
-                checkpoint: advance.map(|a| a.checkpoint.clone()),
+                checkpoint: write_advance(tx, connection, advance)?,
             }))
         })
     }
@@ -342,7 +347,8 @@ impl Store {
                 // A prior admission might already have executed. Freshly staged input may continue.
                 tx.execute(
                     "UPDATE messaging_ingress SET stage = 'done', reason = 'previous_session_missing', input = NULL
-                     WHERE route = ?1 AND stage IN ('admitted','uncertain','blocked')",
+                     WHERE (route = ?1 OR route IN (SELECT destination FROM messaging_route_bindings WHERE binding = ?1))
+                       AND stage IN ('admitting','admitted','uncertain','blocked')",
                     [route],
                 )?;
             }
@@ -354,19 +360,25 @@ impl Store {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
             "WITH route_queue AS (
-                SELECT route,MIN(position) AS head,
-                    MIN(CASE WHEN stage = 'pending' THEN position END) AS unadmitted
-                FROM messaging_ingress
-                WHERE connection = ?1 AND control = 0 AND stage IN ('pending','admitted','uncertain','blocked')
-                GROUP BY route
+                SELECT COALESCE(link.binding,i.route) AS binding,MIN(i.position) AS head,
+                    MIN(CASE WHEN i.stage IN ('pending','admitting') THEN i.position END) AS unadmitted,
+                    MIN(CASE WHEN i.stage = 'preparing' THEN i.position END) AS preparing
+                FROM messaging_ingress i LEFT JOIN messaging_route_bindings link ON link.destination = i.route
+                WHERE i.connection = ?1 AND i.control = 0
+                  AND i.stage IN ('preparing','pending','admitting','admitted','uncertain','blocked')
+                GROUP BY COALESCE(link.binding,i.route)
              )
              SELECT i.input,i.stage,r.id,r.connection,r.room,r.session,r.blocked,r.revision,
                 COALESCE(i.position = q.head,0)
              FROM messaging_ingress i JOIN messaging_routes r ON r.id = i.route
-             LEFT JOIN route_queue q ON q.route = i.route
-             WHERE i.connection = ?1 AND r.blocked = 0 AND
+             LEFT JOIN messaging_route_bindings link ON link.destination = i.route
+             LEFT JOIN messaging_routes parent ON parent.id = link.binding
+             LEFT JOIN route_queue q ON q.binding = COALESCE(link.binding,i.route)
+             WHERE i.connection = ?1 AND r.blocked = 0 AND COALESCE(parent.blocked,0) = 0 AND
                  ((i.control = 1 AND i.stage = 'pending') OR
-                  (i.control = 0 AND (i.position = q.head OR i.position = q.unadmitted)))
+                  (i.control = 0 AND i.stage <> 'preparing' AND
+                     (i.position = q.head OR (i.position = q.unadmitted AND
+                        (q.preparing IS NULL OR i.position < q.preparing)))))
              ORDER BY i.control DESC,i.position",
         )?;
         Ok(query
@@ -765,11 +777,13 @@ impl Store {
     pub fn input_status(&self) -> Result<Vec<InputStatus>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
-            "SELECT i.event,i.connection,r.id,r.session,
-                CASE WHEN r.blocked AND i.stage NOT IN ('done','refused') THEN 'blocked' ELSE i.stage END AS state,
-                COALESCE(i.reason, CASE WHEN r.blocked AND i.stage NOT IN ('done','refused') THEN 'route_unavailable' END),
+            "SELECT i.event,i.connection,r.id,COALESCE(parent.session,r.session),
+                CASE WHEN (r.blocked OR parent.blocked) AND i.stage NOT IN ('done','refused') THEN 'blocked' ELSE i.stage END AS state,
+                COALESCE(i.reason, CASE WHEN (r.blocked OR parent.blocked) AND i.stage NOT IN ('done','refused') THEN 'route_unavailable' END),
                 i.conflict
              FROM messaging_ingress i LEFT JOIN messaging_routes r ON i.route = r.id
+             LEFT JOIN messaging_route_bindings link ON link.destination = r.id
+             LEFT JOIN messaging_routes parent ON parent.id = link.binding
              ORDER BY (state IN ('blocked','uncertain')) DESC,i.position DESC LIMIT 200",
         )?;
         Ok(query
@@ -788,7 +802,7 @@ impl Store {
     }
 }
 
-fn read_route(db: &Connection, id: &str) -> rusqlite::Result<Option<Route>> {
+pub(super) fn read_route(db: &Connection, id: &str) -> rusqlite::Result<Option<Route>> {
     db.query_row(
         "SELECT id,connection,room,session,blocked,revision FROM messaging_routes WHERE id = ?1",
         [id],
@@ -797,7 +811,7 @@ fn read_route(db: &Connection, id: &str) -> rusqlite::Result<Option<Route>> {
     .optional()
 }
 
-fn read_checkpoint(
+pub(super) fn read_checkpoint(
     db: &Connection,
     connection: &str,
     stream: &str,
@@ -810,23 +824,58 @@ fn read_checkpoint(
     .optional()
 }
 
-fn append(
+pub(super) fn check_advance(
+    db: &Connection,
+    connection: &str,
+    advance: Option<&Advance>,
+) -> Result<bool> {
+    Ok(match advance {
+        Some(a) => read_checkpoint(db, connection, &a.stream)? == a.previous,
+        None => true,
+    })
+}
+
+pub(super) fn write_advance(
+    db: &Connection,
+    connection: &str,
+    advance: Option<&Advance>,
+) -> Result<Option<String>> {
+    let Some(a) = advance else { return Ok(None); };
+    db.execute(
+        "INSERT INTO messaging_checkpoints (connection,stream,value) VALUES (?1,?2,?3)
+         ON CONFLICT(connection,stream) DO UPDATE SET value = excluded.value",
+        params![connection, a.stream, a.checkpoint],
+    )?;
+    Ok(Some(a.checkpoint.clone()))
+}
+
+pub(super) fn intake_receipt(
+    db: &Connection,
+    connection: &str,
+    event: &str,
+) -> Result<Option<IntakeReceipt>> {
+    Ok(db.query_row(
+        "SELECT route,disposition FROM messaging_ingress WHERE connection = ?1 AND event = ?2",
+        params![connection,event],
+        |row| Ok(IntakeReceipt { id: event.to_owned(), route: row.get(0)?,
+            disposition: decode(row, 1)?, repeated: false }),
+    ).optional()?)
+}
+
+pub(super) fn fingerprint(event: &InboundEvent) -> Result<String> {
+    // Roles and mention evidence can change across a redelivery.
+    key("event", &(&event.room, &event.sender.id, &event.reply_anchor, &event.body))
+}
+
+pub(super) fn append(
     tx: &Transaction<'_>,
     connection: &str,
     revision: i64,
     candidate: Candidate,
+    preparing: bool,
 ) -> Result<IntakeReceipt> {
     let Candidate { event, decision } = candidate;
-    // Roles and mention evidence can change across a redelivery.
-    let identity = key(
-        "event",
-        &(
-            &event.room,
-            &event.sender.id,
-            &event.reply_anchor,
-            &event.body,
-        ),
-    )?;
+    let identity = fingerprint(&event)?;
     let existing = tx.query_row(
         "SELECT fingerprint,route,disposition FROM messaging_ingress WHERE connection = ?1 AND event = ?2",
         params![connection, event.id],
@@ -852,23 +901,10 @@ fn append(
             repeated: true,
         });
     }
-    let decision = match (&event.body, decision) {
-        (InboundBody::Message(message), Ok(route)) if !message.attachments.is_empty() => {
-            let mut exists = tx.prepare(
-                "SELECT EXISTS(SELECT 1 FROM messaging_media WHERE connection = ?1 AND id = ?2)",
-            )?;
-            let mut valid = true;
-            for attachment in &message.attachments {
-                valid &= exists
-                    .query_row(params![connection, attachment.id], |r| r.get::<_, bool>(0))?;
-            }
-            if valid {
-                Ok(route)
-            } else {
-                Err(Disposition::Invalid)
-            }
-        }
-        (_, decision) => decision,
+    let decision = if preparing {
+        decision
+    } else {
+        attachment_decision(tx, connection, &event, decision)?
     };
     let (route, disposition, input, stage) = match decision {
         Ok(route) => {
@@ -878,9 +914,9 @@ fn append(
             )?;
             (
                 Some(route.id),
-                Disposition::Accepted,
+                if preparing { Disposition::Deferred } else { Disposition::Accepted },
                 Some(serde_json::to_string(&event)?),
-                "pending",
+                if preparing { "preparing" } else { "pending" },
             )
         }
         Err(disposition) => (None, disposition, None, "refused"),
@@ -889,7 +925,7 @@ fn append(
         "INSERT INTO messaging_ingress (connection,event,fingerprint,route,disposition,input,control,policy_revision,stage)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![connection, event.id, identity, route, serde_json::to_string(&disposition)?,
-            input, matches!(event.body, InboundBody::Control(_)), revision, stage],
+            input, event.body.is_control(), revision, stage],
     )?;
     Ok(IntakeReceipt {
         id: event.id,
@@ -899,7 +935,29 @@ fn append(
     })
 }
 
-fn set_input(
+pub(super) fn attachment_decision(
+    tx: &Transaction<'_>,
+    connection: &str,
+    event: &InboundEvent,
+    decision: Result<Route, Disposition>,
+) -> Result<Result<Route, Disposition>> {
+    let Ok(route) = decision else { return Ok(decision) };
+    if let InboundBody::Message(message) = &event.body
+        && !message.attachments.is_empty()
+    {
+        let mut exists = tx.prepare(
+            "SELECT EXISTS(SELECT 1 FROM messaging_media WHERE connection = ?1 AND id = ?2)",
+        )?;
+        for attachment in &message.attachments {
+            if !exists.query_row(params![connection, attachment.id], |r| r.get::<_, bool>(0))? {
+                return Ok(Err(Disposition::Invalid));
+            }
+        }
+    }
+    Ok(Ok(route))
+}
+
+pub(super) fn set_input(
     db: &Connection,
     route: &Route,
     event: &str,

@@ -24,6 +24,7 @@ pub struct Capabilities {
     pub interactive_prompts: bool,
     pub progress: bool,
     pub editing: bool,
+    pub wake: bool,
 }
 
 impl Capabilities {
@@ -35,6 +36,7 @@ impl Capabilities {
         interactive_prompts: false,
         progress: false,
         editing: false,
+        wake: false,
     };
 }
 
@@ -201,6 +203,19 @@ pub struct InboundEvent {
 pub enum InboundBody {
     Message(Message),
     Control(Control),
+    Command(super::Command),
+    Wake,
+}
+
+impl InboundBody {
+    pub(super) fn is_control(&self) -> bool {
+        match self {
+            Self::Control(_) => true,
+            Self::Command(super::Command::UseSkill { .. }) => false,
+            Self::Command(_) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -236,14 +251,14 @@ pub enum Response {
 }
 
 /// Checkpoints are opaque to the gateway. Each advance compares the exact last commit.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Advance {
     pub stream: String,
     pub previous: Option<String>,
     pub checkpoint: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IntakeReceipt {
     pub id: String,
     pub route: Option<String>,
@@ -255,6 +270,9 @@ pub struct IntakeReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
     Accepted,
+    Deferred,
+    Expired,
+    Coalesced,
     Forbidden,
     Unsupported,
     Invalid,
@@ -381,6 +399,7 @@ pub enum GatewayError {
     Forbidden,
     StaleConnection,
     CheckpointChanged,
+    Conflict,
     TemporarilyUnavailable,
 }
 
@@ -392,6 +411,7 @@ impl std::fmt::Display for GatewayError {
             Self::Forbidden => "Adapter action forbidden",
             Self::StaleConnection => "Adapter connection was replaced",
             Self::CheckpointChanged => "Adapter checkpoint changed",
+            Self::Conflict => "Adapter input identity was reused with different data",
             Self::TemporarilyUnavailable => "Gateway messaging store unavailable",
         })
     }

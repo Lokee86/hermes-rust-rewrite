@@ -77,6 +77,16 @@ pub struct TurnControls {
     pub corrections: Option<async_channel::Receiver<TurnCorrection>>,
     pub clarify: bool,
     pub channel_tools: bool,
+    pub channel_policy: ChannelTurnPolicy,
+}
+
+/// Owner-supplied controls that apply to just one channel execution.
+#[derive(Default, Clone)]
+pub struct ChannelTurnPolicy {
+    pub prompt: Option<String>,
+    pub approval_mode: Option<String>,
+    pub skills: Option<std::collections::BTreeSet<String>>,
+    pub selected_skill: Option<String>,
 }
 
 pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, channel:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
@@ -222,7 +232,11 @@ impl Session {
         Attachment::validate_set(&attachments)?;
         let prompt = prompt.trim().to_owned();
         ensure!(!prompt.is_empty() || !attachments.is_empty(), "Enter a message or attach a file");
-        let latest=settings::ProfileSettings::load(&self.profile_root)?;
+        let mut latest=settings::ProfileSettings::load(&self.profile_root)?;
+        if self.channel && let Some(mode) = &controls.channel_policy.approval_mode {
+            ensure!(matches!(mode.as_str(), "manual" | "smart" | "off"), "Invalid channel approval policy");
+            latest.approval_mode.clone_from(mode);
+        }
         let notes = latest.memory_config(self.scheduled || self.channel, self.native_enrolled);
         if self.notes_config != notes {
             self.memory = Self::open_notes(&self.profile_root, notes.clone())?;
@@ -259,6 +273,19 @@ impl Session {
     async fn run_model(&mut self, index: usize, provider: &Provider, python_memory: Option<plugins::PythonMemory>, events: &Sender<Event>, cancel: &CancellationToken, controls: &TurnControls) -> Result<()> {
         self.reasoning_summaries.clear();
         let allow_tools = !self.channel || controls.channel_tools;
+        let channel_policy = self.channel.then_some(&controls.channel_policy);
+        let allowed_skills = channel_policy.and_then(|policy| policy.skills.as_ref());
+        let selected_skill = channel_policy.and_then(|policy| policy.selected_skill.as_deref())
+            .map(|name| {
+                ensure!(allow_tools && self.settings.skill_tools && allowed_skills.is_some_and(|scope| scope.contains(name)),
+                    "This skill is unavailable for the channel");
+                let arguments = json!({"name":name, "limit":300});
+                let local = tools::invoke("skill_view", &arguments, &self.tools);
+                let document = skill_catalog::merge(&self.profile_root, "skill_view", &arguments, local)?;
+                let text = document["content"].as_str().context("Skill document has no text")?;
+                ensure!(text.len() <= 64 * 1024, "Skill document exceeds the channel turn limit");
+                Ok::<_, anyhow::Error>(text.to_owned())
+            }).transpose()?;
         let runtime = allow_tools.then(|| self.plugin_runtime.get_or_insert_with(|| {
             plugins::PluginRuntime::new(self.profile_root.clone(), Some(provider.config().clone()))
         }).clone());
@@ -330,6 +357,14 @@ impl Session {
             if let Some(style)=settings::PERSONALITIES.get(&self.settings.personality){prompt.push_str("\n\n");prompt.push_str(style);}
             // A profile's SOUL.md (Bot Mode persona) is part of its system prompt.
             if let Ok(soul)=std::fs::read_to_string(self.profile_root.join("SOUL.md")) && !soul.trim().is_empty() {prompt.push_str("\n\n");prompt.push_str(soul.trim());}
+            if let Some(prompt_override) = channel_policy.and_then(|policy| policy.prompt.as_deref()) {
+                prompt.push_str("\n\n");
+                prompt.push_str(prompt_override);
+            }
+            if let Some(skill) = &selected_skill {
+                prompt.push_str("\n\n");
+                prompt.push_str(skill);
+            }
             if let Ok(zone)=self.settings.timezone.parse::<chrono_tz::Tz>() {
                 prompt.push_str(&format!("\nUser timezone: {zone}."));
             } else {
@@ -467,6 +502,12 @@ impl Session {
                     turn_controls::clarify(&call, events, self.settings.approval_timeout).await?
                 } else if !allow_tools {
                     (false, json!({"error":"Tools are disabled for this channel"}).to_string())
+                } else if call.name == "skill_view"
+                    && let Some(scope) = allowed_skills
+                    && !serde_json::from_str::<Value>(&call.arguments).ok()
+                        .and_then(|args| args["name"].as_str().map(|name| scope.contains(name))).unwrap_or(false)
+                {
+                    (false, json!({"error":"This skill is unavailable for the channel"}).to_string())
                 } else if let Some(message) = plugin_hooks::pre_tool_call(&mut mcp, &call).await {
                     (false, json!({"error": message}).to_string())
                 } else if selected == settings::MemoryProvider::Reliquary
@@ -500,6 +541,13 @@ impl Session {
                     (true, value.to_string())
                 } else { handle_tool(&call, index, events, &self.tools, self.processes.as_mut(), self.memory.as_mut(), &mut mcp, &self.settings,&self.profile_root).await? };
                 let result = if approved { plugin_hooks::after_tool_call(&mut mcp, &call, result).await } else { result };
+                let result = if call.name == "skills_list" && let Some(scope) = allowed_skills {
+                    let mut value = serde_json::from_str::<Value>(&result).unwrap_or_else(|_| json!({"skills":[]}));
+                    if let Some(skills) = value["skills"].as_array_mut() {
+                        skills.retain(|skill| skill["id"].as_str().is_some_and(|id| scope.contains(id)));
+                    }
+                    value.to_string()
+                } else { result };
                 let result=if call.name=="read_file" {result}else{self.settings.bound_tool_result(result)};
                 self.history.turns[index].entries.push(Entry::Tool { id:call.id, name:call.name, approved, result });
                 self.publish(events)?;

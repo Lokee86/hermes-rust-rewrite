@@ -25,6 +25,9 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
+#[path = "conformance_stock.rs"]
+mod stock;
+
 const LIMIT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy)]
@@ -1195,10 +1198,7 @@ async fn reopens_durable_intake_queue_claim_and_committed_result() {
                 .claim_channel(
                     &session,
                     &id,
-                    crate::authority::ChannelExecution {
-                        tools: false,
-                        interactive: false,
-                    },
+                    crate::authority::ChannelExecution::default(),
                 )
                 .unwrap()
                 .unwrap();
