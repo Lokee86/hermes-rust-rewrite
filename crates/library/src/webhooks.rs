@@ -116,7 +116,10 @@ impl Library {
 }
 
 /// `sha256=<hex>` (GitHub's X-Hub-Signature-256, also accepted bare) over the raw body.
+/// Anyone can sign with an empty key, so a subscription without a secret (a hand-edited or
+/// restored webhooks.json) accepts nothing.
 pub fn verify(secret: &str, body: &[u8], signature: &str) -> bool {
+    if secret.is_empty() { return false; }
     let hex = signature.trim().strip_prefix("sha256=").unwrap_or(signature.trim());
     let Some(given) = (0..hex.len()).step_by(2).map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<Vec<u8>>>() else { return false };
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
@@ -140,6 +143,9 @@ mod tests {
         assert!(verify(&hook.secret, body, &format!("sha256={hex}")));
         assert!(!verify(&hook.secret, b"tampered", &format!("sha256={hex}")));
         assert!(!verify(&hook.secret, body, "sha256=zz"));
+        let unkeyed = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b""), body);
+        let unkeyed: String = unkeyed.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!verify("", body, &format!("sha256={unkeyed}")), "an empty secret accepts nothing");
         library.record_delivery("github-push", Delivery { at: "now".into(), event: "push".into(), status: "ran".into(), id: None }, Some("s1".into())).unwrap();
         let saved = &library.webhooks().unwrap()[0];
         assert_eq!((saved.deliveries.len(), saved.session_id.as_deref()), (1, Some("s1")));
