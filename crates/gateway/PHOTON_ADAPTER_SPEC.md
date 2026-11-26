@@ -1,6 +1,6 @@
 # Photon iMessage stock plugin implementation spec
 
-Register managed Photon iMessage as a bundled Rust adapter with platform key `photon`. Start after BlueBubbles and the shared gate. A headless Mercury profile enrolls a managed line, serves authorized private and group iMessage spaces, and sends supported text, effects, polls and files through Spectrum. This integration is independent of the operator-managed Mac bridge. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [BlueBubbles spec](BLUEBUBBLES_ADAPTER_SPEC.md) · [Hermes Photon guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/photon.md)
+Register managed Photon iMessage as a bundled Rust adapter with platform key `photon`. Start after BlueBubbles and the shared gate. A headless Mercury profile enrolls a managed line, serves authorized private and group iMessage spaces, and sends supported text, effects, polls and files through Spectrum. This integration is independent of the operator-managed Mac bridge. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [BlueBubbles spec](BLUEBUBBLES_ADAPTER_SPEC.md) · [Hermes Photon guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/photon.md) · [Next adapter, Email](EMAIL_ADAPTER_SPEC.md)
 
 ## Enrollment and Spectrum boundary
 
