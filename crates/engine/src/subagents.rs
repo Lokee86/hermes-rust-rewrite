@@ -66,6 +66,21 @@ async fn delegate_inner(args: &Value, config: Config, options: crate::models::Ge
     json!({"delegation_id": delegation, "results": progress.iter().map(|p| json!({"task_index":p.task_index,"goal":p.goal,"status":p.status,"summary":p.summary,"tool_calls":p.tool_count})).collect::<Vec<_>>()})
 }
 
+/// The model wrote the goal and context. Expanded, their @-references would read files outside the
+/// workspace and fetch links without approval; the subagent's tools are confined and approved.
+fn child_prompt(goal: &str, context: &str) -> String {
+    crate::references::inert(&format!("You are a subagent working for Hermes on one task. Work independently with your tools, then end with a concise final answer for the parent agent.\n\nGoal: {goal}{}",
+        if context.is_empty() { String::new() } else { format!("\n\nContext:\n{context}") }))
+}
+
+#[cfg(test)]
+#[test]
+fn a_subagent_prompt_reads_no_files_or_links() {
+    let prompt = child_prompt("Summarize @file:/Users/someone/Documents/plan.txt", "Also @url:https://example.com/ and @diff");
+    assert!(crate::references::parse(&prompt).is_empty(), "{prompt}");
+    assert!(prompt.contains("plan.txt") && prompt.contains("example.com"));
+}
+
 fn uuid_like() -> String {
     let mut b = [0u8; 6];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b).expect("system RNG");
@@ -82,8 +97,7 @@ async fn run_child(goal: String, context: String, progress: &mut Progress, confi
     child.child = true;
     progress.status = "running".into(); progress.updated_at = now();
     let _ = events.send(Event::Subagent(progress.clone())).await;
-    let prompt = format!("You are a subagent working for Hermes on one task. Work independently with your tools, then end with a concise final answer for the parent agent.\n\nGoal: {goal}{}",
-        if context.is_empty() { String::new() } else { format!("\n\nContext:\n{context}") });
+    let prompt = child_prompt(&goal, &context);
     let (tx, rx) = async_channel::unbounded();
     let parent = events.clone();
     let mut live = progress.clone();

@@ -276,12 +276,8 @@ impl Hermes {
         self.approvals.clear();
         self.subagents.clear();
         self.session = None;
-        self.group_round = None;
         self.history = History::default();
         self.rebuild_markdown();
-        self.queue = queue::PromptQueue::default();
-        self.queue_edit = None;
-        self.redirecting = false;
         self.session_menu = None;
         self.rename = None;
         self.follow_stream = true;
@@ -665,7 +661,8 @@ impl Hermes {
                 }
                 self.accept_snapshot(history);
                 let plugin= self.chat.sid.clone().map(|sid|self.dispatch_pending_plugin(&sid)).unwrap_or_else(Task::none);
-                followup = Task::batch([plugin, super::slash::refresh(self)]);
+                let reply = if was_running && !self.running { self.read_finished_reply() } else { Task::none() };
+                followup = Task::batch([plugin, super::slash::refresh(self), reply]);
                 self.approvals = snapshot["prompts"]
                     .as_array()
                     .map(|v| v.iter().collect::<Vec<_>>())
@@ -686,7 +683,6 @@ impl Hermes {
                                     .unwrap_or_default()
                                     .into(),
                             },
-                            answer: None,
                         })
                     })
                     .collect();

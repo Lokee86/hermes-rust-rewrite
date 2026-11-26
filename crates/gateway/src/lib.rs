@@ -132,6 +132,7 @@ pub const METHODS: &[&str] = &[
     "telegram.connect",
     "telegram.disconnect",
     "telegram.send",
+    "telegram.resolve_delivery",
     "messaging.status",
     "messaging.resolve_delivery",
     "messaging.restore_route",
@@ -157,6 +158,8 @@ pub struct GatewayConfig {
     pub provider: Config,
     pub adapters: Vec<messaging::AdapterConfig>,
     pub messaging_audio: Option<Arc<dyn messaging::AudioService>>,
+    #[cfg(test)]
+    telegram_transport: Option<Arc<dyn hermes_telegram::Transport>>,
 }
 
 impl GatewayConfig {
@@ -168,6 +171,8 @@ impl GatewayConfig {
             provider,
             adapters: Vec::new(),
             messaging_audio: None,
+            #[cfg(test)]
+            telegram_transport: None,
         }
     }
 }
@@ -309,7 +314,13 @@ impl Gateway {
         let address = listener.local_addr()?;
         let auth = auth::Auth::load(library.root(), &config.token, address)?;
         let shutdown = CancellationToken::new();
-        let telegram = telegram_host::Host::new(&config.library_root, shutdown.clone());
+        #[cfg(not(test))]
+        let telegram = telegram_host::Host::new(library.root(), shutdown.clone());
+        #[cfg(test)]
+        let telegram = match config.telegram_transport.take() {
+            Some(transport) => telegram_host::Host::with_transport(library.root(), shutdown.clone(), transport),
+            None => telegram_host::Host::new(library.root(), shutdown.clone()),
+        };
         let authority_epoch = owner::advance_authority_epoch(library.root())?;
         let shared = Arc::new(Shared {
             _owner_lock: owner_lock,
@@ -350,7 +361,7 @@ impl Gateway {
         shared.recover_queued().await?;
         shared.start_python_memory().await;
         webhooks::recover(&shared).await?;
-        telegram_host::Host::restore(&shared.telegram);
+        shared.telegram.restore(Some(Arc::downgrade(&shared)));
         for config in config.adapters {
             shared.messaging.restore(&shared, config).await?;
         }
@@ -480,6 +491,9 @@ struct Peer {
     pub(crate) local_native: bool,
 }
 
+const TELEGRAM_SOURCE: &str = "telegram";
+const TELEGRAM_ROUTE_PREFIX: &str = "telegram-route:";
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
@@ -507,6 +521,11 @@ struct Settings {
 }
 
 impl Settings {
+    fn is_telegram_session(&self) -> bool {
+        self.source == TELEGRAM_SOURCE && self.creation_fingerprint.is_none()
+            && self.creation_key.as_deref().is_some_and(|key| key.starts_with(TELEGRAM_ROUTE_PREFIX))
+    }
+
     fn read(dir: &Path) -> Result<Self> {
         match File::open(dir.join("gateway.json")) {
             Ok(file) => serde_json::from_reader(file).context("Invalid gateway session settings"),
@@ -755,6 +774,8 @@ impl Shared {
                 return Err(RpcError::new(4004, "not_found", "The channel conversation is missing"));
             }
             Session::open_channel(&dir, &profile)
+        } else if settings.is_telegram_session() {
+            Session::open_text_only(&dir, workspace.as_deref(), &profile)
         } else if settings.source == "scheduled" {
             Session::open_scheduled(&dir, &actual_workspace, &profile)
         } else {
@@ -769,7 +790,9 @@ impl Shared {
                 )
             })?;
         let processes = engine.enable_local_processes(id).map_err(RpcError::internal)?;
-        engine.set_plugin_runtime(self.plugin_runtime(&profile).await);
+        if !settings.is_telegram_session() {
+            engine.set_plugin_runtime(self.plugin_runtime(&profile).await);
+        }
         settings.cwd = Some(actual_workspace);
         if settings.source.is_empty() {
             settings.source = "rust".into();
@@ -866,7 +889,7 @@ impl Shared {
             "project_id":summary.project_id,"generation_options":settings.generation_options,"cwd":settings.cwd.as_ref().map(|p|p.to_string_lossy().to_string()).unwrap_or_default(),
             "running":view.running,"pending":view.authority.pending(&self.profile_id, &summary.id, self.authority_epoch),"execution_generation":view.generation,"revision":view.revision,
             "turn_started_at":view.started,"started_at":epoch_time(&summary.created_at),
-            "approval_mode":"manual","yolo":false,"tools":{"rust":tool_names()},"skills":{},"mcp_servers":[],
+            "approval_mode":"manual","yolo":false,"tools":{"rust":if settings.is_telegram_session() { vec![] } else { tool_names() }},"skills":{},"mcp_servers":[],
             "terminal_backend":"rust","replay_epoch":self.epoch,"last_sequence":view.sequence,
             "credential_warning": if config.api_key.is_empty() && config.base_url.contains("openrouter.ai") { Some("Set HERMES_RUST_API_KEY or OPENROUTER_API_KEY before starting the gateway") } else { None }
         })
@@ -1164,12 +1187,45 @@ impl Shared {
                     .await.map_err(RpcError::internal)?;
                 Ok(json!({"resolved":resolved}))
             }
-            "telegram.status" | "telegram.connect" | "telegram.disconnect" | "telegram.send" if !peer.local_native => {
+            "telegram.status" | "telegram.connect" | "telegram.disconnect" | "telegram.send" | "telegram.resolve_delivery" if !peer.local_native => {
                 Err(RpcError::new(4403, "permission_denied", "Telegram setup and manual replies require the private profile client"))
             }
-            "telegram.status" => self.telegram.status().await.map_err(RpcError::internal),
-            "telegram.connect" => self.telegram.connect().await.map_err(RpcError::internal),
+            "telegram.status" => {
+                let mut status = self.telegram.status().await.map_err(RpcError::internal)?;
+                if let Some(bot) = status["bot"]["id"].as_i64()
+                    && let Some(issues) = status["work"]["issues"].as_array_mut()
+                {
+                    for issue in issues.iter_mut().filter(|issue| issue["stage"] == "turn_unknown") {
+                        if let (Some(session), Some(update)) = (issue["session_id"].as_str(), issue["update_id"].as_i64())
+                            && let Ok(session) = self.session(session).await
+                            && let Some(receipt) = self.submission_receipt(&session, &telegram_host::submission_key(bot, update))
+                        {
+                            issue["admission_id"] = receipt["admission_id"].clone();
+                            issue["execution_generation"] = receipt["execution_generation"].clone();
+                        }
+                    }
+                }
+                Ok(status)
+            }
+            "telegram.connect" => self.telegram.connect(Some(Arc::downgrade(self))).await.map_err(RpcError::internal),
             "telegram.disconnect" => self.telegram.disconnect().await.map_err(RpcError::internal),
+            "telegram.resolve_delivery" => {
+                let bot_id = params["bot_id"].as_i64().filter(|id| *id > 0)
+                    .ok_or_else(|| RpcError::invalid("A positive bot_id is required"))?;
+                let update_id = params["update_id"].as_i64().filter(|id| *id >= 0)
+                    .ok_or_else(|| RpcError::invalid("A nonnegative update_id is required"))?;
+                let attempt = params["attempt"].as_i64().filter(|n| *n > 0)
+                    .ok_or_else(|| RpcError::invalid("A positive attempt is required"))?;
+                let resolution = match required_string(params, "resolution")? {
+                    "delivered" => hermes_telegram::DeliveryResolution::Delivered,
+                    "discard" => hermes_telegram::DeliveryResolution::Discard,
+                    _ => return Err(RpcError::invalid("resolution must be delivered or discard")),
+                };
+                if !self.telegram.resolve_delivery(bot_id, update_id, attempt, resolution).await.map_err(RpcError::internal)? {
+                    return Err(RpcError::new(4001, "stale_delivery", "No uncertain Telegram delivery matches this attempt"));
+                }
+                Ok(json!({"resolved":true}))
+            }
             "telegram.send" => {
                 let user_id = params["user_id"].as_i64().filter(|id| *id > 0)
                     .ok_or_else(|| RpcError::invalid("user_id must be a positive Telegram user ID"))?;
@@ -1307,6 +1363,9 @@ impl Shared {
             return Err(RpcError::invalid(
                 "request identity must contain 1-256 bytes",
             ));
+        }
+        if source == TELEGRAM_SOURCE || key.as_deref().is_some_and(|key| key.starts_with(TELEGRAM_ROUTE_PREFIX)) {
+            return Err(RpcError::invalid("Telegram route identities are owned by the connector"));
         }
         let project = optional_string(params, "project_id")?;
         let mut options: GenerationOptions = match params.get("generation_options") {
@@ -1882,8 +1941,10 @@ impl Shared {
                 Some(member) if member.first => format!("{}\u{2063}{}\u{2063}\n\n(Group chat \"{}\": you are {}. Reply in your own voice; the other members answer after you.)", admission.text, member.display, member.title, member.display),
                 _ => admission.text.clone(),
             };
-            self.selected_memory().await.configure_turn(target, &self.library, &session, &mut admission);
-            target.set_python_memory(python.clone());
+            if !lock(&session.settings).is_telegram_session() {
+                self.selected_memory().await.configure_turn(target, &self.library, &session, &mut admission);
+                target.set_python_memory(python.clone());
+            }
             let result = {
                 let future = target.run_controlled_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone(), controls);
                 tokio::pin!(future);

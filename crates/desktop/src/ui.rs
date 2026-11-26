@@ -380,14 +380,31 @@ impl Hermes {
             for tab in &self.tabs.entries {
                 let active=self.tabs.active.as_ref()==Some(&tab.id);
                 let label=spaced(&if tab.draft{"NEW SESSION".to_owned()}else{short(&tab.title,19).to_uppercase()});
-                let mut line=row![button(row![tab_dot(active, p), text(label).size(11).font(medium()).color(if active{p.foreground}else{p.muted})].spacing(6).align_y(Alignment::Center)).width(Fill).padding([0,5]).style(quiet_button).on_press(Message::Tab(tabs::Action::Select(tab.id.clone())))].height(30).align_y(Alignment::Center);
+                // Pressing selects the tab and starts a drag; ⌘-press closes it.
+                let label=mouse_area(container(row![tab_dot(active, p), text(label).size(11).font(medium()).color(if active{p.foreground}else{p.muted})].spacing(6).align_y(Alignment::Center))
+                    .width(Fill).height(30).padding([0,5]).align_y(Alignment::Center)).on_press(Message::Tab(tabs::Action::Press(tab.id.clone())));
+                let mut line=row![label].height(30).align_y(Alignment::Center);
                 if self.tabs.entries.len()>1 {line=line.push(icon_button("close","Close tab",Message::Tab(tabs::Action::Close(tab.id.clone())),p));}
                 let underline=container(Space::new().width(Fill).height(2)).style(move |_|panel(if active{p.accent}else{p.background},0.,None));
-                strip=strip.push(mouse_area(container(column![line,underline]).width(tabs::tab_width(tab))).on_right_press(Message::Tab(tabs::Action::Menu(tab.id.clone()))));
+                strip=strip.push(mouse_area(container(column![line,underline]).width(tabs::tab_width(tab)))
+                    .on_right_press(Message::Tab(tabs::Action::Menu(tab.id.clone())))
+                    .on_enter(Message::Tab(tabs::Action::Hover(Some(tab.id.clone()))))
+                    .on_exit(Message::Tab(tabs::Action::Hover(None))));
             }
             let visible=self.tabs.entries.iter().map(tabs::tab_width).sum::<f32>().clamp(112.,640.);
-            row![scrollable(strip).id("hermes-session-tabs").direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(1))).width(visible),
-                icon_button("add","New session",Message::NewChat,p)].align_y(Alignment::Center).into()
+            let tabs_row=row![scrollable(strip).id("hermes-session-tabs").direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(1))).width(visible),
+                icon_button("add","New session",Message::NewChat,p)].align_y(Alignment::Center);
+            match self.tabs.menu.as_ref().and_then(|id|self.tabs.entries.iter().position(|tab|&tab.id==id).map(|index|(id,index))) {
+                Some((id,index)) => {
+                    let mut menu=row![menu_action("close","Close",Message::Tab(tabs::Action::Close(id.clone())),p)].spacing(1);
+                    if self.tabs.entries.len()>1 { menu=menu.push(menu_action("close","Close others",Message::Tab(tabs::Action::CloseOthers(id.clone())),p)); }
+                    if index+1<self.tabs.entries.len() { menu=menu.push(menu_action("chevron-right","Close to the right",Message::Tab(tabs::Action::CloseToRight(id.clone())),p)); }
+                    menu=menu.push(menu_action("close","Close all",Message::Tab(tabs::Action::CloseAll),p))
+                        .push(icon_button("close","Dismiss",Message::Tab(tabs::Action::Dismiss),p));
+                    column![tabs_row,container(menu.align_y(Alignment::Center)).padding(3).style(move |_| panel(p.background, 5.0, Some(p.border)))].into()
+                }
+                None => tabs_row.into(),
+            }
         };
         let mut controls = row![].spacing(0).align_y(Alignment::Center);
         if !overlay {
@@ -665,11 +682,9 @@ impl Hermes {
         }
         // A routine's chat shows its run live while the scheduler executes it; the finished turn replaces this.
         if let (Some(current), Some(library)) = (&self.current, &self.library) && current.title.starts_with("Routine · ")
-            && let Some(job) = super::routine_chats::job_of(library, &current.id) && let Some((secs, live, waiting)) = self.scheduled.live(&job) {
-            let status = if waiting { "Waiting for approval on the Routines page".to_owned() } else { format!("Running now · {}:{:02}", secs / 60, secs % 60) };
-            let body: Element<'_, Message> = if live.is_empty() { text("Thinking…").size(12).color(p.muted).into() }
-                else { text(live.to_owned()).size(appearance::chat_size(13.0)).line_height(1.4).into() };
-            messages = messages.push(container(column![row![icon("watch", 12, p.accent), text(status).size(11).font(medium()).color(p.accent)].spacing(6).align_y(Alignment::Center), body].spacing(8)).padding([0, 12]));
+            && let Some(job) = super::routine_chats::job_of(library, &current.id) && let Some(secs) = self.scheduled.live(&job) {
+            let status = format!("Running now · {}:{:02}", secs / 60, secs % 60);
+            messages = messages.push(container(row![icon("watch", 12, p.accent), text(status).size(11).font(medium()).color(p.accent)].spacing(6).align_y(Alignment::Center)).padding([0, 12]));
         }
         for approval in &self.approvals { messages = messages.push(self.approval_view(approval)); }
         scrollable(container(messages).width(Fill)).id(SCROLL_ID).height(Fill)
@@ -741,7 +756,7 @@ impl Hermes {
                 .style(move |theme, status| { let mut s = send_button(theme, status); if on { s.background = Some(shell_art::accent().fill().into()); } s });
             controls = controls.push(tooltip(voice, text(if on { "End voice conversation" } else { "Start voice conversation" }).size(11), tooltip::Position::Top));
         } else {
-            controls = controls.push(tooltip(action, text(if show_stop { "Stop" } else if self.running && self.group_round.is_some() { "Redirect the current run" } else if self.running { "Queue message" } else { "Send" }).size(11), tooltip::Position::Top));
+            controls = controls.push(tooltip(action, text(if show_stop { "Stop" } else if self.running { "Queue message" } else { "Send" }).size(11), tooltip::Position::Top));
         }
         let surface = container(row![
             icon_button("add", "Attach", Message::ToggleAttach, p), editor, controls,
@@ -758,7 +773,6 @@ impl Hermes {
             dock=dock.push(row![icon("mic",12,p.accent),text(label).size(12).color(p.muted),Space::new().width(Fill),button(text("Cancel").size(11)).on_press(Message::Voice(voice::Action::CancelRecord)).padding([3,6]).style(quiet_button)].spacing(6).align_y(Alignment::Center));
         }
         if let Some(error)=&self.voice.error {dock=dock.push(text(error).size(11).color(p.muted));}
-        if !self.queue.entries.is_empty() { dock = dock.push(self.queue_view()); }
         if let Some(current) = &self.current {
             for entry in &self.chat.pending_queue {
                 let mut item = row![text(format!("{} · {}", entry.status, short(&entry.text, 100))).size(12).color(p.muted), Space::new().width(Fill)].spacing(6);
@@ -782,28 +796,6 @@ impl Hermes {
         if let Some(popup) = slash::popup(self) { dock = dock.push(popup); }
         dock = dock.push(surface);
         container(dock).padding(Padding { top: 8.0, right: 16.0, bottom: 10.0, left: 16.0 }).width(Fill).into()
-    }
-
-    fn queue_view(&self) -> Element<'_, Message> {
-        let p = palette(self.dark);
-        let mut header = row![icon("layers", 12, p.muted), text(format!("{} Queued{}", self.queue.entries.len(), if self.queue.parked { " — paused" } else { "" })).size(11).color(p.muted), Space::new().width(Fill)].spacing(6).align_y(Alignment::Center);
-        if self.queue.parked { header = header.push(button(text("Resume").size(11)).on_press(Message::QueueResume).padding([3, 7]).style(quiet_button)); }
-        else { header = header.push(icon_button("debug-pause", "Pause queue", Message::QueuePause, p)); }
-        let mut entries = column![].spacing(3);
-        for entry in &self.queue.entries {
-            if let Some((id, value)) = &self.queue_edit && *id == entry.id {
-                entries = entries.push(column![text_input("Queued message", value).on_input(Message::QueueEditChanged).on_submit(Message::QueueEditSave).size(12).padding(6).style(field_input),
-                    row![Space::new().width(Fill), button(text("Cancel").size(11)).on_press(Message::QueueEditCancel).padding([3, 7]).style(quiet_button),
-                        button(text("Save").size(11)).on_press(Message::QueueEditSave).padding([3, 7]).style(quiet_button)].spacing(5)].spacing(4));
-            } else {
-                entries = entries.push(row![text(short(&entry.text.replace('\n', " "), 150)).size(12).color(p.muted).width(Fill),
-                    icon_button("edit", "Edit", Message::QueueEdit(entry.id), p),
-                    button(text(if self.running { "Next" } else { "Send" }).size(11)).on_press(Message::QueueSendNow(entry.id)).padding([3, 6]).style(quiet_button),
-                    icon_button("close", "Delete", Message::QueueRemove(entry.id), p)].spacing(4).align_y(Alignment::Center));
-            }
-        }
-        let height = ((self.queue.entries.len() as f32 * 31.0) + if self.queue_edit.is_some() { 35.0 } else { 0.0 }).min(180.0);
-        container(column![header, scrollable(entries).height(height)].spacing(4)).padding([6, 10]).width(Fill).style(move |_| panel(p.background, 7.0, Some(p.border))).into()
     }
 
     fn capabilities(&self) -> Element<'_, Message> {

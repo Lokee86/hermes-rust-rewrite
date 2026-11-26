@@ -114,7 +114,14 @@ impl ChannelQuote {
     }
 }
 
-pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, channel:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionInput {
+    Native,
+    Channel,
+    TextOnly,
+}
+
+pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, input:SessionInput, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
     notes_config: memory::MemoryConfig, native_enrolled: bool, native_query: Option<Arc<dyn native_memory::MemoryQuery>>,
     plugin_runtime: Option<Arc<plugins::PluginRuntime>>,
     python_memory: Option<plugins::PythonMemory>,
@@ -151,7 +158,7 @@ impl Session {
         Self::open_for_profile_with_enrollment(dir, workspace, profile_root, false)
     }
     pub fn open_for_profile_with_enrollment(dir: &Path, workspace: Option<&Path>, profile_root: &Path, native_enrolled: bool) -> Result<Self> {
-        Self::open_with_memory(dir, workspace, profile_root, false, native_enrolled, false)
+        Self::open_with_memory(dir, workspace, profile_root, false, native_enrolled, SessionInput::Native)
     }
     /// Set the authenticated turn's provider binding. A group or child receives its own profile view.
     pub fn set_native_memory(&mut self, native_enrolled: bool, query: Option<Arc<dyn native_memory::MemoryQuery>>) {
@@ -171,11 +178,16 @@ impl Session {
         std::mem::take(&mut self.reasoning_summaries)
     }
     pub fn open_scheduled(dir:&Path, workspace:&Path, profile_root:&Path)->Result<Self> {
-        Self::open_with_memory(dir,Some(workspace),profile_root,true,false,false)
+        Self::open_with_memory(dir,Some(workspace),profile_root,true,false,SessionInput::Native)
     }
     /// A channel is a separate conversation, with literal inbound text and no profile recall.
     pub fn open_channel(dir: &Path, profile_root: &Path) -> Result<Self> {
-        Self::open_with_memory(dir, None, profile_root, false, false, true)
+        Self::open_with_memory(dir, None, profile_root, false, false, SessionInput::Channel)
+    }
+
+    /// Open an isolated conversation for a text channel with no tool or memory access.
+    pub fn open_text_only(dir: &Path, workspace: Option<&Path>, profile_root: &Path) -> Result<Self> {
+        Self::open_with_memory(dir, workspace, profile_root, false, false, SessionInput::TextOnly)
     }
     fn open_notes(root: &Path, config: memory::MemoryConfig) -> Result<Option<memory::MemoryStore>> {
         if config.memory_enabled || config.user_profile_enabled {
@@ -183,9 +195,9 @@ impl Session {
         }
         Ok(None)
     }
-    fn open_with_memory(dir:&Path,workspace:Option<&Path>,profile_root:&Path,scheduled:bool,native_enrolled:bool,channel:bool)->Result<Self>{
+    fn open_with_memory(dir:&Path,workspace:Option<&Path>,profile_root:&Path,scheduled:bool,native_enrolled:bool,input:SessionInput)->Result<Self>{
         let settings=settings::ProfileSettings::load(profile_root)?;
-        let config=settings.memory_config(scheduled || channel, native_enrolled);
+        let config=settings.memory_config(scheduled || input != SessionInput::Native, native_enrolled);
         let default_workspace = dir.join("workspace");
         let workspace = match workspace {
             Some(path) => path,
@@ -195,9 +207,9 @@ impl Session {
         ensure!(workspace.is_dir(), "Project path must be a folder");
         let (store, history) = Store::open(dir)?;
         let memory = Self::open_notes(profile_root,config.clone())?;
-        let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled,settings.checkpoint_max_snapshots)?;
+        let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled && input != SessionInput::TextOnly,settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, channel, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
+        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, input, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
     }
     /// Create an independently configured profile view over this session's
     /// exclusive writer and transcript. The caller serializes all turns.
@@ -209,7 +221,7 @@ impl Session {
         let mut tools = tools::Context::new(self.tools.workspace_root())?
             .with_checkpoints(profile_root, settings.checkpoints_enabled, settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false, channel: false,
+        let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false, input: SessionInput::Native,
             settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() };
         // Terminals belong to the gateway's authorized profile while tools and
         // memory continue to use the member's profile.
@@ -255,19 +267,21 @@ impl Session {
         let python_memory = self.python_memory.take();
         options.validate()?;
         Attachment::validate_set(&attachments)?;
+        let text_only = self.input == SessionInput::TextOnly;
+        ensure!(!text_only || attachments.is_empty(), "This conversation accepts only text");
         let prompt = prompt.trim().to_owned();
         ensure!(!prompt.is_empty() || !attachments.is_empty(), "Enter a message or attach a file");
         let mut latest=settings::ProfileSettings::load(&self.profile_root)?;
-        if self.channel && let Some(mode) = &controls.channel_policy.approval_mode {
+        if self.input == SessionInput::Channel && let Some(mode) = &controls.channel_policy.approval_mode {
             ensure!(matches!(mode.as_str(), "manual" | "smart" | "off"), "Invalid channel approval policy");
             latest.approval_mode.clone_from(mode);
         }
-        let notes = latest.memory_config(self.scheduled || self.channel, self.native_enrolled);
+        let notes = latest.memory_config(self.scheduled || self.input != SessionInput::Native, self.native_enrolled);
         if self.notes_config != notes {
             self.memory = Self::open_notes(&self.profile_root, notes.clone())?;
             self.notes_config = notes;
         }
-        if self.settings.checkpoints_enabled!=latest.checkpoints_enabled || self.settings.checkpoint_max_snapshots!=latest.checkpoint_max_snapshots {
+        if !text_only && (self.settings.checkpoints_enabled!=latest.checkpoints_enabled || self.settings.checkpoint_max_snapshots!=latest.checkpoint_max_snapshots) {
             self.tools=self.tools.with_checkpoints(&self.profile_root,latest.checkpoints_enabled,latest.checkpoint_max_snapshots)?;
         }
         self.tools.configure(&latest);
@@ -275,7 +289,7 @@ impl Session {
         if let Some(memory) = &mut self.memory { memory.reset_turn(); }
         let model = config.model.clone();
         let index = self.history.turns.len();
-        let context = if self.channel { String::new() } else { references::expand(&prompt, self.tools.workspace_root()).await };
+        let context = if self.input != SessionInput::Native { String::new() } else { references::expand(&prompt, self.tools.workspace_root()).await };
         self.history.turns.push(Turn { context, prompt, model, attachments, entries:vec![], status:Status::Running });
         self.publish(&events)?;
         let status = tokio::select! {
@@ -297,8 +311,9 @@ impl Session {
 
     async fn run_model(&mut self, index: usize, provider: &Provider, python_memory: Option<plugins::PythonMemory>, events: &Sender<Event>, cancel: &CancellationToken, controls: &TurnControls) -> Result<()> {
         self.reasoning_summaries.clear();
-        let allow_tools = !self.channel || controls.channel_tools;
-        let channel_policy = self.channel.then_some(&controls.channel_policy);
+        let text_only = self.input == SessionInput::TextOnly;
+        let channel_policy = (self.input == SessionInput::Channel).then_some(&controls.channel_policy);
+        let allow_tools = self.input == SessionInput::Native || (channel_policy.is_some() && controls.channel_tools);
         let allowed_skills = channel_policy.and_then(|policy| policy.skills.as_ref());
         let selected_skill = channel_policy.and_then(|policy| policy.selected_skill.as_deref())
             .map(|name| {
@@ -316,7 +331,7 @@ impl Session {
         }).clone());
         let turn = &self.history.turns[index];
         let selected = self.settings.memory_provider.clone().resolve(self.native_enrolled);
-        let memory_eligible = !self.channel && !self.scheduled && !self.child && turn.attachments.is_empty()
+        let memory_eligible = self.input == SessionInput::Native && !self.scheduled && !self.child && turn.attachments.is_empty()
             && turn.context.is_empty() && !memory_capture::contains_inline_data(&turn.prompt)
             && references::parse(&turn.prompt).is_empty()
             && (provider.config().api_key.is_empty() || !turn.prompt.contains(&provider.config().api_key));
@@ -346,7 +361,7 @@ impl Session {
             }
             if self.processes.is_some() { specs.extend(processes::specs()); }
         }
-        let clarify = controls.clarify && self.settings.tool_enabled("clarify");
+        let clarify = !text_only && controls.clarify && self.settings.tool_enabled("clarify");
         if clarify {
             specs.push(turn_controls::clarification_spec());
         }
@@ -378,7 +393,11 @@ impl Session {
                 self.publish(events)?;
             }
             let mut messages = provider::messages(&self.history, &self.directory)?;
-            let mut prompt=messages[0]["content"].as_str().context("Missing system prompt")?.to_owned();
+            let mut prompt = if text_only {
+                "You are Hermes, a helpful conversation assistant. Reply with plain text.".to_owned()
+            } else {
+                messages[0]["content"].as_str().context("Missing system prompt")?.to_owned()
+            };
             if let Some(style)=settings::PERSONALITIES.get(&self.settings.personality){prompt.push_str("\n\n");prompt.push_str(style);}
             // A profile's SOUL.md (Bot Mode persona) is part of its system prompt.
             if let Ok(soul)=std::fs::read_to_string(self.profile_root.join("SOUL.md")) && !soul.trim().is_empty() {prompt.push_str("\n\n");prompt.push_str(soul.trim());}
@@ -522,6 +541,7 @@ impl Session {
                 for server in &mut mcp { server.close().await; }
                 return Ok(());
             }
+            ensure!(!text_only, "This conversation cannot execute tool calls");
             if let Some(Entry::Assistant { calls: dest, .. }) = self.history.turns[index].entries.last_mut() {
                 dest.clone_from(&calls);
             }

@@ -76,9 +76,6 @@ impl Default for State {
     }
 }
 impl State {
-    pub fn has_service(&self) -> bool {
-        self.info.is_some() || self.busy
-    }
     pub fn update(
         &mut self,
         action: Action,

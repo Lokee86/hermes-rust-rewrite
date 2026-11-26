@@ -256,6 +256,10 @@ impl Store {
         }
         Ok(jobs)
     }
+    /// Runs claimed or running now, whoever owns them.
+    pub fn live_runs(&self) -> Result<Vec<Run>> {
+        Ok(self.read()?.runs.into_iter().filter(|run| run.status.live()).collect())
+    }
     pub fn runs(&self, job_id: &str) -> Result<Vec<Run>> {
         let mut runs: Vec<_> = self
             .read()?

@@ -102,6 +102,31 @@ At most 64 sessions are loaded and 32 sockets connected. WebSocket frames/messag
 
 Unsupported: queued/steered/redirected inputs, multimodal attachments, edit/regenerate/rewind/branch/reset mutations, cross-profile routing, legacy server-to-client request RPCs, tool and plugin management, process/control-socket discovery, bot/room transports, billing, voice, screen/browser control, dashboard settings REST and automatic handoff to a Python gateway. Any optional MCP server is external to Rust; it is connected through the engine, not a fallback to Python.
 
+## Headless Telegram
+
+A native profile can opt in to automatic plain-text replies to unthreaded private DMs from allowlisted Telegram users. Each bot and chat has a durable conversation in that profile. The conversation uses the configured model and profile persona. Incoming text is literal, and these turns have no tools, file or URL expansion, workspace context, plugins, or profile memory.
+
+Stop the profile gateway before configuring it. Put the BotFather token in a private file and use numeric Telegram user IDs in the allowlist. Telegram long polling requires a bot without a webhook. Give each bot one active consumer.
+
+```sh
+hermes-gateway gateway telegram configure --data-dir /path/to/profile --bot-token-file /path/to/private-token --allow-id 123456789
+hermes-gateway gateway run --data-dir /path/to/profile
+hermes-gateway gateway telegram status --data-dir /path/to/profile
+```
+
+Repeat `--allow-id` for additional users. Omit `--data-dir` to use the default profile. The setup uses the existing native credential store, which seals tokens on supported profiles with a system credential service and otherwise uses a private settings file. On Unix the input file must have owner-only permissions. Existing manual inbox configurations keep their behavior until they opt in. The native JSON inbox and polling offset are imported once into the profile database. Only newly accepted messages enqueue agent turns.
+
+Mercury persists accepted updates before acknowledging them to Telegram. Duplicate updates reuse the original record. The connector resumes queued work and sends committed replies after restart. Each chat advances in order, and an uncertain execution or send pauses later work for that chat. Telegram's explicit rate-limit response schedules a retry. A send with a lost or ambiguous response requires an operator decision because it may already have reached the chat.
+
+Use the bot ID and update details from `telegram status` when resolving an uncertain result.
+
+```sh
+hermes-gateway gateway telegram resolve-delivery --data-dir /path/to/profile --bot-id 123456 --update-id 1001 --attempt 1 --resolution delivered
+hermes-gateway gateway telegram resolve-execution --data-dir /path/to/profile --bot-id 123456 --update-id 1002
+```
+
+Choose `--resolution delivered` after confirming the reply in Telegram, or `--resolution discard` to abandon delivery. Resolving either outcome releases the chat without resending. Resolving an uncertain execution marks that turn interrupted and releases the chat. A deleted routed conversation is reported as blocked.
+
 ## Profile memory provider
 
 Choose a provider in Desktop under **Settings → Memory & Context**, or set `memory_provider` in the profile's `agent-settings.json`. The setting applies to subsequent chat turns.

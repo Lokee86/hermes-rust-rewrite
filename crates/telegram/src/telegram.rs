@@ -55,6 +55,7 @@ impl<'de> Deserialize<'de> for Token {
 pub enum ErrorKind {
     Invalid,
     Retryable,
+    RateLimited,
     Cancelled,
     Rejected,
 }
@@ -119,6 +120,7 @@ impl HttpsTransport {
         Ok(Self {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(35))
                 .build()
@@ -172,22 +174,24 @@ impl Transport for HttpsTransport {
                     .cloned()
                     .ok_or_else(|| Error::invalid("Telegram reply has no result"));
             }
-            let retryable = status.as_u16() == 429 || status.is_server_error();
+            let rejection = envelope["ok"] == false
+                && envelope["error_code"].as_u64() == Some(u64::from(status.as_u16()));
+            let kind = match status.as_u16() {
+                429 if rejection => ErrorKind::RateLimited,
+                400..=499 if rejection => ErrorKind::Rejected,
+                _ => ErrorKind::Retryable,
+            };
             let description = envelope
                 .get("description")
                 .and_then(Value::as_str)
                 .unwrap_or("Telegram rejected the request");
             Err(Error {
-                kind: if retryable {
-                    ErrorKind::Retryable
-                } else {
-                    ErrorKind::Rejected
-                },
+                kind,
                 message: token.redact(description),
                 retry_after: envelope
                     .pointer("/parameters/retry_after")
                     .and_then(Value::as_u64)
-                    .map(|seconds| seconds.clamp(1, 60)),
+                    .map(|seconds| seconds.max(1)),
             })
         })
     }
@@ -226,7 +230,6 @@ pub struct Receipt {
 pub struct Client {
     transport: Arc<dyn Transport>,
     token: Token,
-    allowed: BTreeSet<i64>,
 }
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -237,28 +240,11 @@ impl Client {
     pub fn credential(&self) -> &Token {
         &self.token
     }
-    pub fn new(token: Token, allowed: BTreeSet<i64>) -> Result<Self, Error> {
-        Self::with_transport(token, allowed, Arc::new(HttpsTransport::new()?))
+    pub fn new(token: Token) -> Result<Self, Error> {
+        Ok(Self::with_transport(token, Arc::new(HttpsTransport::new()?)))
     }
-    pub fn with_transport(
-        token: Token,
-        allowed: BTreeSet<i64>,
-        transport: Arc<dyn Transport>,
-    ) -> Result<Self, Error> {
-        if allowed.is_empty()
-            || allowed
-                .iter()
-                .any(|id| *id <= 0 || *id > 4_503_599_627_370_495)
-        {
-            return Err(Error::invalid(
-                "Add at least one numeric Telegram user ID to the allowlist.",
-            ));
-        }
-        Ok(Self {
-            transport,
-            token,
-            allowed,
-        })
+    pub fn with_transport(token: Token, transport: Arc<dyn Transport>) -> Self {
+        Self { transport, token }
     }
     async fn request(
         &self,
@@ -321,15 +307,12 @@ impl Client {
             let Some(update_id) = update
                 .get("update_id")
                 .and_then(Value::as_i64)
-                .filter(|id| *id >= 0)
+                .filter(|id| (0..i64::MAX).contains(id))
             else {
                 batch.ignored += 1;
                 continue;
             };
             batch.next_offset = batch.next_offset.max(update_id.saturating_add(1));
-            if update_id < offset {
-                continue;
-            }
             let Some(message) = update.get("message") else {
                 batch.ignored += 1;
                 continue;
@@ -339,8 +322,12 @@ impl Client {
             let private = message.pointer("/chat/type").and_then(Value::as_str) == Some("private");
             if !private
                 || user_id != chat_id
-                || user_id.is_none_or(|id| !self.allowed.contains(&id))
-                || message.pointer("/from/is_bot") == Some(&Value::Bool(true))
+                || user_id.is_none_or(|id| !(1..=4_503_599_627_370_495).contains(&id))
+                || message.pointer("/from/is_bot") != Some(&Value::Bool(false))
+                || message.get("is_topic_message") == Some(&Value::Bool(true))
+                || message.get("message_thread_id").is_some()
+                || message.get("direct_messages_topic").is_some()
+                || message.get("sender_chat").is_some()
             {
                 batch.ignored += 1;
                 continue;
@@ -351,7 +338,7 @@ impl Client {
                 batch.ignored += 1;
                 continue;
             };
-            let Some(message_id) = message.get("message_id").and_then(Value::as_i64) else {
+            let Some(message_id) = message.get("message_id").and_then(Value::as_i64).filter(|id| *id > 0) else {
                 batch.ignored += 1;
                 continue;
             };
@@ -380,8 +367,8 @@ impl Client {
         text: &str,
         cancel: &CancellationToken,
     ) -> Result<Receipt, Error> {
-        if !self.allowed.contains(&user_id) {
-            return Err(Error::invalid("This Telegram user is not on the allowlist"));
+        if user_id <= 0 {
+            return Err(Error::invalid("Invalid Telegram direct chat ID"));
         }
         if text.trim().is_empty() || text.chars().count() > 4096 {
             return Err(Error::invalid("Enter a reply of 1–4096 characters"));
@@ -396,6 +383,7 @@ impl Client {
         let message_id = result
             .get("message_id")
             .and_then(Value::as_i64)
+            .filter(|id| *id > 0 && result.pointer("/chat/id").and_then(Value::as_i64) == Some(user_id))
             .ok_or_else(|| Error::invalid("Telegram did not confirm delivery"))?;
         Ok(Receipt {
             message_id,

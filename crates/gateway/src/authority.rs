@@ -278,6 +278,7 @@ enum AdmissionOrigin {
     Chat,
     Background { unattended: bool },
     Channel,
+    Telegram,
 }
 
 struct SubmissionFence {
@@ -428,6 +429,18 @@ impl Shared {
         Ok(true)
     }
 
+    pub(super) async fn submit_telegram(self: &Arc<Self>, session: Arc<LiveSession>, text: String, submission_id: String) -> RpcResult {
+        if text.trim().is_empty() || text.len() > MAX_PROMPT_BYTES {
+            return Err(RpcError::invalid("Invalid Telegram submission"));
+        }
+        self.admit(session, text, Vec::new(), Some(submission_id), true, AdmissionOrigin::Telegram, None).await
+    }
+
+    pub(super) fn claim_telegram_turn(&self, session: &LiveSession) -> Result<Option<Receipt>> {
+        ensure!(lock(&session.settings).is_telegram_session(), "Expected a Telegram conversation");
+        self.claim_pending(session, None)
+    }
+
     pub(crate) fn submission_receipt(&self, session: &LiveSession, submission_id: &str) -> Option<Value> {
         let sid = lock(&session.summary).id.clone();
         lock(&session.view).authority.receipts.iter().find(|r|r.input_id.as_deref()==Some(submission_id)).map(|r|r.value(&self.profile_id, &sid, self.authority_epoch, true))
@@ -469,8 +482,16 @@ impl Shared {
 
     async fn admit(self: &Arc<Self>, session: Arc<LiveSession>, text:String, attachments:Vec<Attachment>, input:Option<String>, queue: bool, origin: AdmissionOrigin, fence: Option<SubmissionFence>) -> RpcResult {
         let channel = matches!(origin, AdmissionOrigin::Channel);
-        if channel != lock(&session.settings).channel_route.is_some() {
+        let telegram = matches!(origin, AdmissionOrigin::Telegram);
+        let (session_is_channel, session_is_telegram) = {
+            let settings = lock(&session.settings);
+            (settings.channel_route.is_some(), settings.is_telegram_session())
+        };
+        if channel != session_is_channel {
             return Err(RpcError::invalid("This channel conversation accepts messages through its owning adapter"));
+        }
+        if telegram != session_is_telegram {
+            return Err(RpcError::invalid("Telegram conversations only accept messages from their connector"));
         }
         let summary = lock(&session.summary).clone();
         let bot_names = match summary.bot.as_deref() {
@@ -522,7 +543,7 @@ impl Shared {
             committed_ns: None,
             python_selection,
             python_delivery: None,
-            unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
+            unattended: telegram || matches!(origin, AdmissionOrigin::Background { unattended: true }),
             channel: None,
             // Freeze consent at submission, including queued turns that run after a switch.
             ordinary_chat,
@@ -617,7 +638,7 @@ impl Shared {
                 child.group = Some(GroupMember { round: candidate.id.clone(), name, display, title: summary.title.clone(), first: false });
                 next.receipts.push_back(child);
             }
-            let claim = if view.running || channel {
+            let claim = if view.running || channel || telegram {
                 None
             } else {
                 next.claim(view.history.turns.len(), self.authority_epoch)
@@ -653,7 +674,11 @@ impl Shared {
     }
 
     pub(super) fn claim_next(&self, session: &LiveSession) -> Result<Option<Receipt>> {
-        if lock(&session.settings).channel_route.is_some() {
+        let connector_owned = {
+            let settings = lock(&session.settings);
+            settings.channel_route.is_some() || settings.is_telegram_session()
+        };
+        if connector_owned {
             return Ok(None);
         }
         self.claim_pending(session, None)
@@ -724,7 +749,8 @@ impl Shared {
 
     pub(super) async fn recover_queued(self: &Arc<Self>) -> Result<()> {
         for summary in self.library.authority_sessions()? {
-            if Settings::read(&summary.directory)?.channel_route.is_some() {
+            let settings = Settings::read(&summary.directory)?;
+            if settings.channel_route.is_some() || settings.is_telegram_session() {
                 continue;
             }
             // Only acquire the session lock for work owned by this gateway.
