@@ -262,6 +262,7 @@ struct LegacyEntry {
 enum AdmissionOrigin {
     Chat,
     Background { unattended: bool },
+    Telegram,
 }
 
 struct SubmissionFence {
@@ -373,6 +374,18 @@ impl Shared {
         self.admit(session, text, Vec::new(), Some(submission_id), true, AdmissionOrigin::Background { unattended }, None).await
     }
 
+    pub(super) async fn submit_telegram(self: &Arc<Self>, session: Arc<LiveSession>, text: String, submission_id: String) -> RpcResult {
+        if text.trim().is_empty() || text.len() > MAX_PROMPT_BYTES {
+            return Err(RpcError::invalid("Invalid Telegram submission"));
+        }
+        self.admit(session, text, Vec::new(), Some(submission_id), true, AdmissionOrigin::Telegram, None).await
+    }
+
+    pub(super) fn claim_telegram_turn(&self, session: &LiveSession) -> Result<Option<Receipt>> {
+        ensure!(lock(&session.settings).is_telegram_session(), "Expected a Telegram conversation");
+        self.claim_pending(session)
+    }
+
     pub(crate) fn submission_receipt(&self, session: &LiveSession, submission_id: &str) -> Option<Value> {
         let sid = lock(&session.summary).id.clone();
         lock(&session.view).authority.receipts.iter().find(|r|r.input_id.as_deref()==Some(submission_id)).map(|r|r.value(&self.profile_id, &sid, self.authority_epoch, true))
@@ -413,6 +426,10 @@ impl Shared {
     }
 
     async fn admit(self: &Arc<Self>, session: Arc<LiveSession>, text:String, attachments:Vec<Attachment>, input:Option<String>, queue: bool, origin: AdmissionOrigin, fence: Option<SubmissionFence>) -> RpcResult {
+        let telegram = matches!(origin, AdmissionOrigin::Telegram);
+        if lock(&session.settings).is_telegram_session() != telegram {
+            return Err(RpcError::invalid("Telegram conversations only accept messages from their connector"));
+        }
         let summary = lock(&session.summary).clone();
         let bot_names = match summary.bot.as_deref() {
             Some(name) if !name.starts_with("group:") => vec![name.to_owned()],
@@ -463,7 +480,7 @@ impl Shared {
             committed_ns: None,
             python_selection,
             python_delivery: None,
-            unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
+            unattended: telegram || matches!(origin, AdmissionOrigin::Background { unattended: true }),
             // Freeze consent at submission, including queued turns that run after a switch.
             ordinary_chat,
             capture: None,
@@ -557,7 +574,7 @@ impl Shared {
                 child.group = Some(GroupMember { round: candidate.id.clone(), name, display, title: summary.title.clone(), first: false });
                 next.receipts.push_back(child);
             }
-            let claim = if view.running {
+            let claim = if view.running || telegram {
                 None
             } else {
                 next.claim(view.history.turns.len(), self.authority_epoch)
@@ -591,6 +608,13 @@ impl Shared {
     }
 
     pub(super) fn claim_next(&self, session: &LiveSession) -> Result<Option<Receipt>> {
+        if lock(&session.settings).is_telegram_session() {
+            return Ok(None);
+        }
+        self.claim_pending(session)
+    }
+
+    fn claim_pending(&self, session: &LiveSession) -> Result<Option<Receipt>> {
         let mut view = lock(&session.view);
         if view.running || self.shutdown.is_cancelled() {
             return Ok(None);
@@ -643,6 +667,9 @@ impl Shared {
 
     pub(super) async fn recover_queued(self: &Arc<Self>) -> Result<()> {
         for summary in self.library.authority_sessions()? {
+            if Settings::read(&summary.directory)?.is_telegram_session() {
+                continue;
+            }
             // Only acquire the session lock for work owned by this gateway.
             let (_, authority) = hermes_engine::read_conversation(&summary.directory)?;
             let authority: Option<Authority> = authority.map(serde_json::from_value).transpose()?;

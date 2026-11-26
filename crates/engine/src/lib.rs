@@ -63,7 +63,7 @@ pub enum Event {
     MemoryRecall(RecallStatus),
 }
 
-pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
+pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, text_only:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
     notes_config: memory::MemoryConfig, native_enrolled: bool, native_query: Option<Arc<dyn native_memory::MemoryQuery>>,
     plugin_runtime: Option<Arc<plugins::PluginRuntime>>,
     python_memory: Option<plugins::PythonMemory>,
@@ -100,7 +100,7 @@ impl Session {
         Self::open_for_profile_with_enrollment(dir, workspace, profile_root, false)
     }
     pub fn open_for_profile_with_enrollment(dir: &Path, workspace: Option<&Path>, profile_root: &Path, native_enrolled: bool) -> Result<Self> {
-        Self::open_with_memory(dir, workspace, profile_root, false, native_enrolled)
+        Self::open_with_memory(dir, workspace, profile_root, false, native_enrolled, false)
     }
     /// Set the authenticated turn's provider binding. A group or child receives its own profile view.
     pub fn set_native_memory(&mut self, native_enrolled: bool, query: Option<Arc<dyn native_memory::MemoryQuery>>) {
@@ -120,7 +120,11 @@ impl Session {
         std::mem::take(&mut self.reasoning_summaries)
     }
     pub fn open_scheduled(dir:&Path, workspace:&Path, profile_root:&Path)->Result<Self> {
-        Self::open_with_memory(dir,Some(workspace),profile_root,true,false)
+        Self::open_with_memory(dir,Some(workspace),profile_root,true,false,false)
+    }
+    /// Open an isolated conversation for a text channel with no tool or memory access.
+    pub fn open_text_only(dir: &Path, workspace: Option<&Path>, profile_root: &Path) -> Result<Self> {
+        Self::open_with_memory(dir, workspace, profile_root, false, false, true)
     }
     fn open_notes(root: &Path, config: memory::MemoryConfig) -> Result<Option<memory::MemoryStore>> {
         if config.memory_enabled || config.user_profile_enabled {
@@ -128,9 +132,9 @@ impl Session {
         }
         Ok(None)
     }
-    fn open_with_memory(dir:&Path,workspace:Option<&Path>,profile_root:&Path,scheduled:bool,native_enrolled:bool)->Result<Self>{
+    fn open_with_memory(dir:&Path,workspace:Option<&Path>,profile_root:&Path,scheduled:bool,native_enrolled:bool,text_only:bool)->Result<Self>{
         let settings=settings::ProfileSettings::load(profile_root)?;
-        let config=settings.memory_config(scheduled, native_enrolled);
+        let config=settings.memory_config(scheduled || text_only, native_enrolled);
         let default_workspace = dir.join("workspace");
         let workspace = match workspace {
             Some(path) => path,
@@ -140,9 +144,9 @@ impl Session {
         ensure!(workspace.is_dir(), "Project path must be a folder");
         let (store, history) = Store::open(dir)?;
         let memory = Self::open_notes(profile_root,config.clone())?;
-        let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled,settings.checkpoint_max_snapshots)?;
+        let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled && !text_only,settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
+        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, text_only, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
     }
     /// Create an independently configured profile view over this session's
     /// exclusive writer and transcript. The caller serializes all turns.
@@ -154,7 +158,7 @@ impl Session {
         let mut tools = tools::Context::new(self.tools.workspace_root())?
             .with_checkpoints(profile_root, settings.checkpoints_enabled, settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false,
+        let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false, text_only: false,
             settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() };
         // Terminals belong to the gateway's authorized profile while tools and
         // memory continue to use the member's profile.
@@ -193,15 +197,16 @@ impl Session {
         let python_memory = self.python_memory.take();
         options.validate()?;
         Attachment::validate_set(&attachments)?;
+        ensure!(!self.text_only || attachments.is_empty(), "This conversation accepts only text");
         let prompt = prompt.trim().to_owned();
         ensure!(!prompt.is_empty() || !attachments.is_empty(), "Enter a message or attach a file");
         let latest=settings::ProfileSettings::load(&self.profile_root)?;
-        let notes = latest.memory_config(self.scheduled, self.native_enrolled);
+        let notes = latest.memory_config(self.scheduled || self.text_only, self.native_enrolled);
         if self.notes_config != notes {
             self.memory = Self::open_notes(&self.profile_root, notes.clone())?;
             self.notes_config = notes;
         }
-        if self.settings.checkpoints_enabled!=latest.checkpoints_enabled || self.settings.checkpoint_max_snapshots!=latest.checkpoint_max_snapshots {
+        if !self.text_only && (self.settings.checkpoints_enabled!=latest.checkpoints_enabled || self.settings.checkpoint_max_snapshots!=latest.checkpoint_max_snapshots) {
             self.tools=self.tools.with_checkpoints(&self.profile_root,latest.checkpoints_enabled,latest.checkpoint_max_snapshots)?;
         }
         self.tools.configure(&latest);
@@ -209,7 +214,7 @@ impl Session {
         if let Some(memory) = &mut self.memory { memory.reset_turn(); }
         let model = config.model.clone();
         let index = self.history.turns.len();
-        let context = references::expand(&prompt, self.tools.workspace_root()).await;
+        let context = if self.text_only { String::new() } else { references::expand(&prompt, self.tools.workspace_root()).await };
         self.history.turns.push(Turn { context, prompt, model, attachments, entries:vec![], status:Status::Running });
         self.publish(&events)?;
         let status = tokio::select! {
@@ -231,12 +236,14 @@ impl Session {
 
     async fn run_model(&mut self, index: usize, provider: &Provider, python_memory: Option<plugins::PythonMemory>, events: &Sender<Event>, cancel: &CancellationToken) -> Result<()> {
         self.reasoning_summaries.clear();
-        let runtime = self.plugin_runtime.get_or_insert_with(|| {
-            plugins::PluginRuntime::new(self.profile_root.clone(), Some(provider.config().clone()))
-        }).clone();
+        let runtime = (!self.text_only).then(|| {
+            self.plugin_runtime.get_or_insert_with(|| {
+                plugins::PluginRuntime::new(self.profile_root.clone(), Some(provider.config().clone()))
+            }).clone()
+        });
         let turn = &self.history.turns[index];
         let selected = self.settings.memory_provider.clone().resolve(self.native_enrolled);
-        let memory_eligible = !self.scheduled && !self.child && turn.attachments.is_empty()
+        let memory_eligible = !self.text_only && !self.scheduled && !self.child && turn.attachments.is_empty()
             && turn.context.is_empty() && !memory_capture::contains_inline_data(&turn.prompt)
             && references::parse(&turn.prompt).is_empty()
             && (provider.config().api_key.is_empty() || !turn.prompt.contains(&provider.config().api_key));
@@ -245,26 +252,30 @@ impl Session {
         });
         let mut memory_results = Vec::new();
         let mut python_results = Vec::new();
-        let mut mcp: Vec<mcp::Mcp> = if self.settings.connect_profile_mcp() {connector::connect(&self.profile_root).await.context("Could not connect configured MCP server")?.into_iter().collect()}else{vec![]};
+        let mut mcp: Vec<mcp::Mcp> = if !self.text_only && self.settings.connect_profile_mcp() {connector::connect(&self.profile_root).await.context("Could not connect configured MCP server")?.into_iter().collect()}else{vec![]};
         // Enabled catalog plugins (Agent Plugins v1) add their MCP servers; one that fails is skipped.
-        if self.settings.mcp_tools {
+        if let Some(runtime) = &runtime && self.settings.mcp_tools {
             let (live, errors) = runtime.tool_connections().await;
             mcp.extend(live);
             for error in errors {
                 eprintln!("plugin server unavailable: {error}");
             }
         }
-        let mut specs = tools::tool_specs();
-        if !self.child { specs.push(subagents::spec()); }
-        if let Some(spec) = self.memory.as_ref().and_then(|memory| memory.tool_spec()) { specs.push(spec); }
-        for server in &mcp {
-            specs.extend(server.specs().into_iter().filter(|spec| {
-                self.processes.is_none() || !matches!(spec["function"]["name"].as_str(), Some("terminal"|"process_manage"))
-            }));
+        let mut specs = Vec::new();
+        if !self.text_only {
+            specs = tools::tool_specs();
+            if !self.child { specs.push(subagents::spec()); }
+            if let Some(spec) = self.memory.as_ref().and_then(|memory| memory.tool_spec()) { specs.push(spec); }
+            for server in &mcp {
+                specs.extend(server.specs().into_iter().filter(|spec| {
+                    self.processes.is_none() || !matches!(spec["function"]["name"].as_str(), Some("terminal"|"process_manage"))
+                }));
+            }
+            if self.processes.is_some() { specs.extend(processes::specs()); }
         }
-        if self.processes.is_some() { specs.extend(processes::specs()); }
         let python = if memory_eligible
             && let Some(binding) = python_memory
+            && let Some(runtime) = &runtime
             && runtime.is_current(&binding.plugin).await
             && let Ok(settings) = settings::ProfileSettings::load(&self.profile_root)
             && python_memory::TurnMemory::selection_matches(&binding, &settings)
@@ -288,7 +299,11 @@ impl Session {
                 self.publish(events)?;
             }
             let mut messages = provider::messages(&self.history, &self.directory)?;
-            let mut prompt=messages[0]["content"].as_str().context("Missing system prompt")?.to_owned();
+            let mut prompt = if self.text_only {
+                "You are Hermes, a helpful conversation assistant. Reply with plain text.".to_owned()
+            } else {
+                messages[0]["content"].as_str().context("Missing system prompt")?.to_owned()
+            };
             if let Some(style)=settings::PERSONALITIES.get(&self.settings.personality){prompt.push_str("\n\n");prompt.push_str(style);}
             // A profile's SOUL.md (Bot Mode persona) is part of its system prompt.
             if let Ok(soul)=std::fs::read_to_string(self.profile_root.join("SOUL.md")) && !soul.trim().is_empty() {prompt.push_str("\n\n");prompt.push_str(soul.trim());}
@@ -297,7 +312,7 @@ impl Session {
             } else {
                 prompt.push_str(&format!("\nSystem local UTC offset: {}.",chrono::Local::now().format("%:z")));
             }
-            let active_python = if let Some(memory) = &python && runtime.is_current(memory.plugin()).await {
+            let active_python = if let (Some(memory), Some(runtime)) = (&python, &runtime) && runtime.is_current(memory.plugin()).await {
                 memory.active_selection(&self.profile_root).map(|settings| (memory, settings.memory_tool))
             } else {
                 None
@@ -390,6 +405,7 @@ impl Session {
                 });
             }
             if calls.is_empty() { for server in &mut mcp { server.close().await; } return Ok(()); }
+            let runtime = runtime.as_ref().context("This conversation cannot execute tool calls")?;
             if let Some(Entry::Assistant { calls: dest, .. }) = self.history.turns[index].entries.last_mut() {
                 dest.clone_from(&calls);
             }

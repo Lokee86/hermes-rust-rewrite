@@ -1,3 +1,5 @@
+mod telegram;
+
 use super::{discover, serve_control, transport};
 use crate::{Gateway, GatewayConfig};
 use anyhow::{Context, Result, bail, ensure};
@@ -26,6 +28,10 @@ pub async fn serve(args: impl IntoIterator<Item = String>) -> Result<()> {
     let mut ephemeral = false;
     let mut token_file = None;
     let mut args = args.into_iter().peekable();
+    if args.peek().is_some_and(|argument| argument == "telegram") {
+        args.next();
+        return telegram::run(args).await;
+    }
     if args.peek().is_some_and(|argument| argument == "run") { args.next(); }
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -56,7 +62,7 @@ pub async fn serve(args: impl IntoIterator<Item = String>) -> Result<()> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Hermes Rust loopback gateway\n\nUsage: hermes-gateway [--host 127.0.0.1] [--port 8765] [--data-dir PATH] [--token-file PATH]\n\nProvider: HERMES_RUST_BASE_URL, HERMES_RUST_MODEL, HERMES_RUST_API_KEY\nAuthentication: HERMES_RUST_GATEWAY_TOKEN or a private generated token file\nSupports a documented subset of Hermes' legacy and hermes-gateway-v1 WebSocket protocols.\nUse rpc.discover for the supported method list. Ctrl-C or SIGTERM shuts down and saves active turns."
+                    "Hermes Rust loopback gateway\n\nUsage: hermes-gateway [--host 127.0.0.1] [--port 8765] [--data-dir PATH] [--token-file PATH]\n\nProvider: HERMES_RUST_BASE_URL, HERMES_RUST_MODEL, HERMES_RUST_API_KEY\nAuthentication: HERMES_RUST_GATEWAY_TOKEN or a private generated token file\nSupports a documented subset of Hermes' legacy and hermes-gateway-v1 WebSocket protocols.\nUse rpc.discover for the supported method list.\nUse hermes-gateway gateway telegram --help for headless Telegram. Ctrl-C or SIGTERM shuts down and saves active turns."
                 );
                 return Ok(());
             }

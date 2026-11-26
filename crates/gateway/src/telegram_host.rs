@@ -1,80 +1,89 @@
-use hermes_telegram::{Client, Identity, Store, Token, Transport};
+mod worker;
+
+use super::{Shared, lock};
+use hermes_telegram::{Client, DeliveryResolution, Identity, Store, Token, Transport};
 use serde_json::{Value, json};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex as StdMutex, Weak},
+    time::Duration,
+};
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use worker::Connector;
+pub(super) use worker::submission_key;
 
 struct Active {
     bot: Identity,
+    token: Token,
     cancel: CancellationToken,
     task: JoinHandle<()>,
-    _lease: Arc<std::fs::File>,
 }
 
 pub(crate) struct Host {
     store: Store,
     transport: Option<Arc<dyn Transport>>,
     active: Mutex<Option<Active>>,
+    last_error: Arc<StdMutex<Option<String>>>,
     shutdown: CancellationToken,
 }
 
 impl Host {
     pub(crate) fn new(root: &Path, shutdown: CancellationToken) -> Arc<Self> {
+        Self::build(root, shutdown, None)
+    }
+
+    fn build(
+        root: &Path,
+        shutdown: CancellationToken,
+        transport: Option<Arc<dyn Transport>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store: Store::new(root),
-            transport: None,
+            transport,
             active: Mutex::new(None),
+            last_error: Arc::default(),
             shutdown,
         })
     }
 
     #[cfg(test)]
-    fn with_transport(
+    pub(super) fn with_transport(
         root: &Path,
         shutdown: CancellationToken,
         transport: Arc<dyn Transport>,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            store: Store::new(root),
-            transport: Some(transport),
-            active: Mutex::new(None),
-            shutdown,
-        })
+        Self::build(root, shutdown, Some(transport))
     }
 
-    fn client(
-        &self,
-        token: Token,
-        allowed: std::collections::BTreeSet<i64>,
-    ) -> Result<Client, String> {
+    fn client(&self, token: Token) -> Result<Client, String> {
         match &self.transport {
-            Some(transport) => Client::with_transport(token, allowed, transport.clone()),
-            None => Client::new(token, allowed),
+            Some(transport) => Ok(Client::with_transport(token, transport.clone())),
+            None => Client::new(token).map_err(|error| error.to_string()),
         }
-        .map_err(|e| e.to_string())
     }
 
-    pub(crate) fn restore(host: &Arc<Self>) {
-        let host = host.clone();
+    pub(super) fn restore(self: &Arc<Self>, owner: Option<Weak<Shared>>) {
+        let host = self.clone();
         tokio::spawn(async move {
-            // The previous owner's lease can outlive it by a moment; a network fault lasts longer.
+            // The previous owner's lease can outlive it by a moment. Keep
+            // retrying a connection while the saved setup remains enabled.
             let mut wait = Duration::from_millis(250);
             loop {
                 if host.shutdown.is_cancelled() {
                     return;
                 }
-                let settings = match host.load_settings().await {
-                    Ok(Some(settings)) if settings.enabled => settings,
-                    _ => return,
-                };
-                match host.connect_loaded(settings).await {
-                    Ok(_) => return,
-                    Err(_) => {
-                        tokio::select! {
-                            _ = host.shutdown.cancelled() => return,
-                            _ = tokio::time::sleep(wait) => wait = (wait * 2).min(Duration::from_secs(5)),
-                        }
+                match host.connect_inner(owner.clone(), true).await {
+                    Ok(None) => return,
+                    Ok(Some(_)) => wait = Duration::from_secs(5),
+                    Err(error) => {
+                        *lock(&host.last_error) = Some(error);
+                        wait = (wait * 2).min(Duration::from_secs(5));
                     }
+                }
+                tokio::select! {
+                    _ = host.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(wait) => {}
                 }
             }
         });
@@ -89,105 +98,148 @@ impl Host {
 
     pub(crate) async fn status(&self) -> Result<Value, String> {
         let settings = self.load_settings().await?;
-        let active = self.active.lock().await;
-        let connected = active.as_ref().is_some_and(|a| !a.task.is_finished());
-        let bot = active
-            .as_ref()
-            .map(|a| a.bot.clone())
-            .or_else(|| settings.as_ref().and_then(|s| s.bot.clone()));
+        let (connected, bot) = {
+            let active = self.active.lock().await;
+            (
+                active.as_ref().is_some_and(|a| !a.task.is_finished()),
+                active
+                    .as_ref()
+                    .map(|a| a.bot.clone())
+                    .or_else(|| settings.as_ref().and_then(|s| s.bot.clone())),
+            )
+        };
+        let work = if let Some(bot) = bot.clone() {
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || store.work_status(&bot))
+                .await
+                .map_err(|_| "Could not read Telegram work status".to_owned())??
+        } else {
+            json!({"counts":{},"conflicts":0,"issues":[]})
+        };
         Ok(json!({
             "enabled": settings.as_ref().is_some_and(|s| s.enabled),
+            "agent_replies": settings.as_ref().is_some_and(|s| s.agent_replies),
             "connected": connected,
             "bot": bot,
+            "work": work,
+            "last_error": lock(&self.last_error).clone(),
         }))
     }
 
-    pub(crate) async fn connect(&self) -> Result<Value, String> {
-        let settings = self.load_settings().await?.ok_or_else(|| {
-            "Save a Telegram bot token and allowlist before connecting.".to_owned()
-        })?;
-        self.connect_loaded(settings).await
+    pub(super) async fn connect(&self, owner: Option<Weak<Shared>>) -> Result<Value, String> {
+        self.connect_inner(owner, false)
+            .await?
+            .ok_or_else(|| "Save a Telegram bot token and allowlist before connecting".to_owned())
     }
 
-    async fn connect_loaded(&self, settings: hermes_telegram::Settings) -> Result<Value, String> {
+    async fn connect_inner(
+        &self,
+        owner: Option<Weak<Shared>>,
+        restoring: bool,
+    ) -> Result<Option<Value>, String> {
         let mut active = self.active.lock().await;
+        if self.shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(settings) = self.load_settings().await? else {
+            return Ok(None);
+        };
+        if restoring && !settings.enabled {
+            return Ok(None);
+        }
         if let Some(current) = active.as_ref().filter(|a| !a.task.is_finished())
             && settings.enabled
             && settings.bot.as_ref().map(|saved| saved.id) == Some(current.bot.id)
+            && settings.token.as_ref() == Some(&current.token)
         {
-            return Ok(json!({"connected":true,"enabled":true,"bot":current.bot}));
+            return Ok(Some(
+                json!({"connected":true,"enabled":true,"bot":current.bot}),
+            ));
         }
         if let Some(previous) = active.take() {
             previous.cancel.cancel();
             let _ = previous.task.await;
         }
-        if settings.version != 1 || settings.token.is_none() || settings.allowed.is_empty() {
+        if settings.allowed.is_empty()
+            || settings
+                .allowed
+                .iter()
+                .any(|id| !(1..=4_503_599_627_370_495).contains(id))
+        {
             return Err(
-                "Save a Telegram bot token and non-empty allowlist before connecting.".into(),
+                "Save a non-empty allowlist of numeric Telegram user IDs before connecting".into(),
             );
         }
-        let token = settings.token.clone().unwrap();
-        let client = self.client(token.clone(), settings.allowed)?;
-        let verified = client
+        let token = settings
+            .token
+            .ok_or("Save a Telegram bot token before connecting")?;
+        let client = self.client(token.clone())?;
+        let bot = client
             .verify(&self.shutdown)
             .await
             .map_err(|e| e.to_string())?;
         if settings
             .bot
             .as_ref()
-            .is_some_and(|saved| saved.id != verified.id)
+            .is_some_and(|saved| saved.id != bot.id)
         {
             return Err(
-                "The saved Telegram bot identity changed; review the setup before reconnecting."
+                "The saved Telegram bot identity changed; review the setup before reconnecting"
                     .into(),
             );
         }
-        let bot = verified;
         let store = self.store.clone();
         let credential = token.clone();
         let bot_for_store = bot.clone();
-        let (inbox, lease) = tokio::task::spawn_blocking(move || {
+        let lease = tokio::task::spawn_blocking(move || {
             let lease = store.claim(bot_for_store.id)?;
-            let inbox = store.load_inbox(&bot_for_store)?;
-            store.remember_bot(&bot_for_store, &credential)?;
-            Ok::<_, String>((inbox, lease))
+            store.recover_sends(&bot_for_store)?;
+            store.remember_bot(&bot_for_store, &credential, restoring)?;
+            Ok::<_, String>(lease)
         })
         .await
         .map_err(|_| "Could not open the native Telegram inbox".to_owned())??;
 
         let cancel = self.shutdown.child_token();
-        let task = tokio::spawn(run_polling(
-            self.store.clone(),
+        let connector = Arc::new(Connector {
+            store: self.store.clone(),
             client,
-            bot.clone(),
-            token,
-            inbox.cursor,
-            cancel.clone(),
-            lease.clone(),
-        ));
+            bot: bot.clone(),
+            cancel: cancel.clone(),
+        });
+        let last_error = self.last_error.clone();
+        *lock(&last_error) = None;
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            let result = connector
+                .run(owner.filter(|_| settings.agent_replies))
+                .await;
+            if let Err(error) = result {
+                *lock(&last_error) = Some(error);
+            }
+        });
         *active = Some(Active {
             bot: bot.clone(),
+            token,
             cancel,
             task,
-            _lease: lease,
         });
-        Ok(json!({"connected":true,"enabled":true,"bot":bot}))
+        Ok(Some(json!({"connected":true,"enabled":true,"bot":bot})))
     }
 
     pub(crate) async fn disconnect(&self) -> Result<Value, String> {
         let mut active = self.active.lock().await;
         let store = self.store.clone();
-        let persisted = tokio::task::spawn_blocking(move || store.set_disabled())
+        tokio::task::spawn_blocking(move || store.set_disabled())
             .await
-            .map_err(|_| "Could not save Telegram disconnect state".to_owned())?;
+            .map_err(|_| "Could not save Telegram disconnect state".to_owned())??;
         if let Some(connection) = active.take() {
             connection.cancel.cancel();
             connection
                 .task
                 .await
-                .map_err(|_| "Telegram polling task stopped unexpectedly".to_owned())?;
+                .map_err(|_| "Telegram connector stopped unexpectedly".to_owned())?;
         }
-        persisted?;
         Ok(json!({"connected":false,"enabled":false}))
     }
 
@@ -197,19 +249,9 @@ impl Host {
             .as_ref()
             .filter(|a| !a.task.is_finished())
             .ok_or_else(|| "Telegram is disconnected; enable it before replying.".to_owned())?;
-        let bot = connection.bot.clone();
         let store = self.store.clone();
-        let client = {
-            let settings = self
-                .load_settings()
-                .await?
-                .ok_or_else(|| "Telegram setup is unavailable".to_owned())?;
-            let token = settings
-                .token
-                .clone()
-                .ok_or_else(|| "Telegram credential is unavailable".to_owned())?;
-            self.client(token, settings.allowed)?
-        };
+        let client = self.client(connection.token.clone())?;
+        let bot = connection.bot.clone();
         let credential = client.credential().clone();
         let policy_store = store.clone();
         let policy_bot = bot.clone();
@@ -219,17 +261,35 @@ impl Host {
         .await
         .map_err(|_| "Could not check the saved Telegram allowlist".to_owned())??;
         let receipt = client
-            .send(user_id, &text, &self.shutdown)
+            .send(user_id, &text, &connection.cancel)
             .await
             .map_err(|e| e.to_string())?;
-        let store_sent = store.clone();
-        let record_bot = bot.clone();
-        let inbox = tokio::task::spawn_blocking(move || {
-            store_sent.record_sent(&record_bot, user_id, text, receipt)
+        let message_id = receipt.message_id;
+        tokio::task::spawn_blocking(move || store.record_sent(&bot, user_id, text, receipt))
+            .await
+            .map_err(|_| "Reply delivered, but the native inbox could not be saved".to_owned())??;
+        Ok(json!({"sent":true,"message_id":message_id}))
+    }
+
+    pub(super) async fn resolve_delivery(
+        &self,
+        bot_id: i64,
+        update_id: i64,
+        attempt: i64,
+        resolution: DeliveryResolution,
+    ) -> Result<bool, String> {
+        let bot = self
+            .load_settings()
+            .await?
+            .and_then(|settings| settings.bot)
+            .filter(|bot| bot.id == bot_id)
+            .ok_or_else(|| "This bot does not match the saved Telegram connection".to_owned())?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store.resolve_delivery(&bot, update_id, attempt, resolution)
         })
         .await
-        .map_err(|_| "Reply delivered, but the native inbox could not be saved".to_owned())??;
-        Ok(json!({"sent":true,"message_id":inbox.messages.last().map(|m|m.message_id)}))
+        .map_err(|_| "Could not resolve the Telegram delivery".to_owned())?
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -237,65 +297,6 @@ impl Host {
         if let Some(connection) = active.take() {
             connection.cancel.cancel();
             let _ = connection.task.await;
-        }
-    }
-}
-
-async fn run_polling(
-    store: Store,
-    client: Client,
-    bot: Identity,
-    token: Token,
-    mut cursor: i64,
-    cancel: CancellationToken,
-    _lease: Arc<std::fs::File>,
-) {
-    loop {
-        let store_check = store.clone();
-        let bot_check = bot.clone();
-        let token_check = token.clone();
-        let enabled = tokio::task::spawn_blocking(move || {
-            let Some(settings) = store_check.load_settings()? else {
-                return Ok(false);
-            };
-            Ok::<_, String>(
-                settings.enabled
-                    && settings.bot.as_ref().map(|saved| saved.id) == Some(bot_check.id)
-                    && settings.token.as_ref() == Some(&token_check),
-            )
-        })
-        .await;
-        if !matches!(enabled, Ok(Ok(true))) {
-            return;
-        }
-        let batch = tokio::select! {
-            _ = cancel.cancelled() => return,
-            result = client.poll(bot.id, cursor, &cancel) => result,
-        };
-        match batch {
-            Ok(batch) => {
-                let store_poll = store.clone();
-                let bot_poll = bot.clone();
-                let token_poll = token.clone();
-                let next = batch.next_offset;
-                let messages = batch.messages;
-                let result = tokio::task::spawn_blocking(move || {
-                    store_poll.commit_poll(&bot_poll, &token_poll, &messages, next)
-                })
-                .await;
-                match result {
-                    Ok(Ok((inbox, _received))) => cursor = inbox.cursor,
-                    Ok(Err(_)) => return,
-                    Err(_) => return,
-                }
-            }
-            Err(error) if error.kind == hermes_telegram::ErrorKind::Retryable => {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(error.retry_after.unwrap_or(3).clamp(1,60))) => {}
-                }
-            }
-            Err(_) => return,
         }
     }
 }
@@ -364,7 +365,9 @@ mod tests {
                             .unwrap_or_else(|| json!([])))
                     }
                 }
-                Method::SendMessage => Ok(json!({"message_id":77,"date":1234})),
+                Method::SendMessage => {
+                    Ok(json!({"message_id":77,"date":1234,"chat":{"id":body["chat_id"]}}))
+                }
             };
             let pause = matches!(method, Method::GetUpdates);
             Box::pin(async move {
@@ -393,6 +396,7 @@ mod tests {
                 allowed: BTreeSet::from([42]),
                 bot: None,
                 enabled: false,
+                agent_replies: false,
             })
             .unwrap();
         store
@@ -427,7 +431,7 @@ mod tests {
         let fake = Fake::new(vec![json!([update, unallowed, group])]);
         let host = Host::with_transport(root.path(), CancellationToken::new(), fake.clone());
 
-        let connected = host.connect().await.unwrap();
+        let connected = host.connect(None).await.unwrap();
         assert_eq!(connected["enabled"], true);
         assert_eq!(connected["bot"]["id"], 123456);
         let bot: Identity = serde_json::from_value(connected["bot"].clone()).unwrap();
@@ -449,7 +453,7 @@ mod tests {
         let resumed_fake = Fake::new(vec![]);
         let resumed =
             Host::with_transport(root.path(), CancellationToken::new(), resumed_fake.clone());
-        Host::restore(&resumed);
+        resumed.restore(None);
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if resumed_fake.call_count("getUpdates") > 0 {
@@ -477,7 +481,7 @@ mod tests {
             CancellationToken::new(),
             disconnected_fake.clone(),
         );
-        Host::restore(&after_disconnect);
+        after_disconnect.restore(None);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(disconnected_fake.call_count("getMe"), 0);
         assert_eq!(disconnected_fake.call_count("getUpdates"), 0);

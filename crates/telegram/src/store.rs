@@ -1,11 +1,14 @@
-//! Private, atomic native Telegram settings and per-bot inbox persistence.
-use super::telegram::{Identity, Incoming, Receipt, Token};
+//! Native Telegram settings, connection ownership, and per-bot inbox storage.
+mod inbox;
+
+pub use inbox::{DeliveryOutcome, DeliveryResolution, TurnOutcome, Work, WorkStage};
+use super::telegram::{Identity, Token};
 use fs2::FileExt;
 use hermes_engine::secret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -13,7 +16,6 @@ use std::{
 };
 
 const MAX_INBOX_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_MESSAGES: usize = 10_000;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -23,6 +25,8 @@ pub struct Settings {
     pub bot: Option<Identity>,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub agent_replies: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -43,25 +47,15 @@ pub struct Inbox {
     pub revision: u64,
     pub messages: Vec<ChatMessage>,
 }
-impl Inbox {
-    fn empty(bot: Identity) -> Self {
-        Self {
-            version: 1,
-            bot,
-            cursor: 0,
-            revision: 0,
-            messages: vec![],
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Store {
+    profile: PathBuf,
     root: PathBuf,
 }
 impl Store {
     pub fn new(library_root: &Path) -> Self {
         Self {
+            profile: library_root.to_owned(),
             root: library_root.join("messaging").join("telegram"),
         }
     }
@@ -166,11 +160,11 @@ impl Store {
         saved["enabled"] = Value::Bool(false);
         atomic_json(&path, &saved)
     }
-    pub fn remember_bot(&self, identity: &Identity, token: &Token) -> Result<(), String> {
+    pub fn remember_bot(&self, identity: &Identity, token: &Token, require_enabled: bool) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
         let mut saved = self.read_saved()?;
         let settings = Self::decode_settings(saved.clone())?;
-        if settings.token.as_ref() != Some(token) {
+        if settings.token.as_ref() != Some(token) || (require_enabled && !settings.enabled) {
             return Err(
                 "Telegram setup changed. Reopen Messaging and enable the saved setup.".into(),
             );
@@ -209,6 +203,9 @@ impl Store {
     ) -> Result<(), String> {
         let _lock = self.lock("settings.lock")?;
         let settings = self.connection_settings(bot, token)?;
+        if settings.agent_replies {
+            return Err("This Telegram connector is configured for agent replies".into());
+        }
         if !settings.allowed.contains(&user_id) {
             return Err("This Telegram user is no longer on the saved allowlist".into());
         }
@@ -219,129 +216,38 @@ impl Store {
             return Err("Telegram bot identity is invalid".into());
         }
         self.ensure_directory()?;
+        let installation = self.profile.parent()
+            .filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+            .and_then(Path::parent)
+            .unwrap_or(&self.profile);
+        let leases = Store::new(installation);
+        leases.ensure_directory()?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.root.join(format!("bot-{bot_id}.connection.lock")))
+            .open(leases.root.join(format!("bot-{bot_id}.connection.lock")))
             .map_err(|error| error.to_string())?;
         file.try_lock_exclusive().map_err(|_| {
-            "This Telegram bot is already connected in another Hermes window".to_owned()
+            "This Telegram bot is already connected to another profile in this installation".to_owned()
         })?;
         Ok(Arc::new(file))
     }
-    fn inbox_path(&self, bot_id: i64) -> Result<PathBuf, String> {
-        if bot_id <= 0 {
-            return Err("Telegram bot identity is invalid".into());
-        }
-        Ok(self.root.join(format!("bot-{bot_id}.inbox.json")))
-    }
-    fn load_inbox_inner(&self, bot: &Identity) -> Result<Inbox, String> {
-        let path = self.inbox_path(bot.id)?;
-        if !path.exists() {
-            return Ok(Inbox::empty(bot.clone()));
-        }
-        let inbox: Inbox = private_json(&path, MAX_INBOX_BYTES)?;
-        if inbox.version != 1 || inbox.bot.id != bot.id {
-            return Err("Native Telegram inbox identity or version is invalid".into());
-        }
-        Ok(inbox)
-    }
-    pub fn load_inbox(&self, bot: &Identity) -> Result<Arc<Inbox>, String> {
-        let _lock = self.lock(&format!("bot-{}.inbox.lock", bot.id))?;
-        Ok(Arc::new(self.load_inbox_inner(bot)?))
-    }
-    pub fn commit_poll(
+    /// Check current policy while taking a durable step toward execution or delivery.
+    pub fn with_agent_policy<T>(
         &self,
         bot: &Identity,
         token: &Token,
-        messages: &[Incoming],
-        cursor: i64,
-    ) -> Result<(Arc<Inbox>, Vec<Incoming>), String> {
-        // Hold settings through the commit so another window cannot save a
-        // stricter allowlist while an older batch is being persisted.
-        let _settings_lock = self.lock("settings.lock")?;
-        let settings = self.connection_settings(bot, token)?;
-        let _lock = self.lock(&format!("bot-{}.inbox.lock", bot.id))?;
-        let mut inbox = self.load_inbox_inner(bot)?;
-        let mut seen: HashSet<_> = inbox
-            .messages
-            .iter()
-            .filter_map(|message| message.update_id)
-            .collect();
-        let mut received = vec![];
-        for message in messages {
-            if message.bot_id != bot.id
-                || !settings.allowed.contains(&message.user_id)
-                || message.chat_id != message.user_id
-                || message.update_id < inbox.cursor
-                || !seen.insert(message.update_id)
-            {
-                continue;
-            }
-            inbox.messages.push(ChatMessage {
-                update_id: Some(message.update_id),
-                message_id: message.message_id,
-                user_id: message.user_id,
-                sender: message.sender.clone(),
-                text: message.text.clone(),
-                timestamp: message.timestamp,
-                outgoing: false,
-            });
-            received.push(message.clone());
-        }
-        if inbox.messages.len() > MAX_MESSAGES {
-            return Err(
-                "Telegram inbox reached its native storage limit; existing messages were retained"
-                    .into(),
-            );
-        }
-        let next_cursor = inbox.cursor.max(cursor);
-        if !received.is_empty() || next_cursor != inbox.cursor {
-            inbox.cursor = next_cursor;
-            inbox.revision = inbox.revision.saturating_add(1);
-            self.save_inbox(&inbox)?;
-        }
-        Ok((Arc::new(inbox), received))
-    }
-    pub fn record_sent(
-        &self,
-        bot: &Identity,
         user_id: i64,
-        text: String,
-        receipt: Receipt,
-    ) -> Result<Arc<Inbox>, String> {
-        let _lock = self.lock(&format!("bot-{}.inbox.lock", bot.id))?;
-        let mut inbox = self.load_inbox_inner(bot)?;
-        if !inbox.messages.iter().any(|message| {
-            message.outgoing
-                && message.message_id == receipt.message_id
-                && message.user_id == user_id
-        }) {
-            inbox.messages.push(ChatMessage {
-                update_id: None,
-                message_id: receipt.message_id,
-                user_id,
-                sender: "You".into(),
-                text,
-                timestamp: receipt.timestamp,
-                outgoing: true,
-            });
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        let _lock = self.lock("settings.lock")?;
+        let settings = self.connection_settings(bot, token)?;
+        if settings.agent_replies && settings.allowed.contains(&user_id) {
+            return action().map(Some);
         }
-        if inbox.messages.len() > MAX_MESSAGES {
-            return Err("Reply delivered, but the native inbox storage limit was reached".into());
-        }
-        inbox.revision = inbox.revision.saturating_add(1);
-        self.save_inbox(&inbox)?;
-        Ok(Arc::new(inbox))
-    }
-    fn save_inbox(&self, inbox: &Inbox) -> Result<(), String> {
-        let bytes = serde_json::to_vec(inbox).map_err(|error| error.to_string())?;
-        if bytes.len() as u64 > MAX_INBOX_BYTES {
-            return Err("Telegram inbox exceeds the native safe-load limit; existing messages were retained".into());
-        }
-        atomic_bytes(&self.inbox_path(inbox.bot.id)?, &bytes)
+        Ok(None)
     }
 }
 
@@ -409,7 +315,7 @@ mod tests {
             let before = store.read_saved().unwrap();
             assert!(before["token"].as_str().is_some_and(secret::is_sealed));
             for _ in 0..2 {
-                store.remember_bot(&bot, &token).unwrap();
+                store.remember_bot(&bot, &token, false).unwrap();
                 let saved = store.read_saved().unwrap();
                 assert_eq!(saved["token"], before["token"]);
                 assert_eq!(saved["allowed"], before["allowed"]);
@@ -428,6 +334,7 @@ mod tests {
             allowed: BTreeSet::from([42]),
             bot: None,
             enabled: false,
+            agent_replies: false,
         };
         let run_gateway = || {
             let child = std::process::Command::new(std::env::current_exe().unwrap())
