@@ -296,6 +296,9 @@ impl Model {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let router = Router::new()
             .route("/v1/chat/completions", post(model))
+            .route("/v1/models", axum::routing::get(|| async {
+                Json(json!({"data":[{"id":"fixture"},{"id":"second-model"}]}))
+            }))
             .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -318,6 +321,10 @@ impl Model {
 
     pub(super) fn requests(&self) -> Vec<Value> {
         self.state.requests.lock().unwrap().clone()
+    }
+
+    pub(super) fn release_waiting_turn(&self) {
+        self.state.steer_release.add_permits(1);
     }
 }
 

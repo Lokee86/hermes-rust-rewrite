@@ -30,6 +30,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[path = "command_fixtures.rs"]
+mod command_fixtures;
+
 const LIMIT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -292,12 +295,18 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         );
         let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
         let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+        let has_model_picker =
+            payload.pointer("/components/0/components/0/type") == Some(&json!(3));
         let sent = if path.starts_with("interactions/") {
             Write::Callback(payload)
         } else {
             Write::Followup(payload)
         };
         let _ = state.writes.send(sent).await;
+        if has_model_picker {
+            return Json(json!({"id":"600","author":{"id":"9","bot":true},"channel_id":"20"}))
+                .into_response();
+        }
         return StatusCode::NO_CONTENT.into_response();
     }
     if auth != Some("Bot fixture-bot-secret") {

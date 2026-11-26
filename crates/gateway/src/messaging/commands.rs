@@ -8,6 +8,11 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+#[path = "profile_models.rs"]
+mod profile_models;
+pub use profile_models::ModelPicker;
+pub(super) use profile_models::apply_profile_model;
+
 #[path = "requester_commands.rs"]
 mod requester;
 pub(super) use requester::{RequesterCommand, RequesterInvocation};
@@ -19,6 +24,9 @@ CREATE TABLE IF NOT EXISTS messaging_native_invocations (
 );
 CREATE TABLE IF NOT EXISTS messaging_route_models (
     route TEXT PRIMARY KEY REFERENCES messaging_routes(id), model TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messaging_route_model_scopes (
+    route TEXT PRIMARY KEY REFERENCES messaging_route_models(route), provider TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messaging_home_routes (
     connection TEXT PRIMARY KEY, route TEXT NOT NULL REFERENCES messaging_routes(id)
@@ -35,7 +43,11 @@ CREATE TABLE IF NOT EXISTS messaging_fetch_actions (
 pub enum Command {
     Status,
     Queue,
+    Reset,
     SelectModel { model: String },
+    SelectProfileModel { model: String },
+    ModelPicker,
+    ChooseProfileModel { picker: String, message: String, option: usize },
     UseSkill { skill: String, input: String },
     SetHome,
     FetchResult { action: String },
@@ -68,7 +80,7 @@ pub struct CommandDescriptor {
     pub audience: InvocationAudience,
 }
 
-pub(super) const COMMANDS: [CommandDescriptor; 6] = [
+pub(super) const COMMANDS: [CommandDescriptor; 7] = [
     CommandDescriptor {
         name: "status",
         arguments: &[],
@@ -79,6 +91,12 @@ pub(super) const COMMANDS: [CommandDescriptor; 6] = [
         name: "queue",
         arguments: &[],
         operator: false,
+        audience: InvocationAudience::Requester,
+    },
+    CommandDescriptor {
+        name: "reset",
+        arguments: &[],
+        operator: true,
         audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
@@ -124,13 +142,19 @@ pub(super) const COMMANDS: [CommandDescriptor; 6] = [
 
 impl Command {
     pub(super) fn operator(&self) -> bool {
-        matches!(self, Self::SelectModel { .. } | Self::SetHome)
+        matches!(self, Self::SelectModel { .. } | Self::SelectProfileModel { .. }
+            | Self::ModelPicker | Self::ChooseProfileModel { .. } | Self::SetHome | Self::Reset)
+    }
+
+    pub(super) fn uses_profile_model(&self) -> bool {
+        matches!(self, Self::SelectProfileModel { .. } | Self::ModelPicker | Self::ChooseProfileModel { .. })
     }
 
     pub(super) fn valid(&self) -> bool {
         match self {
-            Self::SelectModel { model } => {
-                valid_id(model) && !model.chars().any(char::is_whitespace)
+            Self::SelectModel { model } | Self::SelectProfileModel { model } => profile_models::valid_model(model),
+            Self::ChooseProfileModel { picker, message, option } => {
+                valid_id(picker) && valid_id(message) && *option < profile_models::MAX_CHOICES
             }
             Self::UseSkill { skill, input } => {
                 valid_id(skill)
@@ -147,9 +171,11 @@ impl Command {
 #[serde(rename_all = "snake_case")]
 pub enum InvocationOutcome {
     Ready,
+    ModelPicker(ModelPicker),
     Queue { pending: usize, running: bool },
     Applied,
     PendingResult,
+    Busy,
     ResultReady { delivery: String },
     AlreadyClaimed,
     Expired,
@@ -259,7 +285,11 @@ impl Ingress {
                 if expires_ms.is_some_and(|end| end <= super::runtime::now()) {
                     return Ok(Some(InvocationOutcome::Expired));
                 }
-                db(scope.store.invocation(&route, &event.id, &event.sender.id))
+                let outcome = db(scope.store.invocation(&route, &event.id, &event.sender.id))?;
+                if let Some(InvocationOutcome::ModelPicker(picker)) = &outcome {
+                    return scope.current_model_picker(state, &route, &event.sender, picker);
+                }
+                Ok(outcome)
             })
         })
         .await
@@ -385,10 +415,13 @@ pub(super) fn execute(
                     });
                 Operation::Output(queue)
             }
+            Command::Reset => Operation::Reset,
             Command::SelectModel { model } => Operation::SelectModel(model),
             Command::SetHome => Operation::Home(scope.transport_scope()?),
             Command::FetchResult { action } => Operation::Fetch(action),
-            Command::UseSkill { .. } => Operation::Output(InvocationOutcome::Unsupported),
+            Command::UseSkill { .. } | Command::SelectProfileModel { .. }
+            | Command::ModelPicker | Command::ChooseProfileModel { .. } =>
+                Operation::Output(InvocationOutcome::Unsupported),
         }
     };
     db(scope
@@ -398,6 +431,7 @@ pub(super) fn execute(
 
 enum Operation<'a> {
     Output(InvocationOutcome),
+    Reset,
     SelectModel(&'a str),
     Home(String),
     Fetch(&'a str),
@@ -436,15 +470,14 @@ fn record_requester_invocation(
 }
 
 impl Store {
-    pub(super) fn route_model(&self, route: &str) -> Result<Option<String>> {
+    pub(super) fn route_model(&self, route: &str, provider: &str) -> Result<Option<String>> {
         self.read(|db| {
-            Ok(db
-                .query_row(
-                    "SELECT model FROM messaging_route_models WHERE route = ?1",
-                    [route],
-                    |r| r.get(0),
-                )
-                .optional()?)
+            Ok(db.query_row(
+                "SELECT m.model FROM messaging_route_models m
+                 LEFT JOIN messaging_route_model_scopes s USING(route)
+                 WHERE m.route = ?1 AND (s.provider IS NULL OR s.provider = ?2)",
+                params![route, provider], |r| r.get(0),
+            ).optional()?)
         })
     }
 
@@ -489,9 +522,11 @@ impl Store {
             if existing { return Ok(()) }
             let outcome = match operation {
                 Operation::Output(outcome) => outcome,
+                Operation::Reset => reset_route(tx, route, &event.id)?,
                 Operation::SelectModel(model) => {
                     tx.execute("INSERT INTO messaging_route_models(route,model) VALUES (?1,?2)
                                 ON CONFLICT(route) DO UPDATE SET model = excluded.model", params![route.id,model])?;
+                    tx.execute("DELETE FROM messaging_route_model_scopes WHERE route = ?1", [&route.id])?;
                     InvocationOutcome::Applied
                 }
                 Operation::Home(scope) => {
@@ -568,6 +603,37 @@ impl Store {
             params![connection,delivery], |r| r.get(0),
         )?))
     }
+}
+
+fn reset_route(tx: &rusqlite::Connection, route: &Route, request: &str) -> Result<InvocationOutcome> {
+    // A linked destination can share a session with a different audience.
+    // Scope this reset to the exact unlinked conversation.
+    let linked = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messaging_route_bindings
+           WHERE destination = ?1 OR binding = ?1)",
+        [&route.id], |row| row.get::<_, bool>(0),
+    )?;
+    if linked {
+        return Ok(InvocationOutcome::Unsupported);
+    }
+    let busy = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messaging_ingress
+           WHERE route = ?1 AND event != ?2 AND stage NOT IN ('done','refused'))
+          OR EXISTS(SELECT 1 FROM messaging_deliveries
+           WHERE route = ?1 AND stage IN ('pending','planned'))",
+        params![route.id, request], |row| row.get::<_, bool>(0),
+    )?;
+    if busy {
+        return Ok(InvocationOutcome::Busy);
+    }
+    // The existing native allocator will create the new revision on demand.
+    // Keep the original conversation and its committed receipts in the library.
+    let reset = tx.execute(
+        "UPDATE messaging_routes SET session = NULL, revision = revision + 1
+         WHERE id = ?1 AND revision = ?2 AND blocked = 0",
+        params![route.id, route.revision],
+    )?;
+    Ok(if reset == 1 { InvocationOutcome::Applied } else { InvocationOutcome::Stale })
 }
 
 fn claim_result(

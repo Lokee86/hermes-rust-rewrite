@@ -205,6 +205,15 @@ impl Ingress {
         Ok(())
     }
 
+    pub(super) fn model_provider_scope(&self) -> Result<String, GatewayError> {
+        let owner = self.slot.owner.upgrade().ok_or(GatewayError::StaleConnection)?;
+        db(store::key("channel-model-provider", &(
+            owner.provider.base_url.trim().trim_end_matches('/'),
+            owner.provider.api_key.trim(),
+            owner.provider.model.as_str(),
+        )))
+    }
+
     pub(super) fn transport_scope(&self) -> Result<String, GatewayError> {
         db(transport_scope(self.installation()))
     }

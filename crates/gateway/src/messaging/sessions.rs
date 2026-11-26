@@ -285,7 +285,9 @@ async fn advance_message(
                     policy.prompt = None;
                     policy.skills = None;
                 }
-                let model = policy.model.or(db(scope.store.route_model(&work.route.id))?);
+                let model = policy.model.or(db(scope.store.route_model(
+                    &work.route.id, &scope.model_provider_scope()?,
+                ))?);
                 let selected_skill = match &work.event.body {
                     InboundBody::Command(Command::UseSkill { skill, .. }) => Some(skill.clone()),
                     _ => None,
@@ -481,6 +483,9 @@ async fn apply_command(
     work: &PendingInput,
     command: &Command,
 ) -> Result<(), GatewayError> {
+    if command.uses_profile_model() {
+        return commands::apply_profile_model(owner, scope, work, command).await;
+    }
     let session = if matches!(command, Command::Queue) {
         session_for(owner, scope, &work.route, false).await?
     } else { None };

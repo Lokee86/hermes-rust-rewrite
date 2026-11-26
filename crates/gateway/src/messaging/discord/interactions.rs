@@ -297,6 +297,14 @@ impl DiscordAdapter {
         sender: &Sender,
     ) -> Result<Option<Action>, GatewayError> {
         if interaction.kind != 2 {
+            if let Some(picker) = interaction
+                .data
+                .get("custom_id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.strip_prefix("mrc:model:"))
+            {
+                return Ok(self.model_choice(interaction, picker));
+            }
             return self.component_action(ingress, interaction, room, sender);
         }
         let name = interaction
@@ -322,7 +330,11 @@ impl DiscordAdapter {
         let body = match name {
             "status" => command(Command::Status),
             "queue" => command(Command::Queue),
-            "model" => option("model").and_then(|model| command(Command::SelectModel { model })),
+            "reset" => command(Command::Reset),
+            "model" => command(match option("model") {
+                Some(model) => Command::SelectProfileModel { model },
+                None => Command::ModelPicker,
+            }),
             "skill" => option("skill")
                 .zip(option("input"))
                 .and_then(|(skill, input)| command(Command::UseSkill { skill, input })),
@@ -406,6 +418,32 @@ impl DiscordAdapter {
             _ => None,
         };
         Ok(body)
+    }
+
+    fn model_choice(&self, input: &Interaction, picker: &str) -> Option<Action> {
+        if input.kind != 3
+            || input.data["component_type"] != 3
+            || !picker.starts_with("discord-interaction-")
+            || !valid_id(picker)
+        {
+            return None;
+        }
+        let message = input.message.as_ref()?;
+        if message.pointer("/author/id").and_then(Value::as_str) != Some(self.bot.bot_id.as_str()) {
+            return None;
+        }
+        let id = read_id(message, "id")?;
+        let [value] = input.data["values"].as_array()?.as_slice() else {
+            return None;
+        };
+        let option = value.as_str()?.parse::<usize>().ok()?;
+        Some(Action::Native(InboundBody::Command(
+            Command::ChooseProfileModel {
+                picker: picker.into(),
+                message: id.to_owned(),
+                option,
+            },
+        )))
     }
 
     fn component_action(
@@ -543,6 +581,7 @@ impl DiscordAdapter {
             return;
         };
         let client = self.client.clone();
+        let bot = self.bot.bot_id.clone();
         let cancel = cancel.clone();
         let ingress = ingress.clone();
         tokio::spawn(async move {
@@ -613,8 +652,11 @@ impl DiscordAdapter {
                 let outcome = ingress
                     .callback_outcome(event.clone(), room.clone(), sender.clone(), expires_ms)
                     .await;
-                let text = match outcome {
-                    Ok(Some(outcome)) => outcome_text(outcome),
+                let (payload, is_picker) = match outcome {
+                    Ok(Some(InvocationOutcome::ModelPicker(picker))) => {
+                        (model_picker_payload(&event, &picker.choices), true)
+                    }
+                    Ok(Some(outcome)) => (response_content(&outcome_text(outcome)), false),
                     Ok(None) if Instant::now() < until => {
                         tokio::select! {
                             _ = cancel.cancelled() => return,
@@ -622,8 +664,8 @@ impl DiscordAdapter {
                         }
                         continue;
                     }
-                    Ok(None) => "The outcome is still pending.".into(),
-                    Err(_) => "The outcome is unavailable.".into(),
+                    Ok(None) => (response_content("The outcome is still pending."), false),
+                    Err(_) => (response_content("The outcome is unavailable."), false),
                 };
                 let request = client
                     .open(
@@ -636,8 +678,26 @@ impl DiscordAdapter {
                             "@original",
                         ],
                     )
-                    .json(&private_text(&text));
-                let _ = tokio::time::timeout(Duration::from_secs(4), request.send()).await;
+                    .json(&payload);
+                let result = tokio::time::timeout(Duration::from_secs(4), async {
+                    let response = request.send().await.map_err(|_| RestFailure::Unavailable)?;
+                    if is_picker {
+                        json_response::<Value>(response).await.map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await;
+                if let Ok(Ok(Some(message))) = result
+                    && message.pointer("/author/id").and_then(Value::as_str) == Some(bot.as_str())
+                    && message.get("channel_id").and_then(Value::as_str)
+                        == Some(room.thread.as_deref().unwrap_or(&room.chat))
+                    && let Some(id) = read_id(&message, "id")
+                {
+                    let _ = ingress
+                        .bind_model_picker_message(event, room, sender, id.to_owned())
+                        .await;
+                }
                 return;
             }
         });
@@ -655,13 +715,37 @@ async fn ack_error(mut response: reqwest::Response) -> Option<u64> {
         .as_u64()
 }
 
+fn response_content(text: &str) -> Value {
+    json!({"content":text,"allowed_mentions":{"parse":[],"replied_user":false}})
+}
+
 fn private_text(text: &str) -> Value {
-    json!({"content":text,"flags":EPHEMERAL,"allowed_mentions":{"parse":[],"replied_user":false}})
+    let mut payload = response_content(text);
+    payload["flags"] = json!(EPHEMERAL);
+    payload
+}
+
+fn model_picker_payload(event: &str, choices: &[String]) -> Value {
+    let mut payload = response_content("Choose a model from the configured provider.");
+    let options: Vec<_> = choices
+        .iter()
+        .enumerate()
+        .map(|(index, model)| {
+            let label = &model[..model.floor_char_boundary(model.len().min(100))];
+            json!({"label":label,"value":index.to_string()})
+        })
+        .collect();
+    payload["components"] = json!([{"type":1,"components":[{
+        "type":3,"custom_id":format!("mrc:model:{event}"),
+        "options":options,"min_values":1,"max_values":1,
+    }]}]);
+    payload
 }
 
 fn outcome_text(outcome: InvocationOutcome) -> String {
     match outcome {
         InvocationOutcome::Ready => "Mercury is ready.".into(),
+        InvocationOutcome::ModelPicker(_) => "Model choices are ready.".into(),
         InvocationOutcome::Queue { pending, running } => format!(
             "{pending} queued. {}",
             if running {
@@ -672,6 +756,9 @@ fn outcome_text(outcome: InvocationOutcome) -> String {
         ),
         InvocationOutcome::Applied => "Applied.".into(),
         InvocationOutcome::PendingResult => "The result is still pending.".into(),
+        InvocationOutcome::Busy => {
+            "The conversation still has work. Retry after it settles.".into()
+        }
         InvocationOutcome::ResultReady { .. } => "The result is ready.".into(),
         InvocationOutcome::AlreadyClaimed => "The result was already claimed.".into(),
         InvocationOutcome::Expired => "The action expired.".into(),
@@ -705,7 +792,13 @@ pub(super) async fn synchronize(
             let options = command
                 .arguments
                 .iter()
-                .map(|argument| option(argument.name))
+                .map(|argument| {
+                    let mut field = option(argument.name);
+                    if name == "model" {
+                        field["required"] = json!(false);
+                    }
+                    field
+                })
                 .collect::<Vec<_>>();
             (name, options, command.operator)
         })
