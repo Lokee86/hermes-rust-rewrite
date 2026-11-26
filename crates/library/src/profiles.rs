@@ -124,10 +124,15 @@ impl Library {
         let copy = profile.join(EXPORTED_DATABASE);
         let _ = fs::remove_file(&copy);
         hermes_engine::db::snapshot(&profile, &copy)?;
-        let status = Command::new("tar").arg("--exclude=mercury.db*").arg("-czf").arg(dest).arg("-C").arg(self.profiles_dir()).arg(name).status();
+        // The archive holds the profile's chats and settings: tar fills a private file, which then
+        // takes the chosen name.
+        let parent = dest.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let archive = tempfile::NamedTempFile::new_in(parent).context("Could not write the profile archive")?.into_temp_path();
+        let status = Command::new("tar").arg("--exclude=mercury.db*").arg("-czf").arg(&archive).arg("-C").arg(self.profiles_dir()).arg(name).status();
         let _ = fs::remove_file(&copy);
         let status = status.context("tar is not available")?;
         ensure!(status.success(), "Could not write the profile archive");
+        archive.persist(dest).context("Could not write the profile archive")?;
         Ok(())
     }
     /// Import an archive made by `export_profile`; returns the profile's name.
@@ -149,7 +154,14 @@ impl Library {
         let profile = self.profiles_dir().join(name);
         let copy = profile.join(EXPORTED_DATABASE);
         if copy.is_file() {
-            fs::rename(copy, profile.join(hermes_engine::db::FILE))?;
+            let database = profile.join(hermes_engine::db::FILE);
+            fs::rename(copy, &database)?;
+            // An archive from an earlier version stored the copy readable by everyone.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
+            }
         }
         Ok(name.to_string())
     }
@@ -182,5 +194,35 @@ mod tests {
         let names: Vec<_> = library.profiles().unwrap().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["default", "office"]);
         assert!(library.delete_profile("default").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exported_profile_and_its_imported_chats_stay_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        library.create_profile("work").unwrap();
+        let profile = library.profile_path("work").unwrap();
+        Library::open(&profile).unwrap().create_session(None, Some("Private chat")).unwrap();
+        let archive = dir.path().join("work.tar.gz");
+        library.export_profile("work", &archive).unwrap();
+        assert_eq!(mode(&archive), 0o600, "the archive holds the profile's chats");
+        assert!(!profile.join(EXPORTED_DATABASE).exists());
+        library.delete_profile("work").unwrap();
+        library.import_profile(&archive).unwrap();
+        assert_eq!(mode(&profile.join(hermes_engine::db::FILE)), 0o600);
+
+        // An archive from an earlier version stored its copy readable by everyone.
+        let staging = tempfile::tempdir().unwrap();
+        fs::create_dir(staging.path().join("old")).unwrap();
+        hermes_engine::db::snapshot(&profile, &staging.path().join("old").join(EXPORTED_DATABASE)).unwrap();
+        fs::set_permissions(staging.path().join("old").join(EXPORTED_DATABASE), fs::Permissions::from_mode(0o644)).unwrap();
+        let old = dir.path().join("old.tar.gz");
+        assert!(Command::new("tar").arg("-czf").arg(&old).arg("-C").arg(staging.path()).arg("old").status().unwrap().success());
+        library.import_profile(&old).unwrap();
+        assert_eq!(mode(&library.profile_path("old").unwrap().join(hermes_engine::db::FILE)), 0o600);
+        assert!(hermes_engine::db::open_existing(&library.profile_path("old").unwrap()).unwrap().is_some());
     }
 }

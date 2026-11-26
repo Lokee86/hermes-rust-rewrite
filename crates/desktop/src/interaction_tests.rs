@@ -132,6 +132,26 @@ fn saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets()
     assert_eq!(app.current.as_ref().unwrap().id, "remote-b");
     let _ = app.tab_action(tabs::Action::Reopen);
     assert_eq!(app.current.as_ref().unwrap().id, "remote-a");
+    let c = remote::remote_summary(&root, origin, &json!({"id":"remote-c","title":"C"})).unwrap();
+    app.open_gateway_chat(c);
+    let order = |app: &Hermes| app.tabs.entries.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+    assert_eq!(order(&app), ["remote-b", "remote-a", "remote-c"]);
+    // Dragging a tab over another moves it there; the drag ends with the button.
+    let _ = app.tab_action(tabs::Action::Press("remote-c".into()));
+    let _ = app.tab_action(tabs::Action::Hover(Some("remote-b".into())));
+    let _ = app.tab_action(tabs::Action::Release);
+    let _ = app.tab_action(tabs::Action::Hover(Some("remote-a".into())));
+    assert_eq!(order(&app), ["remote-c", "remote-b", "remote-a"], "hovering after release does not move a tab");
+    let _ = app.tab_action(tabs::Action::Menu("remote-c".into()));
+    assert_eq!(app.tabs.menu.as_deref(), Some("remote-c"));
+    let _ = app.tab_action(tabs::Action::CloseToRight("remote-b".into()));
+    assert_eq!(order(&app), ["remote-c", "remote-b"]);
+    assert!(app.tabs.menu.is_none());
+    let _ = app.tab_action(tabs::Action::CloseOthers("remote-b".into()));
+    assert_eq!(order(&app), ["remote-b"]);
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-b");
+    let _ = app.tab_action(tabs::Action::Reopen);
+    assert_eq!(app.current.as_ref().unwrap().id, "remote-c");
     app.connections.config.mode = connections::Mode::Local;
     app.refresh_gateway_route();
     assert!(app.tabs.entries.iter().all(|tab| !tab.id.starts_with("remote-")));

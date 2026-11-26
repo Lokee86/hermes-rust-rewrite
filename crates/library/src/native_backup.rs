@@ -227,7 +227,9 @@ impl Library {
         for blob in &plan.archive.profile {
             write_blob(&profile, blob, &blob.path)?;
         }
-        let sessions = self.with_catalog(true, |catalog| {
+        // Chats made by a restore that then fails are removed again, so none is left unlisted.
+        let mut created = Vec::new();
+        let restored = self.with_catalog(true, |catalog| {
             let mut imported = 0;
             let mut pins = HashMap::new();
             for saved in &plan.archive.sessions {
@@ -239,6 +241,7 @@ impl Library {
                 // conversations reachable through the ordinary session list.
                 record.bot = None;
                 let directory = self.create_directory(&record.id)?;
+                created.push(directory.clone());
                 for blob in &saved.files {
                     if matches!(blob.path.as_str(), "queued-prompts.json") {
                         let queue = recovery.join("sessions").join(&record.id);
@@ -278,7 +281,17 @@ impl Library {
             }
             // No active-session or selected-project mutation is made here.
             Ok(imported)
-        })?;
+        });
+        let sessions = match restored {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                for directory in created {
+                    let _ = hermes_engine::delete_conversation(&directory);
+                    let _ = fs::remove_dir_all(&directory);
+                }
+                return Err(error);
+            }
+        };
         atomic_json(
             &recovery.join("complete.json"),
             &serde_json::json!({"sessions":sessions,"completed_at":now()}),
@@ -599,5 +612,36 @@ mod tests {
             let session = hermes_engine::Session::open(&chat.directory).unwrap();
             assert!(session.history().turns[0].prompt.starts_with("Saved conversation"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_that_fails_leaves_no_chats_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = Library::open(dir.path().join("source")).unwrap();
+        for title in ["First", "Second"] {
+            let chat = source.create_session(None, Some(title)).unwrap();
+            let mut history = History::default();
+            history.turns.push(hermes_engine::Turn {
+                prompt: format!("{title} chat"), context: String::new(), attachments: vec![],
+                model: "fixture".into(), entries: vec![], status: hermes_engine::Status::Complete,
+            });
+            crate::tests::save_history(&chat.directory, &history);
+        }
+        let archive = dir.path().join("backup.hermes-native.json");
+        source.export_native_backup(&archive).unwrap();
+        let plan = inspect_native_backup(&archive).unwrap();
+        let target = Library::open(dir.path().join("target")).unwrap();
+        assert!(target.list_sessions(&SessionQuery::default()).unwrap().is_empty());
+        // Saving the restored chats fails, as on a full or read-only disk.
+        let database = dir.path().join("target").join(hermes_engine::db::FILE);
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o400)).unwrap();
+        let result = target.import_native_backup(&plan);
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err());
+        assert!(target.list_sessions(&SessionQuery::default()).unwrap().is_empty());
+        let sessions = dir.path().join("target/sessions");
+        assert!(fs::read_dir(&sessions).map_or(true, |mut entries| entries.next().is_none()), "no chat folder is left");
     }
 }

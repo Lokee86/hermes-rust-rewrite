@@ -159,10 +159,24 @@ pub fn retire(path: &Path) {
     let _ = fs::rename(path, name);
 }
 
-/// A consistent copy of a profile's database, for an export.
+/// A consistent copy of a profile's database, for an export. `destination` must not exist yet.
 pub fn snapshot(root: &Path, destination: &Path) -> Result<bool> {
     let Some(db) = open_existing(root)? else { return Ok(false) };
+    // The copy is opened as the database is, refusing a link anywhere in its path.
+    let folder = destination.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let destination = folder.canonicalize().context("Could not copy the chat database")?
+        .join(destination.file_name().context("Choose a file for the database copy")?);
     let name = destination.to_str().context("The export path is not valid text")?;
+    // The copy holds the chats, so it is private before anything is written to it. VACUUM INTO
+    // fills an empty file and keeps its permissions.
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&destination).context("Could not copy the chat database")?;
     db.execute("VACUUM INTO ?1", [name]).context("Could not copy the chat database")?;
     Ok(true)
 }
@@ -311,6 +325,29 @@ mod tests {
         let linked = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(dir.path().join(FILE), linked.path().join(FILE)).unwrap();
         assert!(open(linked.path()).is_err());
+    }
+
+    #[test]
+    fn a_copy_is_private_and_may_be_reached_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path()).unwrap().execute("INSERT INTO documents VALUES ('d', 1, '{}')", []).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("real");
+        fs::create_dir(&target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, out.path().join("link")).unwrap();
+        #[cfg(not(unix))]
+        let _ = fs::create_dir(out.path().join("link"));
+        let copy = out.path().join("link").join("copy.db");
+        assert!(snapshot(dir.path(), &copy).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(snapshot(dir.path(), &copy).is_err(), "an existing file is not replaced");
+        let saved = Connection::open(&copy).unwrap().query_row("SELECT body FROM documents WHERE name = 'd'", [], |row| row.get::<_, String>(0)).unwrap();
+        assert_eq!(saved, "{}");
     }
 
     #[test]

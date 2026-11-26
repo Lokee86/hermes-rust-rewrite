@@ -5,8 +5,8 @@ use crate::appearance::text;
 use crate::ui;
 use chrono::Utc;
 use hermes_engine::{
-    CancellationToken, Config, Event, ToolCall,
-    cron::{self, Claim, Draft, Job, Outcome, Run, Store},
+    Config,
+    cron::{self, Draft, Job, Run, Store},
 };
 use iced::widget::text as text_widget;
 use iced::{
@@ -56,15 +56,11 @@ pub enum Action {
     DeleteCancel,
     DeleteConfirm,
     Stop(String),
-    Approve(String, bool),
     ShowRun(String),
     Opened(u64, Result<Store, String>),
     Loaded(u64, Result<Data, String>),
     Saved(u64, Result<Job, String>),
     Changed(u64, Result<(), String>),
-    Claimed(u64, bool, Result<Vec<Claim>, String>),
-    Engine(u64, String, Event),
-    Finished(u64, String, Result<Outcome, String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +85,7 @@ impl TriggerResult {
 pub struct Data {
     jobs: Vec<Job>,
     runs: Vec<Run>,
+    live: Vec<Run>,
     selected: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,20 +161,6 @@ struct Editor {
     frequency: Frequency,
     model: String,
 }
-struct Pending {
-    call: ToolCall,
-    answer: async_channel::Sender<bool>,
-}
-struct Active {
-    session_dir: PathBuf,
-    job: String,
-    title: String,
-    started: std::time::Instant,
-    cancel: CancellationToken,
-    manual: bool,
-    approval: Option<Pending>,
-    text: String,
-}
 pub struct Scheduled {
     profile: Option<PathBuf>,
     workspace: Option<PathBuf>,
@@ -195,7 +178,8 @@ pub struct Scheduled {
     ticking: bool,
     scope: u64,
     request: u64,
-    active: BTreeMap<String, Active>,
+    /// Runs claimed or running now. The profile's gateway runs routines; this is its record of them.
+    live: Vec<Run>,
     /// Routines gallery: open, and the template being filled with its blanks.
     templates: bool,
     template: Option<(usize, BTreeMap<String, String>)>,
@@ -219,7 +203,7 @@ impl Scheduled {
             ticking: false,
             scope: 0,
             request: 0,
-            active: BTreeMap::new(),
+            live: vec![],
             templates: false,
             template: None,
         }
@@ -302,7 +286,7 @@ impl Scheduled {
     pub fn subscription(&self) -> Subscription<Action> {
         if self.store.is_some() {
             let ticks = iced::time::every(Duration::from_secs(15)).map(|_| Action::Tick);
-            if self.active.is_empty() { ticks } else { Subscription::batch([ticks, iced::time::every(Duration::from_secs(1)).map(|_| Action::Redraw)]) }
+            if self.live.is_empty() { ticks } else { Subscription::batch([ticks, iced::time::every(Duration::from_secs(1)).map(|_| Action::Redraw)]) }
         } else {
             Subscription::none()
         }
@@ -327,9 +311,11 @@ impl Scheduled {
                     } else {
                         vec![]
                     };
+                    let live = store.live_runs().map_err(|error| format!("{error:#}"))?;
                     Ok(Data {
                         jobs,
                         runs,
+                        live,
                         selected,
                     })
                 })
@@ -377,6 +363,7 @@ impl Scheduled {
                     Ok(data) => {
                         self.jobs = data.jobs;
                         self.runs = data.runs;
+                        self.live = data.live;
                         self.selected = data.selected;
                     }
                     Err(error) => self.error = Some(error),
@@ -575,56 +562,11 @@ impl Scheduled {
                 }
             }
             Action::Tick => return self.reload(),
-            Action::Trigger(_) | Action::Triggered(..) | Action::OpenedRoutine(_) | Action::OpenRunChat(_) | Action::Claimed(..) => return Task::none(),
-            Action::Engine(scope, id, event) => {
-                let Some(active) = self.active.get_mut(&id) else {
-                    if let Event::Approval { answer, .. } = event {
-                        let _ = answer.try_send(false);
-                    }
-                    return Task::none();
-                };
-                match event {
-                    Event::Text(delta) => {
-                        if active.text.len() < 262144 {
-                            active.text.push_str(&delta);
-                        }
-                    }
-                    Event::Approval { call, answer } => {
-                        if active.manual && scope == self.scope {
-                            active.approval = Some(Pending { call, answer });
-                        } else {
-                            let _ = answer.try_send(false);
-                        }
-                    }
-                    Event::Snapshot(_) | Event::Subagent(_) | Event::MemoryRecall(_) => {}
-                }
-            }
-            Action::Approve(id, approved) => {
-                if let Some(active) = self.active.get_mut(&id)
-                    && let Some(approval) = active.approval.take()
-                {
-                    let _ = approval.answer.try_send(approved);
-                }
-            }
+            Action::Trigger(_) | Action::Triggered(..) | Action::OpenedRoutine(_) | Action::OpenRunChat(_) => return Task::none(),
             Action::Stop(id) => {
-                if let Some(active) = self.active.get_mut(&id) {
-                    active.cancel.cancel();
-                    if let Some(approval) = active.approval.take() {
-                        let _ = approval.answer.try_send(false);
-                    }
-                }
                 if let Some(store) = self.store.clone() {
                     return self
                         .mutate(move |_| store.cancel(&id).map_err(|error| format!("{error:#}")));
-                }
-            }
-            Action::Finished(scope, id, result) => {
-                self.active.remove(&id);
-                if scope == self.scope {
-                    if let Err(error) = result {
-                        self.error = Some(error);
-                    }
-                    return self.reload();
                 }
             }
             Action::ShowRun(id) => {
@@ -638,26 +580,18 @@ impl Scheduled {
         }
         Task::none()
     }
-    /// (job id, title, the run's transcript folder) for a run still tracked as active.
-    pub fn run_info(&self, run: &str) -> Option<(String, String, PathBuf)> {
-        self.active.get(run).map(|a| (a.job.clone(), a.title.clone(), a.session_dir.clone()))
-    }
     /// Every job, for the sidebar's Cron jobs section.
     pub fn jobs(&self) -> &[Job] { &self.jobs }
     /// Seconds the job has been running, if a run of it is active.
-    pub fn running_for(&self, job: &str) -> Option<u64> { self.active.values().filter(|a| a.job == job).map(|a| a.started.elapsed().as_secs()).max() }
-    /// The job's newest active run as it streams: (seconds running, text so far, waiting on approval).
-    pub fn live(&self, job: &str) -> Option<(u64, &str, bool)> {
-        self.active.values().filter(|a| a.job == job).min_by_key(|a| a.started.elapsed()).map(|a| (a.started.elapsed().as_secs(), a.text.as_str(), a.approval.is_some()))
-    }
+    pub fn running_for(&self, job: &str) -> Option<u64> { self.live.iter().filter(|run| run.job_id == job).map(running_seconds).max() }
+    /// The job's newest live run: seconds running. Its chat shows what it has written.
+    pub fn live(&self, job: &str) -> Option<u64> { self.live.iter().filter(|run| run.job_id == job).map(running_seconds).min() }
     /// The job's most recent runs, newest first: (run id, when it started).
     pub fn recent_runs(&self, job: &str, limit: usize) -> Vec<(String, String)> {
         let mut runs: Vec<&Run> = self.runs.iter().filter(|r| r.job_id == job).collect();
         runs.sort_by(|a, b| b.claimed_at.cmp(&a.claimed_at));
         runs.into_iter().take(limit).map(|r| (r.id.clone(), r.started_at.clone().unwrap_or_else(|| r.claimed_at.clone()))).collect()
     }
-    /// Job id and title of a routine by run id or job id (for opening its chat).
-    pub fn job_title(&self, job: &str) -> Option<String> { self.jobs.iter().find(|j| j.id == job).map(|j| j.title().to_owned()) }
 
 
     /// Routines › New: the curated templates (cron/blueprint_catalog.py), then their blanks.
@@ -788,7 +722,7 @@ impl Scheduled {
                 query.is_empty()
                     || job.title().to_lowercase().contains(&query)
                     || job.prompt.to_lowercase().contains(&query)
-            }).map(|job| { let (g, chip) = super::routines::classify(job, self.active.values().any(|a| a.job == job.id), now); (job, g, chip) }).collect();
+            }).map(|job| { let (g, chip) = super::routines::classify(job, self.running_for(&job.id).is_some(), now); (job, g, chip) }).collect();
             shown.sort_by_key(|(_, g, _)| *g);
             let mut last_group = None;
             for (job, group, chip) in shown {
@@ -974,35 +908,6 @@ impl Scheduled {
                 .width(Fill)
                 .style(quiet),
             );
-            if let Some(active) = self.active.get(&run.id) {
-                if let Some(approval) = &active.approval {
-                    detail = detail.push(
-                        container(
-                            column![
-                                text("Approval required").size(13).font(semibold()),
-                                text(&approval.call.name).size(12),
-                                text(&approval.call.arguments)
-                                    .size(11)
-                                    .font(iced::Font::MONOSPACE),
-                                row![
-                                    button(text("Deny").size(12))
-                                        .on_press(Action::Approve(run.id.clone(), false))
-                                        .style(quiet),
-                                    button(text("Allow once").size(12))
-                                        .on_press(Action::Approve(run.id.clone(), true))
-                                ]
-                                .spacing(8)
-                            ]
-                            .spacing(8),
-                        )
-                        .padding(12)
-                        .style(container::bordered_box),
-                    );
-                }
-                if !active.text.is_empty() {
-                    detail = detail.push(text(&active.text).size(12));
-                }
-            }
             if self.shown_run.as_ref() == Some(&run.id) {
                 if let Some(error) = &run.error {
                     detail = detail.push(text(error).size(12));
@@ -1108,17 +1013,11 @@ impl Scheduled {
         .height(Fill)
         .into()
     }
-    pub fn has_running_jobs(&self) -> bool {
-        !self.active.is_empty()
-    }
-    pub fn stop_all(&mut self) {
-        for active in self.active.values_mut() {
-            active.cancel.cancel();
-            if let Some(approval) = active.approval.take() {
-                let _ = approval.answer.try_send(false);
-            }
-        }
-    }
+}
+/// Seconds since a live run started, or since it was claimed if it has not started yet.
+fn running_seconds(run: &Run) -> u64 {
+    run.started_at.as_deref().unwrap_or(&run.claimed_at).parse::<chrono::DateTime<Utc>>()
+        .map_or(0, |at| u64::try_from(Utc::now().signed_duration_since(at).num_seconds()).unwrap_or(0))
 }
 fn semibold() -> iced::Font {
     iced::Font {
@@ -1196,11 +1095,42 @@ fn meta<'a>(label: &'a str, value: &'a str) -> Element<'a, Action> {
 #[cfg(test)]
 mod trigger_tests {
     use super::*;
+    use hermes_engine::cron::Outcome;
     use iced::futures::StreamExt;
     use serde_json::json;
 
     fn config() -> Config {
         Config { base_url: "http://127.0.0.1:1/v1".into(), model: "fixture".into(), api_key: String::new() }
+    }
+
+    async fn refresh(scheduled: &mut Scheduled) {
+        let task = scheduled.update(Action::Refresh, config());
+        let mut actions = iced_runtime::task::into_stream(task).unwrap();
+        while let Some(action) = actions.next().await {
+            if let iced_runtime::Action::Output(action) = action { let _ = scheduled.update(action, config()); }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routine_the_gateway_runs_shows_as_running_until_it_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_gateway(directory.path()).unwrap();
+        let now = Utc::now();
+        let job = store.create(Draft { name: "Long check".into(), script: "check.py".into(), no_agent: true, ..Draft::default() }, now).unwrap();
+        let mut scheduled = Scheduled::new();
+        scheduled.profile = Some(directory.path().to_owned());
+        scheduled.store = Some(Store::open_view(directory.path()).unwrap());
+        refresh(&mut scheduled).await;
+        assert_eq!(scheduled.running_for(&job.id), None);
+        let claim = store.claim_gateway_now(&job.id, "request", now - chrono::Duration::seconds(90)).unwrap();
+        refresh(&mut scheduled).await;
+        assert!(scheduled.running_for(&job.id).is_some_and(|secs| secs >= 90), "{:?}", scheduled.running_for(&job.id));
+        assert!(scheduled.live(&job.id).is_some());
+        assert_eq!(super::super::routines::classify(&scheduled.jobs[0], scheduled.running_for(&job.id).is_some(), now).1, "Running");
+        store.finish(&claim, Outcome::Completed { output: "done".into() }, now).unwrap();
+        refresh(&mut scheduled).await;
+        assert_eq!(scheduled.running_for(&job.id), None);
+        assert_eq!(scheduled.live(&job.id), None);
     }
 
     #[tokio::test]

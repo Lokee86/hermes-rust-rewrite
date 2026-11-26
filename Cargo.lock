@@ -2523,7 +2523,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "shlex",
  "tempfile",
  "tokio",
  "tokio-util",
