@@ -86,6 +86,8 @@ python3 benchmarks/summarize.py
 
 [`FEATURE_PARITY.md`](FEATURE_PARITY.md) lists every screen against the Electron app and says what is verified live, covered by tests, or only built.
 
+The [backend parity plan](BACKEND_PARITY_PLAN.md) gives contributors the implementation order and acceptance checks for Mercury’s gateway, runtime, and clients.
+
 ## Python plugins
 
 Hermes plugins written in Python (`plugin.yaml` + `__init__.py` with `register(ctx)`) run without installing Python or the Python Hermes agent:
