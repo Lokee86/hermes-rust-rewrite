@@ -1,6 +1,6 @@
 # BlueBubbles stock plugin implementation spec
 
-Register BlueBubbles as a bundled Rust adapter with platform key `bluebubbles`. Start after Buzz and the shared gate. A headless Mercury profile serves authorized iMessage conversations through an operator-managed BlueBubbles Server on a Mac. The bridge supports native text and files, and helper-backed features apply only when qualified. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Buzz spec](BUZZ_ADAPTER_SPEC.md) · [Hermes BlueBubbles guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/bluebubbles.md)
+Register BlueBubbles as a bundled Rust adapter with platform key `bluebubbles`. Start after Buzz and the shared gate. A headless Mercury profile serves authorized iMessage conversations through an operator-managed BlueBubbles Server on a Mac. The bridge supports native text and files, and helper-backed features apply only when qualified. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Buzz spec](BUZZ_ADAPTER_SPEC.md) · [Hermes BlueBubbles guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/bluebubbles.md) · [Next adapter, Photon](PHOTON_ADAPTER_SPEC.md)
 
 ## Bridge and webhook ownership
 

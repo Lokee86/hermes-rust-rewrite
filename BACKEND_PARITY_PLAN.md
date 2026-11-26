@@ -67,6 +67,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 20. Implement IRC and verify TLS network setup, plain-text channels and DMs, optional IRCv3 continuity and qualified send evidence. [IRC spec](crates/gateway/IRC_ADAPTER_SPEC.md)
 21. Implement Buzz and verify joined-channel and DM discovery, NIP-42 streaming and CLI polling, thread replies, media and recovery. [Buzz spec](crates/gateway/BUZZ_ADAPTER_SPEC.md)
 22. Implement BlueBubbles and verify the self-hosted Mac bridge, GUID and alias routing, native media, scoped helper features and recovery. [BlueBubbles spec](crates/gateway/BLUEBUBBLES_ADAPTER_SPEC.md)
+23. Implement Photon and verify managed Spectrum line enrollment, supervised streaming, native iMessage controls and ordered media. [Photon spec](crates/gateway/PHOTON_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 
