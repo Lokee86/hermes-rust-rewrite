@@ -631,23 +631,7 @@ impl Store {
     }
 
     pub fn plan(&self, connection: &str, id: &str, parts: &[DeliveryPart]) -> Result<bool> {
-        self.write(|tx| {
-            for (index, part) in parts.iter().enumerate() {
-                if !effect_store::operation_available(tx, connection, id, u32::try_from(index)?, part)? {
-                    return Ok(false);
-                }
-            }
-            if tx.execute("UPDATE messaging_deliveries SET stage = 'planned' WHERE connection = ?1 AND id = ?2 AND stage = 'pending'",
-                params![connection, id])? == 0 {
-                return Ok(true);
-            }
-            for (index, part) in parts.iter().enumerate() {
-                tx.execute("INSERT INTO messaging_parts (delivery,ordinal,body,stage) VALUES (?1,?2,?3,'pending')",
-                    params![id, i64::try_from(index)?, serde_json::to_string(part)?])?;
-                effect_store::register_operation(tx, connection, id, u32::try_from(index)?, part)?;
-            }
-            Ok(true)
-        })
+        self.write(|tx| install_plan(tx, connection, id, parts))
     }
 
     pub fn reject(&self, connection: &str, id: &str, reason: &str) -> Result<()> {
@@ -1054,6 +1038,29 @@ pub(super) fn set_input(
         params![route.id, event, stage, reason],
     )?;
     Ok(())
+}
+
+pub(super) fn install_plan(
+    tx: &Transaction<'_>,
+    connection: &str,
+    id: &str,
+    parts: &[DeliveryPart],
+) -> Result<bool> {
+    for (index, part) in parts.iter().enumerate() {
+        if !effect_store::operation_available(tx, connection, id, u32::try_from(index)?, part)? {
+            return Ok(false);
+        }
+    }
+    if tx.execute("UPDATE messaging_deliveries SET stage = 'planned' WHERE connection = ?1 AND id = ?2 AND stage = 'pending'",
+        params![connection, id])? == 0 {
+        return Ok(true);
+    }
+    for (index, part) in parts.iter().enumerate() {
+        tx.execute("INSERT INTO messaging_parts (delivery,ordinal,body,stage) VALUES (?1,?2,?3,'pending')",
+            params![id, i64::try_from(index)?, serde_json::to_string(part)?])?;
+        effect_store::register_operation(tx, connection, id, u32::try_from(index)?, part)?;
+    }
+    Ok(true)
 }
 
 pub(super) fn enqueue(
