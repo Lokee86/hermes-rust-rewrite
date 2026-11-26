@@ -142,10 +142,41 @@ pub struct ConnectionSettings {
     pub(super) binding: Option<AccountBinding>,
 }
 
+/// A provider challenge returned only to the private owner while its setup
+/// lease is current. Its text is intentionally absent from diagnostic output.
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnrollmentPrompt {
+    Url { url: String },
+    PairingCode { code: String },
+    Qr { payload: String },
+}
+
+impl EnrollmentPrompt {
+    pub(super) fn validate(&self) -> bool {
+        match self {
+            Self::Url { url } => {
+                url.len() <= 8192
+                    && reqwest::Url::parse(url).is_ok_and(|url| {
+                        url.scheme() == "https"
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                    })
+            }
+            Self::PairingCode { code } => valid_id(code),
+            Self::Qr { payload } => {
+                !payload.trim().is_empty() && payload.len() <= 8192 && !payload.contains('\0')
+            }
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct EnrollmentLease {
     pub id: String,
     pub expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<EnrollmentPrompt>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -314,6 +345,7 @@ impl Store {
         let lease = EnrollmentLease {
             id: crate::new_id(),
             expires_at: time_ms() + ttl_ms,
+            prompt: None,
         };
         self.write(|tx| {
             ensure!(
@@ -380,6 +412,41 @@ impl Store {
             }
             tx.execute("DELETE FROM messaging_enrollment WHERE name=?1", [name])?;
             Ok(())
+        })
+    }
+
+    pub(super) fn renew_credential(
+        &self,
+        name: &str,
+        previous_revision: i64,
+        value: &str,
+    ) -> Result<Option<i64>> {
+        self.write(|tx| {
+            let entry: Option<String> = tx
+                .query_row(
+                    "SELECT credential_ref FROM messaging_configuration
+                 WHERE name=?1 AND revision=?2 AND enabled=1 AND binding IS NOT NULL",
+                    params![name, previous_revision],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let Some(reference) = entry else {
+                return Ok(None);
+            };
+            ensure!(
+                tx.execute(
+                    "UPDATE messaging_connection_secrets SET value=?2 WHERE reference=?1",
+                    params![reference, value],
+                )? == 1,
+                "Adapter credential reference is unavailable"
+            );
+            Ok(Some(tx.query_row(
+                "UPDATE messaging_configuration SET revision=revision+1
+                 WHERE name=?1 RETURNING revision",
+                [name],
+                |row| row.get(0),
+            )?))
         })
     }
 

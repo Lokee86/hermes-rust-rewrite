@@ -39,6 +39,18 @@ impl AdapterFactory for Fixture {
         })
     }
 
+    fn enrollment_prompt<'a>(
+        &'a self,
+        lease: &'a EnrollmentLease,
+        _: CancellationToken,
+    ) -> AdapterFuture<'a, Result<Option<EnrollmentPrompt>, ConnectionFailure>> {
+        Box::pin(async {
+            Ok(self.credential_required.then(|| EnrollmentPrompt::Qr {
+                payload: format!("fixture:{}", lease.id),
+            }))
+        })
+    }
+
     fn connect_enrolled(
         &self,
         credential: EnrollmentCredential,
@@ -197,22 +209,29 @@ async fn owner_enrollment_expires_rotates_and_survives_restart() {
     let mut policy = owner_policy();
     let gateway = open(temp.path(), &[factory.clone()], &policy).await;
     let expired = gateway
-        .begin_adapter_enrollment(&factory.name, Duration::from_millis(1))
-        .await
-        .unwrap();
+        .shared
+        .messaging
+        .begin_enrollment(&factory.name, 1)
+        .await;
     tokio::time::sleep(Duration::from_millis(5)).await;
     let secret = EnrollmentCredential::new("owner-secret".into()).unwrap();
-    assert!(
-        gateway
-            .complete_adapter_enrollment(&factory.name, &expired.id, secret.clone())
-            .await
-            .is_err()
-    );
+    match expired {
+        Ok(expired) => assert!(
+            gateway
+                .complete_adapter_enrollment(&factory.name, &expired.id, secret.clone())
+                .await
+                .is_err()
+        ),
+        Err(expired) => assert!(expired.to_string().contains("expired")),
+    }
 
     let lease = gateway
         .begin_adapter_enrollment(&factory.name, Duration::from_secs(30))
         .await
         .unwrap();
+    assert!(
+        matches!(&lease.prompt, Some(EnrollmentPrompt::Qr { payload }) if payload == &format!("fixture:{}", lease.id))
+    );
     assert!(
         gateway
             .complete_adapter_enrollment(
@@ -234,6 +253,37 @@ async fn owner_enrollment_expires_rotates_and_survives_restart() {
         !serde_json::to_string(&before)
             .unwrap()
             .contains(secret.secret())
+    );
+    let stale_owner_lease = gateway
+        .begin_adapter_enrollment(&factory.name, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let revision = first.configuration_revision().unwrap();
+    let automatic = first
+        .renew_enrolled_credential(
+            revision,
+            &factory.proof,
+            EnrollmentCredential::new("renewed-secret".into()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(automatic > revision);
+    assert_eq!(
+        gateway.adapter_settings().await.unwrap()[0].credential_ref,
+        before.credential_ref
+    );
+    assert_eq!(
+        first
+            .renew_enrolled_credential(revision, &factory.proof, secret.clone(),)
+            .await
+            .unwrap_err(),
+        GatewayError::StaleConnection
+    );
+    assert!(
+        gateway
+            .complete_adapter_enrollment(&factory.name, &stale_owner_lease.id, secret.clone(),)
+            .await
+            .is_err()
     );
 
     let renewed = gateway
@@ -640,6 +690,74 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
             .await
             .unwrap_err(),
         GatewayError::Forbidden
+    );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replacing_a_local_store_fences_reused_actor_and_item_ids() {
+    let temp = TempDir::new().unwrap();
+    let (mut factory, queue) = fixture("local-client", "tenant");
+    factory.proof.local_client = Some(LocalClientIdentity {
+        service: "daemon".into(),
+        store_incarnation: "store-one".into(),
+    });
+    let policy = owner_policy();
+    let room = room("local-chat");
+    let sender = principal("canonical");
+    let event = message("local-item", sender.clone(), room.clone());
+
+    let gateway = open(temp.path(), &[factory.clone()], &policy).await;
+    let ingress = ready(&queue).await;
+    ingress
+        .record_actor(person("canonical", room.clone()))
+        .await
+        .unwrap();
+    let accepted = ingress.submit(vec![event.clone()], None).await.unwrap();
+    let original_route = accepted.receipts[0].route.clone().unwrap();
+    gateway.shutdown().await.unwrap();
+
+    let gateway = open(temp.path(), &[factory.clone()], &policy).await;
+    let same_store = ready(&queue).await;
+    assert_eq!(same_store.connection, ingress.connection);
+    let repeated = same_store.submit(vec![event.clone()], None).await.unwrap();
+    assert!(repeated.receipts[0].repeated);
+    gateway.shutdown().await.unwrap();
+
+    factory
+        .proof
+        .local_client
+        .as_mut()
+        .unwrap()
+        .store_incarnation = "store-two".into();
+    let gateway = open(temp.path(), &[factory], &policy).await;
+    let other_store = ready(&queue).await;
+    assert_ne!(other_store.connection, ingress.connection);
+    assert!(
+        !other_store
+            .authorize_sender(&policy, &room, &sender)
+            .unwrap()
+    );
+    other_store
+        .record_actor(person("canonical", room))
+        .await
+        .unwrap();
+    let fresh = other_store.submit(vec![event], None).await.unwrap();
+    assert_eq!(fresh.receipts[0].disposition, Disposition::Accepted);
+    assert!(!fresh.receipts[0].repeated);
+    assert_ne!(
+        fresh.receipts[0].route.as_deref(),
+        Some(original_route.as_str())
+    );
+    let status = gateway.messaging_status().await.unwrap();
+    assert_eq!(
+        status["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["id"] == "local-item")
+            .count(),
+        2
     );
     gateway.shutdown().await.unwrap();
 }

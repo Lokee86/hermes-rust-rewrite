@@ -8,7 +8,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{EnrollmentCredential, Ingress, ScopePolicy, VerifiedInstallation};
+use super::{
+    EnrollmentCredential, EnrollmentLease, EnrollmentPrompt, Ingress, ScopePolicy,
+    VerifiedInstallation,
+};
 
 /// Major version of the native gateway adapter interface.
 pub const CONTRACT_VERSION: u32 = 1;
@@ -59,6 +62,16 @@ pub trait AdapterFactory: Send + Sync {
         &self,
         cancel: CancellationToken,
     ) -> AdapterFuture<'_, Result<VerifiedAdapter, ConnectionFailure>>;
+
+    /// Request the provider challenge for this private setup lease, if needed.
+    /// Factories tag any provider-side state with the supplied lease identity.
+    fn enrollment_prompt<'a>(
+        &'a self,
+        _lease: &'a EnrollmentLease,
+        _cancel: CancellationToken,
+    ) -> AdapterFuture<'a, Result<Option<EnrollmentPrompt>, ConnectionFailure>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 
     /// Authenticate with a credential approved by the private profile owner.
     /// Factories offering interactive enrollment implement this operation.

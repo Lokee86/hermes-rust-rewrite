@@ -114,6 +114,45 @@ impl Ingress {
         self.slot.descriptor.capabilities
     }
 
+    pub fn configuration_revision(&self) -> Result<u64, GatewayError> {
+        self.checked(true, |state| Ok(state.revision as u64))
+    }
+
+    /// Store a provider-issued renewal proven for this exact live installation.
+    /// Replacing the account or device always requires owner enrollment.
+    pub async fn renew_enrolled_credential(
+        &self,
+        previous_revision: u64,
+        installation: &VerifiedInstallation,
+        credential: EnrollmentCredential,
+    ) -> Result<u64, GatewayError> {
+        let revision = i64::try_from(previous_revision).map_err(|_| GatewayError::Invalid)?;
+        if self.installation() != Some(installation) {
+            return Err(GatewayError::Forbidden);
+        }
+        let scope = self.clone();
+        blocking(move || {
+            let value = db(hermes_engine::secret::seal(
+                scope.root(),
+                credential.secret(),
+            ))?;
+            let mut state = lock(&scope.slot.state);
+            if state.generation.as_deref() != Some(&scope.generation)
+                || !state.accepting
+                || state.revision != revision
+            {
+                return Err(GatewayError::StaleConnection);
+            }
+            let next = db(scope
+                .store
+                .renew_credential(&scope.slot.name, revision, &value))?
+            .ok_or(GatewayError::Forbidden)?;
+            state.revision = next;
+            Ok(next as u64)
+        })
+        .await
+    }
+
     pub(super) fn notify(&self) {
         self.slot.changed.notify_one();
     }
@@ -538,12 +577,44 @@ impl Host {
     }
 
     pub async fn begin_enrollment(&self, name: &str, ttl_ms: i64) -> Result<EnrollmentLease> {
+        let (factory, mut lease) = {
+            let _slots = self.slots.lock().await;
+            let factory = lock(&self.factories)
+                .get(name)
+                .cloned()
+                .context("No adapter factory for this connection")?;
+            (factory, self.store.create_enrollment(name, ttl_ms)?)
+        };
+        let cancel = CancellationToken::new();
+        let remaining = lease
+            .expires_at
+            .saturating_sub(super::profile::time_ms())
+            .max(0);
+        let challenge = tokio::time::timeout(
+            Duration::from_millis(remaining as u64),
+            factory.enrollment_prompt(&lease, cancel.clone()),
+        )
+        .await;
+        cancel.cancel();
+        let prompt = challenge
+            .context("Enrollment expired")?
+            .map_err(|_| anyhow::anyhow!("Adapter could not create an enrollment challenge"))?;
+        ensure!(
+            prompt
+                .as_ref()
+                .is_none_or(super::EnrollmentPrompt::validate),
+            "Invalid enrollment challenge"
+        );
         let _slots = self.slots.lock().await;
         ensure!(
-            lock(&self.factories).contains_key(name),
-            "No adapter factory for this connection"
+            self.store.enrollment_deadline(name, &lease.id)?.is_some()
+                && lock(&self.factories)
+                    .get(name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &factory)),
+            "Enrollment expired or was replaced"
         );
-        self.store.create_enrollment(name, ttl_ms)
+        lease.prompt = prompt;
+        Ok(lease)
     }
 
     pub async fn complete_enrollment(
@@ -956,10 +1027,14 @@ async fn supervise(
         let connect = async {
             match &credential {
                 Some(reference) => {
-                    let credential = store
-                        .credential(reference)
-                        .map_err(|_| ConnectionFailure::Credentials)?
-                        .ok_or(ConnectionFailure::Credentials)?;
+                    let store = store.clone();
+                    let reference = reference.clone();
+                    let credential =
+                        tokio::task::spawn_blocking(move || store.credential(&reference))
+                            .await
+                            .map_err(|_| ConnectionFailure::Retryable)?
+                            .map_err(|_| ConnectionFailure::Credentials)?
+                            .ok_or(ConnectionFailure::Credentials)?;
                     factory.connect_enrolled(credential, child.clone()).await
                 }
                 None => factory.connect(child.clone()).await,
