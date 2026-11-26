@@ -292,12 +292,10 @@ async fn discord_background_rechecks_command_roles_at_native_claim_and_delivery(
             .iter()
             .any(|delivery| delivery["id"] == id && delivery["state"] == "pending")
     );
-    let messages = crate::lock(&fixture.transport.messages);
     assert!(
-        messages
+        crate::lock(&fixture.transport.messages)
             .values()
             .all(|message| message["content"] != "Working")
     );
-    drop(messages);
     gateway.shutdown().await.unwrap();
 }
