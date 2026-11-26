@@ -83,7 +83,7 @@ pub(super) fn rest_failure(error: RestFailure) -> ConnectionFailure {
 }
 
 impl DiscordAdapter {
-    fn remember_channel(&self, channel: Channel) {
+    pub(super) fn remember_channel(&self, channel: Channel) {
         if !channel.is_valid() {
             return;
         }

@@ -20,7 +20,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -35,6 +35,9 @@ mod burst_fixtures;
 
 #[path = "history_fixtures.rs"]
 mod history_fixtures;
+
+#[path = "feedback_fixtures.rs"]
+mod feedback_fixtures;
 
 #[path = "command_fixtures.rs"]
 mod command_fixtures;
@@ -60,6 +63,8 @@ struct Server {
     thread_requester_permissions: Arc<Mutex<Option<u64>>>,
     callback_paths: Arc<Mutex<Vec<String>>>,
     voice_outcome: Arc<AtomicU64>,
+    suppress_progress: Arc<AtomicBool>,
+    feedbacks: Arc<Mutex<Vec<String>>>,
     cdn: Arc<Mutex<BTreeMap<String, Bytes>>>,
 }
 
@@ -151,6 +156,8 @@ impl Fixtures {
             thread_requester_permissions: Arc::default(),
             callback_paths: Arc::default(),
             voice_outcome: Arc::default(),
+            suppress_progress: Arc::default(),
+            feedbacks: Arc::default(),
             cdn: Arc::default(),
         };
         let endpoint = transport.clone();
@@ -356,6 +363,10 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             "session_start_limit":{"total":1000,"remaining":1000,"reset_after":1000,"max_concurrency":1}
         }),
         (Method::GET, ["guilds", "11"]) => json!({"id":"11","owner_id":"99"}),
+        (Method::GET, ["guilds", "11", "threads", "active"]) => json!({
+            "threads":crate::lock(&state.threads).values().cloned().collect::<Vec<_>>(),
+            "members":[]
+        }),
         (Method::GET, ["guilds", "11", "members", "9"]) => {
             json!({"user":{"id":"9","bot":true},"roles":["80"]})
         }
@@ -365,6 +376,14 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         (Method::GET, ["guilds", "11", "roles"]) => {
             let requester = crate::lock(&state.thread_requester_permissions).unwrap_or(8);
             json!([{"id":"11","permissions":requester.to_string()},{"id":"80","permissions":"8"}])
+        }
+        (Method::POST, ["channels", _, "typing"]) => {
+            crate::lock(&state.feedbacks).push(path);
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        (Method::PUT, ["channels", _, "messages", _, "reactions", _, "@me"]) => {
+            crate::lock(&state.feedbacks).push(path);
+            return StatusCode::BAD_GATEWAY.into_response();
         }
         (Method::GET, ["channels", "20"]) => json!({"id":"20","type":1}),
         (Method::GET, ["channels", "21"]) => json!({"id":"21","type":0,"guild_id":"11"}),
@@ -427,6 +446,9 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             }
             let bytes = to_bytes(request.into_body(), 256 * 1024).await.unwrap();
             let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+            if state.suppress_progress.load(Ordering::SeqCst) && payload["content"] == "Working…" {
+                return StatusCode::FORBIDDEN.into_response();
+            }
             let id = state.counter.fetch_add(1, Ordering::SeqCst).to_string();
             let message = json!({"id":id,"channel_id":channel,"author":{"id":"9","bot":true},
                 "nonce":payload["nonce"],"content":payload["content"]});
@@ -909,7 +931,7 @@ async fn discord_fresh_sessions_repair_bounded_history_without_admitting_overlap
         "grants":{"users":["7"]},
         "guilds":{"11":{"channels":{"21":{}}}},
         "commands":{"sync":false},
-        "recovery":{"history_window_secs":120,"max_surfaces":1,"max_messages":10}
+        "recovery":{"history_window_secs":120,"max_surfaces":2,"max_messages":10}
     });
     let gateway = model
         .gateway(
@@ -929,7 +951,14 @@ async fn discord_fresh_sessions_repair_bounded_history_without_admitting_overlap
     wait_reply(&gateway, &format!("discord-message-{original_id}")).await;
     let missing_id = (base + 2).to_string();
     let missing = message(&missing_id, "21", "<@9> recovered", true);
+    let thread_id = (base + 3).to_string();
+    let in_thread = message(&thread_id, "29", "<@9> recovered active thread", true);
     crate::lock(&fixture.transport.history).insert("21".into(), vec![missing, original]);
+    crate::lock(&fixture.transport.history).insert("29".into(), vec![in_thread]);
+    crate::lock(&fixture.transport.threads).extend([
+        ("28".into(), json!({"id":"28","type":12,"guild_id":"11","parent_id":"21"})),
+        ("29".into(), json!({"id":"29","type":11,"guild_id":"11","parent_id":"21"})),
+    ]);
     first.data(json!({"op":9,"d":false})).await;
     let mut replacement = fixture.wire().await;
     replacement.authentication(2).await;
@@ -943,7 +972,11 @@ async fn discord_fresh_sessions_repair_bounded_history_without_admitting_overlap
     assert_eq!(channel, "21");
     assert_eq!(payload["content"], "answer recovered");
     wait_reply(&gateway, &format!("discord-message-{missing_id}")).await;
-    assert_eq!(model.requests().len(), 2);
+    let Write::Message { channel, payload, .. } = fixture.reply().await else { unreachable!() };
+    assert_eq!(channel, "29");
+    assert_eq!(payload["content"], "answer recovered active thread");
+    wait_reply(&gateway, &format!("discord-message-{thread_id}")).await;
+    assert_eq!(model.requests().len(), 3);
     assert_eq!(
         gateway.messaging_status().await.unwrap()["connections"][0]["gap"],
         true

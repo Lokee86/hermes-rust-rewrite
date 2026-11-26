@@ -1,7 +1,9 @@
 mod buckets;
+mod feedback;
 mod render;
 
 pub(in crate::messaging) use buckets::TABLES as DELIVERY_RATE_TABLES;
+pub(in crate::messaging) use feedback::TABLES as FEEDBACK_TABLES;
 pub use render::ReplyMode;
 #[cfg(test)]
 pub(crate) use render::prepare;
@@ -189,6 +191,12 @@ async fn dispatch(
     }
     if sends_voice_note(attempt) {
         return publish_voice_note(client, bot_id, attempt, ingress, channel).await;
+    }
+    if let Some(adapter) = adapter
+        && matches!(attempt.payload.body, DeliveryBody::Progress { .. })
+    {
+        let feedback = &adapter.settings.delivery;
+        feedback::publish(client, channel, feedback.typing, feedback.reactions).await;
     }
     publish(client, bot_id, attempt, ingress, channel).await
 }

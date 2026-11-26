@@ -129,7 +129,7 @@ async fn discord_auto_thread_provisions_once_and_carries_the_durable_coalesced_t
         bot_message("748", "31", "21", "details for discussion", false),
     )
     .await;
-    let Write::Thread { parent, starter } = fixture
+    let Write::Thread { parent, starter, .. } = fixture
         .next_write("thread creation", |write| {
             matches!(write, Write::Thread { .. })
         })

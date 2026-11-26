@@ -36,7 +36,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use voice::Voice;
 
-pub(super) use delivery::DELIVERY_RATE_TABLES;
+pub(super) use delivery::{DELIVERY_RATE_TABLES, FEEDBACK_TABLES};
 pub(super) use manual_thread::TABLES as MANUAL_THREAD_TABLES;
 pub(super) use messages::MESSAGE_TABLES;
 pub(super) use recovery::RECOVERY_TABLES;
@@ -153,16 +153,12 @@ impl DiscordAdapter {
         ingress: &Ingress,
         delivery: &str,
         room: &Room,
-        anchor: Option<&str>,
     ) -> bool {
-        if !self.settings.sends_voice_notes() || !anchor.is_some_and(settings::snowflake) {
-            return false;
-        }
         match self.settings.media.spoken_replies {
             settings::DiscordSpokenReplies::Off => false,
             settings::DiscordSpokenReplies::VoiceNotes =>
                 voice_note::spoken_source(ingress, delivery, room).unwrap_or(false),
-            settings::DiscordSpokenReplies::Always => true,
+            settings::DiscordSpokenReplies::Always => voice_note::channel_reply(ingress, delivery, room).unwrap_or(false),
         }
     }
 }
@@ -243,7 +239,8 @@ impl Adapter for DiscordAdapter {
     ) -> Result<Vec<DeliveryPart>, PreparationFailure> {
         let mut plan = self.prepare(intent)?;
         if matches!(intent.body, DeliveryBody::Reply(_))
-            && self.should_send_voice_note(ingress, &intent.id, &intent.room, intent.reply_anchor.as_deref())
+            && self.voice.playback_key(intent).is_none()
+            && self.should_send_voice_note(ingress, &intent.id, &intent.room)
         {
             delivery::add_voice_note(intent, &mut plan);
         }
@@ -261,8 +258,7 @@ impl Adapter for DiscordAdapter {
                 return self.voice.play(&ingress, &attempt).await;
             }
             if delivery::sends_voice_note(&attempt)
-                && !self.should_send_voice_note(&ingress, &attempt.delivery_id, &attempt.payload.room,
-                    attempt.reply_anchor.as_deref())
+                && !self.should_send_voice_note(&ingress, &attempt.delivery_id, &attempt.payload.room)
             {
                 return DeliveryResult::AttachmentNotPublished;
             }

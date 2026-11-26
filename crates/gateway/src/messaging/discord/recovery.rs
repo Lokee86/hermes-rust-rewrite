@@ -4,14 +4,15 @@ use super::{
         runtime::{db, now},
     },
     DiscordAdapter, Ingress,
-    channels::{read_id, snowflake_timestamp},
+    channels::{Channel, read_id, snowflake_timestamp},
     client::{RestFailure, json_response},
     socket::{MAX_BURST_MESSAGES, TRUSTED_BURST_WINDOW, intake_failure},
 };
 use reqwest::Method;
 use rusqlite::{OptionalExtension, params};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::{collections::BTreeSet, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 pub(in crate::messaging) const RECOVERY_TABLES: &str = "
@@ -20,7 +21,93 @@ CREATE TABLE IF NOT EXISTS messaging_discord_recovery (
 );
 ";
 
+#[derive(Deserialize)]
+struct ActiveThreads {
+    threads: Vec<Channel>,
+    members: Vec<Value>,
+}
+
 impl DiscordAdapter {
+    async fn recovery_surfaces(&self) -> Vec<(String, String)> {
+        let limit = self.settings.recovery.max_surfaces;
+        let mut surfaces = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (guild, settings) in &self.settings.guilds {
+            for (channel, rules) in &settings.channels {
+                for (address, thread) in std::iter::once((channel, None))
+                    .chain(rules.threads.keys().map(|id| (id, Some(id.as_str()))))
+                {
+                    if self.settings.allows_surface(Some(guild), channel, thread)
+                        && seen.insert(address.clone())
+                    {
+                        surfaces.push((address.clone(), guild.clone()));
+                        if surfaces.len() == limit {
+                            return surfaces;
+                        }
+                    }
+                }
+            }
+        }
+        let active = futures_util::future::join_all(
+            self.settings
+                .guilds
+                .iter()
+                .filter(|(guild, settings)| {
+                    settings
+                        .channels
+                        .keys()
+                        .any(|channel| self.settings.allows_surface(Some(guild), channel, None))
+                })
+                .take(limit.min(8))
+                .map(|(guild, _)| async move {
+                    let response = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        self.client
+                            .get::<ActiveThreads>(&["guilds", guild, "threads", "active"]),
+                    )
+                    .await;
+                    (guild, response)
+                }),
+        )
+        .await;
+        for (guild, response) in active {
+            let Ok(Ok(ActiveThreads { threads, members })) = response else {
+                continue;
+            };
+            let joined = members
+                .iter()
+                .filter(|member| read_id(member, "user_id") == Some(self.bot.bot_id.as_str()))
+                .filter_map(|member| read_id(member, "id"))
+                .collect::<BTreeSet<_>>();
+            for mut channel in threads {
+                let Some(parent) = channel.parent_id.as_deref() else {
+                    continue;
+                };
+                if !super::channels::snowflake(&channel.id)
+                    || channel
+                        .guild_id
+                        .as_ref()
+                        .is_some_and(|verified| verified != guild)
+                    || !matches!(channel.kind, 10..=12)
+                    || (channel.kind == 12 && !joined.contains(channel.id.as_str()))
+                    || !self
+                        .settings
+                        .allows_surface(Some(guild), parent, Some(&channel.id))
+                    || !seen.insert(channel.id.clone())
+                {
+                    continue;
+                }
+                channel.guild_id = Some(guild.clone());
+                surfaces.push((channel.id.clone(), guild.clone()));
+                self.remember_channel(channel);
+                if surfaces.len() == limit {
+                    return surfaces;
+                }
+            }
+        }
+        surfaces
+    }
+
     pub(super) fn remember_recovery(&self, ingress: &Ingress) -> Result<(), GatewayError> {
         if self.settings.recovery.history_window_secs == 0 {
             return Ok(());
@@ -56,18 +143,9 @@ impl DiscordAdapter {
         }))
         .map_err(intake_failure)?;
         let Some(cutoff) = cutoff else { return Ok(()) };
-        let mut surfaces = BTreeMap::new();
-        for (guild, settings) in &self.settings.guilds {
-            for (channel, rules) in &settings.channels {
-                surfaces.insert(channel.as_str(), guild.as_str());
-                for thread in rules.threads.keys() {
-                    surfaces.insert(thread.as_str(), guild.as_str());
-                }
-            }
-        }
-        let max_surfaces = self.settings.recovery.max_surfaces;
         let mut remaining = self.settings.recovery.max_messages;
-        for (channel, guild) in surfaces.into_iter().take(max_surfaces) {
+        for (channel, guild) in self.recovery_surfaces().await {
+            let (channel, guild) = (channel.as_str(), guild.as_str());
             if cancel.is_cancelled() {
                 return Err(ConnectionFailure::Stopped);
             }

@@ -44,6 +44,8 @@ impl Route {
             (&Method::GET, ["channels", _]) => "get-channel",
             (&Method::GET, ["channels", _, "messages", _]) => "get-message",
             (&Method::POST, ["channels", _, "messages"]) => "create-message",
+            (&Method::POST, ["channels", _, "typing"]) => "typing",
+            (&Method::PUT, ["channels", _, "messages", _, "reactions", _, "@me"]) => "create-reaction",
             (&Method::PATCH, ["channels", _, "messages", _]) => "edit-message",
             (&Method::DELETE, ["channels", _, "messages", _]) => "delete-message",
             (&Method::POST, ["channels", _, "messages", _, "threads"]) => "create-message-thread",

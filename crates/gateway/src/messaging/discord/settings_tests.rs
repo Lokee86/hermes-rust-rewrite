@@ -117,6 +117,7 @@ struct DiscordFixture {
     wrong_thread: Arc<AtomicBool>,
     deny_send: Arc<AtomicBool>,
     deny_uploads: Arc<AtomicBool>,
+    deny_voice: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
 }
 
@@ -149,6 +150,9 @@ async fn discord_fixture(State(fixture): State<DiscordFixture>, request: Request
             if fixture.deny_uploads.load(Ordering::SeqCst) {
                 deny |= ATTACH_FILES;
             }
+            if fixture.deny_voice.load(Ordering::SeqCst) {
+                deny |= SEND_VOICE_MESSAGES;
+            }
             json!({"id":"21","guild_id":"11","type":0,"permission_overwrites":[
                 {"id":"11","type":0,"deny":ATTACH_FILES.to_string(),"allow":"0"},
                 {"id":"31","type":0,"deny":"0","allow":ATTACH_FILES.to_string()},
@@ -166,7 +170,7 @@ async fn discord_fixture(State(fixture): State<DiscordFixture>, request: Request
         "guilds/11" => json!({"id":"11","owner_id":"80"}),
         "guilds/11/members/9" => json!({"user":{"id":"9","bot":true},"roles":["31"]}),
         "guilds/11/roles" => json!([
-            {"id":"11","permissions":(SEE_CHANNEL | READ_MESSAGE_HISTORY | SEND_IN_THREADS).to_string()},
+            {"id":"11","permissions":(SEE_CHANNEL | READ_MESSAGE_HISTORY | SEND_IN_THREADS | SEND_VOICE_MESSAGES).to_string()},
             {"id":"31","permissions":"0"}
         ]),
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -185,6 +189,7 @@ async fn discord_enrollment_reads_bot_application_and_home_permissions() {
         wrong_thread: Arc::default(),
         deny_send: Arc::default(),
         deny_uploads: Arc::default(),
+        deny_voice: Arc::default(),
         requests: Arc::default(),
     };
     let router = Router::new()
@@ -253,6 +258,14 @@ async fn discord_enrollment_reads_bot_application_and_home_permissions() {
         json!(["attach_files"])
     );
     fixture.deny_uploads.store(false, Ordering::SeqCst);
+
+    fixture.deny_voice.store(true, Ordering::SeqCst);
+    assert!(read().await.is_ok());
+    assert_eq!(
+        factory.verification_status().unwrap()["missing_permissions"],
+        json!(["send_voice_messages"])
+    );
+    fixture.deny_voice.store(false, Ordering::SeqCst);
 
     fixture.wrong_thread.store(true, Ordering::SeqCst);
     assert_eq!(read().await.err(), Some(ConnectionFailure::Configuration));

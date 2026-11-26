@@ -35,6 +35,7 @@ const DIRECT_MESSAGES: u64 = 1 << 12;
 const MESSAGE_CONTENT: u64 = 1 << 15;
 const MEMBERS_FLAGS: u64 = (1 << 14) | (1 << 15);
 const CONTENT_FLAGS: u64 = (1 << 18) | (1 << 19);
+const ADD_REACTIONS: u64 = 1 << 6;
 pub(super) const SEE_CHANNEL: u64 = 1 << 10;
 pub(super) const SEND_MESSAGES: u64 = 1 << 11;
 const ATTACH_FILES: u64 = 1 << 15;
@@ -369,6 +370,8 @@ pub struct DiscordDeliverySettings {
     pub uploads: bool,
     pub max_inline_parts: usize,
     pub forum_posts: bool,
+    pub typing: bool,
+    pub reactions: bool,
 }
 impl Default for DiscordDeliverySettings {
     fn default() -> Self {
@@ -377,6 +380,8 @@ impl Default for DiscordDeliverySettings {
             uploads: true,
             max_inline_parts: 8,
             forum_posts: false,
+            typing: false,
+            reactions: false,
         }
     }
 }
@@ -765,6 +770,9 @@ impl DiscordSettings {
             permissions |= SEE_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY | SEND_IN_THREADS;
             if self.delivery.uploads {
                 permissions |= ATTACH_FILES;
+            }
+            if self.delivery.reactions {
+                permissions |= ADD_REACTIONS;
             }
             if self.sends_voice_notes() {
                 permissions |= SEND_VOICE_MESSAGES;
@@ -1191,6 +1199,9 @@ impl DiscordFactory {
         }
         if self.settings.delivery.uploads && permissions & ATTACH_FILES == 0 {
             status.missing_permissions.push("attach_files");
+        }
+        if self.settings.delivery.reactions && permissions & ADD_REACTIONS == 0 {
+            status.missing_permissions.push("add_reactions");
         }
         if self.settings.sends_voice_notes() && permissions & SEND_VOICE_MESSAGES == 0 {
             status.missing_permissions.push("send_voice_messages");

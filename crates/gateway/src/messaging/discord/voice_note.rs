@@ -41,6 +41,25 @@ pub(in crate::messaging) fn record_source(
     Ok(())
 }
 
+pub(super) fn channel_reply(
+    ingress: &Ingress,
+    delivery: &str,
+    room: &Room,
+) -> Result<bool, GatewayError> {
+    ingress.checked(true, |_| {
+        db(ingress.store.read(|tx| {
+            Ok(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messaging_deliveries d
+                JOIN messaging_effect_sources s ON s.delivery=d.id
+                WHERE d.connection=?1 AND d.id=?2 AND d.sender IS NOT NULL
+                  AND json_extract(d.intent,'$.room')=json(?3))",
+                params![ingress.connection, delivery, serde_json::to_string(room)?],
+                |row| row.get(0),
+            )?)
+        }))
+    })
+}
+
 pub(super) fn spoken_source(
     ingress: &Ingress,
     delivery: &str,

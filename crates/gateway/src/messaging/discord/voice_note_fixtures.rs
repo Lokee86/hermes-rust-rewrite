@@ -103,6 +103,8 @@ impl AudioService for Speech {
 }
 
 fn configuration(fixture: &Fixtures, root: &Path, mode: &str) -> AdapterConfig {
+    // Exercise the voice-first plan without an editable progress message.
+    fixture.transport.suppress_progress.store(true, Ordering::SeqCst);
     fixture.configuration_with(
         root,
         json!({
@@ -193,7 +195,7 @@ async fn spoken_replies_follow_verified_discord_voice_notes_in_default_mode() {
         message("201", "20", "text only", false),
     )
     .await;
-    let Write::Message { payload, .. } = fixture.write().await else {
+    let Write::Message { payload, .. } = fixture.reply().await else {
         panic!("ordinary text should stay text")
     };
     assert_eq!(payload["content"], "answer text only");

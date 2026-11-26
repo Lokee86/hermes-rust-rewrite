@@ -827,7 +827,7 @@ fn outcome_text(outcome: InvocationOutcome) -> String {
             "This conversation has no delivered turns yet.".into()
         }
         InvocationOutcome::History { turns } => turns.into_iter().map(|turn| {
-            format!("You asked: {}\nMercury: {}", turn.prompt, turn.reply)
+            format!("**You**\n{}\n**Mercury**\n{}", turn.prompt, turn.reply)
         }).collect::<Vec<_>>().join("\n\n"),
         InvocationOutcome::HistoryCursor(_) => "The history is unavailable.".into(),
         InvocationOutcome::Applied => "Applied.".into(),

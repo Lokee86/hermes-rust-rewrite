@@ -127,7 +127,7 @@ async fn discord_history_exposes_only_delivered_turns_from_the_requesters_exact_
     };
     assert_eq!(
         presentation["content"],
-        "You asked: mine\nMercury: answer mine"
+        "**You**\nmine\n**Mercury**\nanswer mine"
     );
     assert_eq!(presentation["allowed_mentions"]["parse"], json!([]));
     assert_eq!(model.requests().len(), 3);

@@ -107,6 +107,7 @@ async fn discord_manual_thread_orders_quiet_publication_and_replays_the_private_
                 assert_eq!(payload["enforce_nonce"], true);
                 published = true;
             }
+            Write::VoiceNote { .. } => panic!("manual thread unexpectedly sent a voice note"),
             Write::Followup(payload) => {
                 assert!(acknowledged && published);
                 assert_eq!(

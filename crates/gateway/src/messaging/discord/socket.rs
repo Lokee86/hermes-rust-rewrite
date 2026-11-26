@@ -434,7 +434,7 @@ async fn dispatches(
         let ready = matches!(frame.kind.as_str(), "READY" | "RESUMED");
         let mut last_sequence = frame.sequence;
         let mut continuations = Vec::new();
-        if !first_ready
+        if cursor.is_some()
             && frame.kind == "MESSAGE_CREATE"
             && let Some(mut burst) = adapter.trusted_burst(&frame.data)
         {
