@@ -143,8 +143,9 @@ fn wakes_agent(output: &str) -> bool {
         .is_none_or(|gate| gate["wakeAgent"] != false)
 }
 
+/// The collected data comes from scripts and web pages, so its @-references read no files or links.
 fn block(heading: &str, intro: &str, body: &str, prompt: &str) -> String {
-    let body = &body[..body.floor_char_boundary(body.len().min(MAX_OUTPUT))];
+    let body = references::inert(&body[..body.floor_char_boundary(body.len().min(MAX_OUTPUT))]);
     format!("## {heading}\n{intro}\n\n```\n{body}\n```\n\n{prompt}")
 }
 
@@ -304,6 +305,14 @@ mod tests {
         for text in ["", "data", "{\"wakeAgent\": true}", "{\"wakeAgent\": false}\nmore"] {
             assert!(wakes_agent(text), "{text}");
         }
+    }
+
+    #[test]
+    fn collected_data_cannot_read_files_but_the_routine_prompt_can() {
+        let prompt = block("Script Output", "Data.", "page says @file:/etc/hosts and @diff", "Summarize @file:NOTES.md");
+        let raw: Vec<_> = references::parse(&prompt).into_iter().map(|reference| reference.raw).collect();
+        assert_eq!(raw, ["@file:NOTES.md"]);
+        assert!(prompt.contains("/etc/hosts"));
     }
 
     #[test]

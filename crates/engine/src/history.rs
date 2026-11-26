@@ -281,6 +281,7 @@ struct NativeRecord {
 /// admitted prompt.
 pub struct Store {
     id: String,
+    dir: PathBuf,
     saved: std::sync::Mutex<Saved>,
     _lock: File,
 }
@@ -334,7 +335,7 @@ impl Store {
                 }
             }
         }
-        let store = Self { id, saved: Saved { db, record }.into(), _lock: lock };
+        let store = Self { id, dir: dir.to_owned(), saved: Saved { db, record }.into(), _lock: lock };
         if recovered { store.save(&history)?; }
         Ok((store, history))
     }
@@ -364,7 +365,19 @@ impl Store {
         let change = db::writing(db)?;
         write_changes(&change, &self.id, record.as_ref(), &next)?;
         change.commit().context("Could not save the conversation")?;
+        let rewound = record.as_ref().is_some_and(|record| next.history.turns.len() < record.history.turns.len());
         *record = Some(next);
+        if rewound {
+            // The file the chat moved from still holds the turns just removed.
+            for kept in [LEGACY, LEGACY_CHECKPOINT] {
+                match fs::remove_file(self.dir.join(format!("{kept}.{}", db::MIGRATED))) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error).context("Could not remove the chat's earlier file");
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -476,6 +489,29 @@ mod storage_tests {
         legacy(&dir, &History::default(), None, 1);
         assert_eq!(Store::open(&dir).unwrap().1, history);
         assert_eq!(read_conversation(&dir).unwrap().1, Some(authority));
+    }
+
+    #[test]
+    fn rewinding_a_moved_chat_removes_its_earlier_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions/chat");
+        let mut history = History::default();
+        history.turns = vec![Turn { status: Status::Complete, ..running("first") }, Turn { status: Status::Complete, ..running("secret second") }];
+        legacy(&dir, &history, None, 1);
+        fs::write(dir.join(LEGACY_CHECKPOINT), b"{}").unwrap();
+        let kept = dir.join(format!("{LEGACY}.{}", db::MIGRATED));
+        let checkpoint = dir.join(format!("{LEGACY_CHECKPOINT}.{}", db::MIGRATED));
+        let (store, mut opened) = Store::open(&dir).unwrap();
+        assert!(kept.exists() && checkpoint.exists(), "the file is kept after the move");
+        opened.turns.push(Turn { status: Status::Complete, ..running("third") });
+        store.save(&opened).unwrap();
+        assert!(kept.exists(), "a new reply does not remove it");
+        opened.rewind(1);
+        store.save(&opened).unwrap();
+        assert!(!kept.exists() && !checkpoint.exists(), "the removed turns are not kept in the earlier file");
+        assert_eq!(read_history(&dir).unwrap(), opened);
+        opened.rewind(0);
+        store.save(&opened).unwrap();
     }
 
     /// A process that dies while saving leaves the last whole save.

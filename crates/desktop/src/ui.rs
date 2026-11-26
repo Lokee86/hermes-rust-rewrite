@@ -751,7 +751,7 @@ impl Hermes {
                 .style(move |theme, status| { let mut s = send_button(theme, status); if on { s.background = Some(shell_art::accent().fill().into()); } s });
             controls = controls.push(tooltip(voice, text(if on { "End voice conversation" } else { "Start voice conversation" }).size(11), tooltip::Position::Top));
         } else {
-            controls = controls.push(tooltip(action, text(if show_stop { "Stop" } else if self.running && self.group_round.is_some() { "Redirect the current run" } else if self.running { "Queue message" } else { "Send" }).size(11), tooltip::Position::Top));
+            controls = controls.push(tooltip(action, text(if show_stop { "Stop" } else if self.running { "Queue message" } else { "Send" }).size(11), tooltip::Position::Top));
         }
         let surface = container(row![
             icon_button("add", "Attach", Message::ToggleAttach, p), editor, controls,
@@ -768,7 +768,6 @@ impl Hermes {
             dock=dock.push(row![icon("mic",12,p.accent),text(label).size(12).color(p.muted),Space::new().width(Fill),button(text("Cancel").size(11)).on_press(Message::Voice(voice::Action::CancelRecord)).padding([3,6]).style(quiet_button)].spacing(6).align_y(Alignment::Center));
         }
         if let Some(error)=&self.voice.error {dock=dock.push(text(error).size(11).color(p.muted));}
-        if !self.queue.entries.is_empty() { dock = dock.push(self.queue_view()); }
         if let Some(current) = &self.current {
             for entry in &self.chat.pending_queue {
                 let mut item = row![text(format!("{} · {}", entry.status, short(&entry.text, 100))).size(12).color(p.muted), Space::new().width(Fill)].spacing(6);
@@ -792,28 +791,6 @@ impl Hermes {
         if let Some(popup) = slash::popup(self) { dock = dock.push(popup); }
         dock = dock.push(surface);
         container(dock).padding(Padding { top: 8.0, right: 16.0, bottom: 10.0, left: 16.0 }).width(Fill).into()
-    }
-
-    fn queue_view(&self) -> Element<'_, Message> {
-        let p = palette(self.dark);
-        let mut header = row![icon("layers", 12, p.muted), text(format!("{} Queued{}", self.queue.entries.len(), if self.queue.parked { " — paused" } else { "" })).size(11).color(p.muted), Space::new().width(Fill)].spacing(6).align_y(Alignment::Center);
-        if self.queue.parked { header = header.push(button(text("Resume").size(11)).on_press(Message::QueueResume).padding([3, 7]).style(quiet_button)); }
-        else { header = header.push(icon_button("debug-pause", "Pause queue", Message::QueuePause, p)); }
-        let mut entries = column![].spacing(3);
-        for entry in &self.queue.entries {
-            if let Some((id, value)) = &self.queue_edit && *id == entry.id {
-                entries = entries.push(column![text_input("Queued message", value).on_input(Message::QueueEditChanged).on_submit(Message::QueueEditSave).size(12).padding(6).style(field_input),
-                    row![Space::new().width(Fill), button(text("Cancel").size(11)).on_press(Message::QueueEditCancel).padding([3, 7]).style(quiet_button),
-                        button(text("Save").size(11)).on_press(Message::QueueEditSave).padding([3, 7]).style(quiet_button)].spacing(5)].spacing(4));
-            } else {
-                entries = entries.push(row![text(short(&entry.text.replace('\n', " "), 150)).size(12).color(p.muted).width(Fill),
-                    icon_button("edit", "Edit", Message::QueueEdit(entry.id), p),
-                    button(text(if self.running { "Next" } else { "Send" }).size(11)).on_press(Message::QueueSendNow(entry.id)).padding([3, 6]).style(quiet_button),
-                    icon_button("close", "Delete", Message::QueueRemove(entry.id), p)].spacing(4).align_y(Alignment::Center));
-            }
-        }
-        let height = ((self.queue.entries.len() as f32 * 31.0) + if self.queue_edit.is_some() { 35.0 } else { 0.0 }).min(180.0);
-        container(column![header, scrollable(entries).height(height)].spacing(4)).padding([6, 10]).width(Fill).style(move |_| panel(p.background, 7.0, Some(p.border))).into()
     }
 
     fn capabilities(&self) -> Element<'_, Message> {

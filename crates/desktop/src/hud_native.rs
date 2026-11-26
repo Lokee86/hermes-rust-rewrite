@@ -140,7 +140,6 @@ pub(super) fn synthesize(window: &dyn window::Window, x: f64, y: f64, text: &str
     use objc2::{msg_send, runtime::{AnyClass, AnyObject}};
     #[repr(C)] #[derive(Clone, Copy)] struct P { x: f64, y: f64 }
     unsafe impl objc2::Encode for P { const ENCODING: objc2::Encoding = objc2::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]); }
-    use objc2::Encode;
     let Some(RawWindowHandle::AppKit(h)) = raw(window) else { return };
     unsafe {
         let view = h.ns_view.as_ptr() as *mut AnyObject;
