@@ -366,7 +366,13 @@ impl Ingress {
         let scope = self.clone();
         let changed = blocking(move || {
             scope.checked(true, |_| {
-                db(scope.store.reconcile(&scope.connection, scope.installation(), &delivery, evidence, now()))
+                db(scope.store.reconcile(
+                    &scope.connection,
+                    scope.installation(),
+                    &delivery,
+                    evidence,
+                    scope.capabilities().effects.durable_presentation,
+                ))
             })
         })
         .await?;
@@ -1389,7 +1395,7 @@ async fn deliver(
                         &attempt.delivery_id,
                         (attempt.part, attempt.attempt),
                         result,
-                        now(),
+                        stored.capabilities().effects.durable_presentation,
                     ))
                 })
             })

@@ -1097,6 +1097,191 @@ async fn verified_publication_precedes_stream_revisions_and_finalization() {
     reopened.shutdown().await.unwrap();
 }
 
+fn marker_retirement_plan(intent: &DeliveryIntent) -> Vec<DeliveryPart> {
+    let effect = match &intent.body {
+        DeliveryBody::Retire { marker } => Effect {
+            operation: EffectOperation::Retire {
+                marker: marker.clone(),
+            },
+            ..Effect::default()
+        },
+        _ => Effect::default(),
+    };
+    vec![part(intent, effect)]
+}
+
+#[tokio::test]
+async fn confirmed_prompt_retires_only_after_its_native_decision() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "confirmed-prompt-cleanup", true);
+    let mut access = policy();
+    access.direct_tools = true;
+    access.scope.direct.turn.approval = Some(crate::messaging::ApprovalPolicy::Manual);
+    let config = stock(
+        &driver,
+        access,
+        EffectCapabilities {
+            durable_presentation: true,
+            ..EffectCapabilities::default()
+        },
+        marker_retirement_plan,
+    );
+    let gateway = model.gateway(root.path(), vec![config]).await;
+    let ingress = driver.ready().await;
+    driver.push(dm("prompt", "scope", "approval")).await;
+    let prompt = driver.sent().await;
+    let marker = MarkerRef {
+        delivery: prompt_id(&prompt.attempt).to_owned(),
+        part: 0,
+    };
+    prompt.finish(DeliveryResult::Confirmed {
+        receipt: "prompt-message".into(),
+        editable_message: Some("exact-prompt".into()),
+    });
+    phase(&gateway, &marker.delivery, 0, "sent").await;
+    assert!(!ingress.retire_marker(marker.clone()).await.unwrap());
+    driver
+        .push(control(
+            "decision",
+            "scope",
+            Control::Respond {
+                action_id: marker.delivery,
+                response: Response::Deny,
+            },
+        ))
+        .await;
+    applied(&gateway, "decision", "applied").await;
+    let cleanup = driver.sent().await;
+    assert_eq!(
+        cleanup.attempt.effect.marker.as_ref().unwrap().id,
+        "exact-prompt"
+    );
+    let cleanup_id = cleanup.attempt.delivery_id.clone();
+    cleanup.finish(confirmed("cleanup"));
+    phase(&gateway, &cleanup_id, 0, "sent").await;
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn committed_prompt_retires_once_after_late_confirmation_and_restart() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "prompt-cleanup", true);
+    let config = |access| {
+        stock(
+            &driver,
+            access,
+            EffectCapabilities {
+                durable_presentation: true,
+                ..EffectCapabilities::default()
+            },
+            marker_retirement_plan,
+        )
+    };
+    let mut access = policy();
+    access.direct_tools = true;
+    access.scope.direct.turn.approval = Some(crate::messaging::ApprovalPolicy::Manual);
+    let gateway = model.gateway(root.path(), vec![config(access)]).await;
+    let ingress = driver.ready().await;
+    driver
+        .push(dm("prompt-input", "approval-room", "approval"))
+        .await;
+    let prompt = driver.sent().await;
+    let marker = MarkerRef {
+        delivery: prompt_id(&prompt.attempt).to_owned(),
+        part: 0,
+    };
+    assert_eq!(prompt.attempt.delivery_id, marker.delivery);
+    let original_room = prompt.attempt.payload.room.clone();
+    prompt.finish(DeliveryResult::Uncertain);
+    phase(&gateway, &marker.delivery, 0, "uncertain").await;
+    let platform_prompt = ingress.uncertain_deliveries().await.unwrap().pop().unwrap();
+    let decision = control(
+        "approval-answer",
+        "approval-room",
+        Control::Respond {
+            action_id: marker.delivery.clone(),
+            response: Response::Approve,
+        },
+    );
+    driver.push(decision.clone()).await;
+    applied(&gateway, "approval-answer", "applied").await;
+    assert!(driver.push(decision.clone()).await.repeated);
+    status(&gateway, |state| {
+        input(state, "prompt-input").is_some_and(|row| row["state"] == "done")
+    })
+    .await;
+    let native_calls = model.requests().len();
+    gateway.shutdown().await.unwrap();
+
+    let reopened = model
+        .gateway(root.path(), vec![config(AccessPolicy::default())])
+        .await;
+    let ingress = driver.ready().await;
+    assert!(driver.push(decision.clone()).await.repeated);
+    assert!(
+        ingress
+            .reconcile_delivery(
+                platform_prompt,
+                DeliveryResult::Confirmed {
+                    receipt: "approval-card".into(),
+                    editable_message: Some("exact-approval-card".into())
+                },
+            )
+            .await
+            .unwrap()
+    );
+    let cleanup = driver.sent().await;
+    assert_eq!(cleanup.attempt.payload.room, original_room);
+    assert_eq!(
+        cleanup.attempt.payload.body,
+        DeliveryBody::Retire {
+            marker: marker.clone()
+        }
+    );
+    assert_eq!(
+        cleanup.attempt.payload.effect.visibility,
+        EffectVisibility::default()
+    );
+    assert_eq!(
+        cleanup.attempt.effect.marker.as_ref().unwrap().id,
+        "exact-approval-card"
+    );
+    let cleanup_id = cleanup.attempt.delivery_id.clone();
+    cleanup.finish(DeliveryResult::Uncertain);
+    phase(&reopened, &cleanup_id, 0, "uncertain").await;
+    let platform_cleanup = ingress.uncertain_deliveries().await.unwrap().pop().unwrap();
+    assert_eq!(platform_cleanup.delivery_id, cleanup_id);
+    reopened.shutdown().await.unwrap();
+
+    let restored = model
+        .gateway(root.path(), vec![config(AccessPolicy::default())])
+        .await;
+    let ingress = driver.ready().await;
+    assert!(driver.push(decision).await.repeated);
+    assert!(
+        timeout(Duration::from_millis(250), driver.sent.recv())
+            .await
+            .is_err()
+    );
+    assert!(
+        ingress
+            .reconcile_delivery(platform_cleanup, confirmed("removed-approval-card"))
+            .await
+            .unwrap()
+    );
+    phase(&restored, &cleanup_id, 0, "sent").await;
+    assert!(!ingress.retire_marker(marker).await.unwrap());
+    assert!(
+        timeout(Duration::from_millis(250), driver.sent.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(model.requests().len(), native_calls);
+    restored.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn revoked_actor_can_only_leave_a_scoped_marker_retirement() {
     let root = TempDir::new().unwrap();
@@ -1111,18 +1296,7 @@ async fn revoked_actor_can_only_leave_a_scoped_marker_retirement() {
             durable_presentation: true,
             ..EffectCapabilities::default()
         },
-        |intent| {
-            let effect = match &intent.body {
-                DeliveryBody::Retire { marker } => Effect {
-                    operation: EffectOperation::Retire {
-                        marker: marker.clone(),
-                    },
-                    ..Effect::default()
-                },
-                _ => Effect::default(),
-            };
-            vec![part(intent, effect)]
-        },
+        marker_retirement_plan,
     );
     let gateway = model.gateway(root.path(), vec![config]).await;
     let ingress = driver.ready().await;

@@ -274,38 +274,7 @@ impl Store {
     }
 
     pub fn retire_marker(&self, connection: &str, marker: &MarkerRef) -> Result<bool> {
-        self.write(|tx| {
-            let row: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT d.route,d.intent FROM messaging_effect_markers m
-                 JOIN messaging_deliveries d ON d.id=m.delivery
-                 WHERE d.connection=?1 AND m.delivery=?2 AND m.ordinal=?3 AND m.retired=0",
-                    params![connection, marker.delivery, marker.part],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((route_id, original)) = row else {
-                return Ok(false);
-            };
-            let Some(route) = read_route(tx, &route_id)? else {
-                return Ok(false);
-            };
-            let original = json::<DeliveryIntent>(original)?;
-            let repair = DeliveryIntent {
-                id: key(
-                    "marker-retire",
-                    &(connection, &route_id, &marker.delivery, marker.part),
-                )?,
-                room: route.room.clone(),
-                reply_anchor: original.reply_anchor,
-                edit_target: None,
-                body: DeliveryBody::Retire {
-                    marker: marker.clone(),
-                },
-            };
-            enqueue(tx, &route, None, &repair)?;
-            Ok(true)
-        })
+        self.write(|tx| enqueue_retirement(tx, connection, marker))
     }
 
     pub fn observe_delivery(
@@ -355,6 +324,68 @@ fn load_grant(tx: &Connection, connection: &str, id: &str) -> Result<Option<Repl
     .optional()?
     .map(json)
     .transpose()
+}
+
+fn enqueue_retirement(
+    tx: &Transaction<'_>,
+    connection: &str,
+    marker: &MarkerRef,
+) -> Result<bool> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT d.route,d.intent FROM messaging_effect_markers m
+             JOIN messaging_deliveries d ON d.id=m.delivery
+             WHERE d.connection=?1 AND m.delivery=?2 AND m.ordinal=?3 AND m.retired=0",
+            params![connection, marker.delivery, marker.part],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((route_id, original)) = row else {
+        return Ok(false);
+    };
+    let Some(route) = read_route(tx, &route_id)? else {
+        return Ok(false);
+    };
+    let original = json::<DeliveryIntent>(original)?;
+    if let DeliveryBody::Prompt { action_id, .. } = &original.body {
+        let decided: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messaging_actions WHERE id=?1 AND connection=?2 AND route=?3 AND resolved IS NOT NULL)",
+            params![action_id, connection, route_id],
+            |row| row.get(0),
+        )?;
+        if !decided {
+            return Ok(false);
+        }
+    }
+    let repair = DeliveryIntent {
+        id: key(
+            "marker-retire",
+            &(connection, &route_id, &marker.delivery, marker.part),
+        )?,
+        room: route.room.clone(),
+        reply_anchor: original.reply_anchor,
+        edit_target: None,
+        body: DeliveryBody::Retire {
+            marker: marker.clone(),
+        },
+    };
+    enqueue(tx, &route, None, &repair)?;
+    Ok(true)
+}
+
+pub(super) fn retire_decided_prompt(
+    tx: &Transaction<'_>,
+    connection: &str,
+    delivery: &str,
+) -> Result<()> {
+    // A prompt has one part. The same intent is queued whichever of the
+    // durable decision and the provider's marker confirmation arrives last.
+    let marker = MarkerRef {
+        delivery: delivery.to_owned(),
+        part: 0,
+    };
+    enqueue_retirement(tx, connection, &marker)?;
+    Ok(())
 }
 
 pub(super) fn marker_receipt(
@@ -1441,8 +1472,9 @@ pub(super) fn record(
     id: &str,
     (ordinal, attempt): (u32, u32),
     result: DeliveryResult,
-    now: i64,
+    prompt_cleanup: bool,
 ) -> Result<bool> {
+    let now = crate::messaging::runtime::now();
     let row: Option<(String,String,Option<bool>,Option<bool>,Option<bool>)> = tx.query_row(
         "SELECT p.body,d.intent,a.submitted,a.subsets,a.retransmission FROM messaging_parts p
          JOIN messaging_deliveries d ON d.id=p.delivery
@@ -1480,7 +1512,8 @@ pub(super) fn record(
             remember_receipt(tx, id, ordinal, &persisted)?;
             classified.receipt = Some(receipt);
             classified.editable = editable_message.filter(|id| valid_id(id));
-            if matches!(part.body, DeliveryBody::Progress { .. })
+            if (matches!(part.body, DeliveryBody::Progress { .. })
+                || prompt_cleanup && matches!(part.body, DeliveryBody::Prompt { .. }))
                 && let Some(marker) = &classified.editable
             {
                 remember_marker(
@@ -1629,5 +1662,8 @@ pub(super) fn record(
     }
     apply_pending(tx, connection, &dest, id, ordinal, now)?;
     super::finish_delivery(tx, id)?;
+    if prompt_cleanup && stage.stage == "sent" && matches!(intent.body, DeliveryBody::Prompt { .. }) {
+        retire_decided_prompt(tx, connection, id)?;
+    }
     Ok(true)
 }

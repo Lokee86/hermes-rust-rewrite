@@ -556,8 +556,16 @@ async fn apply_control(
                 &action.request,
                 action.generation,
                 response,
-                || scope.store.settle_action(&work.route, &work.event.id, &action, response, &policy)
-                    .map_err(crate::RpcError::internal),
+                || {
+                    scope.store.settle_action(
+                        &work.route,
+                        &work.event.id,
+                        &action,
+                        response,
+                        &policy,
+                        scope.capabilities().effects.durable_presentation,
+                    ).map_err(crate::RpcError::internal)
+                },
             ))?;
             return if result == "applied" { Ok(()) } else { finish_control(scope, work, result) };
         }

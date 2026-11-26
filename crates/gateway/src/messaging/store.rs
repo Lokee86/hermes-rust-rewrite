@@ -550,6 +550,7 @@ impl Store {
         action: &Action,
         response: &Response,
         policy: &str,
+        prompt_cleanup: bool,
     ) -> Result<()> {
         self.write(|tx| {
             ensure!(tx.execute(
@@ -558,6 +559,9 @@ impl Store {
             )? == 1, "Messaging prompt was already decided");
             super::approvals::record(tx, route, action, response, policy)?;
             super::commands::record_invocation(tx, route, event, &action.recipient, super::InvocationOutcome::Applied)?;
+            if prompt_cleanup {
+                effect_store::retire_decided_prompt(tx, &route.connection, &action.id)?;
+            }
             set_input(tx, route, event, "done", Some("applied"))
         })
     }
@@ -675,9 +679,11 @@ impl Store {
         id: &str,
         attempt: (u32, u32),
         result: DeliveryResult,
-        now: i64,
+        prompt_cleanup: bool,
     ) -> Result<bool> {
-        self.write(|tx| effect_store::record(tx,connection,generation,id,attempt,result,now))
+        self.write(|tx| {
+            effect_store::record(tx, connection, generation, id, attempt, result, prompt_cleanup)
+        })
     }
 
 
@@ -687,7 +693,7 @@ impl Store {
         installation: Option<&super::VerifiedInstallation>,
         delivery: &UncertainDelivery,
         result: DeliveryResult,
-        now: i64,
+        prompt_cleanup: bool,
     ) -> Result<bool> {
         self.write(|tx| {
             let part: Option<DeliveryPart> = tx.query_row(
@@ -705,7 +711,15 @@ impl Store {
             {
                 return Ok(false);
             }
-            effect_store::record(tx,connection,None,&delivery.delivery_id,(delivery.part,delivery.attempt),result,now)
+            effect_store::record(
+                tx,
+                connection,
+                None,
+                &delivery.delivery_id,
+                (delivery.part, delivery.attempt),
+                result,
+                prompt_cleanup,
+            )
         })
     }
 
