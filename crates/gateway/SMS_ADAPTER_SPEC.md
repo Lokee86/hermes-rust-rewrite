@@ -1,6 +1,6 @@
 # Twilio SMS stock plugin implementation spec
 
-Register Twilio SMS as a bundled Rust adapter with platform key `sms`. Start after Email and the shared gate. A headless profile receives signed inbound SMS on a verified Twilio number, admits authorized plain-text interactions, and sends replies and scheduled results under the same provider account and recipient policy. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Email spec](EMAIL_ADAPTER_SPEC.md) · [Hermes SMS guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/sms.md)
+Register Twilio SMS as a bundled Rust adapter with platform key `sms`. Start after Email and the shared gate. A headless profile receives signed inbound SMS on a verified Twilio number, admits authorized plain-text interactions, and sends replies and scheduled results under the same provider account and recipient policy. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Email spec](EMAIL_ADAPTER_SPEC.md) · [Hermes SMS guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/sms.md) · [Next adapter, ntfy](NTFY_ADAPTER_SPEC.md)
 
 ## Registration and signed callbacks
 
