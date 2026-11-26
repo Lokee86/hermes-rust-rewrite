@@ -1,6 +1,6 @@
 # Buzz stock plugin implementation spec
 
-Register Buzz as a bundled Rust adapter with platform key `buzz`. Start after IRC and the shared gate. A headless profile can work as a community member in verified Buzz DMs, channels and forum threads, receive through the relay or CLI polling, and send scoped replies, files and notices through the Buzz CLI. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [IRC spec](IRC_ADAPTER_SPEC.md) · [Hermes Buzz guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/buzz.md) · [Buzz relay protocol](https://github.com/block/buzz/blob/main/NOSTR.md)
+Register Buzz as a bundled Rust adapter with platform key `buzz`. Start after IRC and the shared gate. A headless profile can work as a community member in verified Buzz DMs, channels and forum threads, receive through the relay or CLI polling, and send scoped replies, files and notices through the Buzz CLI. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [IRC spec](IRC_ADAPTER_SPEC.md) · [Hermes Buzz guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/buzz.md) · [Buzz relay protocol](https://github.com/block/buzz/blob/main/NOSTR.md) · [Next adapter, BlueBubbles](BLUEBUBBLES_ADAPTER_SPEC.md)
 
 ## Registration and verified transports
 
