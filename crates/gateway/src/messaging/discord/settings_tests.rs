@@ -98,6 +98,7 @@ fn discord_grants_keep_the_verified_guild_and_exact_thread() {
         DiscordSettings::default().gateway_intents(),
         DIRECT_MESSAGES
     );
+    assert_eq!(DiscordSettings::default().invite_permissions(), 0);
     assert_eq!(
         settings.gateway_intents(),
         DIRECT_MESSAGES
@@ -115,6 +116,7 @@ struct DiscordFixture {
     app_flags: Arc<AtomicU64>,
     wrong_thread: Arc<AtomicBool>,
     deny_send: Arc<AtomicBool>,
+    deny_uploads: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
 }
 
@@ -140,11 +142,13 @@ async fn discord_fixture(State(fixture): State<DiscordFixture>, request: Request
             "session_start_limit":{"total":1000,"remaining":0,"reset_after":1000,"max_concurrency":1}
         }),
         "channels/21" => {
-            let deny = if fixture.deny_send.load(Ordering::SeqCst) {
-                SEND_IN_THREADS
-            } else {
-                0
-            };
+            let mut deny = 0;
+            if fixture.deny_send.load(Ordering::SeqCst) {
+                deny |= SEND_IN_THREADS;
+            }
+            if fixture.deny_uploads.load(Ordering::SeqCst) {
+                deny |= ATTACH_FILES;
+            }
             json!({"id":"21","guild_id":"11","type":0,"permission_overwrites":[
                 {"id":"11","type":0,"deny":ATTACH_FILES.to_string(),"allow":"0"},
                 {"id":"31","type":0,"deny":"0","allow":ATTACH_FILES.to_string()},
@@ -180,6 +184,7 @@ async fn discord_enrollment_reads_bot_application_and_home_permissions() {
         app_flags: Arc::new(AtomicU64::new(0)),
         wrong_thread: Arc::default(),
         deny_send: Arc::default(),
+        deny_uploads: Arc::default(),
         requests: Arc::default(),
     };
     let router = Router::new()
@@ -231,6 +236,8 @@ async fn discord_enrollment_reads_bot_application_and_home_permissions() {
     let status = factory.verification_status().unwrap();
     assert_eq!(status["rest_verified"], true);
     assert_eq!(status["home_verified"], true);
+    assert_eq!(status["session_starts_remaining"], 0);
+    assert_eq!(status["session_start_reset_ms"], 1000);
     assert!(status["invite"].as_str().unwrap().contains("client_id=90"));
     assert!(!status.to_string().contains("fixture-bot-secret"));
     assert!(
@@ -238,6 +245,14 @@ async fn discord_enrollment_reads_bot_application_and_home_permissions() {
             .iter()
             .any(|route| route == "gateway/bot")
     );
+
+    fixture.deny_uploads.store(true, Ordering::SeqCst);
+    assert!(read().await.is_ok());
+    assert_eq!(
+        factory.verification_status().unwrap()["missing_permissions"],
+        json!(["attach_files"])
+    );
+    fixture.deny_uploads.store(false, Ordering::SeqCst);
 
     fixture.wrong_thread.store(true, Ordering::SeqCst);
     assert_eq!(read().await.err(), Some(ConnectionFailure::Configuration));

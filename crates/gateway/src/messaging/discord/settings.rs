@@ -691,12 +691,15 @@ impl DiscordSettings {
     }
 
     fn invite_permissions(&self) -> u64 {
-        let mut permissions = SEE_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY | SEND_IN_THREADS;
-        if self.delivery.uploads {
-            permissions |= ATTACH_FILES;
-        }
-        if self.auto_thread || self.delivery.forum_posts {
-            permissions |= CREATE_PUBLIC_THREADS;
+        let mut permissions = 0;
+        if self.gateway_intents() & GUILD_MESSAGES != 0 {
+            permissions |= SEE_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY | SEND_IN_THREADS;
+            if self.delivery.uploads {
+                permissions |= ATTACH_FILES;
+            }
+            if self.auto_thread || self.delivery.forum_posts {
+                permissions |= CREATE_PUBLIC_THREADS;
+            }
         }
         if self.voice_enabled {
             permissions |= CONNECT_AND_SPEAK;
@@ -875,8 +878,21 @@ struct VerificationStatus {
     invite: Option<String>,
     required_permissions: u64,
     missing_permissions: Vec<&'static str>,
+    recommended_shards: Option<u32>,
+    session_starts_remaining: Option<u32>,
+    session_start_reset_ms: Option<u64>,
     home_verified: Option<bool>,
     issue: Option<&'static str>,
+}
+
+impl VerificationStatus {
+    fn configured(settings: &DiscordSettings) -> Self {
+        Self {
+            required_intents: settings.gateway_intents(),
+            required_permissions: settings.invite_permissions(),
+            ..Self::default()
+        }
+    }
 }
 
 pub(crate) struct DiscordFactory {
@@ -890,11 +906,7 @@ pub(crate) struct DiscordFactory {
 impl DiscordFactory {
     pub(crate) fn new(root: PathBuf, settings: DiscordSettings) -> Result<Self> {
         settings.validate()?;
-        let status = VerificationStatus {
-            required_intents: settings.gateway_intents(),
-            required_permissions: settings.invite_permissions(),
-            ..VerificationStatus::default()
-        };
+        let status = VerificationStatus::configured(&settings);
         Ok(Self {
             settings,
             root,
@@ -928,14 +940,12 @@ impl DiscordFactory {
         credential: EnrollmentCredential,
         cancel: CancellationToken,
     ) -> Result<VerifiedAdapter, ConnectionFailure> {
-        let client = self
-            .client(credential)
-            .map_err(|_| ConnectionFailure::Credentials)?;
-        let mut status = VerificationStatus {
-            required_intents: self.settings.gateway_intents(),
-            required_permissions: self.settings.invite_permissions(),
-            ..VerificationStatus::default()
-        };
+        let mut status = VerificationStatus::configured(&self.settings);
+        let client = self.client(credential).map_err(|_| {
+            status.issue = Some("bot_credential_invalid");
+            *lock(&self.status) = status.clone();
+            ConnectionFailure::Credentials
+        })?;
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ConnectionFailure::Stopped),
@@ -1013,6 +1023,9 @@ impl DiscordFactory {
             return Err(ConnectionFailure::Configuration);
         }
         status.rest_verified = true;
+        status.recommended_shards = Some(gateway.shards);
+        status.session_starts_remaining = Some(limit.remaining);
+        status.session_start_reset_ms = Some(limit.reset_after);
         if let Some(target) = &self.settings.default_delivery_target {
             self.verify_home(client, target, &bot.id, status).await?;
         }
@@ -1086,23 +1099,27 @@ impl DiscordFactory {
             status.issue = Some("default_destination_permissions_unverified");
             ConnectionFailure::Configuration
         })?;
-        let mut needed = vec![
-            (SEE_CHANNEL, "view_channel"),
-            (READ_MESSAGE_HISTORY, "read_message_history"),
-        ];
-        if target.thread.is_some() {
-            needed.push((SEND_IN_THREADS, "send_messages_in_threads"));
+        let send = if target.thread.is_some() {
+            (SEND_IN_THREADS, "send_messages_in_threads")
         } else {
-            needed.push((SEND_MESSAGES, "send_messages"));
-        }
-        if self.settings.delivery.uploads {
-            needed.push((ATTACH_FILES, "attach_files"));
-        }
-        status.missing_permissions = needed
+            (SEND_MESSAGES, "send_messages")
+        };
+        let required = [(SEE_CHANNEL, "view_channel"), send];
+        status.missing_permissions = required
             .into_iter()
             .filter_map(|(flag, name)| (permissions & flag == 0).then_some(name))
             .collect();
-        if !status.missing_permissions.is_empty() {
+        let can_deliver = status.missing_permissions.is_empty();
+        let wants_history = self.settings.delivery.reply_mode != ReplyMode::Off
+            || self.settings.recovery.history_window_secs > 0
+            || self.settings.recovery.context_messages > 0;
+        if wants_history && permissions & READ_MESSAGE_HISTORY == 0 {
+            status.missing_permissions.push("read_message_history");
+        }
+        if self.settings.delivery.uploads && permissions & ATTACH_FILES == 0 {
+            status.missing_permissions.push("attach_files");
+        }
+        if !can_deliver {
             status.issue = Some("default_destination_permissions_missing");
             return Err(ConnectionFailure::Configuration);
         }

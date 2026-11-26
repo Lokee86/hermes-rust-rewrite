@@ -524,6 +524,8 @@ async fn verified_aliases_route_together_and_membership_changes_fence_access() {
     let one = principal(&first.sender_id().unwrap());
     let two = principal(&second.sender_id().unwrap());
     let mut actor = person("canonical", room.clone());
+    let alternate = Room { chat: "another-private-room".into(), ..room.clone() };
+    actor.memberships.push(MemberEvidence { room: alternate.clone(), roles: Default::default() });
     actor.aliases = vec![first, second];
     ingress.record_actor(actor.clone()).await.unwrap();
     let a = ingress
@@ -569,6 +571,12 @@ async fn verified_aliases_route_together_and_membership_changes_fence_access() {
         .unwrap();
     assert_eq!(outsider.receipts[0].disposition, Disposition::Forbidden);
     assert!(ingress.authorize_operator(&policy, &room, &one).unwrap());
+
+    ingress.invalidate_actor_evidence(Some(room.clone())).await.unwrap();
+    assert!(!ingress.authorize_operator(&policy, &room, &one).unwrap());
+    assert!(ingress.authorize_operator(&policy, &alternate, &one).unwrap());
+    ingress.invalidate_actor_evidence(None).await.unwrap();
+    assert!(!ingress.authorize_operator(&policy, &alternate, &one).unwrap());
 
     actor.revision += 1;
     actor.aliases.pop();

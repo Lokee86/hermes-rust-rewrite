@@ -601,6 +601,43 @@ impl Store {
         })
     }
 
+    fn invalidate_actor_evidence(
+        &self,
+        connection: &str,
+        transport: &str,
+        room: Option<&Room>,
+    ) -> Result<()> {
+        self.write(|tx| {
+            if let Some(room) = room {
+                let kind = match room.kind {
+                    RoomKind::Direct => "direct",
+                    RoomKind::Group => "group",
+                };
+                tx.execute(
+                    "UPDATE messaging_actor_evidence SET data = json_set(data, '$.evidence.memberships',
+                       json((SELECT json_group_array(json(member.value))
+                        FROM json_each(data, '$.evidence.memberships') member
+                        WHERE NOT (json_extract(member.value, '$.room.kind') IS ?3
+                           AND json_extract(member.value, '$.room.chat') IS ?4
+                           AND json_extract(member.value, '$.room.thread') IS ?5))))
+                     WHERE connection = ?1 AND json_extract(data, '$.transport_scope') = ?2
+                       AND EXISTS (SELECT 1 FROM json_each(data, '$.evidence.memberships') member
+                         WHERE json_extract(member.value, '$.room.kind') IS ?3
+                           AND json_extract(member.value, '$.room.chat') IS ?4
+                           AND json_extract(member.value, '$.room.thread') IS ?5)",
+                    params![connection, transport, kind, room.chat, room.thread],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE messaging_actor_evidence SET data = json_set(data, '$.evidence.expires_at', 0)
+                     WHERE connection = ?1 AND json_extract(data, '$.transport_scope') = ?2",
+                    params![connection, transport],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     fn actor(&self, connection: &str, id: &str) -> Result<Option<StoredActor>> {
         self.read(|db| {
             Ok(db.query_row(
@@ -793,6 +830,29 @@ impl Ingress {
                 } else {
                     Err(GatewayError::Forbidden)
                 }
+            })
+        })
+        .await?;
+        self.notify();
+        Ok(())
+    }
+
+    /// Withdraw stale membership evidence after a transport gap or an exact
+    /// room authority change. Aliases and actor revisions keep their bindings.
+    pub async fn invalidate_actor_evidence(&self, room: Option<Room>) -> Result<(), GatewayError> {
+        if room.as_ref().is_some_and(|room| {
+            !valid_id(&room.chat)
+                || room.thread.as_deref().is_some_and(|thread| !valid_id(thread))
+        }) {
+            return Err(GatewayError::Invalid);
+        }
+        let scope = self.clone();
+        blocking(move || {
+            scope.checked(false, |_| {
+                let transport = db(key("actor-transport", &scope.installation()))?;
+                db(scope.store.invalidate_actor_evidence(
+                    &scope.connection, &transport, room.as_ref(),
+                ))
             })
         })
         .await?;
