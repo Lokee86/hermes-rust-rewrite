@@ -190,9 +190,17 @@ async fn advance_message(
                 }
                 _ => return Err(GatewayError::Invalid),
             };
-            let attachments = match capture(scope, &session.dir, &message.attachments) {
-                Ok(files) => files,
-                Err(_) => {
+            let attachments = match scope.checked(true, |state| {
+                if !authorized(scope, state, &work)? {
+                    return Ok(None);
+                }
+                capture(scope, &session.dir, &message.attachments)
+                    .map(Some)
+                    .map_err(|_| GatewayError::Invalid)
+            }) {
+                Ok(Some(files)) => files,
+                Ok(None) => return Ok(()),
+                Err(GatewayError::Invalid) => {
                     return db(scope.store.mark(
                         &work.route,
                         &work.event.id,
@@ -200,6 +208,7 @@ async fn advance_message(
                         Some("invalid_attachment"),
                     ));
                 }
+                Err(error) => return Err(error),
             };
             let result = owner
                 .submit_channel(session, message.text.clone(), attachments, native_id)

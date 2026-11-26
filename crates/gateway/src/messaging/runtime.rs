@@ -26,7 +26,6 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const MAX_TEXT: usize = 256 * 1024;
 pub(super) const MAX_BATCH: usize = 100;
 const MAX_PARTS: usize = 128;
-const MAX_FILE: usize = 4 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(100);
 
 pub(crate) fn valid_id(value: &str) -> bool {
@@ -292,54 +291,6 @@ impl Ingress {
         .map(Ok)
     }
 
-    pub async fn stage_attachment(
-        &self,
-        name: String,
-        bytes: Vec<u8>,
-    ) -> Result<AttachmentRef, GatewayError> {
-        if !self.capabilities().attachments {
-            return Err(GatewayError::Unsupported);
-        }
-        if bytes.is_empty()
-            || bytes.len() > MAX_FILE
-            || !valid_id(&name)
-            || name.contains(['/', '\\'])
-            || name == "."
-            || name == ".."
-            || hermes_engine::Attachment::validate_bytes(&name, &bytes).is_err()
-        {
-            return Err(GatewayError::Invalid);
-        }
-        let scope = self.clone();
-        blocking(move || {
-            scope.checked(true, |_| {
-                db(scope.store.put_attachment(&scope.connection, name, &bytes))
-            })
-        })
-        .await
-    }
-
-    /// Read only a gateway-issued artifact in the current delivery attempt.
-    pub async fn reply_artifact(
-        &self,
-        attempt: &SendAttempt,
-        artifact: &AttachmentRef,
-    ) -> Result<Vec<u8>, GatewayError> {
-        let (scope, attempt, artifact) = (self.clone(), attempt.clone(), artifact.clone());
-        blocking(move || {
-            scope.checked(false, |_| {
-                db(scope.store.reply_artifact(
-                    &scope.connection,
-                    &scope.generation,
-                    &attempt,
-                    &artifact,
-                ))?
-                .ok_or(GatewayError::Forbidden)
-            })
-        })
-        .await
-    }
-
     /// List attempts from this authenticated account that need platform evidence.
     pub async fn uncertain_deliveries(&self) -> Result<Vec<UncertainDelivery>, GatewayError> {
         let scope = self.clone();
@@ -451,9 +402,9 @@ pub(super) async fn blocking<T: Send + 'static>(
 }
 
 impl Host {
-    pub fn open(root: &Path) -> Result<Self> {
+    pub fn open(root: &Path, audio: Option<Arc<dyn super::AudioService>>) -> Result<Self> {
         Ok(Self {
-            store: Arc::new(Store::open(root)?),
+            store: Arc::new(Store::open_with_audio(root, audio)?),
             slots: AsyncMutex::default(),
             factories: Mutex::default(),
         })

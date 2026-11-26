@@ -85,6 +85,7 @@ impl AccessPolicy {
         let mut current = match room.kind {
             RoomKind::Direct => RoomPolicy {
                 tools: self.direct_tools,
+                spoken_replies: self.direct_spoken_replies,
                 ..RoomPolicy::default()
             },
             RoomKind::Group => match self.rooms.get(&room.chat) {

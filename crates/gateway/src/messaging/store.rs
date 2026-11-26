@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS messaging_cooldowns (
 );
 ";
 
-pub(super) struct Store(Mutex<Connection>);
+pub(super) struct Store(pub(super) Mutex<Connection>, pub(super) super::media::ProfileAudio);
 
 #[derive(Clone)]
 pub(super) struct Route {
@@ -181,9 +181,22 @@ pub(super) fn optional_decode<T: DeserializeOwned>(
 }
 
 impl Store {
+    #[cfg(test)]
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_audio(root, None)
+    }
+
+    pub(super) fn audio(&self) -> &super::media::ProfileAudio {
+        &self.1
+    }
+
+    pub fn open_with_audio(
+        root: &Path,
+        service: Option<std::sync::Arc<dyn super::AudioService>>,
+    ) -> Result<Self> {
         let connection = hermes_engine::db::open(root)?;
         connection.execute_batch(TABLES)?;
+        connection.execute_batch(super::media::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
@@ -192,7 +205,7 @@ impl Store {
         connection.execute_batch(super::transport::SCHEMA)?;
         connection.execute_batch(super::wake::TABLES)?;
         connection.execute("DELETE FROM messaging_enrollment", [])?;
-        Ok(Self(Mutex::new(connection)))
+        Ok(Self(Mutex::new(connection), super::media::ProfileAudio::new(root, service)))
     }
 
     pub(super) fn write<T>(&self, change: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -264,15 +277,7 @@ impl Store {
         name: String,
         bytes: &[u8],
     ) -> Result<AttachmentRef> {
-        let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-        let id = key("media", &(connection, &name, digest.as_ref()))?;
-        self.write(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO messaging_media VALUES (?1,?2,?3)",
-                params![connection, id, bytes],
-            )?;
-            Ok(AttachmentRef { id, name })
-        })
+        self.write(|tx| super::media::put(tx, connection, name, bytes))
     }
 
     pub fn attachment(&self, connection: &str, attachment: &AttachmentRef) -> Result<Vec<u8>> {
@@ -282,40 +287,6 @@ impl Store {
             params![connection, attachment.id],
             |row| row.get(0),
         )?)
-    }
-
-    pub fn reply_artifact(
-        &self,
-        connection: &str,
-        generation: &str,
-        attempt: &SendAttempt,
-        artifact: &AttachmentRef,
-    ) -> Result<Option<Vec<u8>>> {
-        let db = crate::lock(&self.0);
-        let part: Option<DeliveryPart> = db.query_row(
-            "SELECT p.body FROM messaging_parts p JOIN messaging_deliveries d ON d.id = p.delivery
-             WHERE d.connection = ?1 AND d.id = ?2 AND p.ordinal = ?3 AND p.attempt = ?4
-                 AND p.generation = ?5 AND p.stage = 'sending'",
-            params![connection, attempt.delivery_id, attempt.part, attempt.attempt, generation],
-            |r| decode(r, 0),
-        ).optional()?;
-        let Some(DeliveryPart {
-            body: DeliveryBody::Reply(message),
-            ..
-        }) = part
-        else {
-            return Ok(None);
-        };
-        if !message.attachments.contains(artifact) {
-            return Ok(None);
-        }
-        Ok(db
-            .query_row(
-                "SELECT bytes FROM messaging_media WHERE connection = ?1 AND id = ?2",
-                params![connection, artifact.id],
-                |row| row.get(0),
-            )
-            .optional()?)
     }
 
     pub fn route(&self, id: &str) -> Result<Option<Route>> {
@@ -951,13 +922,8 @@ pub(super) fn attachment_decision(
     if let InboundBody::Message(message) = &event.body
         && !message.attachments.is_empty()
     {
-        let mut exists = tx.prepare(
-            "SELECT EXISTS(SELECT 1 FROM messaging_media WHERE connection = ?1 AND id = ?2)",
-        )?;
-        for attachment in &message.attachments {
-            if !exists.query_row(params![connection, attachment.id], |r| r.get::<_, bool>(0))? {
-                return Ok(Err(Disposition::Invalid));
-            }
+        if !super::media::attachments_authorized(tx, connection, event, &message.attachments)? {
+            return Ok(Err(Disposition::Invalid));
         }
     }
     Ok(Ok(route))

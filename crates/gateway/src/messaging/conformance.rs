@@ -27,6 +27,8 @@ use tokio::{
 
 #[path = "conformance_stock.rs"]
 mod stock;
+#[path = "media_conformance.rs"]
+mod media_conformance;
 
 const LIMIT: Duration = Duration::from_secs(12);
 
@@ -383,6 +385,7 @@ fn policy() -> AccessPolicy {
                 mention_required: true,
                 per_participant: true,
                 tools: false,
+                ..RoomPolicy::default()
             },
         )]
         .into_iter()
@@ -1612,8 +1615,15 @@ async fn attachment_and_reply_artifact_stay_with_the_verified_account() {
     access.direct_tools = true;
     let gateway = model.gateway(root.path(), vec![push.config(access)]).await;
     let ingress = push.ready().await;
+    let metadata = dm("attachment", "destination", "");
+    let grant = ingress.authorize_media(
+        MediaSource::from(&metadata),
+        AttachmentManifest { name: "note.txt".into(), size: Some(11), sha256: None },
+        MediaPurpose::Attachment,
+        Duration::from_secs(10),
+    ).await.unwrap();
     let attachment = ingress
-        .stage_attachment("note.txt".into(), b"staged text".to_vec())
+        .stage_attachment(grant, || async { Ok(&b"staged text"[..]) })
         .await
         .unwrap();
     let input = InboundEvent {

@@ -155,6 +155,7 @@ pub struct GatewayConfig {
     pub token: String,
     pub provider: Config,
     pub adapters: Vec<messaging::AdapterConfig>,
+    pub messaging_audio: Option<Arc<dyn messaging::AudioService>>,
 }
 
 impl GatewayConfig {
@@ -165,6 +166,7 @@ impl GatewayConfig {
             token: String::new(),
             provider,
             adapters: Vec::new(),
+            messaging_audio: None,
         }
     }
 }
@@ -283,7 +285,7 @@ impl Gateway {
             ensure!(names.insert(adapter.name.clone()), "Duplicate messaging connection name");
         }
         let library = Library::open(&config.library_root)?;
-        let messaging = messaging::Host::open(library.root())?;
+        let messaging = messaging::Host::open(library.root(), config.messaging_audio)?;
         let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
         let listener = TcpListener::bind(config.bind)
             .await

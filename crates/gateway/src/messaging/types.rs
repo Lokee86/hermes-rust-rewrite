@@ -140,6 +140,8 @@ pub struct AccessPolicy {
     pub rooms: BTreeMap<String, RoomPolicy>,
     pub direct_tools: bool,
     #[serde(default)]
+    pub direct_spoken_replies: bool,
+    #[serde(default)]
     pub scope: ScopePolicy,
 }
 
@@ -149,6 +151,10 @@ pub struct RoomPolicy {
     pub mention_required: bool,
     pub per_participant: bool,
     pub tools: bool,
+    #[serde(default)]
+    pub spoken_addressing: Vec<String>,
+    #[serde(default)]
+    pub spoken_replies: bool,
 }
 
 impl AccessPolicy {
@@ -189,6 +195,10 @@ pub struct AttachmentRef {
 }
 
 impl AttachmentRef {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
