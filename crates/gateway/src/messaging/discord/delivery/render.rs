@@ -1,6 +1,7 @@
 use crate::messaging::{
     DeliveryBody, DeliveryIntent, DeliveryPart, Effect, EffectDependency, EffectOperation, Message,
     PreparationFailure, Prompt, ProvisionResource, ReceiptKind, RoomKind,
+    effects::MAX_ATTACHMENT_PLAN_PARTS,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -129,29 +130,40 @@ pub(crate) fn prepare_with(
         return Err(PreparationFailure::Rejected);
     }
 
-    let text_parts = split_markdown(&message.text);
-    let mut messages = if options.uploads && text_parts.len() > options.max_inline_parts.max(1) {
-        vec![Message::text(&message.text)]
+    let mut messages: Vec<_> = split_markdown(&message.text)
+        .into_iter()
+        .filter(|text| !text.trim().is_empty())
+        .map(Message::text)
+        .collect();
+    let markdown = options.uploads && messages.len() > options.max_inline_parts.max(1);
+    let mut file_messages = Vec::new();
+    let file_destinations = if markdown {
+        &mut file_messages
     } else {
-        text_parts
-            .into_iter()
-            .filter(|text| !text.trim().is_empty())
-            .map(Message::text)
-            .collect::<Vec<_>>()
+        &mut messages
     };
     for (index, files) in message.attachments.chunks(FILES_PER_MESSAGE).enumerate() {
-        if index == messages.len() {
-            messages.push(Message::text(""));
+        if index == file_destinations.len() {
+            file_destinations.push(Message::text(""));
         }
-        messages[index].attachments.extend_from_slice(files);
+        file_destinations[index]
+            .attachments
+            .extend_from_slice(files);
     }
+
     let mut plan = Vec::new();
     let mut messages = messages.into_iter();
     if options.surface != DeliverySurface::Existing {
-        let (resource, body) = match options.surface {
+        let (resource, starter) = match options.surface {
             DeliverySurface::ThreadFromMessage => {
                 (ProvisionResource::Thread, Message::text("Open discussion"))
             }
+            DeliverySurface::ForumPost if markdown => (
+                // The forum post has its own committed thread ID before the
+                // generated attachment or its complete text can be published.
+                ProvisionResource::Topic,
+                Message::text("Reply follows in this thread."),
+            ),
             DeliverySurface::ForumPost => (
                 ProvisionResource::Topic,
                 messages.next().ok_or(PreparationFailure::Rejected)?,
@@ -160,30 +172,44 @@ pub(crate) fn prepare_with(
         };
         plan.push(part(
             intent,
-            DeliveryBody::Reply(body),
+            DeliveryBody::Reply(starter),
             Effect {
                 operation: EffectOperation::Provision { resource },
                 ..Effect::default()
             },
         ));
     }
+
+    let attachment = markdown.then_some(plan.len() as u32);
+    if markdown {
+        plan.push(publication(
+            intent,
+            options,
+            plan.len(),
+            Message::text(&message.text),
+            true,
+            None,
+        ));
+    }
     for (index, message) in messages.enumerate() {
-        let ordinal = u32::try_from(plan.len()).map_err(|_| PreparationFailure::Rejected)?;
-        let first = index == 0 && options.surface == DeliverySurface::Existing;
-        let reply = options.surface == DeliverySurface::Existing
-            && (options.reply_mode == ReplyMode::All
-                || first && options.reply_mode == ReplyMode::First);
-        let mut effect = create_effect(intent, ordinal, reply);
-        if options.surface != DeliverySurface::Existing {
-            effect.operation = publish_using_destination();
-        }
-        let mut rendered = part(intent, DeliveryBody::Reply(message), effect);
-        if first && let Some(edit) = intent.edit_target.as_ref().filter(|id| snowflake(id)) {
-            rendered.edit_target = Some(edit.clone());
-            rendered.effect.operation_key = None;
-            rendered.effect.publish_after_definite_edit_refusal = true;
-        }
-        plan.push(rendered);
+        plan.push(publication(
+            intent,
+            options,
+            plan.len(),
+            message,
+            index == 0,
+            attachment,
+        ));
+    }
+    for message in file_messages {
+        plan.push(publication(
+            intent,
+            options,
+            plan.len(),
+            message,
+            false,
+            None,
+        ));
     }
     if options.surface == DeliverySurface::ForumPost && plan.len() == 1 {
         // Discord's forum creation publishes its starter atomically. This
@@ -197,10 +223,44 @@ pub(crate) fn prepare_with(
             },
         ));
     }
-    if plan.is_empty() || plan.len() > MAX_PARTS {
+    let limit = if markdown {
+        MAX_ATTACHMENT_PLAN_PARTS
+    } else {
+        MAX_PARTS
+    };
+    if plan.is_empty() || plan.len() > limit {
         return Err(PreparationFailure::Rejected);
     }
     Ok(plan)
+}
+
+fn publication(
+    intent: &DeliveryIntent,
+    options: PlanOptions,
+    ordinal: usize,
+    message: Message,
+    first: bool,
+    attachment_fallback_for: Option<u32>,
+) -> DeliveryPart {
+    let inline = options.surface == DeliverySurface::Existing;
+    let reply = inline
+        && (options.reply_mode == ReplyMode::All
+            || first && options.reply_mode == ReplyMode::First);
+    let mut effect = create_effect(intent, ordinal as u32, reply);
+    if !inline {
+        effect.operation = publish_using_destination();
+    }
+    effect.attachment_fallback_for = attachment_fallback_for;
+    let mut rendered = part(intent, DeliveryBody::Reply(message), effect);
+    if inline
+        && first
+        && let Some(edit) = intent.edit_target.as_ref().filter(|id| snowflake(id))
+    {
+        rendered.edit_target = Some(edit.clone());
+        rendered.effect.operation_key = None;
+        rendered.effect.publish_after_definite_edit_refusal = true;
+    }
+    rendered
 }
 
 fn part(intent: &DeliveryIntent, body: DeliveryBody, effect: Effect) -> DeliveryPart {

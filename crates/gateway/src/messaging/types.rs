@@ -432,6 +432,9 @@ pub enum DeliveryResult {
     Submitted,
     /// Evidence that the requested edit was definitively not published.
     EditNotPublished,
+    /// The attachment was definitively refused without publishing the message.
+    /// Only a text alternative in the stored plan can follow this result.
+    AttachmentNotPublished,
     Rejected,
     Uncertain,
 }

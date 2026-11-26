@@ -165,6 +165,8 @@ async fn publish(
     ingress: &Ingress,
     channel: &str,
 ) -> SendResult<DeliveryResult> {
+    let markdown = matches!(&attempt.payload.body, DeliveryBody::Reply(message)
+        if measure(&message.text) > CONTENT_LIMIT);
     let (mut payload, uploads) = render_message(attempt, ingress).await?;
     if let Some(target) = attempt
         .payload
@@ -183,7 +185,10 @@ async fn publish(
             payload,
             uploads,
         )?;
-        let edited = client.json(request, Call::Edit).await?;
+        let edited = client
+            .execute(request, Call::Edit)
+            .await?
+            .into_publication(Call::Edit, markdown)?;
         return if own_message(&edited, bot_id, channel) == Some(target) {
             Ok(confirmed(target, false))
         } else {
@@ -217,7 +222,10 @@ async fn publish(
         payload,
         uploads,
     )?;
-    let created = client.json(request, Call::Mutation).await?;
+    let created = client
+        .execute(request, Call::Mutation)
+        .await?
+        .into_publication(Call::Mutation, markdown)?;
     if !created["nonce"].is_null() && created["nonce"].as_str() != Some(&key) {
         return Err(DeliveryResult::Uncertain);
     }
@@ -449,8 +457,13 @@ async fn render_message(
     match &attempt.payload.body {
         DeliveryBody::Reply(message) => {
             let export = measure(&message.text) > CONTENT_LIMIT;
-            if (export || !message.attachments.is_empty()) && !ingress.capabilities().attachments {
-                return Err(DeliveryResult::Rejected);
+            if !ingress.capabilities().attachments {
+                if export {
+                    return Err(DeliveryResult::AttachmentNotPublished);
+                }
+                if !message.attachments.is_empty() {
+                    return Err(DeliveryResult::Rejected);
+                }
             }
             if export {
                 payload["content"] = json!("Full reply attached.");
@@ -567,6 +580,23 @@ impl HttpReply {
         } else {
             Err(call.transport_failure())
         }
+    }
+
+    fn into_publication(self, call: Call, generated_markdown: bool) -> SendResult<Value> {
+        // Only provider responses that explicitly refuse the upload allow the
+        // durable text alternative. Rate limits are handled before this step.
+        let upload_refused = match self.status {
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE => true,
+            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN => matches!(
+                self.body["code"].as_u64(),
+                Some(40_005 | 50_045 | 50_046 | 50_110 | 50_123 | 50_146 | 400_001)
+            ),
+            _ => false,
+        };
+        if generated_markdown && upload_refused {
+            return Err(DeliveryResult::AttachmentNotPublished);
+        }
+        self.into_json(call)
     }
 
     fn failure(&self, call: Call) -> DeliveryResult {

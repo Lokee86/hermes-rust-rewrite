@@ -16,7 +16,7 @@ use reqwest::header::HeaderMap;
 use std::path::Path;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -92,8 +92,16 @@ fn rendering_pins_first_reply_and_uses_complete_markdown_for_long_output() {
         },
     )
     .unwrap();
-    assert_eq!(file.len(), 1);
+    assert_eq!(file.len(), normal.len() + 1);
     assert_eq!(file[0].body, input.body);
+    for (chunk, alternative) in normal.iter().zip(&file[1..]) {
+        assert_eq!(chunk.body, alternative.body);
+        assert_eq!(alternative.effect.attachment_fallback_for, Some(0));
+        assert_ne!(
+            alternative.effect.operation_key,
+            file[0].effect.operation_key
+        );
+    }
     let off = prepare_with(
         &input,
         PlanOptions {
@@ -242,6 +250,23 @@ struct ForcedLimit {
     remaining: u32,
 }
 
+struct UploadResponse {
+    status: StatusCode,
+    body: Value,
+    pause: Option<Preflight>,
+}
+
+fn multipart_json(bytes: &[u8]) -> Option<Value> {
+    let wire = std::str::from_utf8(bytes).ok()?;
+    let part = wire
+        .split_once("name=\"payload_json\"")?
+        .1
+        .split_once("\r\n\r\n")?
+        .1;
+    let json = part.split_once("\r\n")?.0;
+    serde_json::from_str(json).ok()
+}
+
 #[derive(Clone)]
 struct Wire {
     seen: async_channel::Sender<RequestSeen>,
@@ -249,6 +274,8 @@ struct Wire {
     preflight: Arc<Mutex<Option<Preflight>>>,
     wrong_message_owner: Arc<AtomicBool>,
     forced_limit: Arc<Mutex<Option<ForcedLimit>>>,
+    upload_response: Arc<Mutex<Option<UploadResponse>>>,
+    next_receipt: Arc<AtomicU64>,
 }
 
 impl Wire {
@@ -258,7 +285,13 @@ impl Wire {
         assert_eq!(request.headers()["authorization"], "Bot fixture-token");
         let headers = request.headers().clone();
         let bytes = to_bytes(request.into_body(), 512 * 1024).await.unwrap();
-        let payload: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        let payload: Value = serde_json::from_slice(&bytes)
+            .ok()
+            .or_else(|| multipart_json(&bytes))
+            .unwrap_or_default();
+        let markdown = bytes
+            .windows(b"filename=\"reply.md\"".len())
+            .any(|value| value == b"filename=\"reply.md\"");
         if method != Method::GET {
             state
                 .seen
@@ -270,6 +303,16 @@ impl Wire {
                 })
                 .await
                 .unwrap();
+        }
+        if markdown {
+            let response = state.upload_response.lock().await.take();
+            if let Some(response) = response {
+                if let Some(pause) = response.pause {
+                    pause.started.send(()).unwrap();
+                    pause.release.await.unwrap();
+                }
+                return (response.status, Json(response.body)).into_response();
+            }
         }
         let read = method == Method::GET;
         let reply = match (method, path.as_str()) {
@@ -305,7 +348,18 @@ impl Wire {
                 if std::mem::take(&mut *unknown) {
                     return StatusCode::BAD_GATEWAY.into_response();
                 }
-                json!({"id":"902","channel_id":"301","author":{"id":BOT},"nonce":payload["nonce"]})
+                let id = state
+                    .next_receipt
+                    .fetch_add(1, Ordering::Relaxed)
+                    .to_string();
+                json!({"id":id,"channel_id":"301","author":{"id":BOT},"nonce":payload["nonce"]})
+            }
+            (Method::POST, "/channels/400/messages") => {
+                let id = state
+                    .next_receipt
+                    .fetch_add(1, Ordering::Relaxed)
+                    .to_string();
+                json!({"id":id,"channel_id":"400","author":{"id":BOT},"nonce":payload["nonce"]})
             }
             (Method::POST, "/channels/302/messages") => {
                 json!({"id":"903","channel_id":"302","author":{"id":BOT},"nonce":payload["nonce"]})
@@ -346,6 +400,7 @@ struct RestFixture {
     preflight: Arc<Mutex<Option<Preflight>>>,
     wrong_message_owner: Arc<AtomicBool>,
     forced_limit: Arc<Mutex<Option<ForcedLimit>>>,
+    upload_response: Arc<Mutex<Option<UploadResponse>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -356,12 +411,15 @@ impl RestFixture {
         let preflight = Arc::new(Mutex::new(None));
         let wrong_message_owner = Arc::new(AtomicBool::new(false));
         let forced_limit = Arc::new(Mutex::new(None));
+        let upload_response = Arc::new(Mutex::new(None));
         let state = Wire {
             seen,
             first_unknown: Arc::new(Mutex::new(first_unknown)),
             preflight: preflight.clone(),
             wrong_message_owner: wrong_message_owner.clone(),
             forced_limit: forced_limit.clone(),
+            upload_response: upload_response.clone(),
+            next_receipt: Arc::new(AtomicU64::new(902)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = DiscordClient::for_fixture(
@@ -390,6 +448,7 @@ impl RestFixture {
             preflight,
             wrong_message_owner,
             forced_limit,
+            upload_response,
             task,
         }
     }
@@ -753,22 +812,337 @@ async fn upload_uses_the_exact_host_attachment_and_complete_markdown_bytes() {
     assert!(
         posted
             .bytes
-            .windows(source.len())
-            .any(|part| part == source)
-    );
-    assert!(
-        posted
-            .bytes
             .windows(text.len())
             .any(|part| part == text.as_bytes())
     );
     let wire = std::str::from_utf8(&posted.bytes).unwrap();
     assert!(wire.contains("filename=\"reply.md\""));
-    assert!(wire.contains("filename=\"proof.txt\""));
+    let file = fixture.sent().await;
+    assert!(file.bytes.windows(source.len()).any(|part| part == source));
+    assert!(
+        std::str::from_utf8(&file.bytes)
+            .unwrap()
+            .contains("filename=\"proof.txt\"")
+    );
     status(&gateway, |row| {
-        row["id"] == message.id && row["part_state"] == "sent"
+        row["id"] == message.id && row["state"] == "sent"
     })
     .await;
+    gateway.shutdown().await.unwrap();
+}
+
+fn markdown_options() -> PlanOptions {
+    PlanOptions {
+        max_inline_parts: 1,
+        ..PlanOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn definite_markdown_refusal_activates_exact_ordered_text_after_restart() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(markdown_options(), false).await;
+    let (gateway, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let room = direct("301");
+    let route = ingress
+        .verify_destination(room, chrono::Utc::now().timestamp_millis() + 60_000)
+        .await
+        .unwrap();
+    let (entered, waiting) = oneshot::channel();
+    let (resume, release) = oneshot::channel();
+    *fixture.upload_response.lock().await = Some(UploadResponse {
+        status: StatusCode::BAD_REQUEST,
+        body: json!({"code":50_045}),
+        pause: Some(Preflight {
+            started: entered,
+            release,
+        }),
+    });
+    let text = "Complete reply including @everyone and useful text. ".repeat(115);
+    let parts = render::split_markdown(&text);
+    let id = gateway
+        .send_messaging_notification(&route, "long-reply", text.clone())
+        .unwrap();
+    let upload = fixture.sent().await;
+    let primary = multipart_json(&upload.bytes).unwrap();
+    tokio::time::timeout(WAIT, waiting).await.unwrap().unwrap();
+
+    let mut revoked = AccessPolicy::default();
+    revoked.scope.direct.enabled = Some(false);
+    gateway
+        .set_adapter_policy("discord-fixture", revoked)
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    status(&gateway, |row| {
+        row["id"] == id
+            && row["part"] == 0
+            && row["part_state"] == "skipped"
+            && row["error"] == "attachment_not_accepted"
+    })
+    .await;
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 1 && row["part_state"] == "pending" && row["attempt"] == 0
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    gateway.shutdown().await.unwrap();
+
+    let (reopened, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    reopened
+        .set_adapter_policy("discord-fixture", AccessPolicy::default())
+        .await
+        .unwrap();
+    let mut recovered = String::new();
+    for (index, expected) in parts.iter().enumerate() {
+        let sent = fixture.sent().await;
+        assert_eq!(sent.method, Method::POST);
+        assert_eq!(sent.path, "/channels/301/messages");
+        let body: Value = serde_json::from_slice(&sent.bytes).unwrap();
+        assert_eq!(body["content"], *expected);
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(body["allowed_mentions"]["replied_user"], false);
+        assert_eq!(body["flags"], QUIET);
+        assert_eq!(body["nonce"], nonce(&id, (index + 1) as u32, index == 0));
+        assert_ne!(body["nonce"], primary["nonce"]);
+        recovered.push_str(body["content"].as_str().unwrap());
+    }
+    assert_eq!(recovered, text);
+    status(&reopened, |row| row["id"] == id && row["state"] == "sent").await;
+    let receipts = ingress
+        .store
+        .read(|db| {
+            let mut query = db.prepare(
+                "SELECT receipt FROM messaging_parts WHERE delivery=?1 ORDER BY ordinal",
+            )?;
+            Ok(query
+                .query_map([&id], |row| row.get::<_, Option<String>>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert_eq!(receipts[0], None);
+    assert_eq!(receipts.len(), parts.len() + 1);
+    for (index, receipt) in receipts[1..].iter().enumerate() {
+        assert_eq!(receipt.as_deref(), Some((902 + index).to_string().as_str()));
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_markdown_upload_waits_and_late_confirmation_skips_the_text() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(markdown_options(), false).await;
+    let (gateway, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let room = direct("301");
+    let route = ingress
+        .verify_destination(room.clone(), chrono::Utc::now().timestamp_millis() + 60_000)
+        .await
+        .unwrap();
+    *fixture.upload_response.lock().await = Some(UploadResponse {
+        status: StatusCode::BAD_GATEWAY,
+        body: Value::Null,
+        pause: None,
+    });
+    let id = gateway
+        .send_messaging_notification(&route, "lost-upload", "full markdown ".repeat(270))
+        .unwrap();
+    let sent = fixture.sent().await;
+    let primary = multipart_json(&sent.bytes).unwrap();
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 0 && row["part_state"] == "uncertain"
+    })
+    .await;
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 1 && row["part_state"] == "standby"
+    })
+    .await;
+    gateway.shutdown().await.unwrap();
+
+    let (reopened, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    let echo = json!({"id":"901","channel_id":"301","author":{"id":BOT},"nonce":primary["nonce"]});
+    observe_create(&ingress, BOT, &room, &echo).await.unwrap();
+    status(&reopened, |row| {
+        row["id"] == id && row["part"] == 0 && row["part_state"] == "sent"
+    })
+    .await;
+    status(&reopened, |row| {
+        row["id"] == id && row["part"] == 1 && row["part_state"] == "skipped"
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_early_authenticated_echo_fences_text_even_if_rest_reports_upload_refusal() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(markdown_options(), false).await;
+    let (gateway, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let room = direct("301");
+    let route = ingress
+        .verify_destination(room.clone(), chrono::Utc::now().timestamp_millis() + 60_000)
+        .await
+        .unwrap();
+    let (entered, waiting) = oneshot::channel();
+    let (resume, release) = oneshot::channel();
+    *fixture.upload_response.lock().await = Some(UploadResponse {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        body: Value::Null,
+        pause: Some(Preflight {
+            started: entered,
+            release,
+        }),
+    });
+    let id = gateway
+        .send_messaging_notification(&route, "early-echo", "attachment ".repeat(300))
+        .unwrap();
+    let primary = multipart_json(&fixture.sent().await.bytes).unwrap();
+    tokio::time::timeout(WAIT, waiting).await.unwrap().unwrap();
+    let echo = json!({"id":"901","channel_id":"301","author":{"id":BOT},"nonce":primary["nonce"]});
+    observe_create(&ingress, BOT, &room, &echo).await.unwrap();
+    resume.send(()).unwrap();
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 0 && row["part_state"] == "sent"
+    })
+    .await;
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 1 && row["part_state"] == "skipped"
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn forum_long_reply_fallback_stays_in_the_one_confirmed_child_thread() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(
+        PlanOptions {
+            surface: DeliverySurface::ForumPost,
+            ..markdown_options()
+        },
+        false,
+    )
+    .await;
+    let access = AccessPolicy {
+        rooms: [("311".into(), Default::default())].into_iter().collect(),
+        ..AccessPolicy::default()
+    };
+    let (gateway, ingress) = fixture.gateway(root.path(), access).await;
+    let room = Room {
+        kind: RoomKind::Group,
+        chat: "311".into(),
+        thread: None,
+    };
+    let route = ingress
+        .verify_destination(room, chrono::Utc::now().timestamp_millis() + 60_000)
+        .await
+        .unwrap();
+    *fixture.upload_response.lock().await = Some(UploadResponse {
+        status: StatusCode::FORBIDDEN,
+        body: json!({"code":400_001}),
+        pause: None,
+    });
+    let text = "Long forum reply text ".repeat(240);
+    let id = gateway
+        .send_messaging_notification(&route, "forum-fallback", text.clone())
+        .unwrap();
+    let starter = fixture.sent().await;
+    assert_eq!(starter.path, "/channels/311/threads");
+    let payload: Value = serde_json::from_slice(&starter.bytes).unwrap();
+    assert_eq!(
+        payload["message"]["content"],
+        "Reply follows in this thread."
+    );
+    let upload = fixture.sent().await;
+    assert_eq!(upload.path, "/channels/400/messages");
+    assert!(multipart_json(&upload.bytes).is_some());
+    for expected in render::split_markdown(&text) {
+        let sent = fixture.sent().await;
+        assert_eq!(sent.path, "/channels/400/messages");
+        let body: Value = serde_json::from_slice(&sent.bytes).unwrap();
+        assert_eq!(body["content"], expected);
+        assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+    }
+    status(&gateway, |row| row["id"] == id && row["state"] == "sent").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_rate_limit_retries_the_same_attachment_instead_of_the_text_alternative() {
+    let root = TempDir::new().unwrap();
+    let fixture = RestFixture::start(markdown_options(), false).await;
+    let (gateway, ingress) = fixture.gateway(root.path(), AccessPolicy::default()).await;
+    let route = ingress
+        .verify_destination(
+            direct("301"),
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        )
+        .await
+        .unwrap();
+    *fixture.forced_limit.lock().await = Some(ForcedLimit {
+        bucket: "message-writes",
+        seconds: 1.0,
+        remaining: 1,
+    });
+    let id = gateway
+        .send_messaging_notification(&route, "rate-limited-upload", "attachment ".repeat(300))
+        .unwrap();
+    let first = fixture.sent().await;
+    let primary = multipart_json(&first.bytes).unwrap();
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 0 && row["part_state"] == "pending"
+    })
+    .await;
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 1 && row["part_state"] == "standby"
+    })
+    .await;
+    let last = fixture.sent().await;
+    assert_eq!(
+        multipart_json(&last.bytes).unwrap()["nonce"],
+        primary["nonce"]
+    );
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 0 && row["part_state"] == "sent" && row["attempt"] == 2
+    })
+    .await;
+    status(&gateway, |row| {
+        row["id"] == id && row["part"] == 1 && row["part_state"] == "skipped"
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fixture.sent.recv())
+            .await
+            .is_err()
+    );
     gateway.shutdown().await.unwrap();
 }
 

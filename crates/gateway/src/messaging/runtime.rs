@@ -1671,13 +1671,22 @@ fn outbound_policy(
 }
 
 fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]) -> bool {
-    if plan.is_empty() || plan.len() > MAX_PARTS || intent.room.thread.is_some() && !caps.threads {
+    let has_attachment_alternative = plan.iter().any(|part| part.effect.attachment_fallback_for.is_some());
+    let limit = if has_attachment_alternative {
+        super::effects::MAX_ATTACHMENT_PLAN_PARTS
+    } else {
+        MAX_PARTS
+    };
+    if plan.is_empty() || plan.len() > limit || intent.room.thread.is_some() && !caps.threads {
         return false;
     }
     plan.iter().enumerate().all(|(index, part)| {
-        if part.room != intent.room
-            || part.edit_target.is_some()
-                && (index != 0 || !caps.editing || part.edit_target != intent.edit_target)
+        let first_alternative = index == 1
+            && part.effect.attachment_fallback_for == Some(0)
+            && part.edit_target == plan[0].edit_target;
+        let may_edit = caps.editing && (index == 0 || first_alternative)
+            && part.edit_target == intent.edit_target;
+        if part.room != intent.room || part.edit_target.is_some() && !may_edit
         {
             return false;
         }

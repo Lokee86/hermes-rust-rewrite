@@ -752,7 +752,7 @@ pub(super) fn claim(
     let row: Option<(u32,u32,String,String)> = tx.query_row(
         "SELECT p.ordinal,p.attempt,p.stage,p.body FROM messaging_parts p
          JOIN messaging_deliveries d ON d.id=p.delivery WHERE d.connection=?1 AND d.id=?2 AND d.stage='planned'
-         AND p.stage NOT IN ('sent','discarded','partial','submitted')
+         AND p.stage NOT IN ('sent','discarded','partial','submitted','skipped')
          AND NOT EXISTS(SELECT 1 FROM messaging_cooldowns c WHERE c.connection=d.connection AND c.until_ms>?3 AND (c.scope='' OR c.scope=d.destination))
          AND NOT EXISTS(SELECT 1 FROM messaging_deliveries earlier WHERE earlier.connection=d.connection AND earlier.destination=d.destination
              AND earlier.id!=d.id AND earlier.stage IN ('pending','planned')
@@ -1495,6 +1495,28 @@ fn record_recipients(
     Ok(classified)
 }
 
+/// An authenticated create can arrive before its REST response. If that
+/// evidence conflicts with a refusal, keep the alternative fenced and let
+/// reconciliation apply the positive evidence to the original attempt.
+fn pending_publication(
+    tx: &Transaction<'_>,
+    connection: &str,
+    destination: &str,
+    delivery: &str,
+    ordinal: u32,
+) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messaging_effect_identifiers k
+         JOIN messaging_effect_observations o ON o.connection=k.connection AND o.destination=k.destination
+          AND o.kind=k.kind AND o.value=k.value
+         WHERE k.connection=?1 AND k.destination=?2 AND k.delivery=?3 AND k.ordinal=?4
+           AND json_extract(o.evidence,'$.recipient') IS NULL
+           AND json_extract(o.evidence,'$.state') IN ('accepted','delivered','read','played')
+           AND (o.kind='provider' OR json_type(o.evidence,'$.receipt')='text'))",
+        params![connection, destination, delivery, ordinal], |row| row.get(0),
+    )?)
+}
+
 pub(super) fn record(
     tx: &Transaction<'_>,
     connection: &str,
@@ -1648,6 +1670,26 @@ pub(super) fn record(
             let mut classified = RecordedEffect::with("pending", Some("rate_limited"));
             classified.release_slot = receipts.is_empty();
             classified
+        }
+        DeliveryResult::AttachmentNotPublished
+            if generation.is_some()
+                && !exact_replay
+                && receipts.is_empty()
+                && matches!(part.effect.operation, EffectOperation::Message | EffectOperation::Publish { .. }) =>
+        {
+            if pending_publication(tx, connection, &dest, id, ordinal)? {
+                RecordedEffect::uncertain()
+            } else {
+                let enabled = tx.execute(
+                    "UPDATE messaging_parts SET stage='pending' WHERE delivery=?1 AND stage='standby'
+                     AND json_extract(body,'$.effect.attachment_fallback_for')=?2",
+                    params![id, ordinal],
+                )? > 0;
+                let stage = if enabled { "skipped" } else { "rejected" };
+                let mut classified = RecordedEffect::with(stage, Some("attachment_not_accepted"));
+                classified.release_slot = true;
+                classified
+            }
         }
         DeliveryResult::EditNotPublished
             if !exact_replay

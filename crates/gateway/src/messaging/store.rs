@@ -615,7 +615,7 @@ impl Store {
                  AND NOT EXISTS (SELECT 1 FROM messaging_effect_parts delay
                      WHERE delay.delivery = p.delivery AND delay.ordinal = p.ordinal AND delay.retry_after_ms > ?2)
                  AND NOT EXISTS (SELECT 1 FROM messaging_parts preceding WHERE preceding.delivery = p.delivery
-                     AND preceding.ordinal < p.ordinal AND preceding.stage NOT IN ('sent','discarded','partial','submitted'))
+                     AND preceding.ordinal < p.ordinal AND preceding.stage NOT IN ('sent','discarded','partial','submitted','skipped'))
              ))
              ORDER BY d.position",
         )?;
@@ -1057,8 +1057,9 @@ pub(super) fn install_plan(
         return Ok(true);
     }
     for (index, part) in parts.iter().enumerate() {
-        tx.execute("INSERT INTO messaging_parts (delivery,ordinal,body,stage) VALUES (?1,?2,?3,'pending')",
-            params![id, i64::try_from(index)?, serde_json::to_string(part)?])?;
+        let stage = if part.effect.attachment_fallback_for.is_some() { "standby" } else { "pending" };
+        tx.execute("INSERT INTO messaging_parts (delivery,ordinal,body,stage) VALUES (?1,?2,?3,?4)",
+            params![id, i64::try_from(index)?, serde_json::to_string(part)?, stage])?;
         effect_store::register_operation(tx, connection, id, u32::try_from(index)?, part)?;
     }
     Ok(true)
@@ -1096,10 +1097,18 @@ pub(super) fn enqueue(
 }
 
 fn finish_delivery(db: &Connection, id: &str) -> Result<()> {
+    // A final primary outcome leaves any unused alternative terminal as well.
+    db.execute(
+        "UPDATE messaging_parts AS alternative SET stage='skipped' WHERE alternative.delivery=?1 AND alternative.stage='standby'
+         AND EXISTS(SELECT 1 FROM messaging_parts primary_part WHERE primary_part.delivery=alternative.delivery
+           AND primary_part.ordinal=json_extract(alternative.body,'$.effect.attachment_fallback_for')
+           AND primary_part.stage IN ('sent','partial','submitted','rejected','discarded','skipped'))",
+        [id],
+    )?;
     db.execute(
         "UPDATE messaging_deliveries SET stage = CASE
             WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'rejected') THEN 'rejected'
-            WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage NOT IN ('sent','discarded','partial','submitted')) THEN 'planned'
+            WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage NOT IN ('sent','discarded','partial','submitted','skipped')) THEN 'planned'
             WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'discarded') THEN 'discarded'
             WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'partial') THEN 'partial'
             WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'submitted') THEN 'submitted'
