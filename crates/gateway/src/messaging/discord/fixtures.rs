@@ -322,6 +322,11 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             "url":state.gateway,"shards":1,
             "session_start_limit":{"total":1000,"remaining":1000,"reset_after":1000,"max_concurrency":1}
         }),
+        (Method::GET, ["guilds", "11"]) => json!({"id":"11","owner_id":"99"}),
+        (Method::GET, ["guilds", "11", "members", "9"]) => {
+            json!({"user":{"id":"9","bot":true},"roles":[]})
+        }
+        (Method::GET, ["guilds", "11", "roles"]) => json!([{"id":"11","permissions":"8"}]),
         (Method::GET, ["channels", "20"]) => json!({"id":"20","type":1}),
         (Method::GET, ["channels", "21"]) => json!({"id":"21","type":0,"guild_id":"11"}),
         (Method::GET, ["channels", "22"]) => {
@@ -532,6 +537,145 @@ async fn discord_identifies_resumes_deduplicates_and_routes_threads_through_the_
     assert_eq!(channel, "20");
     assert_eq!(payload["content"], "answer next");
     assert_eq!(model.requests().len(), 3);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_verified_thread_receives_routine_and_signed_webhook_without_a_chat() {
+    use hermes_engine::cron::{Draft, RunStatus, Store};
+    use hermes_library::webhooks::Webhook;
+
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let config = fixture.configuration_with(
+        root.path(),
+        json!({
+            "guilds":{"11":{"channels":{"21":{"threads":{"22":{}}}}}},
+            "commands":{"enabled":true,"sync":false},
+            "default_delivery_target":{"guild":"11","channel":"21","thread":"22"},
+        }),
+    );
+    let gateway = model.gateway(root.path(), vec![config]).await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "proactive").await;
+    wait_status(&gateway, |status| {
+        status["connections"][0]["health"] == "ready"
+    })
+    .await;
+
+    let db = hermes_engine::db::open(root.path()).unwrap();
+    let route: String = db.query_row(
+        "SELECT r.id FROM messaging_routes r JOIN messaging_verified_destinations d ON d.route=r.id
+         WHERE json_extract(r.room,'$.thread')='22' AND r.session IS NULL",
+        [], |row| row.get(0),
+    ).unwrap();
+    let destination = format!("channel:{route}");
+    let library = hermes_library::Library::open(root.path()).unwrap();
+    let hook = library
+        .create_webhook(Webhook {
+            name: "fixture-hook".into(),
+            prompt: "Deploy notification".into(),
+            deliver: destination.clone(),
+            deliver_only: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let payload = br#"{"ref":"fixture-revision"}"#.to_vec();
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, hook.secret.as_bytes());
+    let signed = ring::hmac::sign(&key, &payload);
+    let hex: String = signed
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let signature = format!("sha256={hex}");
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/webhooks/fixture-hook", gateway.http_url());
+    let post = |sig: &str| {
+        client
+            .post(&endpoint)
+            .header("x-hub-signature-256", sig)
+            .header("x-hermes-delivery-id", "fixture-delivery")
+            .body(payload.clone())
+            .send()
+    };
+    assert_eq!(
+        post("sha256=00").await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            post(&signature).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+    }
+    let Write::Message {
+        channel, payload, ..
+    } = fixture
+        .next_write("a signed webhook notification", |write| {
+            matches!(write, Write::Message { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(channel, "22");
+    assert!(
+        payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("fixture-revision")
+    );
+    assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
+
+    let jobs = Store::open_view(root.path()).unwrap();
+    let job = jobs
+        .create(
+            Draft {
+                name: "Fixture routine".into(),
+                prompt: "routine delivery".into(),
+                deliver: destination,
+                workdir: Some(root.path().to_owned()),
+                paused: true,
+                ..Draft::default()
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let trigger = || {
+        gateway
+            .shared
+            .scheduler
+            .claim_gateway_now(&job.id, "single-trigger", chrono::Utc::now())
+            .unwrap()
+            .run
+            .id
+    };
+    assert_eq!(trigger(), trigger());
+    gateway.shared.scheduler_notify.notify_one();
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.reply().await
+    else {
+        unreachable!()
+    };
+    assert_eq!(channel, "22");
+    assert_eq!(payload["content"], "answer routine delivery");
+    let status = wait_status(&gateway, |status| {
+        status["deliveries"].as_array().is_some_and(|deliveries| {
+            deliveries.len() == 2
+                && deliveries
+                    .iter()
+                    .all(|delivery| delivery["state"] == "sent" && delivery["route"] == route)
+        })
+    })
+    .await;
+    assert_eq!(status["input"], json!([]));
+    assert_eq!(model.requests().len(), 1);
+    assert_eq!(jobs.runs(&job.id).unwrap()[0].status, RunStatus::Completed);
     gateway.shutdown().await.unwrap();
 }
 
