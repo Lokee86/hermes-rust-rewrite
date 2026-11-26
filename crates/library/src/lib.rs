@@ -248,7 +248,28 @@ impl Library {
         request_key: Option<&str>,
         initialize: impl FnOnce(&SessionSummary, Option<&Path>) -> Result<()>,
     ) -> Result<SessionSummary> {
-        let default_project = if project_id.is_none() { self.default_project()? } else { None };
+        self.create_initialized(project_id, title, request_key, true, initialize)
+    }
+
+    /// Create a durable, idempotent conversation for a background producer.
+    pub fn create_background_session(
+        &self,
+        title: &str,
+        request_key: &str,
+        initialize: impl FnOnce(&SessionSummary) -> Result<()>,
+    ) -> Result<SessionSummary> {
+        self.create_initialized(None, Some(title), Some(request_key), false, |summary, _| initialize(summary))
+    }
+
+    fn create_initialized(
+        &self,
+        project_id: Option<&str>,
+        title: Option<&str>,
+        request_key: Option<&str>,
+        activate: bool,
+        initialize: impl FnOnce(&SessionSummary, Option<&Path>) -> Result<()>,
+    ) -> Result<SessionSummary> {
+        let default_project = if activate && project_id.is_none() { self.default_project()? } else { None };
         let project_id=project_id.or_else(||default_project.as_ref().map(|p|p.id.as_str()));
         self.with_catalog(true, |catalog| {
             let workspace = project_id.map(|id| ensure_project(catalog, id).map(|project| project.path.clone())).transpose()?;
@@ -283,8 +304,10 @@ impl Library {
             let summary = self.summary(&record);
             initialize(&summary, workspace.as_deref())?;
             if !hermes_engine::has_conversation(&directory)? { hermes_engine::create_conversation(&directory, &History::default())?; }
-            catalog.active_session = Some(record.id.clone());
-            catalog.selected_project = record.project_id.clone();
+            if activate {
+                catalog.active_session = Some(record.id.clone());
+                catalog.selected_project = record.project_id.clone();
+            }
             catalog.sessions.push(record);
             Ok(summary)
         })

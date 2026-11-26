@@ -2610,6 +2610,8 @@ dependencies = [
  "fs2",
  "hermes-engine",
  "reqwest",
+ "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

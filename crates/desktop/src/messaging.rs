@@ -418,12 +418,13 @@ impl Messaging {
                 let Some(store) = self.store.clone() else {
                     return (Task::none(), vec![]);
                 };
-                let settings = Settings {
+                let mut settings = Settings {
                     version: 1,
                     token: Some(token),
                     allowed,
                     bot: if self.token.trim().is_empty() { self.bot.clone() } else { None },
                     enabled: false,
+                    agent_replies: false,
                 };
                 self.shutdown();
                 self.saving = true;
@@ -433,6 +434,7 @@ impl Messaging {
                     Task::perform(
                         async move {
                             tokio::task::spawn_blocking(move || {
+                                settings.agent_replies = store.load_settings()?.is_some_and(|saved| saved.agent_replies);
                                 store.save_settings(&settings)?;
                                 Ok(Arc::new(settings))
                             })
