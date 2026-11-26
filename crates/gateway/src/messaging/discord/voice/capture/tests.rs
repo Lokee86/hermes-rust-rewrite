@@ -16,7 +16,7 @@ fn voice_states() -> serde_json::Value {
 #[tokio::test]
 async fn handshake_binds_bot_session_guild_channel_and_discord_endpoint() {
     let (_root, gateway, ingress, _) = fixtures::profile().await;
-    let voice = Voice::new(900);
+    let voice = Voice::new(900, Default::default());
     voice.observe("GUILD_CREATE", &voice_states(), &ingress);
     let room = fixtures::room();
     assert_eq!(
@@ -108,7 +108,7 @@ async fn speech(sink: &mpsc::Sender<Signal>, link: &AudioLink, speaker: (u64, u3
 #[tokio::test]
 async fn live_capture_admits_two_current_speakers_and_fences_old_or_muted_audio() {
     let (_root, gateway, ingress, spoken) = fixtures::profile().await;
-    let voice = Voice::new(900);
+    let voice = Voice::new(900, Default::default());
     voice.observe("GUILD_CREATE", &voice_states(), &ingress);
     let room = fixtures::room();
     voice
@@ -122,16 +122,8 @@ async fn live_capture_admits_two_current_speakers_and_fences_old_or_muted_audio(
         &ingress,
     );
     let (sink, source) = mpsc::channel(96);
-    let link = Arc::new(AudioLink {
-        driver: Mutex::new(Driver::new(Config::default())),
-        stopped: CancellationToken::new(),
-        ready: AtomicBool::new(true),
-        epoch: AtomicU64::new(1),
-        playing: AtomicBool::new(false),
-        transport_epoch: AtomicU64::new(1),
-        last_progress: Mutex::new(Instant::now()),
-        playback: tokio::sync::Mutex::new(()),
-    });
+    let link = Arc::new(AudioLink::new(Driver::new(Config::default())));
+    link.refresh(true);
     let binding = {
         let mut state = crate::lock(&voice.state);
         let call = state.calls.get_mut(&8).unwrap();
@@ -224,5 +216,74 @@ async fn live_capture_admits_two_current_speakers_and_fences_old_or_muted_audio(
     voice.reset();
     task.await.unwrap();
     assert!(link.stopped.is_cancelled());
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn ambient_track_ducks_releases_and_stops_when_the_audience_changes() {
+    let (_root, gateway, ingress, _) = fixtures::profile().await;
+    let settings = serde_json::from_value(json!({
+        "enabled":true,"ambient_gain":0.20,"duck_gain":0.03,"ack_enabled":false
+    }))
+    .unwrap();
+    let voice = Voice::new(900, settings);
+    let mut roster = voice_states();
+    roster["voice_states"].as_array_mut().unwrap().pop();
+    voice.observe("GUILD_CREATE", &roster, &ingress);
+    voice
+        .join(&ingress, &fixtures::actor("10"), &fixtures::room(), "8")
+        .unwrap();
+    voice.observe(
+        "VOICE_STATE_UPDATE",
+        &json!({"guild_id":"8","channel_id":"12","user_id":"900","session_id":"cue-test"}),
+        &ingress,
+    );
+    let call = FixtureCall::attach(&voice, &ingress, 8).unwrap();
+    let gain = || {
+        crate::lock(&call.link.ambient)
+            .as_ref()
+            .map(AmbientTrack::gain)
+    };
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while gain() != Some(0.20) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let wav = crate::messaging::discord::media::pcm_wave(&[512; 8000]);
+    let input = super::super::cues::speech_input(&wav, Duration::from_secs(1), 0).unwrap();
+    let (speech, _) = call.link.start_speech(input, &voice.cues);
+    assert_eq!(gain(), Some(0.03));
+    assert!(call.link.capture_blocked());
+    drop(speech);
+    assert!(call.link.capture_blocked());
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let mut rose_smoothly = false;
+        loop {
+            if let Some(level) = gain() {
+                if level == 0.20 {
+                    assert!(rose_smoothly);
+                    break;
+                }
+                rose_smoothly |= (0.03..0.20).contains(&level);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    voice.observe(
+        "VOICE_STATE_UPDATE",
+        &json!({"guild_id":"8","channel_id":"12","user_id":"30"}),
+        &ingress,
+    );
+    assert_eq!(gain(), None);
+    tokio::time::sleep(Duration::from_millis(190)).await;
+    assert_eq!(gain(), None);
+    voice.leave("8").unwrap();
+    assert!(call.link.stopped.is_cancelled());
     gateway.shutdown().await.unwrap();
 }

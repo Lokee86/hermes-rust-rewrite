@@ -196,6 +196,9 @@ impl Ingress {
             let event = InboundEvent { id: "active-execution".into(), room: room.clone(), sender: sender.clone(),
                 reply_anchor: None, mentioned: true, body: InboundBody::Command(super::Command::Status) };
             let Ok(route) = self.route_event(&state.policy, &event)? else { return Err(GatewayError::Forbidden) };
+            let Some(route) = db(self.store.route(&route.id))?.filter(|route| !route.blocked) else {
+                return Ok(None);
+            };
             let route = db(self.store.conversation(&route))?;
             Ok(route.session.filter(|_| !route.blocked))
         })?;
@@ -1494,7 +1497,7 @@ async fn work_loop(
         let Some(shared) = owner.upgrade() else {
             break Ok(());
         };
-        if let Err(error) = sessions::advance(&shared, scope, stop).await {
+        if let Err(error) = sessions::advance(&shared, scope, adapter.as_ref(), stop).await {
             break if error == GatewayError::StaleConnection {
                 Ok(())
             } else {

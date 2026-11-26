@@ -306,7 +306,7 @@ async fn open_cdn(
 
 /// Voice notes are Ogg Opus. Apply pre-skip and the ending granule at
 /// the output sample rate and bound decoded PCM independently of file size.
-fn decode_voice_note(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
+pub(super) fn decode_voice_note(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
     if bytes.starts_with(b"RIFF") {
         return if bytes.len() <= MAX_FILE {
             Ok(bytes.to_vec())

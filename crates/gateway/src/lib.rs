@@ -1851,7 +1851,12 @@ impl Shared {
             channel_tools: admission.channel.as_ref().is_some_and(|policy| policy.tools),
             channel_policy: admission.channel.as_ref().map(|channel| channel.policy.clone()).unwrap_or_default(),
         };
+        let feedback_stop = cancel.child_token();
+        let _feedback_lifetime = feedback_stop.clone().drop_guard();
         let mut stream = TurnStream {
+            first_tool_feedback: admission.channel.as_mut()
+                .and_then(|channel| channel.first_tool_feedback.take())
+                .map(|feedback| (feedback, feedback_stop.clone())),
             approval_context: admission.channel.as_ref().and_then(|channel| channel.approval_context.clone()),
             unattended: admission.unattended || admission.channel.as_ref().is_some_and(|policy| !policy.interactive),
             id: admission.id.clone(),
@@ -1926,6 +1931,7 @@ impl Shared {
             }
             (result, target.history().clone(), target.take_reasoning_summaries())
         };
+        feedback_stop.cancel();
         while let Ok(event) = rx.try_recv() {
             self.handle_event(&session, event, &mut stream, &cancel);
         }
@@ -1980,6 +1986,9 @@ impl Shared {
                 .iter_mut()
                 .find(|r| Some(&r.id) == current.as_ref())
             {
+                if let Some(channel) = &mut receipt.channel {
+                    channel.first_tool_feedback = None;
+                }
                 receipt.status = "terminal".into();
                 receipt.outcome = Some(status.into());
                 receipt.result = Some(payload.clone());
@@ -2078,6 +2087,11 @@ impl Shared {
                                 }
                                 for call in calls {
                                     if stream.tools.insert(call.id.clone()) {
+                                        if let Some((feedback, stop)) = stream.first_tool_feedback.take()
+                                            && !stop.is_cancelled()
+                                        {
+                                            feedback(stop);
+                                        }
                                         self.emit(session,"tool.start",json!({"tool_id":call.id,"name":call.name,"args":serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null),"args_text":call.arguments}));
                                     }
                                 }
@@ -2151,6 +2165,7 @@ impl Shared {
 }
 
 struct TurnStream {
+    first_tool_feedback: Option<(messaging::FirstToolFeedback, CancellationToken)>,
     unattended: bool,
     approval_context: Option<messaging::ToolApprovalContext>,
     id: String,

@@ -18,6 +18,10 @@ pub const CONTRACT_VERSION: u32 = 1;
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Live feedback attached to an execution. The turn token is cancelled on
+/// settlement. No feedback is stored or replayed as a delivery effect.
+pub type FirstToolFeedback = Arc<dyn Fn(CancellationToken) + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
     pub text_intake: bool,
@@ -120,6 +124,16 @@ pub trait Adapter: Send + Sync {
         ingress: Ingress,
         cancel: CancellationToken,
     ) -> AdapterFuture<'_, ConnectionFailure>;
+
+    /// Optionally bind live, best-effort feedback to this input before execution.
+    /// The returned callback runs once on the first tool call and must return promptly.
+    fn first_tool_feedback(
+        &self,
+        _ingress: Ingress,
+        _event: &InboundEvent,
+    ) -> Option<FirstToolFeedback> {
+        None
+    }
 
     /// Render the committed intent into bounded platform operations without network effects.
     fn prepare(&self, intent: &DeliveryIntent) -> Result<Vec<DeliveryPart>, PreparationFailure>;

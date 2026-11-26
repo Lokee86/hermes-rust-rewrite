@@ -166,6 +166,7 @@ pub struct DiscordSettings {
     pub auto_thread: bool,
     pub auto_thread_inline_fallback: bool,
     pub voice_enabled: bool,
+    pub voice_fx: DiscordVoiceFxSettings,
     pub dispatch_silence_secs: u64,
     pub recovery: DiscordRecoverySettings,
     pub commands: DiscordCommandSettings,
@@ -192,6 +193,7 @@ impl Default for DiscordSettings {
             auto_thread: false,
             auto_thread_inline_fallback: false,
             voice_enabled: false,
+            voice_fx: DiscordVoiceFxSettings::default(),
             dispatch_silence_secs: 300,
             recovery: DiscordRecoverySettings::default(),
             commands: DiscordCommandSettings::default(),
@@ -200,6 +202,81 @@ impl Default for DiscordSettings {
             default_delivery_target: None,
             deployment_secret: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscordVoiceFxSettings {
+    pub enabled: bool,
+    pub ambient_enabled: bool,
+    /// Optional local PCM WAV or Ogg Opus loop. Relative paths are profile-relative.
+    pub ambient_path: Option<PathBuf>,
+    pub ambient_gain: DiscordVoiceGain,
+    pub duck_gain: DiscordVoiceGain,
+    pub speech_gain: DiscordVoiceGain,
+    pub lead_silence_ms: u16,
+    pub ack_enabled: bool,
+    pub ack_phrases: Option<Vec<String>>,
+}
+
+impl Default for DiscordVoiceFxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ambient_enabled: true,
+            ambient_path: None,
+            ambient_gain: DiscordVoiceGain(180),
+            duck_gain: DiscordVoiceGain(60),
+            speech_gain: DiscordVoiceGain(1000),
+            lead_silence_ms: 200,
+            ack_enabled: true,
+            ack_phrases: None,
+        }
+    }
+}
+
+impl DiscordVoiceFxSettings {
+    fn validate(&self) -> Result<()> {
+        ensure!(self.lead_silence_ms <= 1000, "Invalid Discord voice cue lead silence");
+        ensure!(
+            self.ack_phrases.as_ref().is_none_or(|phrases| {
+                phrases.len() <= 16 && phrases.iter().all(|phrase| {
+                    !phrase.trim().is_empty()
+                        && phrase.len() <= super::super::media::MAX_FEEDBACK_TEXT
+                        && !phrase.chars().any(char::is_control)
+                })
+            }),
+            "Invalid Discord voice acknowledgement phrases"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct DiscordVoiceGain(u16);
+
+impl TryFrom<f64> for DiscordVoiceGain {
+    type Error = &'static str;
+
+    fn try_from(gain: f64) -> Result<Self, Self::Error> {
+        if !(0.0..=1.0).contains(&gain) {
+            return Err("Discord voice gains must be between 0 and 1");
+        }
+        Ok(Self((gain * 1000.0).round() as u16))
+    }
+}
+
+impl From<DiscordVoiceGain> for f64 {
+    fn from(gain: DiscordVoiceGain) -> Self {
+        f64::from(gain.0) / 1000.0
+    }
+}
+
+impl DiscordVoiceGain {
+    pub(super) fn amplitude(self) -> f32 {
+        f32::from(self.0) / 1000.0
     }
 }
 
@@ -455,6 +532,7 @@ impl DiscordSettings {
                 .chain(&self.ignored_channels),
         )?;
         self.grants.validate(false)?;
+        self.voice_fx.validate()?;
         self.direct.rules.validate(self.dm_role_guild.is_some())?;
         validate_ids(
             self.dm_role_guild

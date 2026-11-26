@@ -26,6 +26,9 @@ const MAX_PROFILE_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_PENDING_GRANTS: i64 = 64;
 const MAX_FETCH_GRANTS_PER_EFFECT: i64 = 32;
 const MAX_READ_LIFETIME: Duration = Duration::from_secs(120);
+pub(super) const MAX_FEEDBACK_TEXT: usize = 256;
+const MAX_FEEDBACK_WAV: usize = 2 * 1024 * 1024;
+const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_FETCH_LIFETIME: Duration = Duration::from_secs(900);
 const DOWNLOAD_OPERATION: &str = "download_media";
 
@@ -699,6 +702,40 @@ impl Ingress {
             })
         })
         .await
+    }
+
+    /// Synthesize a configured live cue for an authorized tool-enabled actor.
+    /// Cues use available local speech capacity and have no artifact or receipt.
+    pub(super) async fn synthesize_voice_feedback(
+        &self,
+        room: &Room,
+        actor: &Sender,
+        phrase: &str,
+    ) -> Result<Vec<u8>, GatewayError> {
+        if phrase.trim().is_empty() || phrase.len() > MAX_FEEDBACK_TEXT {
+            return Err(GatewayError::Invalid);
+        }
+        let check = || self.checked(true, |state| {
+            if state.policy.delivery_policy(room).protection.is_some()
+                || !state.policy.room_policy(room).is_some_and(|room| room.tools)
+                || !self.authorized_identity(&state.policy, room, actor)?
+                    .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
+            {
+                return Err(GatewayError::Forbidden);
+            }
+            Ok(())
+        });
+        check()?;
+        let audio = self.store.audio();
+        let _permit = audio.active.try_lock().map_err(|_| GatewayError::TemporarilyUnavailable)?;
+        let bytes = tokio::time::timeout(FEEDBACK_TIMEOUT, audio.service.synthesize(&audio.root, phrase))
+            .await.map_err(|_| GatewayError::TemporarilyUnavailable)??;
+        check()?;
+        if bytes.len() > MAX_FEEDBACK_WAV {
+            return Err(GatewayError::Invalid);
+        }
+        validate_wav(&bytes, None)?;
+        Ok(bytes)
     }
 
     /// Render speech from this verified reply's exact committed text. The

@@ -12,6 +12,7 @@ use std::{io::Read, path::Path, sync::Arc};
 pub(super) async fn advance(
     owner: &Arc<Shared>,
     scope: &Ingress,
+    adapter: &dyn Adapter,
     stop: &CancellationToken,
 ) -> Result<(), GatewayError> {
     db(scope.store.expire_preparations(&scope.connection, chrono::Utc::now().timestamp_millis()))?;
@@ -22,7 +23,7 @@ pub(super) async fn advance(
         match &input.event.body {
             InboundBody::Control(control) => apply_control(owner, scope, &input, control).await?,
             InboundBody::Command(Command::UseSkill { .. } | Command::Background { .. })
-            | InboundBody::Message(_) | InboundBody::Wake => advance_message(owner, scope, input).await?,
+            | InboundBody::Message(_) | InboundBody::Wake => advance_message(owner, scope, adapter, input).await?,
             InboundBody::Command(command) => apply_command(owner, scope, &input, command).await?,
         }
     }
@@ -146,6 +147,7 @@ fn authorized(
 async fn advance_message(
     owner: &Arc<Shared>,
     scope: &Ingress,
+    adapter: &dyn Adapter,
     work: PendingInput,
 ) -> Result<(), GatewayError> {
     let wake = matches!(work.event.body, InboundBody::Wake);
@@ -280,6 +282,9 @@ async fn advance_message(
     }
     match receipt["status"].as_str() {
         Some("queued") if allowed => {
+            let feedback = (!background && !wake)
+                .then(|| adapter.first_tool_feedback(scope.clone(), &work.event))
+                .flatten();
             let claim = scope.checked(true, |state| {
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
@@ -322,6 +327,7 @@ async fn advance_message(
                         tools,
                         interactive: individual && !background && scope.capabilities().interactive_prompts,
                         model,
+                        first_tool_feedback: if tools { feedback } else { None },
                         approval_context: (individual && !background && !wake && tools).then(|| super::ToolApprovalContext {
                             ingress: scope.clone(),
                             route: work.route.id.clone(),

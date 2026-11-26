@@ -1,21 +1,20 @@
 //! Scoped leases over Discord's independent voice transport.
+use super::settings::DiscordVoiceFxSettings;
 use crate::messaging::{
     ActorKind, DeliveryIntent, DeliveryResult, GatewayError, Ingress, Room, RoomKind, SendAttempt,
     Sender,
 };
 use capture::AudioLink;
+use cues::VoiceCues;
 use reqwest::Url;
 use serde_json::{Value, json};
 use songbird::{
-    Config, ConnectionInfo, CoreEvent, Driver, Event, EventContext, EventHandler, TrackEvent,
+    Config, ConnectionInfo, CoreEvent, Driver, Event, EventContext, EventHandler,
     driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
-    events::EventData,
-    input::RawAdapter,
-    tracks::{PlayMode, Track},
+    tracks::PlayMode,
 };
 use std::{
     collections::{HashMap, HashSet},
-    io::Cursor,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,6 +25,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 mod capture;
+mod cues;
+#[cfg(test)]
+pub(super) use capture::FixtureCall;
 
 const MAX_CALLS: usize = 4;
 const MAX_STATES: usize = 8192;
@@ -40,6 +42,7 @@ const PLAYBACK: &str = "discord-voice-playback-";
 pub(super) struct Voice {
     bot: u64,
     state: Arc<Mutex<VoiceState>>,
+    cues: Arc<VoiceCues>,
 }
 
 #[derive(Default)]
@@ -113,10 +116,11 @@ fn state_command(guild: u64, channel: Option<u64>) -> Value {
 }
 
 impl Voice {
-    pub(super) fn new(bot: u64) -> Self {
+    pub(super) fn new(bot: u64, settings: DiscordVoiceFxSettings) -> Self {
         Self {
             bot,
             state: Arc::new(Mutex::new(VoiceState::default())),
+            cues: Arc::new(VoiceCues::new(settings)),
         }
     }
 
@@ -376,6 +380,7 @@ impl Voice {
         if !self.audience_allowed(ingress, &binding) {
             return DeliveryResult::Rejected;
         }
+        link.cancel_ack();
         let Ok(_exclusivity) = link.playback.try_lock() else {
             return DeliveryResult::Retryable {
                 after: Duration::from_secs(1),
@@ -388,27 +393,13 @@ impl Voice {
         let Ok(bytes) = ingress.reply_artifact(attempt, &artifact).await else {
             return DeliveryResult::Rejected;
         };
-        let Some(input) = playback_input(&bytes) else {
+        let Some(input) = cues::speech_input(&bytes, PLAY_LIMIT, self.cues.lead_ms()) else {
             return DeliveryResult::Rejected;
         };
         if !link.valid(epoch) || !self.audience_allowed(ingress, &binding) {
             return DeliveryResult::Rejected;
         }
-        let (done, finished) = oneshot::channel();
-        let completion = Arc::new(Mutex::new(Some(done)));
-        let mut track = Track::new(input);
-        for event in [TrackEvent::End, TrackEvent::Error] {
-            track.events.add_event(
-                EventData::new(event.into(), TrackFinished(completion.clone())),
-                Duration::ZERO,
-            );
-        }
-
-        link.playing.store(true, Ordering::Release);
-        let playback = ActivePlayback {
-            flag: &link.playing,
-            track: crate::lock(&link.driver).play_only(track),
-        };
+        let (playback, finished) = link.start_speech(input, &self.cues);
         let confirmed = playback_completed(&link.stopped, finished, || {
             link.valid(epoch) && self.audience_allowed(ingress, &binding)
         })
@@ -448,6 +439,10 @@ impl Voice {
         let listeners = {
             let state = crate::lock(&self.state);
             if !state.complete_rosters.contains(&binding.guild)
+                || state
+                    .calls
+                    .get(&binding.guild)
+                    .is_none_or(|call| call.binding.id != binding.id)
                 || state
                     .members
                     .get(&(binding.guild, self.bot))
@@ -559,7 +554,7 @@ impl VoiceState {
             && let Some(link) = &call.link
         {
             // A changed call audience invalidates audio already captured or playing.
-            link.epoch.fetch_add(1, Ordering::AcqRel);
+            link.invalidate_output();
         }
     }
 }
@@ -602,20 +597,6 @@ fn authorized(ingress: &Ingress, room: &Room, actor: &Sender) -> Result<bool, Ga
             .authorized_identity(&state.policy, room, actor)?
             .is_some_and(|(_, kind)| kind == ActorKind::Person))
     })
-}
-
-fn playback_input(bytes: &[u8]) -> Option<songbird::input::Input> {
-    let (rate, samples) = super::voice_note::wav_pcm(bytes)?;
-    if samples.len() as u64 / 2 > rate as u64 * PLAY_LIMIT.as_secs() {
-        return None;
-    }
-    let float_pcm: Vec<u8> = samples
-        .chunks_exact(2)
-        .flat_map(|sample| {
-            (f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0).to_le_bytes()
-        })
-        .collect();
-    Some(RawAdapter::new(Cursor::new(float_pcm), rate as u32, 1).into())
 }
 
 async fn playback_completed(
@@ -661,14 +642,14 @@ async fn interrupted_or_revoked_playback_does_not_get_a_completion_receipt() {
 }
 
 struct ActivePlayback<'a> {
-    flag: &'a AtomicBool,
+    link: &'a AudioLink,
     track: songbird::tracks::TrackHandle,
 }
 
 impl Drop for ActivePlayback<'_> {
     fn drop(&mut self) {
         let _ = self.track.stop();
-        self.flag.store(false, Ordering::Release);
+        self.link.end_speech();
     }
 }
 

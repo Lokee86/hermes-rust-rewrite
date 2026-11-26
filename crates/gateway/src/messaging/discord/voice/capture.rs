@@ -2,7 +2,7 @@ use super::{
     Arc, AtomicBool, AtomicU64, Binding, CancellationToken, Channels, Config, ConnectionInfo,
     CoreEvent, DecodeConfig, DecodeMode, Driver, Event, EventContext, EventHandler, Ingress,
     JOIN_TIMEOUT, Mutex, Ordering, SAMPLE_INTERVAL, SampleRate, VOICE_ORIGIN, Voice, authorized,
-    mpsc,
+    cues::AmbientTrack, mpsc,
 };
 use crate::messaging::{
     AttachmentManifest, InboundBody, InboundEvent, MediaPurpose, MediaRead, MediaSource, Message,
@@ -24,6 +24,7 @@ const MIN_UTTERANCE: usize = 16_000 / 5;
 const SILENCE: Duration = Duration::from_millis(650);
 const GRANT_LIFETIME: Duration = Duration::from_secs(90);
 const MAX_FRAME: usize = 16_000 * 120 / 1000;
+const SPEECH_ECHO_TAIL: Duration = Duration::from_millis(180);
 
 pub(super) struct AudioLink {
     pub(super) driver: Mutex<Driver>,
@@ -31,12 +32,33 @@ pub(super) struct AudioLink {
     pub(super) ready: AtomicBool,
     pub(super) epoch: AtomicU64,
     pub(super) playing: AtomicBool,
+    pub(super) ambient: Mutex<Option<AmbientTrack>>,
+    pub(super) ack: Mutex<Option<CancellationToken>>,
+    pub(super) last_mic: Mutex<Option<Instant>>,
+    quiet_until: Mutex<Instant>,
     transport_epoch: AtomicU64,
     last_progress: Mutex<Instant>,
     pub(super) playback: tokio::sync::Mutex<()>,
 }
 
 impl AudioLink {
+    fn new(driver: Driver) -> Self {
+        Self {
+            driver: Mutex::new(driver),
+            stopped: CancellationToken::new(),
+            ready: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            ambient: Mutex::new(None),
+            ack: Mutex::new(None),
+            last_mic: Mutex::new(None),
+            quiet_until: Mutex::new(Instant::now()),
+            transport_epoch: AtomicU64::new(0),
+            last_progress: Mutex::new(Instant::now()),
+            playback: tokio::sync::Mutex::new(()),
+        }
+    }
+
     pub(super) fn start(
         voice: Voice,
         binding: Binding,
@@ -46,16 +68,7 @@ impl AudioLink {
         let driver = Driver::new(Config::default().decode_mode(DecodeMode::Decode(
             DecodeConfig::new(Channels::Mono, SampleRate::Hz16000),
         )));
-        let link = Arc::new(Self {
-            driver: Mutex::new(driver),
-            stopped: CancellationToken::new(),
-            ready: AtomicBool::new(false),
-            epoch: AtomicU64::new(0),
-            playing: AtomicBool::new(false),
-            transport_epoch: AtomicU64::new(0),
-            last_progress: Mutex::new(Instant::now()),
-            playback: tokio::sync::Mutex::new(()),
-        });
+        let link = Arc::new(Self::new(driver));
         let (signals, receiver) = mpsc::channel(96);
         let handler = DriverEvents {
             link: Arc::downgrade(&link),
@@ -83,13 +96,32 @@ impl AudioLink {
                 result = tokio::time::timeout(JOIN_TIMEOUT, connect) => matches!(result, Ok(Ok(()))),
             };
             if connected && !active.stopped.is_cancelled() {
-                receive(voice, binding, ingress, active.clone(), receiver).await;
+                active.run(voice, binding, ingress, receiver).await;
             } else {
                 active.stopped.cancel();
                 crate::lock(&active.driver).leave();
             }
         });
         link
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        voice: Voice,
+        binding: Binding,
+        ingress: Ingress,
+        receiver: mpsc::Receiver<Signal>,
+    ) {
+        tokio::join!(
+            receive(
+                voice.clone(),
+                binding.clone(),
+                ingress.clone(),
+                self.clone(),
+                receiver
+            ),
+            voice.ambient(&binding, &ingress, &self),
+        );
     }
 
     pub(super) fn valid(&self, epoch: u64) -> bool {
@@ -102,10 +134,20 @@ impl AudioLink {
         *crate::lock(&self.last_progress)
     }
 
+    pub(super) fn end_speech(&self) {
+        *crate::lock(&self.quiet_until) = Instant::now() + SPEECH_ECHO_TAIL;
+        self.playing.store(false, Ordering::Release);
+    }
+
+    fn capture_blocked(&self) -> bool {
+        self.playing.load(Ordering::Acquire) || Instant::now() < *crate::lock(&self.quiet_until)
+    }
+
     fn refresh(&self, ready: bool) {
+        self.ready.store(false, Ordering::Release);
         *crate::lock(&self.last_progress) = Instant::now();
         self.transport_epoch.fetch_add(1, Ordering::AcqRel);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.invalidate_output();
         self.ready.store(ready, Ordering::Release);
     }
 }
@@ -142,16 +184,15 @@ impl EventHandler for DriverEvents {
             EventContext::DriverReconnect(_) => link.refresh(true),
             EventContext::DriverDisconnect(_) => link.refresh(false),
             EventContext::SpeakingStateUpdate(update) => {
-                if let Some(user) = update.user_id
-                    && user.0 != self.bot
-                {
+                if let Some(user) = update.user_id {
                     let signal = Signal::Speaker {
                         transport: link.transport_epoch.load(Ordering::Acquire),
                         ssrc: update.ssrc,
                         user: user.0,
-                        microphone: update
-                            .speaking
-                            .contains(songbird::model::SpeakingState::MICROPHONE),
+                        microphone: user.0 != self.bot
+                            && update
+                                .speaking
+                                .contains(songbird::model::SpeakingState::MICROPHONE),
                     };
                     if self.signals.try_send(signal).is_err() {
                         link.epoch.fetch_add(1, Ordering::AcqRel);
@@ -167,9 +208,7 @@ impl EventHandler for DriverEvents {
                     link.epoch.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            EventContext::VoiceTick(tick)
-                if link.valid(epoch) && !link.playing.load(Ordering::Acquire) =>
-            {
+            EventContext::VoiceTick(tick) if link.valid(epoch) && !link.capture_blocked() => {
                 for (ssrc, audio) in tick.speaking.iter().take(MAX_SPEAKERS) {
                     if audio.packet.is_some()
                         && let Some(pcm) = &audio.decoded_voice
@@ -226,7 +265,7 @@ async fn receive(
             biased;
             _ = link.stopped.cancelled() => break,
             _ = timer.tick() => {
-                if !link.valid(epoch) || link.playing.load(Ordering::Acquire) {
+                if !link.valid(epoch) || link.capture_blocked() {
                     captures.clear();
                     continue;
                 }
@@ -267,7 +306,7 @@ async fn receive(
                 }
                 Signal::Frame { epoch: current, ssrc, pcm } if current == epoch && link.valid(epoch) => {
                     let Some(&actor) = speakers.get(&ssrc) else { continue };
-                    if link.playing.load(Ordering::Acquire) || !member_eligible(&voice, &binding, actor) {
+                    if link.capture_blocked() || !member_eligible(&voice, &binding, actor) {
                         captures.remove(&ssrc);
                         continue;
                     }
@@ -284,6 +323,7 @@ async fn receive(
                         }
                         captures.entry(ssrc).or_insert(capture)
                     };
+                    link.note_microphone();
                     let remaining = MAX_UTTERANCE - capture.pcm.len();
                     capture.pcm.extend_from_slice(&pcm[..pcm.len().min(remaining)]);
                     capture.last = Instant::now();
@@ -294,6 +334,65 @@ async fn receive(
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::messaging::discord) struct FixtureCall {
+    link: Arc<AudioLink>,
+    signals: mpsc::Sender<Signal>,
+}
+
+#[cfg(test)]
+impl FixtureCall {
+    pub(in crate::messaging::discord) fn attach(
+        voice: &Voice,
+        ingress: &Ingress,
+        guild: u64,
+    ) -> Option<Self> {
+        let (signals, receiver) = mpsc::channel(96);
+        let link = Arc::new(AudioLink::new(Driver::new(Config::default())));
+        link.refresh(true);
+        let binding = {
+            let mut state = crate::lock(&voice.state);
+            let call = state
+                .calls
+                .get_mut(&guild)
+                .filter(|call| call.session.is_some() && call.link.is_none())?;
+            call.link = Some(link.clone());
+            call.binding.clone()
+        };
+        tokio::spawn(
+            link.clone()
+                .run(voice.clone(), binding, ingress.clone(), receiver),
+        );
+        Some(Self { link, signals })
+    }
+
+    pub(in crate::messaging::discord) async fn utterance(&self, user: u64, ssrc: u32) {
+        self.signals
+            .send(Signal::Speaker {
+                transport: self.link.transport_epoch.load(Ordering::Acquire),
+                ssrc,
+                user,
+                microphone: true,
+            })
+            .await
+            .unwrap();
+        for _ in 0..14 {
+            self.signals
+                .send(Signal::Frame {
+                    epoch: self.link.epoch.load(Ordering::Acquire),
+                    ssrc,
+                    pcm: vec![1000; 320],
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    pub(in crate::messaging::discord) fn speaking(&self) -> bool {
+        self.link.playing.load(Ordering::Acquire)
     }
 }
 

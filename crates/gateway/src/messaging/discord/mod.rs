@@ -22,8 +22,8 @@ pub use settings::{DiscordConnectionSettings, DiscordSettings};
 
 use super::{
     Adapter, AdapterFuture, ConnectionFailure, DeliveryBody, DeliveryIntent, DeliveryPart,
-    DeliveryResult, Effect, Ingress, Message, PreparationFailure, Room, RoomKind, SendAttempt,
-    Sender, SpokenReplyMode, VerifiedInstallation,
+    DeliveryResult, Effect, FirstToolFeedback, InboundEvent, Ingress, Message, PreparationFailure,
+    Room, RoomKind, SendAttempt, Sender, SpokenReplyMode, VerifiedInstallation,
 };
 use channels::Channel;
 use client::DiscordClient;
@@ -57,7 +57,7 @@ pub(super) struct DiscordAdapter {
 
 impl DiscordAdapter {
     fn new(settings: DiscordSettings, client: DiscordClient, bot: VerifiedBot) -> Self {
-        let voice = Voice::new(bot.bot_id.parse().unwrap_or_default());
+        let voice = Voice::new(bot.bot_id.parse().unwrap_or_default(), settings.voice_fx.clone());
         Self {
             client,
             settings,
@@ -195,6 +195,10 @@ impl Adapter for DiscordAdapter {
                 () = self.refresh_pending_memberships(&ingress, &cancel) => ConnectionFailure::Stopped,
             }
         })
+    }
+
+    fn first_tool_feedback(&self, ingress: Ingress, event: &InboundEvent) -> Option<FirstToolFeedback> {
+        self.settings.voice_enabled.then(|| self.voice.first_tool_feedback(ingress, event)).flatten()
     }
 
     fn prepare(&self, intent: &DeliveryIntent) -> Result<Vec<DeliveryPart>, PreparationFailure> {

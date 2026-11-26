@@ -134,11 +134,16 @@ impl VoiceNote {
 
 /// Read the mono 16-bit PCM WAV emitted by the profile speech service.
 pub(super) fn wav_pcm(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    let (rate, channels, samples) = wav_pcm_format(bytes)?;
+    (channels == 1).then_some((rate, samples))
+}
+
+pub(super) fn wav_pcm_format(bytes: &[u8]) -> Option<(usize, u32, &[u8])> {
     if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
         return None;
     }
     let mut chunks = bytes.get(12..)?;
-    let mut rate = None;
+    let mut format = None;
     let mut samples = None;
     while !chunks.is_empty() {
         let header = chunks.get(..8)?;
@@ -146,18 +151,22 @@ pub(super) fn wav_pcm(bytes: &[u8]) -> Option<(usize, &[u8])> {
         let end = 8usize.checked_add(size)?;
         let data = chunks.get(8..end)?;
         match &header[..4] {
-            b"fmt " if data.get(..4)? == [1, 0, 1, 0] && data.get(14..16)? == [16, 0] => {
-                rate = Some(u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize);
+            b"fmt " if data.get(..2)? == [1, 0] && data.get(14..16)? == [16, 0] => {
+                let channels = u16::from_le_bytes(data.get(2..4)?.try_into().ok()?);
+                let rate = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+                format = Some((rate, u32::from(channels)));
             }
             b"data" if !data.is_empty() && data.len().is_multiple_of(2) => samples = Some(data),
             _ => {}
         }
         chunks = chunks.get(end + size % 2..)?;
     }
-    Some((
-        rate.filter(|rate| (8_000..=192_000).contains(rate))?,
-        samples?,
-    ))
+    let (rate, channels) = format?;
+    let samples = samples?;
+    ((8_000..=192_000).contains(&rate)
+        && (1..=2).contains(&channels)
+        && samples.len().is_multiple_of(channels as usize * 2))
+        .then_some((rate, channels, samples))
 }
 
 pub(super) fn encode(wav: &[u8]) -> Result<VoiceNote, GatewayError> {

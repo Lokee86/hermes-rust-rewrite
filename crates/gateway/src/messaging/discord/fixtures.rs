@@ -47,6 +47,8 @@ mod background_fixtures;
 mod manual_thread_fixtures;
 #[path = "voice_note_fixtures.rs"]
 mod voice_note_fixtures;
+#[path = "voice_cue_fixtures.rs"]
+mod voice_cue_fixtures;
 #[path = "membership_fixtures.rs"]
 mod membership_fixtures;
 #[path = "thread_update_fixtures.rs"]
