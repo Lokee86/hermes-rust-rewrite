@@ -1,6 +1,6 @@
 # IRC stock plugin implementation spec
 
-Register IRC as a bundled Rust adapter with platform key `irc`. Start after SimpleX and the shared gate. A headless profile can connect to a configured IRC network, work in authorized DMs and addressed joined channels, and send bounded plain-text replies and scheduled results. Qualify enhanced identity, confirmation and replay only when the network negotiates them. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [SimpleX spec](SIMPLEX_ADAPTER_SPEC.md) · [Hermes IRC guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/irc.md)
+Register IRC as a bundled Rust adapter with platform key `irc`. Start after SimpleX and the shared gate. A headless profile can connect to a configured IRC network, work in authorized DMs and addressed joined channels, and send bounded plain-text replies and scheduled results. Qualify enhanced identity, confirmation and replay only when the network negotiates them. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [SimpleX spec](SIMPLEX_ADAPTER_SPEC.md) · [Hermes IRC guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/irc.md) · [Next adapter, Buzz](BUZZ_ADAPTER_SPEC.md)
 
 ## Connection and routing
 
