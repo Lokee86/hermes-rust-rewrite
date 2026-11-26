@@ -136,11 +136,14 @@ impl Ingress {
             if self.route_event(&state.policy, &event)?.is_err() {
                 return Err(GatewayError::Forbidden);
             }
-            let operator = state.policy.operator(&event.sender);
+            let operator = self.authorize_operator(&state.policy, &event.room, &event.sender)?;
+            let turn = state.policy.turn_policy(&event.room);
             Ok(COMMANDS
                 .iter()
                 .copied()
-                .filter(|item| !item.operator || operator)
+                .filter(|item| (!item.operator || operator)
+                    && (item.name != "skill" || turn.skills.as_ref().is_some_and(|skills| !skills.is_empty()))
+                    && (item.name != "fetch-result" || self.capabilities().interactive_prompts))
                 .collect())
         })
     }
@@ -155,7 +158,7 @@ impl Ingress {
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |state| {
-                let event = InboundEvent {
+                let mut event = InboundEvent {
                     id: event_id,
                     room,
                     sender,
@@ -166,6 +169,7 @@ impl Ingress {
                 let Ok(route) = scope.route_event(&state.policy, &event)? else {
                     return Err(GatewayError::Forbidden);
                 };
+                scope.normalize_event(&mut event)?;
                 db(scope.store.invocation(&route, &event.id, &event.sender.id))
             })
         })
@@ -190,7 +194,7 @@ impl Ingress {
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |state| {
-                let event = InboundEvent {
+                let mut event = InboundEvent {
                     id: input,
                     room,
                     sender,
@@ -201,6 +205,7 @@ impl Ingress {
                 let Ok(route) = scope.route_event(&state.policy, &event)? else {
                     return Err(GatewayError::Forbidden);
                 };
+                scope.normalize_event(&mut event)?;
                 db(scope
                     .store
                     .defer_result(&route, &event.id, &event.sender.id, expires_ms))?
@@ -223,7 +228,7 @@ impl Ingress {
         let scope = self.clone();
         let changed = blocking(move || {
             scope.checked(true, |state| {
-                let event = InboundEvent {
+                let mut event = InboundEvent {
                     id: invocation,
                     room,
                     sender,
@@ -236,6 +241,7 @@ impl Ingress {
                 let Ok(route) = scope.route_event(&state.policy, &event)? else {
                     return Err(GatewayError::Forbidden);
                 };
+                scope.normalize_event(&mut event)?;
                 db(scope.store.release_result(
                     &route,
                     &action,

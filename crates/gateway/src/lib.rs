@@ -138,6 +138,13 @@ pub const METHODS: &[&str] = &[
     "messaging.bind_conversation",
     "messaging.wake_target",
     "messaging.send",
+    "messaging.profile.settings",
+    "messaging.profile.enrollment_begin",
+    "messaging.profile.enrollment_complete",
+    "messaging.profile.enable",
+    "messaging.profile.policy",
+    "messaging.profile.pair",
+    "messaging.profile.unpair",
 ];
 
 /// Gateway settings. The provider key stays in memory and is never sent to clients.
@@ -193,6 +200,23 @@ impl RunningGateway {
     }
     pub async fn stop_adapter(&self, name: &str) -> bool {
         self.shared.messaging.stop(name).await
+    }
+    pub async fn adapter_settings(&self) -> Result<Vec<messaging::ConnectionSettings>> {
+        self.shared.messaging.settings().await
+    }
+    pub async fn begin_adapter_enrollment(&self, name: &str, ttl: Duration) -> Result<messaging::EnrollmentLease> {
+        self.shared.messaging.begin_enrollment(name, ttl.as_millis().try_into()?).await
+    }
+    pub async fn complete_adapter_enrollment(
+        &self, name: &str, lease: &str, credential: messaging::EnrollmentCredential,
+    ) -> Result<()> {
+        self.shared.messaging.complete_enrollment(&self.shared, name, lease, credential).await
+    }
+    pub async fn enable_adapter(&self, name: &str, enabled: bool) -> Result<()> {
+        self.shared.messaging.enable(&self.shared, name, enabled).await
+    }
+    pub async fn bind_adapter_receiver(&self, receiver: &str, names: &[String]) -> Result<messaging::SharedReceiver> {
+        self.shared.messaging.bind_receiver(self.shared.library.root(), receiver, names).await
     }
     pub async fn messaging_status(&self) -> Result<Value> {
         self.shared.messaging.status(&self.shared.profile_id).await
@@ -310,7 +334,7 @@ impl Gateway {
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
         for config in config.adapters {
-            shared.messaging.configure(&shared, config).await?;
+            shared.messaging.restore(&shared, config).await?;
         }
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
         if stock_plugins::has_memory_plugin() {
@@ -1031,9 +1055,46 @@ impl Shared {
                 Ok(json!({"acknowledged":lock(&session.view).approvals.contains_key(id)}))
             }
             "approval.respond" => self.respond(params, peer).await,
-            "messaging.status" | "messaging.resolve_delivery" | "messaging.restore_route"
-            | "messaging.bind_conversation" | "messaging.wake_target" | "messaging.send" if !peer.local_native => {
+            method if method.starts_with("messaging.") && !peer.local_native => {
                 Err(RpcError::new(4403, "permission_denied", "Messaging operations require the private profile client"))
+            }
+            "messaging.profile.settings" => Ok(json!({"connections":self.messaging.settings().await.map_err(RpcError::internal)?})),
+            "messaging.profile.enrollment_begin" => {
+                let name = required_string(params, "name")?;
+                let ttl = params["ttl_ms"].as_i64().unwrap_or(300_000);
+                Ok(json!(self.messaging.begin_enrollment(name, ttl).await.map_err(RpcError::internal)?))
+            }
+            "messaging.profile.enrollment_complete" => {
+                let name = required_string(params, "name")?;
+                let lease = required_string(params, "lease")?;
+                let credential = messaging::EnrollmentCredential::new(required_string(params, "credential")?.to_owned())
+                    .map_err(|_| RpcError::invalid("Invalid adapter credential"))?;
+                self.messaging.complete_enrollment(self, name, lease, credential).await.map_err(RpcError::internal)?;
+                Ok(json!({"verified":true}))
+            }
+            "messaging.profile.enable" => {
+                let name = required_string(params, "name")?;
+                let enabled = params["enabled"].as_bool().ok_or_else(|| RpcError::invalid("enabled is required"))?;
+                self.messaging.enable(self, name, enabled).await.map_err(RpcError::internal)?;
+                Ok(json!({"enabled":enabled}))
+            }
+            "messaging.profile.policy" => {
+                let name = required_string(params, "name")?;
+                let policy = serde_json::from_value(params["policy"].clone())
+                    .map_err(|_| RpcError::invalid("Invalid adapter policy"))?;
+                self.messaging.policy(name, policy).await.map_err(RpcError::internal)?;
+                Ok(json!({"saved":true}))
+            }
+            "messaging.profile.pair" => {
+                let paired = self.messaging.pairing(required_string(params, "name")?,
+                    required_string(params, "code")?, None).await.map_err(RpcError::internal)?;
+                Ok(json!({"paired":paired}))
+            }
+            "messaging.profile.unpair" => {
+                let removed = self.messaging.pairing(required_string(params, "name")?,
+                    required_string(params, "actor")?, Some(required_string(params, "room")?))
+                    .await.map_err(RpcError::internal)?;
+                Ok(json!({"removed":removed}))
             }
             "messaging.status" => self.messaging.status(&self.profile_id).await.map_err(RpcError::internal),
             "messaging.bind_conversation" => {

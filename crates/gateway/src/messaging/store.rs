@@ -156,7 +156,10 @@ pub(super) fn key(kind: &str, parts: &impl Serialize) -> Result<String> {
     Ok(id)
 }
 
-pub(super) fn decode<T: DeserializeOwned>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<T> {
+pub(super) fn decode<T: DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
     let bytes = row.get_ref(index)?.as_str()?;
     serde_json::from_str(bytes).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -183,9 +186,12 @@ impl Store {
         connection.execute_batch(TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
+        connection.execute_batch(super::profile::SCHEMA)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
+        connection.execute_batch(super::transport::SCHEMA)?;
         connection.execute_batch(super::wake::TABLES)?;
+        connection.execute("DELETE FROM messaging_enrollment", [])?;
         Ok(Self(Mutex::new(connection)))
     }
 

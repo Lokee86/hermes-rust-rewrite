@@ -8,7 +8,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::Ingress;
+use super::{EnrollmentCredential, Ingress, ScopePolicy, VerifiedInstallation};
 
 /// Major version of the native gateway adapter interface.
 pub const CONTRACT_VERSION: u32 = 1;
@@ -59,6 +59,16 @@ pub trait AdapterFactory: Send + Sync {
         &self,
         cancel: CancellationToken,
     ) -> AdapterFuture<'_, Result<VerifiedAdapter, ConnectionFailure>>;
+
+    /// Authenticate with a credential approved by the private profile owner.
+    /// Factories offering interactive enrollment implement this operation.
+    fn connect_enrolled(
+        &self,
+        _credential: EnrollmentCredential,
+        _cancel: CancellationToken,
+    ) -> AdapterFuture<'_, Result<VerifiedAdapter, ConnectionFailure>> {
+        Box::pin(std::future::ready(Err(ConnectionFailure::Configuration)))
+    }
 }
 
 pub struct VerifiedAdapter {
@@ -67,6 +77,11 @@ pub struct VerifiedAdapter {
 }
 
 pub trait Adapter: Send + Sync {
+    /// Installation scope verified as part of this authenticated connection.
+    fn verified_installation(&self) -> Option<VerifiedInstallation> {
+        None
+    }
+
     /// Run intake until cancellation or disconnection. Ingress only accepts
     /// events from this verified connection generation.
     fn listen(
@@ -103,6 +118,7 @@ pub enum PreparationFailure {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AccessPolicy {
     pub users: BTreeSet<String>,
     pub roles: BTreeSet<String>,
@@ -110,9 +126,12 @@ pub struct AccessPolicy {
     pub operator_roles: BTreeSet<String>,
     pub rooms: BTreeMap<String, RoomPolicy>,
     pub direct_tools: bool,
+    #[serde(default)]
+    pub scope: ScopePolicy,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoomPolicy {
     pub mention_required: bool,
     pub per_participant: bool,
@@ -126,16 +145,6 @@ impl AccessPolicy {
 
     pub(super) fn operator(&self, sender: &Sender) -> bool {
         self.operators.contains(&sender.id) || !self.operator_roles.is_disjoint(&sender.roles)
-    }
-
-    pub(super) fn room_policy(&self, room: &Room) -> Option<RoomPolicy> {
-        if room.kind == RoomKind::Direct {
-            return Some(RoomPolicy {
-                tools: self.direct_tools,
-                ..RoomPolicy::default()
-            });
-        }
-        self.rooms.get(&room.chat).cloned()
     }
 }
 
@@ -390,6 +399,8 @@ pub struct ConnectionStatus {
     pub identity: Option<String>,
     pub health: Health,
     pub gap: bool,
+    pub enabled: bool,
+    pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

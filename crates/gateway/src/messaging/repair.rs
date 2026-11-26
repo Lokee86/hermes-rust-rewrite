@@ -113,7 +113,7 @@ impl Ingress {
             || page.items.len() > MAX_BATCH
             || page.previous.as_deref().is_some_and(|id| !valid_id(id))
             || page.items.iter().any(|item| {
-                !valid_id(&item.event.id) || !matches!(item.event.body, InboundBody::Message(_))
+                !valid_id(&item.event.id) || !matches!(&item.event.body, InboundBody::Message(message) if super::runtime::valid_message(message))
             })
         {
             return Err(GatewayError::Invalid);
@@ -173,8 +173,9 @@ impl Ingress {
                     return Err(GatewayError::CheckpointChanged);
                 }
                 let mut candidates = Vec::new();
-                for event in db(scope.store.repair_items(&scope.connection, &id))? {
+                for mut event in db(scope.store.repair_items(&scope.connection, &id))? {
                     let decision = scope.route_event(&state.policy, &event)?;
+                    scope.normalize_event(&mut event)?;
                     candidates.push(Candidate { event, decision });
                 }
                 db(scope.store.finish_repair(

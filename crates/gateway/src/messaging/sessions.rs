@@ -258,18 +258,33 @@ async fn advance_message(
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
                 }
-                let tools = state
-                    .policy
-                    .room_policy(&work.event.room)
-                    .is_some_and(|room| room.tools);
+                let individual = wake || scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
+                    .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
+                let tools = individual && state.policy.room_policy(&work.event.room).is_some_and(|room| room.tools);
+                let policy = state.policy.turn_policy(&work.event.room);
+                let model = policy.model.or(db(scope.store.route_model(&work.route.id))?);
+                let selected_skill = match &work.event.body {
+                    InboundBody::Command(Command::UseSkill { skill, .. }) => Some(skill.clone()),
+                    _ => None,
+                };
+                let approval_mode = policy.approval.map(|mode| match mode {
+                    super::ApprovalPolicy::Manual => "manual",
+                    super::ApprovalPolicy::Smart => "smart",
+                    super::ApprovalPolicy::Off => "off",
+                }.to_owned());
                 db(owner.claim_channel(
                     &session,
                     &native_id,
                     ChannelExecution {
                         tools,
-                        interactive: scope.capabilities().interactive_prompts,
-                        model: db(scope.store.route_model(&work.route.id))?,
-                        policy: hermes_engine::ChannelTurnPolicy::default(),
+                        interactive: individual && scope.capabilities().interactive_prompts,
+                        model,
+                        policy: hermes_engine::ChannelTurnPolicy {
+                            prompt: policy.prompt,
+                            approval_mode,
+                            skills: policy.skills,
+                            selected_skill,
+                        },
                     },
                 ))
             })?;
@@ -296,7 +311,9 @@ async fn advance_message(
                         .store
                         .publish_progress(&work.route, &work.event, reply))?;
                 }
-                if caps.interactive_prompts {
+                if caps.interactive_prompts && scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
+                    .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
+                {
                     publish_prompts(scope, &session, &work, &receipt)?;
                 }
                 Ok(())
@@ -324,10 +341,9 @@ async fn advance_message(
             if receipt["outcome"] == "complete" {
                 let text = receipt["result"]["text"].as_str().unwrap_or_default();
                 let tools = scope.checked(true, |state| {
-                    Ok(state
-                        .policy
-                        .room_policy(&work.event.room)
-                        .is_some_and(|policy| policy.tools))
+                    Ok(scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
+                        .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
+                        && state.policy.room_policy(&work.event.room).is_some_and(|policy| policy.tools))
                 })?;
                 let message = outbound_message(scope, &session.dir, text, tools);
                 if !message.text.trim().is_empty() || !message.attachments.is_empty() {
@@ -424,8 +440,13 @@ async fn apply_command(
         session_for(owner, scope, &work.route, false).await?
     } else { None };
     scope.checked(true, |state| commands::execute(
-        scope, work, command, session.as_deref(), authorized(scope, state, work)?,
-        state.policy.operator(&work.event.sender),
+        scope, work, command, session.as_deref(),
+        authorized(scope, state, work)? && match command {
+            Command::SelectModel { model } => state.policy.turn_policy(&work.event.room).model
+                .is_none_or(|owner_model| owner_model == *model),
+            _ => true,
+        },
+        scope.authorize_operator(&state.policy, &work.event.room, &work.event.sender)?,
     ))
 }
 
@@ -440,7 +461,7 @@ async fn apply_control(
         if !authorized(scope, state, work)? {
             return finish_control(scope, work, "forbidden");
         }
-        let operator = state.policy.operator(&work.event.sender);
+        let operator = scope.authorize_operator(&state.policy, &work.event.room, &work.event.sender)?;
         if let Control::ReplaceQueued { event_id, text } = control {
             let Some((stage, target)) = db(scope.store.input(&work.route, event_id))? else {
                 return finish_control(scope, work, "stale");

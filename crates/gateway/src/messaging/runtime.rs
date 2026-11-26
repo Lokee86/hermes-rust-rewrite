@@ -1,6 +1,11 @@
 use super::{
+    profile::{
+        AccountBinding, ConnectionSettings, EnrollmentCredential, EnrollmentLease,
+        VerifiedInstallation,
+    },
     sessions,
     store::{self, Candidate, PendingDelivery, Store},
+    transport::{InstallationKey, SharedReceiver},
     types::*,
 };
 use crate::{Shared, lock};
@@ -8,7 +13,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
@@ -40,6 +45,7 @@ pub(super) fn valid_advance(advance: Option<&Advance>) -> bool {
 pub(crate) struct Host {
     store: Arc<Store>,
     slots: AsyncMutex<BTreeMap<String, Managed>>,
+    factories: Mutex<BTreeMap<String, Arc<dyn AdapterFactory>>>,
 }
 
 struct Managed {
@@ -60,6 +66,7 @@ pub(super) struct State {
     pub(super) revision: i64,
     generation: Option<String>,
     identity: Option<String>,
+    installation: Option<VerifiedInstallation>,
     accepting: bool,
     health: Health,
     gap: bool,
@@ -73,9 +80,19 @@ pub struct Ingress {
     pub(super) store: Arc<Store>,
     pub(super) connection: String,
     pub(super) generation: String,
+    installation: Option<VerifiedInstallation>,
+    root: PathBuf,
 }
 
 impl Ingress {
+    pub fn installation(&self) -> Option<&VerifiedInstallation> {
+        self.installation.as_ref()
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(super) fn checked<T>(
         &self,
         accepting: bool,
@@ -130,8 +147,9 @@ impl Ingress {
         let result = blocking(move || {
             scope.checked(true, |state| {
                 let mut candidates = Vec::with_capacity(events.len());
-                for event in events {
+                for mut event in events {
                     let decision = scope.route_event(&state.policy, &event)?;
+                    scope.normalize_event(&mut event)?;
                     candidates.push(Candidate { event, decision });
                 }
                 db(scope.store.intake(
@@ -178,7 +196,13 @@ impl Ingress {
         let Some(room) = policy.room_policy(&event.room) else {
             return Ok(Err(Disposition::Forbidden));
         };
-        if !policy.allows(&event.sender) {
+        let Some((sender, kind)) = self.authorized_identity(policy, &event.room, &event.sender)?
+        else {
+            return Ok(Err(Disposition::Forbidden));
+        };
+        if kind != super::ActorKind::Person
+            && !matches!(event.body, InboundBody::Message(_) | InboundBody::Command(super::Command::Status))
+        {
             return Ok(Err(Disposition::Forbidden));
         }
         match &event.body {
@@ -212,10 +236,15 @@ impl Ingress {
                 if !command.valid() {
                     return Ok(Err(Disposition::Invalid));
                 }
+                if let super::Command::UseSkill { skill, .. } = command
+                    && (!room.tools || !policy.turn_policy(&event.room).skills.is_some_and(|skills| skills.contains(skill)))
+                {
+                    return Ok(Err(Disposition::Forbidden));
+                }
             }
             InboundBody::Wake => return Ok(Err(Disposition::Unsupported)),
         }
-        let participant = room.per_participant.then_some(event.sender.id.as_str());
+        let participant = room.per_participant.then_some(sender.id.as_str());
         db(store::Route::new(
             &self.connection,
             event.room.clone(),
@@ -341,7 +370,7 @@ impl Ingress {
     }
 }
 
-fn valid_message(message: &Message) -> bool {
+pub(super) fn valid_message(message: &Message) -> bool {
     message.text.len() <= MAX_TEXT
         && (!message.text.trim().is_empty() || !message.attachments.is_empty())
         && message.attachments.len() <= 8
@@ -387,6 +416,7 @@ impl Host {
         Ok(Self {
             store: Arc::new(Store::open(root)?),
             slots: AsyncMutex::default(),
+            factories: Mutex::default(),
         })
     }
 
@@ -412,23 +442,78 @@ impl Host {
     }
 
     pub async fn configure(&self, owner: &Arc<Shared>, config: AdapterConfig) -> Result<()> {
+        self.configure_inner(owner, config, false).await
+    }
+
+    pub async fn restore(&self, owner: &Arc<Shared>, config: AdapterConfig) -> Result<()> {
+        self.configure_inner(owner, config, true).await
+    }
+
+    async fn configure_inner(
+        &self,
+        owner: &Arc<Shared>,
+        config: AdapterConfig,
+        restore: bool,
+    ) -> Result<()> {
         let descriptor = Self::validate(&config)?;
         let mut slots = self.slots.lock().await;
         ensure!(!owner.shutdown.is_cancelled(), "Gateway is shutting down");
-        if let Some(previous) = slots.remove(&config.name) {
+        let mut saved =
+            self.store
+                .register_connection(&config.name, &descriptor.platform, &config.policy)?;
+        if !restore && (!saved.enabled || saved.policy != config.policy) {
+            saved = self
+                .store
+                .enable_connection_with_policy(&config.name, &config.policy)?;
+        } else if restore
+            && saved.credential_ref.is_none()
+            && saved.enabled
+            && saved.policy != config.policy
+        {
+            // Programmatic adapters bring their policy with their factory.
+            // Owner-enrolled adapters restore their persisted settings.
+            saved.revision =
+                self.store
+                    .set_connection_policy(&config.name, &config.policy)? as u64;
+            saved.policy = config.policy;
+        }
+        lock(&self.factories).insert(config.name, config.factory.clone());
+        self.activate(owner, &mut slots, config.factory, descriptor, saved)
+            .await;
+        Ok(())
+    }
+
+    async fn activate(
+        &self,
+        owner: &Arc<Shared>,
+        slots: &mut BTreeMap<String, Managed>,
+        factory: Arc<dyn AdapterFactory>,
+        descriptor: Descriptor,
+        saved: ConnectionSettings,
+    ) {
+        if let Some(previous) = slots.remove(&saved.name) {
+            {
+                let mut state = lock(&previous.slot.state);
+                state.accepting = false;
+                state.generation = None;
+            }
             previous.stop.cancel();
             let _ = previous.task.await;
         }
+        if !saved.enabled || owner.shutdown.is_cancelled() {
+            return;
+        }
         let stop = owner.shutdown.child_token();
         let slot = Arc::new(Slot {
-            name: config.name.clone(),
+            name: saved.name.clone(),
             descriptor,
             state: Mutex::new(State {
-                policy: config.policy,
-                revision: 0,
+                policy: saved.policy,
+                revision: saved.revision as i64,
                 generation: None,
                 accepting: false,
                 identity: None,
+                installation: None,
                 health: Health::Connecting,
                 gap: false,
             }),
@@ -439,26 +524,227 @@ impl Host {
             self.store.clone(),
             owner.library.root().to_owned(),
             slot.clone(),
-            config.factory,
+            factory,
+            saved.binding,
+            saved.credential_ref,
             stop.clone(),
         ));
-        slots.insert(config.name, Managed { slot, stop, task });
+        slots.insert(saved.name, Managed { slot, stop, task });
+    }
+
+    pub async fn settings(&self) -> Result<Vec<ConnectionSettings>> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.connection_settings()).await?
+    }
+
+    pub async fn begin_enrollment(&self, name: &str, ttl_ms: i64) -> Result<EnrollmentLease> {
+        let _slots = self.slots.lock().await;
+        ensure!(
+            lock(&self.factories).contains_key(name),
+            "No adapter factory for this connection"
+        );
+        self.store.create_enrollment(name, ttl_ms)
+    }
+
+    pub async fn complete_enrollment(
+        &self,
+        owner: &Arc<Shared>,
+        name: &str,
+        lease: &str,
+        credential: EnrollmentCredential,
+    ) -> Result<()> {
+        let deadline = self
+            .store
+            .enrollment_deadline(name, lease)?
+            .context("Enrollment expired or was replaced")?;
+        let factory = lock(&self.factories)
+            .get(name)
+            .cloned()
+            .context("No adapter factory for this connection")?;
+        let cancel = owner.shutdown.child_token();
+        let remaining = deadline.saturating_sub(super::profile::time_ms()).max(0);
+        let verified = tokio::select! {
+            _ = cancel.cancelled() => anyhow::bail!("Gateway is shutting down"),
+            answer = tokio::time::timeout(Duration::from_millis(remaining as u64),
+                factory.connect_enrolled(credential.clone(), cancel.clone())) => answer,
+        };
+        cancel.cancel();
+        let verified = verified
+            .context("Enrollment expired")?
+            .map_err(|_| anyhow::anyhow!("Adapter credential verification failed"))?;
+        let proof = verified.adapter.verified_installation();
+        ensure!(
+            valid_id(&verified.account)
+                && proof.as_ref().is_none_or(VerifiedInstallation::validate),
+            "Adapter did not verify a valid account"
+        );
+        let binding = AccountBinding::new(verified.account, proof.as_ref());
+        drop(verified.adapter);
+        let descriptor = factory.descriptor();
+        let value = hermes_engine::secret::seal(owner.library.root(), credential.secret())?;
+        let mut slots = self.slots.lock().await;
+        ensure!(!owner.shutdown.is_cancelled(), "Gateway is shutting down");
+        let saved = self
+            .store
+            .connection_setting(name)?
+            .context("No such messaging connection")?;
+        ensure!(
+            saved.platform == descriptor.platform
+                && descriptor.version == CONTRACT_VERSION
+                && lock(&self.factories)
+                    .get(name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &factory)),
+            "Adapter factory changed during enrollment"
+        );
+        if let Some(managed) = slots.get(name) {
+            let mut state = lock(&managed.slot.state);
+            self.store
+                .complete_enrollment(name, lease, &binding, &value)?;
+            state.generation = None;
+            state.accepting = false;
+        } else {
+            self.store
+                .complete_enrollment(name, lease, &binding, &value)?;
+        }
+        let saved = self
+            .store
+            .connection_setting(name)?
+            .context("No such messaging connection")?;
+        self.activate(owner, &mut slots, factory, descriptor, saved)
+            .await;
         Ok(())
     }
 
-    pub async fn policy(&self, name: &str, policy: AccessPolicy) -> Result<()> {
+    pub async fn enable(&self, owner: &Arc<Shared>, name: &str, enabled: bool) -> Result<()> {
+        let mut slots = self.slots.lock().await;
+        if enabled {
+            let factory = lock(&self.factories)
+                .get(name)
+                .cloned()
+                .context("No adapter factory for this connection")?;
+            self.store.set_connection_enabled(name, true)?;
+            let saved = self
+                .store
+                .connection_setting(name)?
+                .context("No such messaging connection")?;
+            self.activate(
+                owner,
+                &mut slots,
+                factory.clone(),
+                factory.descriptor(),
+                saved,
+            )
+            .await;
+        } else {
+            if let Some(managed) = slots.get(name) {
+                let mut state = lock(&managed.slot.state);
+                self.store.set_connection_enabled(name, false)?;
+                state.generation = None;
+                state.accepting = false;
+            } else {
+                self.store.set_connection_enabled(name, false)?;
+            }
+            if let Some(managed) = slots.remove(name) {
+                managed.stop.cancel();
+                let _ = managed.task.await;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn pairing(&self, name: &str, code: &str, revoke: Option<&str>) -> Result<bool> {
+        ensure!(valid_id(name) && valid_id(code), "Invalid pairing scope");
         let slots = self.slots.lock().await;
         let slot = &slots
             .get(name)
             .context("No such messaging connection")?
             .slot;
-        let mut state = lock(&slot.state);
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .context("Messaging policy revision exhausted")?;
-        state.policy = policy;
+        let state = lock(&slot.state);
+        let connection = state
+            .identity
+            .as_deref()
+            .filter(|_| state.accepting)
+            .context("Connection is not verified")?;
+        let changed = match revoke {
+            Some(chat) => {
+                ensure!(valid_id(chat), "Invalid pairing scope");
+                self.store.revoke_pairing(connection, code, chat)?
+            }
+            None => {
+                ensure!(state.policy.scope.pair_direct, "Pairing is disabled");
+                self.store.approve_pairing(connection, code)?
+            }
+        };
         slot.changed.notify_one();
+        Ok(changed)
+    }
+
+    pub async fn bind_receiver(
+        &self,
+        root: &Path,
+        receiver: &str,
+        names: &[String],
+    ) -> Result<SharedReceiver> {
+        ensure!(
+            valid_id(receiver) && !names.is_empty() && names.len() <= 100,
+            "Invalid shared receiver"
+        );
+        let slots = self.slots.lock().await;
+        let mut routes = Vec::with_capacity(names.len());
+        for name in names {
+            let slot = &slots
+                .get(name)
+                .context("No such messaging connection")?
+                .slot;
+            let state = lock(&slot.state);
+            let generation = state
+                .generation
+                .clone()
+                .filter(|_| state.accepting)
+                .context("Receiver connection is not verified")?;
+            let installation = state
+                .installation
+                .clone()
+                .filter(|installation| installation.receiver.as_deref() == Some(receiver))
+                .context("Connection verification did not bind this receiver")?;
+            let key = InstallationKey::from(&installation);
+            ensure!(
+                !routes.iter().any(|(existing, _)| existing == &key),
+                "Ambiguous receiver installation"
+            );
+            routes.push((
+                key,
+                Ingress {
+                    slot: slot.clone(),
+                    store: self.store.clone(),
+                    connection: state
+                        .identity
+                        .clone()
+                        .context("Receiver connection is not verified")?,
+                    generation,
+                    installation: Some(installation),
+                    root: root.to_owned(),
+                },
+            ));
+        }
+        let lease = account_lease(root, &store::key("receiver", &receiver)?)?
+            .context("Receiver already has an owner")?;
+        Ok(SharedReceiver {
+            routes,
+            _lease: lease,
+        })
+    }
+
+    pub async fn policy(&self, name: &str, policy: AccessPolicy) -> Result<()> {
+        let slots = self.slots.lock().await;
+        if let Some(managed) = slots.get(name) {
+            let mut state = lock(&managed.slot.state);
+            state.revision = self.store.set_connection_policy(name, &policy)?;
+            state.policy = policy;
+            managed.slot.changed.notify_one();
+        } else {
+            self.store.set_connection_policy(name, &policy)?;
+        }
         Ok(())
     }
 
@@ -497,14 +783,37 @@ impl Host {
                     identity: state.identity.clone(),
                     health: state.health,
                     gap: state.gap,
+                    enabled: true,
+                    revision: state.revision as u64,
                 }
             })
             .collect();
         let store = self.store.clone();
-        let (input, deliveries) = tokio::task::spawn_blocking(move || -> Result<_> {
-            Ok((store.input_status()?, store.delivery_status()?))
+        let (input, deliveries, settings) = tokio::task::spawn_blocking(move || -> Result<_> {
+            Ok((
+                store.input_status()?,
+                store.delivery_status()?,
+                store.connection_settings()?,
+            ))
         })
         .await??;
+        let mut connections = connections;
+        for saved in settings {
+            if !connections
+                .iter()
+                .any(|connection| connection.name == saved.name)
+            {
+                connections.push(ConnectionStatus {
+                    name: saved.name,
+                    platform: saved.platform,
+                    identity: None,
+                    health: Health::Stopped,
+                    gap: false,
+                    enabled: saved.enabled,
+                    revision: saved.revision,
+                });
+            }
+        }
         Ok(
             serde_json::json!({"profile_id":profile,"connections":connections,"input":input,"deliveries":deliveries}),
         )
@@ -636,26 +945,52 @@ async fn supervise(
     root: std::path::PathBuf,
     slot: Arc<Slot>,
     factory: Arc<dyn AdapterFactory>,
+    expected_binding: Option<AccountBinding>,
+    credential: Option<String>,
     stop: CancellationToken,
 ) {
     let mut wait = Duration::from_millis(250);
     while !stop.is_cancelled() && owner.strong_count() != 0 {
         lock(&slot.state).health = Health::Connecting;
         let child = stop.child_token();
+        let connect = async {
+            match &credential {
+                Some(reference) => {
+                    let credential = store
+                        .credential(reference)
+                        .map_err(|_| ConnectionFailure::Credentials)?
+                        .ok_or(ConnectionFailure::Credentials)?;
+                    factory.connect_enrolled(credential, child.clone()).await
+                }
+                None => factory.connect(child.clone()).await,
+            }
+        };
         let verified = tokio::select! {
             biased;
             _ = stop.cancelled() => break,
-            result = factory.connect(child.clone()) => result,
+            result = connect => result,
         };
-        let health = match verified {
-            Ok(verified) if valid_id(&verified.account) => {
-                let identity = match store::key(
-                    "connection",
-                    &(&slot.descriptor.platform, &verified.account),
-                ) {
-                    Ok(identity) => identity,
-                    Err(_) => break,
-                };
+        let checked = verified.and_then(|verified| {
+            let proof = verified.adapter.verified_installation();
+            if !valid_id(&verified.account)
+                || !proof.as_ref().is_none_or(VerifiedInstallation::validate)
+            {
+                return Err(ConnectionFailure::Credentials);
+            }
+            let binding = AccountBinding::new(verified.account, proof.as_ref());
+            if expected_binding
+                .as_ref()
+                .is_some_and(|expected| expected != &binding)
+            {
+                return Err(ConnectionFailure::Credentials);
+            }
+            let identity = binding
+                .key(&slot.descriptor.platform)
+                .map_err(|_| ConnectionFailure::Configuration)?;
+            Ok((verified.adapter, identity, proof))
+        });
+        let health = match checked {
+            Ok((adapter, identity, installation)) => {
                 let lease = account_lease(&root, &identity);
                 match lease {
                     Ok(Some(_lease)) => {
@@ -675,22 +1010,20 @@ async fn supervise(
                             store: store.clone(),
                             connection: identity.clone(),
                             generation: crate::new_id(),
+                            installation: installation.clone(),
+                            root: root.clone(),
                         };
                         {
                             let mut state = lock(&slot.state);
                             state.identity = Some(identity);
+                            state.installation = installation;
                             state.generation = Some(ingress.generation.clone());
                             state.accepting = true;
                             state.health = Health::Ready;
                             state.gap = gap;
                         }
-                        let result = drive(
-                            owner.clone(),
-                            ingress.clone(),
-                            verified.adapter,
-                            child.clone(),
-                        )
-                        .await;
+                        let result =
+                            drive(owner.clone(), ingress.clone(), adapter, child.clone()).await;
                         ingress.revoke();
                         let _ = store.recover_sends(&ingress.connection);
                         failure_health(result)
@@ -699,7 +1032,6 @@ async fn supervise(
                     Err(_) => Health::Configuration,
                 }
             }
-            Ok(_) => Health::Credentials,
             Err(failure) => failure_health(failure),
         };
         child.cancel();
@@ -917,7 +1249,10 @@ fn delivery_authorized(
             route.room,
             participant,
         ))?;
-        return Ok(state.policy.allows(sender) && current.id == route.id);
+        return Ok(
+            scope.authorize_sender(&state.policy, &pending.intent.room, sender)?
+                && current.id == route.id,
+        );
     }
     db(scope.store.allows_notification(&route.id, now()))
 }

@@ -104,12 +104,13 @@ impl Ingress {
             scope.checked(true, |state| {
                 let Handoff { id, items, advance } = handoff;
                 let mut candidates = Vec::with_capacity(items.len());
-                for item in items {
+                for mut item in items {
                     let decision = scope.route_candidate(
                         &state.policy,
                         &item.event,
                         item.preparation.is_some(),
                     )?;
+                    scope.normalize_event(&mut item.event)?;
                     candidates.push((
                         Candidate {
                             event: item.event,
