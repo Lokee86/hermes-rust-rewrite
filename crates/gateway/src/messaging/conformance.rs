@@ -29,6 +29,8 @@ use tokio::{
 mod stock;
 #[path = "media_conformance.rs"]
 mod media_conformance;
+#[path = "effects_conformance.rs"]
+mod effects_conformance;
 
 const LIMIT: Duration = Duration::from_secs(12);
 
@@ -217,6 +219,7 @@ impl Adapter for Fixture {
             .map(|(index, body)| DeliveryPart {
                 room: intent.room.clone(),
                 body,
+                effect: Effect::default(),
                 edit_target: if index == 0 {
                     intent.edit_target.clone()
                 } else {
@@ -1234,13 +1237,21 @@ async fn reopens_durable_intake_queue_claim_and_committed_result() {
         &[DeliveryPart {
             room: intent.room.clone(),
             body: intent.body.clone(),
+            effect: Effect::default(),
             edit_target: None,
         }],
     )
     .unwrap();
     let pending = db.ready_deliveries(&connection, 1).unwrap().remove(0);
     assert_eq!(
-        db.claim(&connection, "crashed-generation", &pending, 1)
+        db.claim(&connection, "crashed-generation", &pending, &store::OutboundPolicy {
+            now: 1,
+            visibility: EffectVisibility::default(),
+            protection: None,
+            submitted: false,
+            subsets: false,
+            retransmission: false,
+        })
             .unwrap()
             .unwrap()
             .attempt,

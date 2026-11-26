@@ -1,10 +1,11 @@
 use super::{
+    EffectVisibility, effects::valid_effect_plan,
     profile::{
         AccountBinding, ConnectionSettings, EnrollmentCredential, EnrollmentLease,
         VerifiedInstallation,
     },
     sessions,
-    store::{self, Candidate, PendingDelivery, Store},
+    store::{self, Candidate, OutboundPolicy, PendingDelivery, Store},
     transport::{InstallationKey, SharedReceiver},
     types::*,
 };
@@ -311,20 +312,14 @@ impl Ingress {
     ) -> Result<bool, GatewayError> {
         match &evidence {
             DeliveryResult::Confirmed { receipt, .. } if valid_id(receipt) => {}
+            DeliveryResult::EffectConfirmed(receipt) if valid_id(&receipt.id) => {}
             DeliveryResult::Retryable { .. } => {}
             _ => return Err(GatewayError::Invalid),
         }
         let scope = self.clone();
         let changed = blocking(move || {
             scope.checked(true, |_| {
-                db(scope.store.record(
-                    &scope.connection,
-                    None,
-                    &delivery.delivery_id,
-                    (delivery.part, delivery.attempt),
-                    evidence,
-                    now(),
-                ))
+                db(scope.store.reconcile(&scope.connection, &delivery, evidence, now()))
             })
         })
         .await?;
@@ -1184,32 +1179,54 @@ async fn deliver(
                     .store
                     .editable_progress(&pending.route, &pending.intent.id))?;
             }
-            match adapter.prepare(&pending.intent) {
+            let plan = adapter.prepare(&pending.intent).and_then(|mut parts| {
+                let protection = scope.checked(true, |state| {
+                    Ok(state.policy.delivery_policy(&pending.intent.room).protection)
+                }).map_err(|_| PreparationFailure::Rejected)?;
+                for part in &mut parts {
+                    if let Some(required) = &protection {
+                        if part.effect.protection.as_ref().is_some_and(|value| value != required) {
+                            return Err(PreparationFailure::Rejected);
+                        }
+                        part.effect.protection = Some(required.clone());
+                    }
+                }
+                Ok(parts)
+            });
+            let refusal = match plan {
                 Ok(parts) if valid_plan(scope.capabilities(), &pending.intent, &parts) => {
-                    db(scope
-                        .store
-                        .plan(&scope.connection, &pending.intent.id, &parts))?;
+                    let stored = scope.checked(true, |state| {
+                        if !delivery_authorized(scope, state, &pending)? {
+                            return Ok(None);
+                        }
+                        db(scope.store.plan(&scope.connection, &pending.intent.id, &parts)).map(Some)
+                    })?;
+                    match stored {
+                        None => continue,
+                        Some(false) => Some("conflicting_operation_identity"),
+                        Some(true) => None,
+                    }
                 }
-                failure => {
-                    let reason = match failure {
-                        Err(PreparationFailure::Unsupported) => "unsupported_delivery",
-                        Err(PreparationFailure::Rejected) => "delivery_rejected",
-                        Ok(_) => "invalid_delivery_plan",
-                    };
-                    db(scope
-                        .store
-                        .reject(&scope.connection, &pending.intent.id, reason))?;
-                    continue;
-                }
+                Err(PreparationFailure::Unsupported) => Some("unsupported_delivery"),
+                Err(PreparationFailure::Rejected) => Some("delivery_rejected"),
+                Ok(_) => Some("invalid_delivery_plan"),
+            };
+            if let Some(reason) = refusal {
+                scope.checked(true, |state| {
+                    if delivery_authorized(scope, state, &pending)? {
+                        db(scope.store.reject(&scope.connection, &pending.intent.id, reason))?;
+                    }
+                    Ok(())
+                })?;
+                continue;
             }
         }
         let attempt = scope.checked(true, |state| {
             if !delivery_authorized(scope, state, &pending)? {
                 return Ok(None);
             }
-            db(scope
-                .store
-                .claim(&scope.connection, &scope.generation, &pending, now()))
+            let policy = outbound_policy(scope, state, &pending.intent.room);
+            db(scope.store.claim(&scope.connection, &scope.generation, &pending, &policy))
         })?;
         let Some(attempt) = attempt else { continue };
         let scope = scope.clone();
@@ -1217,7 +1234,11 @@ async fn deliver(
         let cancel = stop.child_token();
         sends.spawn(async move {
             let authorized = scope.checked(false, |state| {
-                Ok(state.accepting && delivery_authorized(&scope, state, &pending)?)
+                if !state.accepting || !delivery_authorized(&scope, state, &pending)? {
+                    return Ok(false);
+                }
+                let policy = outbound_policy(&scope, state, &pending.intent.room);
+                db(scope.store.recheck(&scope.connection, &scope.generation, &pending, &attempt, &policy))
             })?;
             if cancel.is_cancelled() || !authorized {
                 return scope.checked(false, |_| {
@@ -1283,6 +1304,22 @@ fn delivery_authorized(
     db(scope.store.allows_notification(&route.id, now()))
 }
 
+fn outbound_policy(scope: &Ingress, state: &State, room: &Room) -> OutboundPolicy {
+    let policy = state.policy.delivery_policy(room);
+    let caps = scope.capabilities().effects;
+    OutboundPolicy {
+        now: now(),
+        visibility: EffectVisibility {
+            notify: policy.notifications,
+            mention: policy.mentions,
+        },
+        protection: policy.protection,
+        submitted: caps.submitted && policy.submitted,
+        subsets: caps.recipient_subsets,
+        retransmission: caps.retransmission,
+    }
+}
+
 fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]) -> bool {
     if plan.is_empty() || plan.len() > MAX_PARTS || intent.room.thread.is_some() && !caps.threads {
         return false;
@@ -1309,11 +1346,14 @@ fn valid_plan(caps: Capabilities, intent: &DeliveryIntent, plan: &[DeliveryPart]
             (DeliveryBody::Progress { .. }, DeliveryBody::Progress { .. }) => {
                 caps.progress && plan.len() == 1 && part.body == intent.body
             }
+            (DeliveryBody::Retire { .. }, DeliveryBody::Retire { .. }) => {
+                caps.effects.durable_presentation && plan.len() == 1 && part.body == intent.body
+            }
             _ => false,
         }
-    })
+    }) && valid_effect_plan(caps, intent, plan)
 }
 
-fn now() -> i64 {
+pub(super) fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }

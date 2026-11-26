@@ -1,5 +1,6 @@
 //! Native gateway contract for messaging adapters.
 mod commands;
+mod effects;
 mod intake;
 mod media;
 mod policy;
@@ -26,6 +27,7 @@ pub use profile::*;
 pub use repair::*;
 pub use media::{ArtifactFetch, AttachmentManifest, AudioService, MediaPurpose, MediaRead, MediaSource};
 pub(super) use runtime::Host;
+pub use effects::*;
 pub use runtime::Ingress;
 pub use transport::*;
 pub use types::*;

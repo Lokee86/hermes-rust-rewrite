@@ -1,4 +1,8 @@
-use super::types::*;
+use super::{RecipientOutcome, types::*};
+
+#[path = "store_effects.rs"]
+mod effect_store;
+pub(super) use effect_store::OutboundPolicy;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -119,6 +123,8 @@ pub(super) struct DeliveryStatus {
     pub attempt: Option<u32>,
     pub part_state: Option<String>,
     pub error: Option<String>,
+    pub provider_status: Vec<effect_store::ProviderStatus>,
+    pub recipients: std::collections::BTreeMap<String, RecipientOutcome>,
 }
 
 #[derive(Serialize)]
@@ -197,6 +203,7 @@ impl Store {
         let connection = hermes_engine::db::open(root)?;
         connection.execute_batch(TABLES)?;
         connection.execute_batch(super::media::TABLES)?;
+        connection.execute_batch(effect_store::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
@@ -402,6 +409,7 @@ impl Store {
                 params![progress, route.id],
             )?;
             enqueue(tx, route, Some(&event.sender), intent)?;
+            effect_store::source(tx, intent, &event.id)?;
             set_input(tx, route, &event.id, "done", None)
         })
     }
@@ -422,7 +430,10 @@ impl Store {
                 reply_id,
             },
         };
-        self.write(|tx| enqueue(tx, route, Some(&event.sender), &intent))
+        self.write(|tx| {
+            enqueue(tx, route, Some(&event.sender), &intent)?;
+            effect_store::source(tx, &intent, &event.id)
+        })
     }
 
     pub fn editable_progress(&self, route: &str, reply: &str) -> Result<Option<String>> {
@@ -432,7 +443,8 @@ impl Store {
             .query_row(
                 "SELECT p.editable_message FROM messaging_deliveries d
              JOIN messaging_parts p ON p.delivery = d.id
-             WHERE d.id = ?1 AND d.route = ?2 AND d.stage = 'sent' AND p.ordinal = 0",
+             WHERE d.id = ?1 AND d.route = ?2 AND d.stage = 'sent' AND p.ordinal = 0
+               AND NOT EXISTS (SELECT 1 FROM messaging_effect_markers m WHERE m.delivery=d.id AND m.ordinal=p.ordinal AND m.retired=1)",
                 params![progress, route],
                 |row| row.get(0),
             )
@@ -475,13 +487,15 @@ impl Store {
             )? == 0 {
                 return Ok(());
             }
-            enqueue(tx, route, Some(&event.sender), &DeliveryIntent {
+            let intent = DeliveryIntent {
                 id: action.id.clone(),
                 room: route.room.clone(),
                 reply_anchor: event.reply_anchor.clone(),
                 edit_target: None,
                 body: DeliveryBody::Prompt { action_id: action.id.clone(), prompt },
-            })
+            };
+            enqueue(tx, route, Some(&event.sender), &intent)?;
+            effect_store::source(tx, &intent, &event.id)
         })
     }
 
@@ -535,9 +549,9 @@ impl Store {
              AND NOT EXISTS (SELECT 1 FROM messaging_cooldowns c WHERE c.connection = d.connection
                  AND c.until_ms > ?2 AND (c.scope = '' OR c.scope = d.destination))
              AND (d.stage = 'pending' OR EXISTS (
-                 SELECT 1 FROM messaging_parts p WHERE p.delivery = d.id AND p.stage = 'pending'
+                 SELECT 1 FROM messaging_parts p WHERE p.delivery = d.id AND p.stage IN ('pending','uncertain')
                  AND NOT EXISTS (SELECT 1 FROM messaging_parts preceding WHERE preceding.delivery = p.delivery
-                     AND preceding.ordinal < p.ordinal AND preceding.stage NOT IN ('sent','discarded'))
+                     AND preceding.ordinal < p.ordinal AND preceding.stage NOT IN ('sent','discarded','partial','submitted'))
              ))
              ORDER BY d.position",
         )?;
@@ -553,17 +567,23 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn plan(&self, connection: &str, id: &str, parts: &[DeliveryPart]) -> Result<()> {
+    pub fn plan(&self, connection: &str, id: &str, parts: &[DeliveryPart]) -> Result<bool> {
         self.write(|tx| {
+            for (index, part) in parts.iter().enumerate() {
+                if !effect_store::operation_available(tx, connection, id, u32::try_from(index)?, part)? {
+                    return Ok(false);
+                }
+            }
             if tx.execute("UPDATE messaging_deliveries SET stage = 'planned' WHERE connection = ?1 AND id = ?2 AND stage = 'pending'",
                 params![connection, id])? == 0 {
-                return Ok(());
+                return Ok(true);
             }
             for (index, part) in parts.iter().enumerate() {
                 tx.execute("INSERT INTO messaging_parts (delivery,ordinal,body,stage) VALUES (?1,?2,?3,'pending')",
                     params![id, i64::try_from(index)?, serde_json::to_string(part)?])?;
+                effect_store::register_operation(tx, connection, id, u32::try_from(index)?, part)?;
             }
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -583,37 +603,40 @@ impl Store {
         connection: &str,
         generation: &str,
         pending: &PendingDelivery,
-        now: i64,
+        policy: &OutboundPolicy,
     ) -> Result<Option<SendAttempt>> {
-        self.write(|tx| {
-            let id = &pending.intent.id;
-            let part = tx.query_row(
-                "UPDATE messaging_parts SET stage = 'sending',attempt = attempt + 1,generation = ?3,reason = NULL
-                 WHERE delivery = ?2 AND stage = 'pending' AND ordinal = (
-                     SELECT MIN(ordinal) FROM messaging_parts WHERE delivery = ?2 AND stage NOT IN ('sent','discarded')
-                 ) AND EXISTS (
-                     SELECT 1 FROM messaging_deliveries d WHERE d.id = ?2 AND d.connection = ?1 AND d.stage = 'planned'
-                     AND NOT EXISTS (SELECT 1 FROM messaging_cooldowns c WHERE c.connection = d.connection
-                         AND c.until_ms > ?4 AND (c.scope = '' OR c.scope = d.destination))
-                 )
-                 RETURNING ordinal,attempt,body",
-                params![connection, id, generation, now], |row| Ok(SendAttempt {
-                    delivery_id: id.clone(), part: row.get(0)?, attempt: row.get(1)?,
-                    reply_anchor: pending.intent.reply_anchor.clone(), payload: decode(row, 2)?,
-                }),
-            ).optional()?;
-            Ok(part)
-        })
+        self.write(|tx| effect_store::claim(tx,connection,generation,pending,policy))
+    }
+
+    pub fn recheck(
+        &self,
+        connection: &str,
+        generation: &str,
+        pending: &PendingDelivery,
+        send: &SendAttempt,
+        policy: &OutboundPolicy,
+    ) -> Result<bool> {
+        self.write(|tx| effect_store::recheck(tx,connection,generation,pending,send,policy))
     }
 
     pub fn release(&self, connection: &str, generation: &str, attempt: &SendAttempt) -> Result<()> {
         self.write(|tx| {
-            tx.execute(
-                "UPDATE messaging_parts SET stage = 'pending',reason = 'send_cancelled_before_dispatch',generation = NULL
+            let (next, reason) = if attempt.effect.retransmission {
+                ("uncertain", "send_outcome_unknown")
+            } else {
+                ("pending", "send_cancelled_before_dispatch")
+            };
+            let released = tx.execute(
+                "UPDATE messaging_parts SET stage = ?6,reason = ?7,generation = NULL
                  WHERE delivery = ?2 AND ordinal = ?3 AND attempt = ?4 AND generation = ?5 AND stage = 'sending'
                  AND EXISTS(SELECT 1 FROM messaging_deliveries WHERE id = ?2 AND connection = ?1)",
-                params![connection, attempt.delivery_id, attempt.part, attempt.attempt, generation],
+                params![connection, attempt.delivery_id, attempt.part, attempt.attempt, generation, next, reason],
             )?;
+            if released != 0 && !attempt.effect.retransmission
+                && effect_store::status_outcomes(tx,&attempt.delivery_id,attempt.part)?.is_empty()
+            {
+                effect_store::release_slot(tx,&attempt.delivery_id,attempt.part)?;
+            }
             Ok(())
         })
     }
@@ -623,60 +646,34 @@ impl Store {
         connection: &str,
         generation: Option<&str>,
         id: &str,
-        (part, attempt): (u32, u32),
+        attempt: (u32, u32),
         result: DeliveryResult,
         now: i64,
     ) -> Result<bool> {
-        let (stage, reason, receipt, editable_message, retry) = match result {
-            DeliveryResult::Confirmed {
-                receipt,
-                editable_message,
-            } if super::runtime::valid_id(&receipt) => (
-                "sent",
-                None,
-                Some(receipt),
-                editable_message.filter(|id| super::runtime::valid_id(id)),
-                None,
-            ),
-            DeliveryResult::Retryable { after, scope } => (
-                "pending",
-                Some("rate_limited"),
-                None,
-                None,
-                Some((after, scope)),
-            ),
-            DeliveryResult::Rejected => ("rejected", Some("platform_rejected"), None, None, None),
-            _ => ("uncertain", Some("send_outcome_unknown"), None, None, None),
-        };
+        self.write(|tx| effect_store::record(tx,connection,generation,id,attempt,result,now))
+    }
+
+
+    pub fn reconcile(
+        &self, connection: &str, delivery: &UncertainDelivery, result: DeliveryResult, now: i64,
+    ) -> Result<bool> {
         self.write(|tx| {
-            if tx.execute(
-                "UPDATE messaging_parts SET stage = ?6,receipt = ?7,reason = ?8,editable_message = ?9,generation = NULL
-                 WHERE delivery = ?2 AND ordinal = ?3 AND attempt = ?4 AND generation IS ?5
-                 AND stage = CASE WHEN ?5 IS NULL THEN 'uncertain' ELSE 'sending' END
-                 AND EXISTS(SELECT 1 FROM messaging_deliveries WHERE id = ?2 AND connection = ?1)",
-                params![connection, id, part, attempt, generation, stage, receipt, reason, editable_message],
-            )? == 0 {
-                return Ok(false);
-            }
-            if let Some((after, scope)) = retry {
-                let millis = i64::try_from(after.as_millis()).unwrap_or(i64::MAX).max(1);
-                tx.execute(
-                    "INSERT INTO messaging_cooldowns (connection,scope,until_ms)
-                     SELECT connection,CASE WHEN ?2 THEN destination ELSE '' END,?3 FROM messaging_deliveries WHERE id = ?1
-                     ON CONFLICT(connection,scope) DO UPDATE SET until_ms = MAX(until_ms,excluded.until_ms)",
-                    params![id, scope == RetryScope::Destination, now.saturating_add(millis)],
-                )?;
-            }
-            finish_delivery(tx, id)?;
-            Ok(true)
+            let part: Option<DeliveryPart> = tx.query_row(
+                "SELECT p.body FROM messaging_parts p JOIN messaging_deliveries d ON d.id=p.delivery
+                 WHERE d.connection=?1 AND p.delivery=?2 AND p.ordinal=?3 AND p.attempt=?4 AND p.stage='uncertain'",
+                params![connection,delivery.delivery_id,delivery.part,delivery.attempt],
+                |row| decode(row,0),
+            ).optional()?;
+            if part.is_none_or(|part| part.room!=delivery.room) { return Ok(false) }
+            effect_store::record(tx,connection,None,&delivery.delivery_id,(delivery.part,delivery.attempt),result,now)
         })
     }
 
     pub fn uncertain_deliveries(&self, connection: &str) -> Result<Vec<UncertainDelivery>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
-            "SELECT d.id,p.ordinal,p.attempt,r.room FROM messaging_deliveries d
-             JOIN messaging_parts p ON p.delivery = d.id JOIN messaging_routes r ON r.id = d.route
+            "SELECT d.id,p.ordinal,p.attempt,p.body FROM messaging_deliveries d
+             JOIN messaging_parts p ON p.delivery = d.id
              WHERE d.connection = ?1 AND p.stage = 'uncertain' ORDER BY d.position LIMIT 200",
         )?;
         Ok(query
@@ -685,7 +682,7 @@ impl Store {
                     delivery_id: row.get(0)?,
                     part: row.get(1)?,
                     attempt: row.get(2)?,
-                    room: decode(row, 3)?,
+                    room: decode::<DeliveryPart>(row, 3)?.room,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -731,11 +728,13 @@ impl Store {
     pub fn delivery_status(&self) -> Result<Vec<DeliveryStatus>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
-            "SELECT d.id,d.connection,d.route,d.stage,p.ordinal,p.attempt,p.stage,COALESCE(p.reason,d.reason)
+            "SELECT d.id,d.connection,d.route,d.stage,p.ordinal,p.attempt,
+               CASE WHEN p.stage='pending' AND p.reason LIKE 'eligibility_%' THEN 'blocked' ELSE p.stage END,
+               COALESCE(p.reason,d.reason)
              FROM messaging_deliveries d LEFT JOIN messaging_parts p ON p.delivery = d.id
              ORDER BY (p.stage = 'uncertain') DESC,d.position DESC,p.ordinal LIMIT 200",
         )?;
-        Ok(query
+        let mut items = query
             .query_map([], |row| {
                 Ok(DeliveryStatus {
                     id: row.get(0)?,
@@ -746,9 +745,18 @@ impl Store {
                     attempt: row.get(5)?,
                     part_state: row.get(6)?,
                     error: row.get(7)?,
+                    provider_status: Vec::new(),
+                    recipients: Default::default(),
                 })
             })?
-            .collect::<rusqlite::Result<_>>()?)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for status in &mut items {
+            if let Some(part) = status.part {
+                status.provider_status = effect_store::provider_status(&db,&status.id,part)?;
+                status.recipients = effect_store::status_outcomes(&db,&status.id,part)?;
+            }
+        }
+        Ok(items)
     }
 
     pub fn input_status(&self) -> Result<Vec<InputStatus>> {
@@ -955,7 +963,7 @@ fn enqueue(
         "Messaging destination does not match the route"
     );
     let body = serde_json::to_string(intent)?;
-    let destination = key("destination", &(&route.room.chat, &route.room.thread))?;
+    let destination = effect_store::destination(&route.room)?;
     let inserted = db.execute(
         "INSERT OR IGNORE INTO messaging_deliveries (id,connection,destination,route,intent,sender,stage)
          VALUES (?1,?2,?3,?4,?5,?6,'pending')",
@@ -979,8 +987,10 @@ fn finish_delivery(db: &Connection, id: &str) -> Result<()> {
     db.execute(
         "UPDATE messaging_deliveries SET stage = CASE
             WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'rejected') THEN 'rejected'
-            WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage NOT IN ('sent','discarded')) THEN 'planned'
+            WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage NOT IN ('sent','discarded','partial','submitted')) THEN 'planned'
             WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'discarded') THEN 'discarded'
+            WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'partial') THEN 'partial'
+            WHEN EXISTS (SELECT 1 FROM messaging_parts WHERE delivery = ?1 AND stage = 'submitted') THEN 'submitted'
             ELSE 'sent' END
          WHERE id = ?1 AND stage = 'planned'",
         [id],

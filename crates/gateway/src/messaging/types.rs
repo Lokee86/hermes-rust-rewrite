@@ -9,8 +9,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    EnrollmentCredential, EnrollmentLease, EnrollmentPrompt, Ingress, ScopePolicy,
-    VerifiedInstallation,
+    Effect, EffectCapabilities, EffectReceipt, EnrollmentCredential, EnrollmentLease, EnrollmentPrompt,
+    Ingress, MarkerRef, RecipientResults, ResolvedEffect, ScopePolicy, VerifiedInstallation,
 };
 
 /// Major version of the native gateway adapter interface.
@@ -28,6 +28,7 @@ pub struct Capabilities {
     pub progress: bool,
     pub editing: bool,
     pub wake: bool,
+    pub effects: EffectCapabilities,
 }
 
 impl Capabilities {
@@ -40,6 +41,13 @@ impl Capabilities {
         progress: false,
         editing: false,
         wake: false,
+        effects: EffectCapabilities {
+            prepare_resources: false,
+            durable_presentation: false,
+            submitted: false,
+            recipient_subsets: false,
+            retransmission: false,
+        },
     };
 }
 
@@ -334,6 +342,7 @@ pub enum DeliveryBody {
     Reply(Message),
     Prompt { action_id: String, prompt: Prompt },
     Progress { text: String, reply_id: String },
+    Retire { marker: MarkerRef },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -352,6 +361,8 @@ pub enum Prompt {
 pub struct DeliveryPart {
     pub room: Room,
     pub body: DeliveryBody,
+    #[serde(default, skip_serializing_if = "Effect::is_default")]
+    pub effect: Effect,
     /// The first reply part may replace the editable message provided by the intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_target: Option<String>,
@@ -364,6 +375,7 @@ pub struct SendAttempt {
     pub attempt: u32,
     pub reply_anchor: Option<String>,
     pub payload: DeliveryPart,
+    pub effect: ResolvedEffect,
 }
 
 /// A previously attempted operation whose platform outcome is unknown.
@@ -393,6 +405,12 @@ pub enum DeliveryResult {
         after: Duration,
         scope: RetryScope,
     },
+    EffectConfirmed(EffectReceipt),
+    Recipients(RecipientResults),
+    /// A complete write on a negotiated write-only transport.
+    Submitted,
+    /// Evidence that the requested edit was definitively not published.
+    EditNotPublished,
     Rejected,
     Uncertain,
 }
