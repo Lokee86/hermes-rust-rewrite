@@ -310,6 +310,7 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         (Method::GET, ["channels", "22"]) => {
             json!({"id":"22","type":11,"guild_id":"11","parent_id":"21"})
         }
+        (Method::GET, ["channels", "23"]) => json!({"id":"23","type":0,"guild_id":"12"}),
         (Method::GET, ["channels", channel, "messages"]) => {
             json!(
                 crate::lock(&state.history)
@@ -681,6 +682,86 @@ async fn discord_resume_never_skips_a_dispatch_that_failed_to_commit() {
     };
     assert_eq!(payload["content"], "answer retry after a failed commit");
     assert_eq!(model.requests().len(), 1);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_requester_commands_answer_privately_without_creating_a_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let settings = json!({
+        "grants":{"users":["7"]},
+        "guilds":{
+            "11":{"operator_roles":["31"],"channels":{"21":{}}},
+            "12":{"channels":{"23":{}}}
+        },
+        "commands":{"sync":false,"guild_roles":{"11":["31"]}},
+    });
+    let gateway = model
+        .gateway(root.path(), vec![fixture.configuration_with(root.path(), settings)])
+        .await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "requester").await;
+    let interaction = |offset: u64, command: &str, channel: &str, guild: &str, roles: &[&str]| {
+        let id = (((now() - 1_420_070_400_000) as u64) << 22) + offset;
+        json!({
+            "id":id.to_string(), "application_id":"90", "type":2,
+            "token":format!("callback-{id}"), "channel_id":channel, "guild_id":guild,
+            "member":{"roles":roles,"user":{"id":"8"}}, "data":{"name":command},
+        })
+    };
+    let allowed = interaction(1, "status", "21", "11", &["31"]);
+    let event = format!("discord-interaction-{}", allowed["id"].as_str().unwrap());
+    wire.dispatch(2, "INTERACTION_CREATE", allowed).await;
+    let Write::Callback(response) = fixture.write().await else {
+        panic!("expected requester callback")
+    };
+    assert_eq!(response["type"], 4);
+    assert_eq!(response["data"]["flags"], 64);
+    assert_eq!(
+        response["data"]["content"],
+        "Mercury is ready. Operator role verified."
+    );
+    let mut chat = message("300", "21", "stay outside chat", true);
+    chat["author"]["id"] = json!("8");
+    chat["member"]["roles"] = json!(["31"]);
+    wire.dispatch(3, "MESSAGE_CREATE", chat).await;
+
+    for (position, command, channel, guild, roles) in [
+        (4, "queue", "21", "11", &["31"][..]),
+        (5, "status", "23", "12", &["31"][..]),
+        (6, "status", "21", "11", &[][..]),
+    ] {
+        let denied = interaction(position, command, channel, guild, roles);
+        wire.dispatch(position, "INTERACTION_CREATE", denied).await;
+        let Write::Callback(response) = fixture.write().await else {
+            panic!("expected private refusal")
+        };
+        assert_eq!(response["type"], 4);
+        assert_eq!(response["data"]["flags"], 64);
+        assert!(
+            !response["data"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Mercury is ready")
+        );
+    }
+
+    let status = gateway.messaging_status().await.unwrap();
+    let input = status["input"].as_array().unwrap();
+    let invocation = input.iter().find(|entry| entry["id"] == event).unwrap();
+    assert_eq!(invocation["state"], "done");
+    assert!(invocation["route"].is_null());
+    assert!(
+        input
+            .iter()
+            .any(|entry| entry["id"] == "discord-message-300" && entry["state"] == "refused")
+    );
+    assert!(model.requests().is_empty());
+    assert_eq!(status["deliveries"], json!([]));
     gateway.shutdown().await.unwrap();
 }
 

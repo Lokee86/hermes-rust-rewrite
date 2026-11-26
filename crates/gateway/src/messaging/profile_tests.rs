@@ -602,6 +602,84 @@ async fn verified_aliases_route_together_and_membership_changes_fence_access() {
 }
 
 #[tokio::test]
+async fn discord_requester_command_rechecks_exact_guild_roles_and_revocation() {
+    use super::commands::{RequesterCommand, RequesterInvocation};
+    use super::discord::DiscordSettings;
+
+    let temp = TempDir::new().unwrap();
+    let (factory, receiver) = fixture("requester-commands", "tenant");
+    let settings: DiscordSettings = serde_json::from_value(serde_json::json!({
+        "grants":{"users":["7"]},
+        "guilds":{
+            "11":{"operator_roles":["31"],"channels":{"21":{"threads":{"22":{}}}}},
+            "12":{"channels":{"23":{}}}
+        },
+        "commands":{"guild_roles":{"11":["31"]}}
+    })).unwrap();
+    let gateway = open(temp.path(), &[factory], &settings.host_policy()).await;
+    let ingress = ready(&receiver).await;
+    let exact = Room { kind: RoomKind::Group, chat: "21".into(), thread: None };
+    let foreign = Room { kind: RoomKind::Group, chat: "23".into(), thread: None };
+    let sender = Sender { id: "8".into(), roles: ["discord-role:11:31".into()].into() };
+    let mut evidence = person("8", exact.clone());
+    evidence.memberships[0].roles = sender.roles.clone();
+    evidence.memberships.push(MemberEvidence {
+        room: foreign.clone(), roles: sender.roles.clone(),
+    });
+    ingress.record_actor(evidence.clone()).await.unwrap();
+    let reader = RequesterInvocation {
+        id: "private-status".into(), room: exact.clone(), sender: sender.clone(),
+        command: RequesterCommand::Status,
+    };
+    let advance = |before: Option<&str>, next: &str| Advance {
+        stream: "interactions".into(), previous: before.map(str::to_owned), checkpoint: next.into(),
+    };
+    assert_eq!(
+        ingress.commit_requester_command(reader.clone(), advance(None, "1")).await.unwrap(),
+        Disposition::Accepted,
+    );
+    assert!(ingress.requester_command_response(&reader).unwrap().operator);
+    let wrong_room = RequesterInvocation { id: "forged-role".into(), room: foreign, ..reader.clone() };
+    assert_eq!(
+        ingress.commit_requester_command(wrong_room.clone(), advance(Some("1"), "2")).await.unwrap(),
+        Disposition::Forbidden,
+    );
+    assert!(matches!(ingress.requester_command_response(&wrong_room), Err(GatewayError::Forbidden)));
+    let misplaced = RequesterInvocation { id: reader.id.clone(), ..wrong_room };
+    assert!(matches!(ingress.requester_command_response(&misplaced), Err(GatewayError::Forbidden)));
+    assert_eq!(
+        ingress.submit(vec![message("chat", sender.clone(), exact.clone())], None).await.unwrap().receipts[0].disposition,
+        Disposition::Forbidden,
+    );
+    assert!(!ingress.authorize_operator(&settings.host_policy(), &exact, &sender).unwrap());
+    assert_eq!(ingress.checkpoint("interactions".into()).await.unwrap().as_deref(), Some("2"));
+
+    // Membership or even just command policy revocation fences an accepted
+    // receipt before the adapter can read its private result.
+    ingress.invalidate_actor_evidence(Some(exact)).await.unwrap();
+    assert_eq!(
+        ingress.commit_requester_command(reader.clone(), advance(Some("2"), "3")).await.unwrap(),
+        Disposition::Accepted,
+    );
+    assert!(matches!(ingress.requester_command_response(&reader), Err(GatewayError::Forbidden)));
+    evidence.revision += 1;
+    ingress.record_actor(evidence).await.unwrap();
+    assert!(ingress.requester_command_response(&reader).is_ok());
+    let mut revoked = settings;
+    revoked.commands.guild_roles.clear();
+    gateway.set_adapter_policy("requester-commands", revoked.host_policy()).await.unwrap();
+    assert!(matches!(ingress.requester_command_response(&reader), Err(GatewayError::Forbidden)));
+
+    let status = gateway.messaging_status().await.unwrap();
+    let entry = status["input"].as_array().unwrap().iter()
+        .find(|item| item["id"] == "private-status").unwrap();
+    assert!(entry["route"].is_null() && entry["session"].is_null());
+    assert_eq!(entry["state"], "done");
+    assert_eq!(status["deliveries"], serde_json::json!([]));
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn connection_observations_use_weak_provenance_without_merging_identical_text() {
     let temp = TempDir::new().unwrap();
     let (factory, queue) = fixture("weak-provenance", "tenant");

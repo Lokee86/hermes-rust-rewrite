@@ -663,10 +663,15 @@ impl Host {
     pub(crate) async fn restore_discord(&self, owner: &Arc<Shared>) -> Result<()> {
         let mut slots = self.slots.lock().await;
         for (name, settings) in self.store.discord_connections()? {
-            let connection = self.store.connection_setting(&name)?.context("Discord connection is unavailable")?;
+            let mut connection = self.store.connection_setting(&name)?.context("Discord connection is unavailable")?;
+            let policy = settings.host_policy();
             let factory = Arc::new(DiscordFactory::new(owner.library.root().to_owned(), settings)?);
             let descriptor = factory.descriptor();
             ensure!(connection.platform == descriptor.platform, "Invalid saved Discord connection platform");
+            if connection.policy != policy {
+                connection.revision = self.store.set_connection_policy(&name, &policy)? as u64;
+                connection.policy = policy;
+            }
             lock(&self.factories).insert(name, factory.clone());
             self.activate(owner, &mut slots, factory, descriptor, connection).await;
         }

@@ -29,6 +29,7 @@ pub struct RoomRules {
     /// The nearest explicit grant replaces broader allow choices. Denials and
     /// inherited restrictions still apply.
     pub grant: Option<RoomGrant>,
+    pub requester_commands: Option<RequesterCommandGrant>,
     pub mention_required: Option<bool>,
     pub per_participant: Option<bool>,
     pub turn: TurnPolicy,
@@ -42,6 +43,16 @@ pub struct RoomGrant {
     pub paired: bool,
     pub users: BTreeSet<String>,
     pub roles: BTreeSet<String>,
+}
+
+/// An explicit command grant for an authenticated requester. It has no
+/// authority over conversation turns, deliveries or interactive prompts.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequesterCommandGrant {
+    pub users: BTreeSet<String>,
+    pub roles: BTreeSet<String>,
+    pub operator_roles: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -180,6 +191,19 @@ impl AccessPolicy {
                             .as_ref()
                             .is_some_and(|roles| !roles.is_disjoint(&sender.roles)))
             })
+    }
+
+    pub(super) fn requester_command_grant(
+        &self, room: &Room, actor: &Sender,
+    ) -> Option<&RequesterCommandGrant> {
+        let grant = self.rules(room).filter_map(|rule| rule.requester_commands.as_ref()).last()?;
+        (self.room_policy(room).is_some()
+            && !self.scope.denied_users.contains(&actor.id)
+            && self.scope.denied_roles.is_disjoint(&actor.roles)
+            && self.rules(room).all(|rule| !rule.denied_users.contains(&actor.id)
+                && rule.denied_roles.is_disjoint(&actor.roles))
+            && (grant.users.contains(&actor.id) || !grant.roles.is_disjoint(&actor.roles)))
+            .then_some(grant)
     }
 
     pub fn turn_policy(&self, room: &Room) -> TurnPolicy {

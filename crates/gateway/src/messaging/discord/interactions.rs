@@ -2,7 +2,7 @@ use super::{
     super::{
         Advance, Command, ConnectionFailure, Control, DeliveryBody, DeliveryIntent, Disposition,
         GatewayError, InboundBody, InboundEvent, InvocationOutcome, Prompt, Response, Room, Sender,
-        commands::COMMANDS,
+        commands::{COMMANDS, RequesterCommand, RequesterInvocation},
         runtime::{db, now, valid_id},
         store,
     },
@@ -58,6 +58,15 @@ enum Action {
 }
 
 impl Action {
+    fn requester_command(&self) -> Option<RequesterCommand> {
+        match self {
+            Self::Native(InboundBody::Command(Command::Status)) => Some(RequesterCommand::Status),
+            Self::Help => Some(RequesterCommand::Help),
+            Self::Identity => Some(RequesterCommand::Identity),
+            _ => None,
+        }
+    }
+
     fn input(&self) -> InboundBody {
         match self {
             Self::Native(body) => body.clone(),
@@ -68,6 +77,7 @@ impl Action {
 
 enum Presentation {
     Text(String),
+    Requester(RequesterInvocation),
     Deferred {
         input: String,
         room: Room,
@@ -190,6 +200,32 @@ impl DiscordAdapter {
             );
             return Ok(());
         };
+        if self.settings.commands.has_explicit_grants()
+            && let Some(command) = action.requester_command()
+            && ingress
+                .checked(true, |state| {
+                    Ok(!ingress.authorize_sender(&state.policy, &route.room, &sender)?)
+                })
+                .map_err(intake_failure)?
+        {
+            let request = RequesterInvocation {
+                id: event.id,
+                room: route.room,
+                sender,
+                command,
+            };
+            let disposition = ingress
+                .commit_requester_command(request.clone(), advance)
+                .await
+                .map_err(intake_failure)?;
+            let presentation = if disposition == Disposition::Accepted {
+                Presentation::Requester(request)
+            } else {
+                Presentation::Text("The gateway refused this interaction.".into())
+            };
+            self.respond(ingress, input, presentation, frame.received, cancel);
+            return Ok(());
+        }
         event.body = action.input();
         let result = ingress
             .submit(vec![event], Some(advance))
@@ -513,6 +549,24 @@ impl DiscordAdapter {
             let _permit = permit;
             let initial = match &presentation {
                 Presentation::Text(text) => json!({"type":4,"data": private_text(text)}),
+                Presentation::Requester(request) => {
+                    let text = match ingress.requester_command_response(request) {
+                        Ok(access) => match request.command {
+                            RequesterCommand::Status if access.operator => {
+                                "Mercury is ready. Operator role verified.".into()
+                            }
+                            RequesterCommand::Status => outcome_text(InvocationOutcome::Ready),
+                            RequesterCommand::Identity => {
+                                format!("Discord account {}", access.actor)
+                            }
+                            RequesterCommand::Help => {
+                                "Available with this grant: /status, /help, /whoami.".into()
+                            }
+                        },
+                        Err(_) => "The gateway refused this interaction.".into(),
+                    };
+                    json!({"type":4,"data":private_text(&text)})
+                }
                 Presentation::Deferred { .. } => json!({"type":5,"data":{"flags":EPHEMERAL}}),
                 Presentation::Modal { id, question } => json!({"type":9,"data":{
                     "custom_id":id,"title":question.chars().take(45).collect::<String>(),

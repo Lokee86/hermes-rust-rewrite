@@ -8,6 +8,10 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+#[path = "requester_commands.rs"]
+mod requester;
+pub(super) use requester::{RequesterCommand, RequesterInvocation};
+
 pub(super) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_native_invocations (
     connection TEXT NOT NULL, event TEXT NOT NULL, route TEXT NOT NULL, actor TEXT NOT NULL,
@@ -406,13 +410,24 @@ pub(super) fn record_invocation(
     actor: &str,
     outcome: InvocationOutcome,
 ) -> Result<()> {
+    record_requester_invocation(tx, &route.connection, event, &route.id, actor, outcome)
+}
+
+fn record_requester_invocation(
+    tx: &rusqlite::Connection,
+    connection: &str,
+    event: &str,
+    scope: &str,
+    actor: &str,
+    outcome: InvocationOutcome,
+) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO messaging_native_invocations(connection,event,route,actor,outcome)
          VALUES (?1,?2,?3,?4,?5)",
         params![
-            route.connection,
+            connection,
             event,
-            route.id,
+            scope,
             actor,
             serde_json::to_string(&outcome)?
         ],

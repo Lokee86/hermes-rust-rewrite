@@ -953,30 +953,8 @@ pub(super) fn append(
         event.id = id;
     }
     let identity = fingerprint(&event)?;
-    let existing = tx.query_row(
-        "SELECT fingerprint,route,disposition FROM messaging_ingress WHERE connection = ?1 AND event = ?2",
-        params![connection, event.id],
-        |row| Ok((row.get::<_, String>(0)?, row.get(1)?, decode(row, 2)?)),
-    ).optional()?;
-    if let Some((old, route, disposition)) = existing {
-        if old != identity {
-            tx.execute(
-                "UPDATE messaging_ingress SET conflict = 1 WHERE connection = ?1 AND event = ?2",
-                params![connection, event.id],
-            )?;
-            return Ok(IntakeReceipt {
-                id: event.id,
-                route: None,
-                disposition: Disposition::Conflict,
-                repeated: false,
-            });
-        }
-        return Ok(IntakeReceipt {
-            id: event.id,
-            route,
-            disposition,
-            repeated: true,
-        });
+    if let Some(receipt) = ingress_replay(tx, connection, &event.id, &identity)? {
+        return Ok(receipt);
     }
     let decision = if preparing {
         decision
@@ -1013,6 +991,37 @@ pub(super) fn append(
         disposition,
         repeated: false,
     })
+}
+
+pub(super) fn ingress_replay(
+    tx: &Connection, connection: &str, event: &str, identity: &str,
+) -> Result<Option<IntakeReceipt>> {
+    let existing = tx.query_row(
+        "SELECT fingerprint,route,disposition FROM messaging_ingress WHERE connection = ?1 AND event = ?2",
+        params![connection, event],
+        |row| Ok((row.get::<_, String>(0)?, row.get(1)?, decode(row, 2)?)),
+    ).optional()?;
+    let Some((old, route, disposition)) = existing else {
+        return Ok(None);
+    };
+    if old != identity {
+        tx.execute(
+            "UPDATE messaging_ingress SET conflict = 1 WHERE connection = ?1 AND event = ?2",
+            params![connection, event],
+        )?;
+        return Ok(Some(IntakeReceipt {
+            id: event.to_owned(),
+            route: None,
+            disposition: Disposition::Conflict,
+            repeated: false,
+        }));
+    }
+    Ok(Some(IntakeReceipt {
+        id: event.to_owned(),
+        route,
+        disposition,
+        repeated: true,
+    }))
 }
 
 pub(super) fn attachment_decision(

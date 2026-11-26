@@ -8,8 +8,8 @@ use crate::{
     messaging::{
         AccessPolicy, AdapterFactory, AdapterFuture, CONTRACT_VERSION, Capabilities,
         ConnectionFailure, ConnectionSettings, DeliveryPolicy, Descriptor, EffectCapabilities,
-        EnrollmentCredential, RoomGrant, RoomRules, TurnPolicy, VerifiedAdapter,
-        VerifiedInstallation,
+        EnrollmentCredential, RequesterCommandGrant, RoomGrant, RoomRules, TurnPolicy,
+        VerifiedAdapter, VerifiedInstallation,
         store::{self, Store},
     },
 };
@@ -323,6 +323,30 @@ pub struct DiscordCommandSettings {
     pub guild_roles: BTreeMap<String, BTreeSet<String>>,
 }
 
+impl DiscordCommandSettings {
+    pub(super) fn has_explicit_grants(&self) -> bool {
+        self.users.is_some() || !self.guild_roles.is_empty()
+    }
+
+    fn requester_grant(
+        &self,
+        guild: Option<&str>,
+        operator_roles: BTreeSet<String>,
+    ) -> Option<RequesterCommandGrant> {
+        (self.enabled && self.has_explicit_grants()).then(|| RequesterCommandGrant {
+            users: self.users.clone().unwrap_or_default(),
+            roles: guild
+                .and_then(|id| {
+                    self.guild_roles
+                        .get(id)
+                        .map(|roles| map_roles(Some(id), roles))
+                })
+                .unwrap_or_default(),
+            operator_roles,
+        })
+    }
+}
+
 impl Default for DiscordCommandSettings {
     fn default() -> Self {
         Self {
@@ -573,7 +597,7 @@ impl DiscordSettings {
         roles: &BTreeSet<String>,
     ) -> bool {
         self.commands.enabled
-            && (self.commands.users.is_none() && self.commands.guild_roles.is_empty()
+            && (!self.commands.has_explicit_grants()
                 || self
                     .commands
                     .users
@@ -639,19 +663,35 @@ impl DiscordSettings {
             self.direct.pairing,
             false,
         );
+        // Direct command grants use explicit users. The optional DM guild can
+        // still prove a configured operator role for that requester.
+        let dm_operator_roles = self
+            .dm_role_guild
+            .as_deref()
+            .and_then(|id| {
+                self.guilds
+                    .get(id)
+                    .map(|guild| map_roles(Some(id), &guild.operator_roles))
+            })
+            .unwrap_or_default();
+        policy.scope.direct.requester_commands =
+            self.commands.requester_grant(None, dm_operator_roles);
         for (guild_id, guild) in &self.guilds {
             let guild_grants = guild.rules.grants.as_ref().unwrap_or(&self.grants);
-            policy
-                .operator_roles
-                .extend(map_roles(Some(guild_id), &guild.operator_roles));
+            let operator_roles = map_roles(Some(guild_id), &guild.operator_roles);
+            policy.operator_roles.extend(operator_roles.iter().cloned());
+            let requester_commands = self
+                .commands
+                .requester_grant(Some(guild_id), operator_roles);
             for (channel_id, channel) in &guild.channels {
-                let room = compile_room(
+                let mut room = compile_room(
                     &[&guild.rules, &channel.rules],
                     Some(guild_id),
                     guild_grants,
                     false,
                     true,
                 );
+                room.requester_commands = requester_commands.clone();
                 policy.scope.rooms.insert(channel_id.clone(), room);
                 if self.voice_enabled {
                     policy
