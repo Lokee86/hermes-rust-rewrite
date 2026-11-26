@@ -215,6 +215,7 @@ impl Store {
         connection.execute_batch(super::discord::DELIVERY_RATE_TABLES)?;
         connection.execute_batch(super::discord::FEEDBACK_TABLES)?;
         connection.execute_batch(super::discord::MANUAL_THREAD_TABLES)?;
+        connection.execute_batch(super::discord::THREAD_UPDATE_TABLES)?;
         connection.execute_batch(super::discord::voice_note::TABLES)?;
         connection.execute_batch(effect_store::TABLES)?;
         connection.execute_batch(super::approvals::TABLES)?;

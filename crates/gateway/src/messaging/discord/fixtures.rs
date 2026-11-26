@@ -49,6 +49,8 @@ mod manual_thread_fixtures;
 mod voice_note_fixtures;
 #[path = "membership_fixtures.rs"]
 mod membership_fixtures;
+#[path = "thread_update_fixtures.rs"]
+mod thread_update_fixtures;
 
 const LIMIT: Duration = Duration::from_secs(15);
 
@@ -63,6 +65,10 @@ struct Server {
     threads: Arc<Mutex<BTreeMap<String, Value>>>,
     thread_creates: Arc<AtomicU64>,
     thread_requester_permissions: Arc<Mutex<Option<u64>>>,
+    thread_bot_permissions: Arc<Mutex<Option<u64>>>,
+    thread_update_writes: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    lose_thread_update_responses: Arc<AtomicBool>,
+    limit_next_pin: Arc<AtomicBool>,
     callback_paths: Arc<Mutex<Vec<String>>>,
     voice_outcome: Arc<AtomicU64>,
     suppress_progress: Arc<AtomicBool>,
@@ -165,6 +171,10 @@ impl Fixtures {
             threads: Arc::default(),
             thread_creates: Arc::default(),
             thread_requester_permissions: Arc::default(),
+            thread_bot_permissions: Arc::default(),
+            thread_update_writes: Arc::default(),
+            lose_thread_update_responses: Arc::default(),
+            limit_next_pin: Arc::default(),
             callback_paths: Arc::default(),
             voice_outcome: Arc::default(),
             suppress_progress: Arc::default(),
@@ -386,8 +396,9 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         }
         (Method::GET, ["guilds", "11", "roles"]) => {
             let requester = crate::lock(&state.thread_requester_permissions).unwrap_or(8);
+            let bot = crate::lock(&state.thread_bot_permissions).unwrap_or(8);
             json!([
-                {"id":"11","permissions":requester.to_string()},{"id":"80","permissions":"8"},
+                {"id":"11","permissions":requester.to_string()},{"id":"80","permissions":bot.to_string()},
                 {"id":"31","permissions":"0"},{"id":"41","permissions":"0"}
             ])
         }
@@ -433,9 +444,47 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             };
             found
         }
+        (Method::PATCH, ["channels", thread]) => {
+            let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
+            let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+            let name = payload["name"].as_str().expect("thread update name");
+            let actual = {
+                let mut threads = crate::lock(&state.threads);
+                let Some(actual) = threads.get_mut(*thread) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                actual["name"] = json!(name);
+                actual.clone()
+            };
+            crate::lock(&state.thread_update_writes).push((path, Some(name.to_owned())));
+            if state.lose_thread_update_responses.load(Ordering::SeqCst) {
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+            actual
+        }
+        (Method::PUT, ["channels", thread, "messages", "pins", id]) => {
+            if state.limit_next_pin.swap(false, Ordering::SeqCst) {
+                return (StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"retry_after":2.75,"global":true}))).into_response();
+            }
+            {
+                let mut messages = crate::lock(&state.messages);
+                let Some(message) = messages.get_mut(&(thread.to_string(), id.to_string())) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                message["pinned"] = json!(true);
+            }
+            crate::lock(&state.thread_update_writes).push((path, None));
+            return if state.lose_thread_update_responses.load(Ordering::SeqCst) {
+                StatusCode::BAD_GATEWAY.into_response()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            };
+        }
         (Method::POST, ["channels", parent, "messages", starter, "threads"]) => {
             let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
             let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+            let name = payload["name"].clone();
             state.thread_creates.fetch_add(1, Ordering::SeqCst);
             let _ = state
                 .writes
@@ -449,7 +498,8 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
                 "400" => return StatusCode::BAD_GATEWAY.into_response(),
                 "401" => return StatusCode::FORBIDDEN.into_response(),
                 _ => {
-                    let thread = json!({"id":starter,"type":11,"parent_id":parent,"owner_id":"9","guild_id":"11"});
+                    let thread = json!({"id":starter,"type":11,"parent_id":parent,"owner_id":"9","guild_id":"11",
+                        "name":name,"thread_metadata":{"archived":false,"locked":false}});
                     crate::lock(&state.threads).insert(starter.to_string(), thread.clone());
                     thread
                 }
@@ -467,9 +517,12 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             let message = crate::lock(&state.messages)
                 .get(&(channel.to_string(), id.to_string()))
                 .cloned();
-            let Some(message) = message else {
+            let Some(mut message) = message else {
                 return StatusCode::NOT_FOUND.into_response();
             };
+            if message["pinned"].is_null() {
+                message["pinned"] = json!(false);
+            }
             message
         }
         (Method::POST, ["channels", channel, "messages"]) => {

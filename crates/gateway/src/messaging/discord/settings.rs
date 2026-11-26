@@ -40,6 +40,7 @@ pub(super) const SEE_CHANNEL: u64 = 1 << 10;
 pub(super) const SEND_MESSAGES: u64 = 1 << 11;
 const ATTACH_FILES: u64 = 1 << 15;
 const SEND_VOICE_MESSAGES: u64 = 1 << 46;
+pub(super) const PIN_MESSAGES: u64 = 1 << 51;
 pub(super) const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 const CONNECT_AND_SPEAK: u64 = (1 << 20) | (1 << 21);
 pub(super) const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
@@ -372,6 +373,8 @@ pub struct DiscordDeliverySettings {
     pub forum_posts: bool,
     pub typing: bool,
     pub reactions: bool,
+    pub rename_auto_threads: bool,
+    pub pin_first_thread_message: bool,
 }
 impl Default for DiscordDeliverySettings {
     fn default() -> Self {
@@ -382,6 +385,8 @@ impl Default for DiscordDeliverySettings {
             forum_posts: false,
             typing: false,
             reactions: false,
+            rename_auto_threads: false,
+            pin_first_thread_message: false,
         }
     }
 }
@@ -422,7 +427,7 @@ pub(super) fn scoped_role(guild: &str, role: &str) -> String {
     format!("discord-role:{guild}:{role}")
 }
 
-fn map_roles(guild: Option<&str>, roles: &BTreeSet<String>) -> BTreeSet<String> {
+pub(super) fn map_roles(guild: Option<&str>, roles: &BTreeSet<String>) -> BTreeSet<String> {
     guild
         .into_iter()
         .flat_map(|id| roles.iter().map(move |role| scoped_role(id, role)))
@@ -765,6 +770,9 @@ impl DiscordSettings {
             }
             if self.delivery.reactions {
                 permissions |= ADD_REACTIONS;
+            }
+            if self.delivery.pin_first_thread_message {
+                permissions |= PIN_MESSAGES;
             }
             if self.sends_voice_notes() {
                 permissions |= SEND_VOICE_MESSAGES;

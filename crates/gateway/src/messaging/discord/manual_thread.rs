@@ -212,6 +212,7 @@ impl Ingress {
         &self,
         mut request: ManualThread,
         advance: Advance,
+        pin_first_message: bool,
     ) -> Result<Disposition, GatewayError> {
         if !valid_input_id(&request.event)
             || !valid_advance(Some(&advance))
@@ -281,6 +282,11 @@ impl Ingress {
                              VALUES (?1,?2,?3,?4,?5)",
                             params![scope.connection, request.event, delivery, installation, serde_json::to_string(&request)?],
                         )?;
+                        if pin_first_message && request.spec.message.is_some() {
+                            delivery::thread_updates::reserve_starter_pin(
+                                tx, &scope.connection, &delivery, &installation, &request.guild,
+                            )?;
+                        }
                     }
                     disposition
                 };
@@ -365,7 +371,7 @@ fn read_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reservation> {
     })
 }
 
-fn receipt(
+pub(super) fn receipt(
     db: &rusqlite::Connection,
     delivery: &str,
     ordinal: u32,
@@ -470,7 +476,7 @@ impl DiscordAdapter {
         Ok(())
     }
 
-    pub(super) fn reconcile_manual_threads(&self, ingress: &Ingress, cancel: &CancellationToken) {
+    pub(super) fn maintain_threads(&self, ingress: &Ingress, cancel: &CancellationToken) {
         let Ok(worker) = self.manual_recovery.clone().try_acquire_owned() else {
             return;
         };
@@ -478,11 +484,15 @@ impl DiscordAdapter {
         let bot = self.bot.bot_id.clone();
         let ingress = ingress.clone();
         let cancel = cancel.clone();
+        let delivery = self.settings.delivery.clone();
         tokio::spawn(async move {
             let _worker = worker;
             tokio::select! {
                 _ = cancel.cancelled() => {},
-                _ = recover_threads(client, bot, ingress) => {},
+                _ = async {
+                    recover_threads(client.clone(), bot.clone(), ingress.clone()).await;
+                    delivery::thread_updates::maintain(&client, &bot, &ingress, &delivery).await;
+                } => {},
             }
         });
     }

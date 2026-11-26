@@ -1,6 +1,7 @@
 mod buckets;
 mod feedback;
 mod render;
+pub(super) mod thread_updates;
 
 pub(in crate::messaging) use buckets::TABLES as DELIVERY_RATE_TABLES;
 pub(in crate::messaging) use feedback::TABLES as FEEDBACK_TABLES;
@@ -26,6 +27,8 @@ use reqwest::{Method, RequestBuilder, StatusCode, multipart};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+const AUTO_THREAD_NAME: &str = "Mercury discussion";
 
 const QUIET: u16 = 1 << 12;
 const UNKNOWN_CHANNEL: u64 = 10_003;
@@ -466,7 +469,7 @@ async fn provision(
                             Method::POST,
                             &["channels", parent, "messages", anchor, "threads"],
                         )
-                        .json(&json!({"name":"Mercury discussion"})),
+                        .json(&json!({"name":AUTO_THREAD_NAME})),
                     Call::Mutation,
                 )
                 .await?;
@@ -813,44 +816,55 @@ impl Rest<'_> {
             }
             check_authority(self.ingress, self.attempt, self.destination).await?;
         }
-        let mut response = client
-            .execute(request)
-            .await
-            .map_err(|_| call.transport_failure())?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let mut data = Vec::new();
-        loop {
-            match response.chunk().await {
-                Ok(None) => break,
-                Ok(Some(chunk)) if chunk.len().saturating_add(data.len()) <= MAX_JSON => {
-                    data.extend_from_slice(&chunk);
-                }
-                _ => {
-                    data.clear();
-                    break;
-                }
-            }
-        }
-        let body = serde_json::from_slice(&data).unwrap_or(Value::Null);
-        if let Some(result) = buckets::observe(
-            self.ingress,
-            route.as_ref(),
-            status,
-            &headers,
-            &body,
-            self.attempt.attempt,
-        )
-        .await
-        {
-            return Err(result);
-        }
-        Ok(HttpReply { status, body })
+        execute_http(self.ingress, route.as_ref(), client, request, call, self.attempt.attempt).await
     }
 
     async fn json(&self, request: RequestBuilder, call: Call) -> SendResult<Value> {
         self.execute(request, call).await?.into_json(call)
     }
+}
+
+async fn execute_http(
+    ingress: &Ingress,
+    route: Option<&buckets::Route>,
+    client: reqwest::Client,
+    request: reqwest::Request,
+    call: Call,
+    attempt: u32,
+) -> SendResult<HttpReply> {
+    let mut response = client
+        .execute(request)
+        .await
+        .map_err(|_| call.transport_failure())?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut data = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(None) => break,
+            Ok(Some(chunk)) if chunk.len().saturating_add(data.len()) <= MAX_JSON => {
+                data.extend_from_slice(&chunk);
+            }
+            _ => {
+                data.clear();
+                break;
+            }
+        }
+    }
+    let body = serde_json::from_slice(&data).unwrap_or(Value::Null);
+    if let Some(result) = buckets::observe(
+        ingress,
+        route,
+        status,
+        &headers,
+        &body,
+        attempt,
+    )
+    .await
+    {
+        return Err(result);
+    }
+    Ok(HttpReply { status, body })
 }
 
 fn retry(after: Duration, scope: RetryScope) -> DeliveryResult {

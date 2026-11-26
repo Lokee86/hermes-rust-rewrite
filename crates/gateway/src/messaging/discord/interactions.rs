@@ -238,7 +238,14 @@ impl DiscordAdapter {
                 spec: spec.clone(),
                 created_ms: snowflake_timestamp(&input.id).ok_or(ConnectionFailure::Retryable)?,
             };
-            let accepted = ingress.commit_manual_thread(request.clone(), advance).await.map_err(intake_failure)?;
+            let accepted = ingress
+                .commit_manual_thread(
+                    request.clone(),
+                    advance,
+                    self.settings.delivery.pin_first_thread_message,
+                )
+                .await
+                .map_err(intake_failure)?;
             let presentation = if accepted == Disposition::Accepted {
                 Presentation::ManualThread(request)
             } else {

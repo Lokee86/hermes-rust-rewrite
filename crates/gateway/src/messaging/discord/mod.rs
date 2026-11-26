@@ -42,6 +42,7 @@ pub(super) use manual_thread::TABLES as MANUAL_THREAD_TABLES;
 pub(super) use messages::MESSAGE_TABLES;
 pub(super) use recovery::RECOVERY_TABLES;
 pub(super) use socket::SOCKET_TABLES;
+pub(super) use delivery::thread_updates::TABLES as THREAD_UPDATE_TABLES;
 
 pub(super) struct DiscordAdapter {
     client: DiscordClient,
@@ -248,6 +249,9 @@ impl Adapter for DiscordAdapter {
             && self.should_send_voice_note(ingress, &intent.id, &intent.room)
         {
             delivery::add_voice_note(intent, &mut plan);
+        }
+        if let Err(error) = self.reserve_auto_thread_updates(ingress, intent) {
+            eprintln!("Could not reserve optional Discord thread updates: {error}");
         }
         Ok(plan)
     }

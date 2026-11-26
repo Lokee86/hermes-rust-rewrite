@@ -417,7 +417,7 @@ async fn dispatches(
                 frame = queue.recv() => frame,
                 _ = maintenance.tick(), if !first_ready => {
                     adapter.resume_preparations(ingress, cancel).await?;
-                    adapter.reconcile_manual_threads(ingress, cancel);
+                    adapter.maintain_threads(ingress, cancel);
                     for operation in adapter.voice_housekeeping(ingress) {
                         let _ = outgoing.try_send(operation);
                     }

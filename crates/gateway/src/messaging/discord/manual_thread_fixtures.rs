@@ -1,7 +1,7 @@
 use super::super::settings::SEE_CHANNEL;
 use super::*;
 
-fn thread_request(offset: u64, name: &str, starter: Option<&str>) -> Value {
+pub(super) fn thread_request(offset: u64, name: &str, starter: Option<&str>) -> Value {
     let id = (((now() - 1_420_070_400_000) as u64) << 22) + offset;
     let mut options = vec![
         json!({"name":"name","value":name}),
