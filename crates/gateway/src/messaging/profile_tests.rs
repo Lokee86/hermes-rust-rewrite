@@ -19,7 +19,10 @@ impl AdapterFactory for Fixture {
         Descriptor {
             platform: "proof-fixture".into(),
             version: CONTRACT_VERSION,
-            capabilities: Capabilities::TEXT,
+            capabilities: Capabilities {
+                attachments: true,
+                ..Capabilities::TEXT
+            },
         }
     }
 
@@ -641,6 +644,40 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
         ingress.transport_authority(&redirect).await,
         Err(GatewayError::Forbidden)
     ));
+    // A valid media grant does not extend a provider address grant or allow
+    // that address's credential to follow a foreign origin.
+    let read_endpoint = TransportAddress {
+        reference: "read-grant".into(),
+        operation: "download_media".into(),
+        ..address.clone()
+    };
+    ingress
+        .record_transport_address(read_endpoint.clone(), Some(secret.clone()))
+        .await
+        .unwrap();
+    let read_use = TransportUse {
+        reference: read_endpoint.reference,
+        operation: read_endpoint.operation,
+        endpoint: "https://foreign.example/forged".into(),
+        ..use_.clone()
+    };
+    let source = MediaSource::from(&message(
+        "download",
+        principal("canonical"),
+        address.room.clone().unwrap(),
+    ));
+    let manifest = AttachmentManifest {
+        name: "note.txt".into(),
+        size: Some(8),
+        sha256: None,
+    };
+    assert_eq!(
+        ingress
+            .download_attachment(source, manifest, read_use, Duration::from_secs(30))
+            .await
+            .unwrap_err(),
+        GatewayError::Forbidden,
+    );
     use_.actor = Some("other".into());
     assert!(matches!(
         ingress.transport_authority(&use_).await,

@@ -3,6 +3,7 @@
 use super::{
     runtime::{Ingress, State, blocking, db, valid_id},
     store::{Store, key},
+    transport::TransportUse,
     types::*,
 };
 use anyhow::{Result, ensure};
@@ -21,8 +22,10 @@ pub(super) const MAX_FILE: usize = 4 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROFILE_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_PENDING_GRANTS: i64 = 64;
+const MAX_FETCH_GRANTS_PER_EFFECT: i64 = 32;
 const MAX_READ_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_FETCH_LIFETIME: Duration = Duration::from_secs(900);
+const DOWNLOAD_OPERATION: &str = "download_media";
 
 pub(super) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_media_reads (
@@ -217,6 +220,10 @@ impl Ingress {
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |state| {
+                let mut source = source;
+                let (verified, _) = scope.effective_sender(&state.policy, &source.room, &source.sender)?
+                    .ok_or(GatewayError::Forbidden)?;
+                source.sender = verified;
                 scope.media_allowed(state, &source, purpose)?;
                 let token = crate::new_id();
                 let now = now();
@@ -268,6 +275,90 @@ impl Ingress {
             return Err(GatewayError::Invalid);
         }
         let bytes = self.read_media(&grant, open).await?;
+        self.finish_attachment(grant, bytes).await
+    }
+
+    /// Receive a provider asset through a previously verified HTTPS address.
+    /// The address, actor, operation and room are checked before issuing the
+    /// request. Redirects and implicit proxy settings cannot forward its credential.
+    pub async fn download_attachment(
+        &self,
+        source: MediaSource,
+        manifest: AttachmentManifest,
+        locator: TransportUse,
+        lifetime: Duration,
+    ) -> Result<AttachmentRef, GatewayError> {
+        if locator.operation != DOWNLOAD_OPERATION || locator.room.as_ref() != Some(&source.room) {
+            return Err(GatewayError::Forbidden);
+        }
+        let grant = self
+            .authorize_media(source, manifest, MediaPurpose::Attachment, lifetime)
+            .await?;
+        if locator.actor.as_deref() != Some(grant.source.sender.id.as_str()) {
+            return Err(GatewayError::Forbidden);
+        }
+        self.claim_media_read(&grant)?;
+        let mut response = tokio::time::timeout(remaining(grant.expires_ms)?, async {
+            let address = self.transport_authority(&locator).await?;
+            self.checked(true, |state| self.recheck_media(state, &grant))?;
+            let client = db(reqwest::Client::builder()
+                .https_only(true)
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(remaining(grant.expires_ms)?)
+                .build()
+                .map_err(Into::into))?;
+            let mut request = client
+                .get(address.endpoint.clone())
+                .header(reqwest::header::ACCEPT_ENCODING, "identity");
+            if let Some(bearer) = address.credential() {
+                request = request.bearer_auth(bearer);
+            }
+            request
+                .send()
+                .await
+                .map_err(|_| GatewayError::TemporarilyUnavailable)
+        })
+        .await
+        .map_err(|_| GatewayError::TemporarilyUnavailable)??;
+        let status = response.status();
+        if status.is_redirection()
+            || status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::GONE
+        {
+            return Err(GatewayError::Forbidden);
+        }
+        if !status.is_success() {
+            return Err(GatewayError::TemporarilyUnavailable);
+        }
+        let limit = grant.manifest.size.unwrap_or(MAX_FILE);
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(GatewayError::Invalid);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| GatewayError::TemporarilyUnavailable)?
+        {
+            self.checked(true, |state| self.recheck_media(state, &grant))?;
+            if chunk.len() > limit - bytes.len() {
+                return Err(GatewayError::Invalid);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        verify_bytes(&grant.manifest, &bytes)?;
+        self.transport_authority(&locator).await?;
+        self.finish_attachment(grant, bytes).await
+    }
+
+    async fn finish_attachment(
+        &self,
+        grant: MediaRead,
+        bytes: Vec<u8>,
+    ) -> Result<AttachmentRef, GatewayError> {
         if hermes_engine::Attachment::validate_bytes(&grant.manifest.name, &bytes).is_err() {
             return Err(GatewayError::Invalid);
         }
@@ -412,6 +503,25 @@ impl Ingress {
         Open: FnOnce() -> Opened,
         Opened: Future<Output = Result<R, GatewayError>>,
     {
+        self.claim_media_read(grant)?;
+        let bytes = tokio::time::timeout(remaining(grant.expires_ms)?, async {
+            let mut reader = open().await?;
+            let mut data = Vec::with_capacity(grant.manifest.size.unwrap_or_default());
+            let limit = grant.manifest.size.unwrap_or(MAX_FILE);
+            (&mut reader)
+                .take((limit + 1) as u64)
+                .read_to_end(&mut data)
+                .await
+                .map_err(|_| GatewayError::TemporarilyUnavailable)?;
+            verify_bytes(&grant.manifest, &data)?;
+            Ok::<_, GatewayError>(data)
+        })
+        .await
+        .map_err(|_| GatewayError::TemporarilyUnavailable)??;
+        Ok(bytes)
+    }
+
+    fn claim_media_read(&self, grant: &MediaRead) -> Result<(), GatewayError> {
         self.checked(true, |state| {
             self.recheck_media(state, grant)?;
             let consumed = db(self.store.write(|tx| {
@@ -422,31 +532,7 @@ impl Ingress {
                 )? == 1)
             }))?;
             if consumed { Ok(()) } else { Err(GatewayError::Forbidden) }
-        })?;
-        let bytes = tokio::time::timeout(remaining(grant.expires_ms)?, async {
-            let mut reader = open().await?;
-            let mut data = Vec::with_capacity(grant.manifest.size.unwrap_or_default());
-            let limit = grant.manifest.size.unwrap_or(MAX_FILE);
-            (&mut reader)
-                .take((limit + 1) as u64)
-                .read_to_end(&mut data)
-                .await
-                .map_err(|_| GatewayError::TemporarilyUnavailable)?;
-            if data.is_empty()
-                || data.len() > limit
-                || grant.manifest.size.is_some_and(|n| n != data.len())
-                || grant
-                    .manifest
-                    .sha256
-                    .is_some_and(|hash| digest(&SHA256, &data).as_ref() != hash)
-            {
-                return Err(GatewayError::Invalid);
-            }
-            Ok::<_, GatewayError>(data)
         })
-        .await
-        .map_err(|_| GatewayError::TemporarilyUnavailable)??;
-        Ok(bytes)
     }
 
     pub(super) fn spoken_addressed(
@@ -472,7 +558,7 @@ impl Ingress {
         if source.room.thread.is_some() && !self.capabilities().threads {
             return Err(GatewayError::Unsupported);
         }
-        if !policy.allows(&source.sender) {
+        if !self.authorize_sender(policy, &source.room, &source.sender)? {
             return Err(GatewayError::Forbidden);
         }
         if purpose == MediaPurpose::SpokenAddressing {
@@ -508,7 +594,7 @@ impl Ingress {
             scope.checked(false, |state| {
                 let identity = ArtifactUse::from(&attempt);
                 let effect = scope.check_effect(state, &identity, Some(&attempt))?;
-                scope.artifact_in_effect(&identity, &effect, &artifact)?;
+                scope.artifact_in_effect(state, &identity, &effect, &artifact)?;
                 db(scope.store.attachment(&scope.connection, &artifact))
             })
         })
@@ -600,7 +686,7 @@ impl Ingress {
             scope.checked(false, |state| {
                 let identity = ArtifactUse::from(&attempt);
                 let effect = scope.check_effect(state, &identity, Some(&attempt))?;
-                scope.artifact_in_effect(&identity, &effect, &artifact)?;
+                scope.artifact_in_effect(state, &identity, &effect, &artifact)?;
                 let token = crate::new_id();
                 let hashed = db(key("artifact-fetch", &token))?;
                 db(scope.store.write(|tx| {
@@ -608,6 +694,21 @@ impl Ingress {
                         "DELETE FROM messaging_artifact_fetch WHERE expires_ms <= ?1",
                         [now()],
                     )?;
+                    let active: i64 = tx.query_row(
+                        "SELECT count(*) FROM messaging_artifact_fetch
+                         WHERE connection = ?1 AND delivery = ?2 AND ordinal = ?3 AND attempt = ?4",
+                        params![
+                            scope.connection,
+                            identity.delivery,
+                            identity.ordinal,
+                            identity.attempt
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    ensure!(
+                        active < MAX_FETCH_GRANTS_PER_EFFECT,
+                        "Artifact fetch quota reached"
+                    );
                     tx.execute(
                         "INSERT INTO messaging_artifact_fetch VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![
@@ -650,7 +751,7 @@ impl Ingress {
                         .provider_artifact(&scope.connection, &hashed, &object))?
                     .ok_or(GatewayError::Forbidden)?;
                 let effect = scope.check_effect(state, &identity, None)?;
-                scope.artifact_in_effect(&identity, &effect, &artifact)?;
+                scope.artifact_in_effect(state, &identity, &effect, &artifact)?;
                 db(scope.store.attachment(&scope.connection, &artifact))
             })
         })
@@ -691,10 +792,8 @@ impl Ingress {
         if effect.blocked || state.policy.room_policy(room).is_none() {
             return Err(GatewayError::Forbidden);
         }
-        if effect
-            .sender
-            .as_ref()
-            .is_some_and(|sender| !state.policy.allows(sender))
+        if let Some(sender) = &effect.sender
+            && !self.authorize_sender(&state.policy, room, sender)?
         {
             return Err(GatewayError::Forbidden);
         }
@@ -703,6 +802,7 @@ impl Ingress {
 
     fn artifact_in_effect(
         &self,
+        state: &State,
         identity: &ArtifactUse,
         effect: &ScopedEffect,
         artifact: &AttachmentRef,
@@ -711,7 +811,12 @@ impl Ingress {
             return Err(GatewayError::Forbidden);
         };
         if message.attachments.contains(artifact)
-            || db(self.store.spoken_reply(&self.connection, identity))?.as_ref() == Some(artifact)
+            || state
+                .policy
+                .room_policy(&effect.room)
+                .is_some_and(|room| room.spoken_replies)
+                && db(self.store.spoken_reply(&self.connection, identity))?.as_ref()
+                    == Some(artifact)
         {
             Ok(())
         } else {
@@ -919,6 +1024,19 @@ pub(super) fn attachments_authorized(
         }
     }
     Ok(true)
+}
+
+fn verify_bytes(manifest: &AttachmentManifest, data: &[u8]) -> Result<(), GatewayError> {
+    if data.is_empty()
+        || data.len() > MAX_FILE
+        || manifest.size.is_some_and(|n| n != data.len())
+        || manifest
+            .sha256
+            .is_some_and(|hash| digest(&SHA256, data).as_ref() != hash)
+    {
+        return Err(GatewayError::Invalid);
+    }
+    Ok(())
 }
 
 fn valid_source(source: &MediaSource) -> bool {
