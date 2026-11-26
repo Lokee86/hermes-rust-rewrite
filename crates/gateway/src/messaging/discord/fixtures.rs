@@ -39,6 +39,7 @@ struct Server {
     writes: mpsc::Sender<Write>,
     counter: Arc<AtomicU64>,
     messages: Arc<Mutex<BTreeMap<(String, String), Value>>>,
+    history: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
 }
 
 struct Wire {
@@ -112,6 +113,7 @@ impl Fixtures {
             writes: writes_tx,
             counter: Arc::new(AtomicU64::new(500)),
             messages: Arc::default(),
+            history: Arc::default(),
         };
         let endpoint = transport.clone();
         let router = Router::new()
@@ -308,7 +310,14 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         (Method::GET, ["channels", "22"]) => {
             json!({"id":"22","type":11,"guild_id":"11","parent_id":"21"})
         }
-        (Method::GET, ["channels", _, "messages"]) => json!([]),
+        (Method::GET, ["channels", channel, "messages"]) => {
+            json!(
+                crate::lock(&state.history)
+                    .get(*channel)
+                    .cloned()
+                    .unwrap_or_default()
+            )
+        }
         (Method::GET, ["channels", channel, "messages", id]) => {
             let message = crate::lock(&state.messages)
                 .get(&(channel.to_string(), id.to_string()))
@@ -519,6 +528,57 @@ async fn discord_missing_heartbeat_ack_resumes_then_invalid_session_reports_gap(
 }
 
 #[tokio::test]
+async fn discord_fresh_sessions_repair_bounded_history_without_admitting_overlap() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let settings = json!({
+        "grants":{"users":["7"]},
+        "guilds":{"11":{"channels":{"21":{}}}},
+        "commands":{"sync":false},
+        "recovery":{"history_window_secs":120,"max_surfaces":1,"max_messages":10}
+    });
+    let gateway = model
+        .gateway(
+            root.path(),
+            vec![fixture.configuration_with(root.path(), settings)],
+        )
+        .await;
+    fixture.activate(&gateway).await;
+    let mut first = fixture.wire().await;
+    first.authentication(2).await;
+    fixture.ready(&first, "known-history").await;
+    let base = ((now() - 1_420_070_400_000) as u64) << 22;
+    let original_id = (base + 1).to_string();
+    let original = message(&original_id, "21", "<@9> original", true);
+    first.dispatch(2, "MESSAGE_CREATE", original.clone()).await;
+    fixture.reply().await;
+    wait_reply(&gateway, &format!("discord-message-{original_id}")).await;
+    let missing_id = (base + 2).to_string();
+    let missing = message(&missing_id, "21", "<@9> recovered", true);
+    crate::lock(&fixture.transport.history).insert("21".into(), vec![missing, original]);
+    first.data(json!({"op":9,"d":false})).await;
+    let mut replacement = fixture.wire().await;
+    replacement.authentication(2).await;
+    fixture.ready(&replacement, "after-history").await;
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.reply().await
+    else {
+        panic!("expected reply to recovered Discord history")
+    };
+    assert_eq!(channel, "21");
+    assert_eq!(payload["content"], "answer recovered");
+    wait_reply(&gateway, &format!("discord-message-{missing_id}")).await;
+    assert_eq!(model.requests().len(), 2);
+    assert_eq!(
+        gateway.messaging_status().await.unwrap()["connections"][0]["gap"],
+        true
+    );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn discord_role_updates_revoke_guild_input_without_blocking_an_independent_dm() {
     let root = tempfile::tempdir().unwrap();
     let model = Model::new().await;
@@ -676,8 +736,18 @@ async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_c
     };
     assert_eq!(rejected["type"], 4);
     assert_eq!(rejected["data"]["flags"], 64);
-    let event = id_base + 2;
-    wire.dispatch(4, "INTERACTION_CREATE", click(event, &id))
+    let expired = id_base - (5_000_u64 << 22);
+    wire.dispatch(4, "INTERACTION_CREATE", click(expired, &id))
+        .await;
+    wait_status(&gateway, |state| {
+        state["input"].as_array().unwrap().iter().any(|input| {
+            input["id"] == format!("discord-interaction-{expired}") && input["state"] == "refused"
+        })
+    })
+    .await;
+    assert_eq!(model.requests().len(), 1);
+    let event = (((now() - 1_420_070_400_000) as u64) << 22) + 2;
+    wire.dispatch(5, "INTERACTION_CREATE", click(event, &id))
         .await;
     let mut acknowledged = false;
     let mut applied = false;
