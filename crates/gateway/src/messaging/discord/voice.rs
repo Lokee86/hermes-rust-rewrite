@@ -46,6 +46,7 @@ pub(super) struct Voice {
 struct VoiceState {
     channels: HashSet<(u64, u64)>,
     members: HashMap<(u64, u64), Member>,
+    complete_rosters: HashSet<u64>,
     calls: HashMap<u64, Call>,
     leaving: HashSet<u64>,
 }
@@ -192,7 +193,15 @@ impl Voice {
                         state.update_channel(guild, channel);
                     }
                 }
+                state.complete_rosters.remove(&guild);
                 if let Some(members) = payload["voice_states"].as_array() {
+                    if members.len() <= MAX_STATES - state.members.len()
+                        && members.iter().all(|member| {
+                            id(&member["user_id"]).is_some() && id(&member["channel_id"]).is_some()
+                        })
+                    {
+                        state.complete_rosters.insert(guild);
+                    }
                     for member in members.iter().take(MAX_STATES) {
                         state.update_member(self.bot, guild, member);
                     }
@@ -202,6 +211,7 @@ impl Voice {
                 state.channels.retain(|(current, _)| *current != guild);
                 state.members.retain(|(current, _), _| *current != guild);
                 state.calls.remove(&guild);
+                state.complete_rosters.remove(&guild);
                 state.leaving.remove(&guild);
             }
             "CHANNEL_CREATE" | "CHANNEL_UPDATE" => state.update_channel(guild, payload),
@@ -440,10 +450,11 @@ impl Voice {
         }
         let listeners = {
             let state = crate::lock(&self.state);
-            if state
-                .members
-                .get(&(binding.guild, self.bot))
-                .is_none_or(|bot| bot.channel != binding.channel || bot.muted)
+            if !state.complete_rosters.contains(&binding.guild)
+                || state
+                    .members
+                    .get(&(binding.guild, self.bot))
+                    .is_none_or(|bot| bot.channel != binding.channel || bot.muted)
             {
                 return false;
             }
@@ -497,7 +508,8 @@ impl VoiceState {
         }
         let mut channel = id(&payload["channel_id"]);
         let old = self.members.get(&(guild, user)).copied();
-        if self.members.len() >= MAX_STATES && old.is_none() {
+        if self.members.len() >= MAX_STATES && old.is_none() && channel.is_some() {
+            self.complete_rosters.remove(&guild);
             channel = None;
         }
         let member = channel.map(|channel| Member {

@@ -185,6 +185,18 @@ async fn live_capture_admits_two_current_speakers_and_fences_old_or_muted_audio(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    assert!(!voice.audience_allowed(&ingress, &binding));
+    voice.observe(
+        "VOICE_STATE_UPDATE",
+        &json!({
+            "guild_id":"8","channel_id":null,"user_id":"30"
+        }),
+        &ingress,
+    );
+    assert!(voice.audience_allowed(&ingress, &binding));
+    crate::lock(&voice.state).complete_rosters.remove(&8);
+    assert!(!voice.audience_allowed(&ingress, &binding));
+
     speech(&sink, &link, (20, 2), 5_000).await;
     voice.observe(
         "VOICE_STATE_UPDATE",
