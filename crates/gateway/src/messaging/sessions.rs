@@ -279,7 +279,7 @@ async fn advance_message(
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
                 }
-                let quote = scope.quote_context_source(state, &work.event, &work.route)?;
+                let context = scope.prepared_context_source(state, &work.event, &work.route)?;
                 let attachments = attachment_context(scope, &work)?;
                 let individual = wake || scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
                     .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
@@ -321,7 +321,7 @@ async fn advance_message(
                             approval_mode,
                             skills: policy.skills,
                             selected_skill,
-                            quote,
+                            context,
                             attachments,
                         },
                     },

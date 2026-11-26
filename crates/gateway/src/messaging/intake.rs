@@ -1,5 +1,5 @@
 use super::{
-    quotes::{QuoteCommit, QuoteReference, stage_quote},
+    quotes::{QuoteCommit, QuoteReference, ScrollbackReference, stage_quote},
     runtime::{Ingress, MAX_BATCH, State, blocking, db, now, valid_advance, valid_id},
     store::{self, Candidate, Store},
     types::*,
@@ -57,7 +57,18 @@ pub enum PreparationPurpose {
     Context,
     Burst,
     Quote(QuoteReference),
+    Scrollback(ScrollbackReference),
     Thread { id: String, inline_on_refusal: bool },
+}
+
+impl PreparationPurpose {
+    pub(super) fn context_reference(&self) -> Option<&QuoteReference> {
+        match self {
+            Self::Quote(source) => Some(source),
+            Self::Scrollback(request) => Some(&request.before),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +86,9 @@ impl HandoffItem {
                     && preparation.expires_ms > 0
                     && preparation.protection.as_deref().is_none_or(valid_id)
                     && matches!(self.event.body, InboundBody::Message(_))
-                    && !matches!(&preparation.purpose, PreparationPurpose::Quote(source) if !source.valid())
+                    && preparation.purpose.context_reference().is_none_or(QuoteReference::valid)
+                    && !matches!(&preparation.purpose, PreparationPurpose::Scrollback(request)
+                        if !request.valid(&self.event))
                     && !matches!(&preparation.purpose, PreparationPurpose::Thread { id, .. }
                         if !valid_id(id) || self.event.room.kind != RoomKind::Group
                             || self.event.room.thread.is_some() || self.event.reply_anchor.as_ref() != Some(id))
@@ -83,29 +96,53 @@ impl HandoffItem {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HandoffMode {
+    Independent,
+    TextBurst,
+    AddressedBurst,
+}
+
 impl Ingress {
     /// Commit all dispositions before an acknowledgement or an SDK-owned
     /// checkpoint can advance. The bridge can replay this call after restart.
     pub async fn stage_handoff(&self, handoff: Handoff) -> Result<IntakeResult, GatewayError> {
-        self.stage(handoff, false).await
+        self.stage(handoff, HandoffMode::Independent).await
     }
 
     /// Merge a compatible text burst at durable admission. Every original ID
     /// retains a disposition even when several inputs form one turn.
     pub async fn stage_text_burst(&self, handoff: Handoff) -> Result<IntakeResult, GatewayError> {
+        self.stage_burst(handoff, HandoffMode::TextBurst).await
+    }
+
+    /// Coalesce continuations of a newly admitted addressed message. Keep
+    /// each original anchor in its receipt and only the first in the turn.
+    pub async fn stage_addressed_burst(&self, handoff: Handoff) -> Result<IntakeResult, GatewayError> {
+        self.stage_burst(handoff, HandoffMode::AddressedBurst).await
+    }
+
+    async fn stage_burst(&self, handoff: Handoff, mode: HandoffMode) -> Result<IntakeResult, GatewayError> {
         let first = handoff.items.first().ok_or(GatewayError::Invalid)?;
-        if !handoff.items.iter().all(|item| {
-            item.preparation.is_none() && item.event.room == first.event.room
+        let addressed = mode == HandoffMode::AddressedBurst;
+        let mut identities = std::collections::BTreeSet::new();
+        if !handoff.items.iter().enumerate().all(|(index, item)| {
+            item.event.room == first.event.room
                 && item.event.sender.id == first.event.sender.id
-                && item.event.reply_anchor == first.event.reply_anchor
                 && matches!(&item.event.body, InboundBody::Message(message) if message.attachments.is_empty())
+                && if addressed {
+                    item.event.mentioned && (index == 0 || item.preparation.is_none())
+                        && identities.insert(&item.event.id)
+                } else {
+                    item.preparation.is_none() && item.event.reply_anchor == first.event.reply_anchor
+                }
         }) {
             return Err(GatewayError::Invalid);
         }
-        self.stage(handoff, true).await
+        self.stage(handoff, mode).await
     }
 
-    async fn stage(&self, handoff: Handoff, merge: bool) -> Result<IntakeResult, GatewayError> {
+    async fn stage(&self, handoff: Handoff, mode: HandoffMode) -> Result<IntakeResult, GatewayError> {
         if !valid_id(&handoff.id)
             || handoff.items.is_empty()
             || handoff.items.len() > MAX_BATCH
@@ -138,8 +175,8 @@ impl Ingress {
                     {
                         candidate.decision = candidate.decision.and(Err(Disposition::Invalid));
                     }
-                    if let (Some(PreparationPurpose::Quote(source)), Ok(route)) =
-                        (item.preparation.as_ref().map(|p| &p.purpose), &candidate.decision)
+                    if let (Some(source), Ok(route)) =
+                        (item.preparation.as_ref().and_then(|p| p.purpose.context_reference()), &candidate.decision)
                         && !scope.allows_quote(state, &candidate.event, &route.id, source)?
                     {
                         candidate.decision = Err(Disposition::Forbidden);
@@ -158,7 +195,7 @@ impl Ingress {
                     &id,
                     candidates,
                     advance.as_ref(),
-                    merge,
+                    mode,
                     &scope.quote_transport()?,
                 ))?
             })
@@ -196,7 +233,7 @@ impl Ingress {
                 let staged = db(scope.store.preparation(&scope.connection, &event))?;
                 if let Some(staged) = staged
                     && staged.token == token
-                    && !matches!(staged.purpose, PreparationPurpose::Quote(_))
+                    && staged.purpose.context_reference().is_none()
                     && (!matches!(staged.purpose, PreparationPurpose::Thread { .. })
                         || scope.prepared_thread_selected(&event)?)
                     && scope.pending_authorized(state, &staged)?
@@ -234,7 +271,7 @@ impl Ingress {
         route: &str,
         purpose: &PreparationPurpose,
     ) -> Result<bool, GatewayError> {
-        if let PreparationPurpose::Quote(source) = purpose {
+        if let Some(source) = purpose.context_reference() {
             return self.quote_preparation_allowed(state, event, route, source);
         }
         Ok(self
@@ -263,7 +300,7 @@ impl Ingress {
                 if token != staged.token {
                     return Err(GatewayError::Forbidden);
                 }
-                if matches!(staged.purpose, PreparationPurpose::Quote(_)) {
+                if staged.purpose.context_reference().is_some() {
                     return Err(GatewayError::Unsupported);
                 }
                 if let Some(finished) = staged.finished {
@@ -327,7 +364,7 @@ impl Store {
         id: &str,
         candidates: Vec<(Candidate, Option<Preparation>)>,
         advance: Option<&Advance>,
-        merge: bool,
+        mode: HandoffMode,
         quote_transport: &str,
     ) -> Result<Result<IntakeResult, GatewayError>> {
         let identities = candidates
@@ -340,7 +377,10 @@ impl Store {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        let fingerprint = store::key("handoff", &(identities, advance, merge))?;
+        let addressed = mode == HandoffMode::AddressedBurst;
+        let merge = mode != HandoffMode::Independent;
+        let kind = if addressed { "addressed-handoff" } else { "handoff" };
+        let fingerprint = store::key(kind, &(identities, advance, merge))?;
         self.write(|tx| {
             let old = tx.query_row(
                 "SELECT fingerprint, receipts FROM messaging_handoffs WHERE connection = ?1 AND id = ?2",
@@ -387,8 +427,13 @@ impl Store {
             } else {
                 None
             };
-            let mut receipts = Vec::with_capacity(candidates.len());
-            for (candidate, preparation) in candidates {
+            let mut receipts: Vec<IntakeReceipt> = Vec::with_capacity(candidates.len());
+            for (index, (mut candidate, preparation)) in candidates.into_iter().enumerate() {
+                if addressed && index > 0 && !receipts.first().is_some_and(|first| {
+                    !first.repeated && matches!(first.disposition, Disposition::Accepted | Disposition::Deferred)
+                }) {
+                    candidate.decision = Err(Disposition::Forbidden);
+                }
                 let prepare = preparation.is_some()
                     && preparation.as_ref().is_some_and(|p| p.expires_ms > chrono::Utc::now().timestamp_millis());
                 let candidate = if preparation.is_some() && !prepare {
@@ -406,7 +451,7 @@ impl Store {
                         params![connection, receipt.id, preparation.token,
                             serde_json::to_string(&preparation.purpose)?, preparation.expires_ms],
                     )?;
-                    if matches!(preparation.purpose, PreparationPurpose::Quote(_)) {
+                    if preparation.purpose.context_reference().is_some() {
                         let route = receipt.route.as_deref()
                             .ok_or_else(|| anyhow::anyhow!("Quote preparation has no route"))?;
                         stage_quote(tx, connection, &receipt.id, route, quote_transport)?;
@@ -415,7 +460,9 @@ impl Store {
                 receipts.push(receipt);
             }
             if let Some(event) = merge_event
-                && receipts.iter().all(|receipt| !receipt.repeated && receipt.disposition == Disposition::Accepted
+                && receipts.iter().enumerate().all(|(index, receipt)| !receipt.repeated
+                    && (receipt.disposition == Disposition::Accepted || addressed && index == 0
+                        && receipt.disposition == Disposition::Deferred)
                     && receipt.route == receipts[0].route)
             {
                 tx.execute(
@@ -430,6 +477,19 @@ impl Store {
                         params![connection,receipt.id,disposition,event.id],
                     )?;
                     receipt.disposition = Disposition::Coalesced;
+                }
+            } else if addressed {
+                let refused = serde_json::to_string(&Disposition::Forbidden)?;
+                for receipt in receipts.iter_mut().skip(1)
+                    .filter(|receipt| !receipt.repeated && receipt.disposition == Disposition::Accepted)
+                {
+                    tx.execute(
+                        "UPDATE messaging_ingress SET input=NULL,route=NULL,stage='refused',disposition=?3,
+                         reason='burst_not_admitted' WHERE connection=?1 AND event=?2",
+                        params![connection,receipt.id,refused],
+                    )?;
+                    receipt.route = None;
+                    receipt.disposition = Disposition::Forbidden;
                 }
             }
             let checkpoint = store::write_advance(tx, connection, advance)?;

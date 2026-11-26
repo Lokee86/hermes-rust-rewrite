@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
     sync::mpsc,
-    time::{Instant, interval_at, sleep_until, timeout},
+    time::{Instant, interval_at, sleep_until, timeout, timeout_at},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message as WsMessage};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,8 @@ pub(super) const STREAM: &str = "discord.gateway.v10";
 const FRESH_SESSION: &str = "fresh";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISPATCH_QUEUE: usize = 128;
+pub(super) const TRUSTED_BURST_WINDOW: Duration = Duration::from_millis(300);
+pub(super) const MAX_BURST_MESSAGES: usize = 6;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const IDENTIFY_INTERVAL_MS: i64 = 5_000;
 
@@ -405,16 +407,21 @@ async fn dispatches(
     let mut first_ready = true;
     let mut maintenance = tokio::time::interval(Duration::from_secs(2));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pending = None;
     loop {
-        let frame = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            frame = queue.recv() => frame,
-            _ = maintenance.tick(), if !first_ready => {
-                adapter.resume_preparations(ingress, cancel).await?;
-                for operation in adapter.voice_housekeeping(ingress) {
-                    let _ = outgoing.try_send(operation);
+        let frame = if pending.is_some() {
+            pending.take()
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                frame = queue.recv() => frame,
+                _ = maintenance.tick(), if !first_ready => {
+                    adapter.resume_preparations(ingress, cancel).await?;
+                    for operation in adapter.voice_housekeeping(ingress) {
+                        let _ = outgoing.try_send(operation);
+                    }
+                    continue;
                 }
-                continue;
             }
         };
         let Some(frame) = frame else { break };
@@ -424,6 +431,31 @@ async fn dispatches(
             continue;
         }
         let ready = matches!(frame.kind.as_str(), "READY" | "RESUMED");
+        let mut last_sequence = frame.sequence;
+        let mut continuations = Vec::new();
+        if !first_ready
+            && frame.kind == "MESSAGE_CREATE"
+            && let Some(mut burst) = adapter.trusted_burst(&frame.data)
+        {
+            let deadline = frame.received + TRUSTED_BURST_WINDOW;
+            for _ in 1..MAX_BURST_MESSAGES {
+                let next = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    received = timeout_at(deadline, queue.recv()) => received.ok().flatten(),
+                };
+                let Some(next) = next else { break };
+                if next.kind != "MESSAGE_CREATE"
+                    || next.received > deadline
+                    || next.sequence <= last_sequence
+                    || !burst.take(&next.data)
+                {
+                    pending = Some(next);
+                    break;
+                }
+                last_sequence = next.sequence;
+                continuations.push(next.data);
+            }
+        }
         let next = if frame.kind == "READY" {
             let bot = frame.data.pointer("/user/id").and_then(Value::as_str);
             let app = frame
@@ -457,7 +489,7 @@ async fn dispatches(
             }
         } else {
             let mut cursor = cursor.clone().ok_or(ConnectionFailure::Retryable)?;
-            cursor.sequence = frame.sequence;
+            cursor.sequence = last_sequence;
             cursor
         };
         let checkpoint =
@@ -469,7 +501,7 @@ async fn dispatches(
         };
         let fresh = previous.as_deref() == Some(FRESH_SESSION) && frame.kind == "READY";
         adapter
-            .dispatch(ingress, frame, advance, &outgoing, cancel)
+            .dispatch(ingress, frame, continuations, advance, &outgoing, cancel)
             .await?;
         previous = Some(checkpoint);
         cursor = Some(next);

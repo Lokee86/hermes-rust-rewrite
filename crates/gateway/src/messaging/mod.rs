@@ -40,7 +40,7 @@ pub use intake::*;
 pub use observations::ConnectionObservation;
 pub use policy::*;
 pub use profile::*;
-pub use quotes::{QuoteHydration, QuoteLookup, QuoteReference};
+pub use quotes::{QuoteHydration, QuoteLookup, QuoteReference, ScrollbackQuote, ScrollbackReference};
 pub use receiver::ReceiverItem;
 pub use repair::*;
 pub use media::{ArtifactFetch, AttachmentManifest, AudioService, MediaPurpose, MediaRead, MediaSource};

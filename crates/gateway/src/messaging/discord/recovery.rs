@@ -6,7 +6,7 @@ use super::{
     DiscordAdapter, Ingress,
     channels::{read_id, snowflake_timestamp},
     client::{RestFailure, json_response},
-    socket::intake_failure,
+    socket::{MAX_BURST_MESSAGES, TRUSTED_BURST_WINDOW, intake_failure},
 };
 use reqwest::Method;
 use rusqlite::{OptionalExtension, params};
@@ -142,27 +142,54 @@ impl DiscordAdapter {
             page.sort_by_key(|message| {
                 read_id(message, "id").and_then(|id| id.parse::<u64>().ok())
             });
-            for mut raw in page {
-                let Some(id) = read_id(&raw, "id").map(str::to_owned) else {
-                    continue;
-                };
-                let invalid = read_id(&raw, "channel_id") != Some(channel)
-                    || snowflake_timestamp(&id).is_none_or(|date| date < floor)
-                    || cursor
-                        .as_deref()
-                        .and_then(|id| id.parse::<u64>().ok())
-                        .is_some_and(|n| id.parse::<u64>().is_ok_and(|id| id <= n));
-                if invalid {
+            let initial = cursor.as_deref().and_then(|id| id.parse::<u64>().ok());
+            let mut rows = page
+                .into_iter()
+                .filter_map(|mut raw| {
+                    let id = read_id(&raw, "id")?;
+                    let index = id.parse::<u64>().ok()?;
+                    let date = snowflake_timestamp(id)?;
+                    if read_id(&raw, "channel_id") != Some(channel)
+                        || date < floor
+                        || initial.is_some_and(|previous| index <= previous)
+                    {
+                        return None;
+                    }
+                    let id = id.to_owned();
+                    raw["guild_id"] = json!(guild);
+                    Some((id, index, date, raw))
+                })
+                .peekable();
+            let mut last_index = initial;
+            while let Some((mut id, mut index, date, raw)) = rows.next() {
+                if last_index.is_some_and(|previous| index <= previous) {
                     continue;
                 }
-                raw["guild_id"] = json!(guild);
+                let mut continued = Vec::new();
+                if let Some(mut burst) = self.trusted_burst(&raw) {
+                    let limit = date + TRUSTED_BURST_WINDOW.as_millis() as i64;
+                    for _ in 1..MAX_BURST_MESSAGES {
+                        if !rows.peek().is_some_and(|(_, next, at, raw)| {
+                            *next > index && *at <= limit && burst.take(raw)
+                        }) {
+                            break;
+                        }
+                        if let Some((next_id, next_index, _, next)) = rows.next() {
+                            id = next_id;
+                            index = next_index;
+                            continued.push(next);
+                        }
+                    }
+                }
                 let advance = Advance {
                     stream: stream.clone(),
                     previous: cursor.clone(),
                     checkpoint: id.clone(),
                 };
-                self.message(ingress, raw, advance, cancel).await?;
+                self.message(ingress, raw, continued, advance, cancel)
+                    .await?;
                 cursor = Some(id);
+                last_index = Some(index);
             }
         }
         if cancel.is_cancelled() {

@@ -30,11 +30,68 @@ pub(super) struct MessageCreate {
     pub webhook_id: Option<String>,
 }
 
+pub(super) struct TrustedBurst {
+    channel: String,
+    guild: Option<String>,
+    actor: String,
+    ids: std::collections::BTreeSet<String>,
+}
+
+fn plain_bot_message(raw: &Value) -> Option<MessageCreate> {
+    let message = serde_json::from_value::<MessageCreate>(raw.clone()).ok()?;
+    (message.author.bot
+        && !message.author.system
+        && message.webhook_id.is_none()
+        && message.kind == 0
+        && snowflake(&message.id)
+        && !message.content.trim().is_empty()
+        && raw.get("message_reference").is_none_or(Value::is_null)
+        && raw
+            .get("attachments")
+            .is_none_or(|files| files.as_array().is_some_and(Vec::is_empty)))
+    .then_some(message)
+}
+
+impl TrustedBurst {
+    pub(super) fn take(&mut self, data: &Value) -> bool {
+        let Some(message) = plain_bot_message(data) else {
+            return false;
+        };
+        message.channel_id == self.channel
+            && message.guild_id == self.guild
+            && message.author.id == self.actor
+            && message.mentions.is_empty()
+            && self.ids.insert(message.id)
+    }
+}
+
 impl DiscordAdapter {
+    pub(super) fn trusted_burst(&self, data: &Value) -> Option<TrustedBurst> {
+        let message = plain_bot_message(data)?;
+        let addressed = message
+            .mentions
+            .iter()
+            .any(|user| user.id == self.bot.bot_id)
+            && (message.content.contains(&format!("<@{}>", self.bot.bot_id))
+                || message
+                    .content
+                    .contains(&format!("<@!{}>", self.bot.bot_id)));
+        (addressed
+            && message.author.id != self.bot.bot_id
+            && self.settings.trusted_bots.contains(&message.author.id))
+        .then(|| TrustedBurst {
+            channel: message.channel_id,
+            guild: message.guild_id,
+            actor: message.author.id,
+            ids: [message.id].into(),
+        })
+    }
+
     pub(super) async fn dispatch(
         &self,
         ingress: &Ingress,
         frame: Dispatch,
+        continuations: Vec<Value>,
         advance: Advance,
         outgoing: &mpsc::Sender<Value>,
         cancel: &CancellationToken,
@@ -42,7 +99,11 @@ impl DiscordAdapter {
         self.observe_channels(&frame.kind, &frame.data);
         self.observe_voice(&frame.kind, &frame.data, ingress);
         match frame.kind.as_str() {
-            "MESSAGE_CREATE" => return self.message(ingress, frame.data, advance, cancel).await,
+            "MESSAGE_CREATE" => {
+                return self
+                    .message(ingress, frame.data, continuations, advance, cancel)
+                    .await;
+            }
             "INTERACTION_CREATE" => {
                 return self
                     .interaction(ingress, frame, advance, outgoing, cancel)
@@ -67,6 +128,7 @@ impl DiscordAdapter {
         &self,
         ingress: &Ingress,
         data: Value,
+        continuations: Vec<Value>,
         advance: Advance,
         cancel: &CancellationToken,
     ) -> Result<(), ConnectionFailure> {
@@ -158,16 +220,22 @@ impl DiscordAdapter {
             refuse(ingress, event, Disposition::Forbidden, advance).await?;
             return Ok(());
         }
-        self.accept_message(
-            ingress,
-            event,
-            &message.channel_id,
-            &message.id,
-            data,
-            advance,
-            cancel,
-        )
-        .await
+        let continued = continuations
+            .into_iter()
+            .map(|raw| {
+                let continued = plain_bot_message(&raw).ok_or(ConnectionFailure::Retryable)?;
+                Ok(InboundEvent {
+                    id: format!("discord-message-{}", continued.id),
+                    room: event.room.clone(),
+                    sender: event.sender.clone(),
+                    reply_anchor: Some(continued.id),
+                    mentioned: true,
+                    body: InboundBody::Message(Message::text(continued.content.trim())),
+                })
+            })
+            .collect::<Result<Vec<_>, ConnectionFailure>>()?;
+        self.accept_message(ingress, event, data, continued, advance, cancel)
+            .await
     }
 
     pub(super) async fn route_for_message(

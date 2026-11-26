@@ -3,24 +3,28 @@ use super::{
         Advance, ConnectionFailure, DeferredInput, DeliveryResult, Disposition, EffectReceipt,
         GatewayError, Handoff, HandoffItem, InboundBody, InboundEvent, MediaSource, Message,
         Preparation, PreparationPurpose, QuoteHydration, QuoteLookup, QuoteReference, ReceiptKind,
-        RoomKind,
+        RoomKind, ScrollbackQuote, ScrollbackReference,
         prepared_threads::ThreadPreparation,
+        quotes::{MAX_SCROLLBACK_BYTES, MAX_SCROLLBACK_MESSAGE_BYTES},
         runtime::{blocking, db, now},
         store,
     },
     DiscordAdapter, Ingress,
     channels::{read_id, snowflake},
-    client::{DiscordClient, RestFailure},
+    client::{DiscordClient, RestFailure, json_response},
     dispatch::refuse,
     media::{self, AttachmentSource},
     socket::intake_failure,
 };
+use hermes_engine::ChannelHistoryMessage;
+use reqwest::Method;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -43,6 +47,17 @@ struct Manifest {
     quote: Option<QuoteReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread: Option<AutoThread>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scrollback: Option<u8>,
+}
+
+impl Manifest {
+    fn same_input(&self, other: &Self) -> bool {
+        self.channel == other.channel
+            && self.message == other.message
+            && self.attachments == other.attachments
+            && self.quote == other.quote
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -76,12 +91,13 @@ impl DiscordAdapter {
         &self,
         ingress: &Ingress,
         event: InboundEvent,
-        channel: &str,
-        message: &str,
         raw: Value,
+        continued: Vec<InboundEvent>,
         advance: Advance,
         cancel: &CancellationToken,
     ) -> Result<(), ConnectionFailure> {
+        let channel = read_id(&raw, "channel_id").ok_or(ConnectionFailure::Retryable)?;
+        let message = read_id(&raw, "id").ok_or(ConnectionFailure::Retryable)?;
         let attachments = match media::attachment_sources(&raw) {
             Ok(attachments) => attachments,
             Err(_) => {
@@ -99,8 +115,10 @@ impl DiscordAdapter {
             refuse(ingress, event, Disposition::Unsupported, advance).await?;
             return Ok(());
         }
+        let person = raw.pointer("/author/bot").and_then(Value::as_bool) != Some(true);
         let quote = raw
             .get("message_reference")
+            .filter(|_| person)
             .filter(|reference| {
                 reference
                     .get("channel_id")
@@ -129,11 +147,33 @@ impl DiscordAdapter {
         } else {
             None
         };
-        if attachments.is_empty() && quote.is_none() && thread.is_none() {
-            ingress
-                .submit(vec![event], Some(advance))
-                .await
+        let mut scrollback = None;
+        if person && thread.is_none() && self.settings.recovery.context_messages > 0 {
+            let trigger = QuoteReference {
+                room: event.room.clone(),
+                message_id: message.to_owned(),
+            };
+            let can_read = ingress
+                .checked(true, |state| {
+                    let Ok(route) = ingress.route_candidate(&state.policy, &event, true)? else {
+                        return Ok(false);
+                    };
+                    ingress.allows_quote(state, &event, &route.id, &trigger)
+                })
                 .map_err(intake_failure)?;
+            if can_read {
+                scrollback = Some(self.settings.recovery.context_messages as u8);
+            }
+        }
+        if attachments.is_empty() && quote.is_none() && thread.is_none() && scrollback.is_none() {
+            if continued.is_empty() {
+                ingress
+                    .submit(vec![event], Some(advance))
+                    .await
+                    .map_err(intake_failure)?;
+            } else {
+                commit_messages(ingress, event, None, continued, advance).await?;
+            }
             return Ok(());
         }
 
@@ -155,12 +195,13 @@ impl DiscordAdapter {
             attachments,
             quote,
             thread,
+            scrollback,
         };
         let id = event.id.clone();
         let scope = ingress.clone();
         let durable_manifest = manifest.clone();
         let event_key = id.clone();
-        let expires_ms = blocking(move || scope.checked(true, |_| {
+        let reservation = blocking(move || scope.checked(true, |_| {
             db(scope.store.write(|tx| {
                 let serialized = serde_json::to_string(&durable_manifest)?;
                 let expires = now() + PREPARATION_TTL_MS;
@@ -169,14 +210,14 @@ impl DiscordAdapter {
                        VALUES (?1,?2,?3,?4)",
                     params![scope.connection,event_key,expires,serialized],
                 )?;
-                let stored: (i64, String) = tx.query_row(
+                let stored: (i64, Manifest) = tx.query_row(
                     "SELECT expires,manifest FROM messaging_discord_preparation WHERE connection=?1 AND event=?2",
-                    params![scope.connection,event_key], |row| Ok((row.get(0)?,row.get(1)?)),
+                    params![scope.connection,event_key], |row| Ok((row.get(0)?,store::decode(row,1)?)),
                 )?;
-                Ok((stored.1 == serialized).then_some(stored.0))
+                Ok(stored.1.same_input(&durable_manifest).then_some(stored))
             }))
         })).await.map_err(intake_failure)?;
-        let Some(expires_ms) = expires_ms else {
+        let Some((expires_ms, manifest)) = reservation else {
             let scope = ingress.clone();
             let key = event.id.clone();
             let cursor = advance.clone();
@@ -195,8 +236,6 @@ impl DiscordAdapter {
             return Ok(());
         };
         let token = db(store::key("discord-preparation", &id)).map_err(intake_failure)?;
-        let handoff_id = db(store::key("discord-handoff", &(&id, &advance.checkpoint)))
-            .map_err(intake_failure)?;
         let preparation = Preparation {
             token,
             expires_ms,
@@ -205,6 +244,15 @@ impl DiscordAdapter {
                     id: manifest.message.clone(),
                     inline_on_refusal: thread.inline_on_refusal,
                 }
+            } else if let Some(count) = manifest.scrollback {
+                PreparationPurpose::Scrollback(ScrollbackReference {
+                    before: QuoteReference {
+                        room: event.room.clone(),
+                        message_id: manifest.message.clone(),
+                    },
+                    reply: manifest.quote.clone(),
+                    count,
+                })
             } else {
                 manifest
                     .quote
@@ -213,21 +261,21 @@ impl DiscordAdapter {
             },
             protection: None,
         };
-        let receipt = ingress
-            .stage_handoff(Handoff {
-                id: handoff_id,
-                items: vec![HandoffItem {
-                    event: event.clone(),
-                    preparation: Some(preparation.clone()),
-                }],
-                advance: Some(advance),
-            })
-            .await
-            .map_err(intake_failure)?;
+        let receipt = commit_messages(
+            ingress,
+            event,
+            Some(preparation.clone()),
+            continued,
+            advance,
+        )
+        .await?;
         if receipt
             .receipts
             .first()
             .is_some_and(|receipt| receipt.disposition == Disposition::Deferred)
+            && let Some(staged) =
+                db(ingress.store.preparation(&ingress.connection, &id)).map_err(intake_failure)?
+            && let Some(event) = staged.event
         {
             self.start_preparation(
                 ingress,
@@ -297,6 +345,43 @@ impl DiscordAdapter {
     }
 }
 
+async fn commit_messages(
+    ingress: &Ingress,
+    first: InboundEvent,
+    preparation: Option<Preparation>,
+    continued: Vec<InboundEvent>,
+    advance: Advance,
+) -> Result<super::super::IntakeResult, ConnectionFailure> {
+    let id = db(store::key(
+        "discord-handoff",
+        &(&first.id, &advance.checkpoint),
+    ))
+    .map_err(intake_failure)?;
+    let burst = !continued.is_empty();
+    let items = std::iter::once(HandoffItem {
+        event: first,
+        preparation,
+    })
+    .chain(continued.into_iter().map(|event| HandoffItem {
+        event,
+        preparation: None,
+    }))
+    .collect();
+    let handoff = Handoff {
+        id,
+        items,
+        advance: Some(advance),
+    };
+    if burst {
+        ingress
+            .stage_addressed_burst(handoff)
+            .await
+            .map_err(intake_failure)
+    } else {
+        ingress.stage_handoff(handoff).await.map_err(intake_failure)
+    }
+}
+
 struct PreparationWorker {
     workers: Arc<Mutex<BTreeSet<String>>>,
     event: String,
@@ -353,7 +438,7 @@ async fn hydrate(
     };
     let event = &source.event_id;
     let token = &input.preparation.token;
-    if let PreparationPurpose::Quote(_) = input.preparation.purpose {
+    if input.preparation.purpose.context_reference().is_some() {
         ingress
             .hydrate_quote(event, token, |requested| async {
                 let message = if manifest.attachments.is_empty() {
@@ -364,7 +449,18 @@ async fn hydrate(
                             .await?,
                     )
                 };
-                let quote = get_quote(client, &manifest.channel, requested).await?;
+                let quote = if let Some(count) = manifest.scrollback {
+                    let (messages, quote) = tokio::join!(
+                        read_scrollback(client, &manifest.channel, &requested.message_id, count),
+                        read_scrollback_quote(client, &manifest.channel, manifest.quote.clone()),
+                    );
+                    QuoteLookup::Scrollback {
+                        messages,
+                        quote: quote?,
+                    }
+                } else {
+                    get_quote(client, &manifest.channel, requested).await?
+                };
                 Ok(QuoteHydration {
                     message,
                     quote,
@@ -413,6 +509,94 @@ async fn media_body(
         max_inbound_bytes,
     )
     .await
+}
+
+async fn read_scrollback(
+    client: &DiscordClient,
+    channel: &str,
+    before: &str,
+    count: u8,
+) -> Vec<ChannelHistoryMessage> {
+    let Ok(upper) = before.parse::<u64>() else {
+        return Vec::new();
+    };
+    let request = client
+        .bot(Method::GET, &["channels", channel, "messages"])
+        .query(&[("before", before), ("limit", &count.to_string())]);
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let response = request.send().await.map_err(|_| RestFailure::Unavailable)?;
+        json_response::<Vec<Value>>(response).await
+    })
+    .await;
+    let Ok(Ok(mut rows)) = result else {
+        return Vec::new();
+    };
+    if rows.len() > usize::from(count) {
+        return Vec::new();
+    }
+    rows.sort_by_key(|row| {
+        std::cmp::Reverse(
+            read_id(row, "id")
+                .and_then(|id| id.parse::<u64>().ok())
+                .unwrap_or(0),
+        )
+    });
+    let mut bytes = 0;
+    let mut seen = BTreeSet::new();
+    let mut messages = Vec::new();
+    for row in rows {
+        if read_id(&row, "channel_id") != Some(channel)
+            || row.get("webhook_id").is_some_and(|id| !id.is_null())
+        {
+            continue;
+        }
+        let Some(id) = read_id(&row, "id").filter(|id| id.parse::<u64>().is_ok_and(|n| n < upper))
+        else {
+            continue;
+        };
+        let Some(author) = row.get("author").and_then(|user| read_id(user, "id")) else {
+            continue;
+        };
+        let Some(text) = row
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && !text.contains('\0'))
+        else {
+            continue;
+        };
+        if !seen.insert(id.to_owned()) {
+            continue;
+        }
+        let budget = MAX_SCROLLBACK_MESSAGE_BYTES.min(MAX_SCROLLBACK_BYTES - bytes);
+        let text = &text[..text.floor_char_boundary(budget.min(text.len()))];
+        if text.is_empty() {
+            break;
+        }
+        bytes += text.len();
+        messages.push(ChannelHistoryMessage {
+            message_id: id.to_owned(),
+            author_id: author.to_owned(),
+            text: text.to_owned(),
+        });
+    }
+    messages.reverse();
+    messages
+}
+
+async fn read_scrollback_quote(
+    client: &DiscordClient,
+    channel: &str,
+    quote: Option<QuoteReference>,
+) -> Result<Option<ScrollbackQuote>, GatewayError> {
+    let Some(reference) = quote else {
+        return Ok(None);
+    };
+    match get_quote(client, channel, reference).await? {
+        QuoteLookup::Found { source, text } => Ok(Some(ScrollbackQuote { source, text })),
+        QuoteLookup::Unavailable => Ok(None),
+        _ => Err(GatewayError::Invalid),
+    }
 }
 
 async fn get_quote(
