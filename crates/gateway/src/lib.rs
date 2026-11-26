@@ -136,6 +136,7 @@ pub const METHODS: &[&str] = &[
     "messaging.resolve_delivery",
     "messaging.restore_route",
     "messaging.bind_conversation",
+    "messaging.bind_provisioned_destination",
     "messaging.wake_target",
     "messaging.send",
     "messaging.profile.settings",
@@ -231,6 +232,17 @@ impl RunningGateway {
     }
     pub async fn bind_messaging_conversation(&self, destination: &str, binding: &str) -> Result<()> {
         self.shared.messaging.bind_conversation(destination,binding).await
+    }
+    pub async fn bind_messaging_provisioned_destination(
+        &self,
+        connection: &str,
+        delivery: &str,
+        part: u32,
+        attempt: u32,
+    ) -> Result<String> {
+        self.shared.messaging.bind_provisioned_destination(
+            self.shared.library.root(), connection, delivery, part, attempt,
+        ).await
     }
     pub async fn set_messaging_wake_target(&self, connection: &str, target: messaging::WakeTarget) -> Result<()> {
         self.shared.messaging.set_wake_target(connection,target).await
@@ -1106,6 +1118,15 @@ impl Shared {
                 self.messaging.bind_conversation(required_string(params,"destination")?, required_string(params,"binding")?)
                     .await.map_err(RpcError::internal)?;
                 Ok(json!({"bound":true}))
+            }
+            "messaging.bind_provisioned_destination" => {
+                let id = |name| params[name].as_u64().and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| RpcError::invalid(format!("{name} is required")));
+                let route = self.messaging.bind_provisioned_destination(
+                    self.library.root(), required_string(params, "connection")?,
+                    required_string(params, "delivery")?, id("part")?, id("attempt")?,
+                ).await.map_err(RpcError::internal)?;
+                Ok(json!({"route":route}))
             }
             "messaging.wake_target" => {
                 let target = serde_json::from_value(params["target"].clone())

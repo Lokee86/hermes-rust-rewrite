@@ -360,7 +360,7 @@ impl Ingress {
         let scope = self.clone();
         let changed = blocking(move || {
             scope.checked(true, |_| {
-                db(scope.store.reconcile(&scope.connection, &delivery, evidence, now()))
+                db(scope.store.reconcile(&scope.connection, scope.installation(), &delivery, evidence, now()))
             })
         })
         .await?;
@@ -910,6 +910,82 @@ impl Host {
         self.store.share_conversation(&destination, &binding)
     }
 
+    pub async fn bind_provisioned_destination(
+        &self,
+        root: &Path,
+        connection: &str,
+        delivery: &str,
+        part: u32,
+        attempt: u32,
+    ) -> Result<String> {
+        ensure!(valid_id(connection) && valid_id(delivery) && attempt != 0, "Invalid provisioned effect identity");
+        let slots = self.slots.lock().await;
+        let (slot, state) = slots.values().find_map(|managed| {
+            let state = lock(&managed.slot.state);
+            (state.accepting && state.identity.as_deref() == Some(connection))
+                .then_some((&managed.slot, state))
+        }).context("Messaging connection is unavailable")?;
+        let caps = slot.descriptor.capabilities;
+        ensure!(caps.threads && caps.effects.prepare_resources, "Provisioned destinations are unavailable");
+        let generation = state.generation.as_deref().context("Unverified messaging connection")?;
+        let provisioned = self.store.provisioned_destination(connection, delivery, (part, attempt))?
+            .context("No current confirmed destination for this effect attempt")?;
+        let scope = Ingress {
+            slot: slot.clone(),
+            store: self.store.clone(),
+            connection: connection.to_owned(),
+            generation: generation.to_owned(),
+            installation: state.installation.clone(),
+            root: root.to_path_buf(),
+        };
+        ensure!(
+            provisioned.scope.allows_installation(scope.installation()),
+            "Provisioned destination installation changed"
+        );
+        let child = &provisioned.room;
+        let policy = &state.policy;
+        let sender = provisioned.sender.as_ref();
+        let child_policy = policy.room_policy(child).context("Provisioned destination is forbidden")?;
+        let participant = if child_policy.per_participant {
+            Some(sender.context("Provisioned destination requires an authorized participant")?.id.as_str())
+        } else {
+            None
+        };
+        for (room, route) in [
+            (&provisioned.parent.room, Some(&provisioned.parent)),
+            (&provisioned.binding.room, Some(&provisioned.binding)),
+            (child, None),
+        ] {
+            let rules = policy.room_policy(room).context("Provisioned conversation scope is forbidden")?;
+            ensure!(
+                rules.per_participant == child_policy.per_participant,
+                "Provisioned conversation participant scope changed"
+            );
+            if let Some(sender) = sender {
+                ensure!(scope.authorize_sender(policy, room, sender)?, "Provisioning actor is no longer authorized");
+            }
+            if let Some(route) = route {
+                // A resource-scoped session cannot be transferred to an ordinary thread.
+                ensure!(
+                    store::Route::new(connection, room.clone(), participant)?.id == route.id,
+                    "Provisioned conversation route scope changed"
+                );
+            }
+        }
+        if let Some(required) = &provisioned.effect.transport {
+            ensure!(
+                scope.authorize_effect_transport(policy, required, &provisioned.parent.room, sender)?.is_some(),
+                "Provisioned destination transport address is no longer authorized"
+            );
+        }
+        let destination = store::Route::new(connection, child.clone(), participant)?;
+        self.store.bind_provisioned_destination(
+            delivery, (part, attempt), &provisioned, &destination, generation, policy,
+        )?;
+        slot.changed.notify_waiters();
+        Ok(destination.id)
+    }
+
     pub async fn set_wake_target(&self, name: &str, target: super::WakeTarget) -> Result<()> {
         let slots = self.slots.lock().await;
         let slot = &slots.get(name).context("Unknown messaging connection")?.slot;
@@ -1376,6 +1452,7 @@ fn outbound_policy(
     };
     Ok(OutboundPolicy {
         now: now(),
+        installation: scope.installation().cloned(),
         visibility: EffectVisibility {
             notify: policy.notifications,
             mention: policy.mentions,

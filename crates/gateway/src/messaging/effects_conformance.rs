@@ -9,6 +9,7 @@ type Render = dyn Fn(&DeliveryIntent) -> Vec<DeliveryPart> + Send + Sync;
 struct EffectFixture {
     wire: Fixture,
     render: Arc<Render>,
+    device: String,
 }
 
 fn stock(
@@ -17,12 +18,23 @@ fn stock(
     capabilities: EffectCapabilities,
     render: impl Fn(&DeliveryIntent) -> Vec<DeliveryPart> + Send + Sync + 'static,
 ) -> AdapterConfig {
+    stock_on_device(driver, policy, capabilities, "device", render)
+}
+
+fn stock_on_device(
+    driver: &Driver,
+    policy: AccessPolicy,
+    capabilities: EffectCapabilities,
+    device: &str,
+    render: impl Fn(&DeliveryIntent) -> Vec<DeliveryPart> + Send + Sync + 'static,
+) -> AdapterConfig {
     let mut wire = driver.fixture.clone();
     wire.capabilities.effects = capabilities;
     let mut config = driver.config(policy);
     config.factory = Arc::new(EffectFixture {
         wire,
         render: Arc::new(render),
+        device: device.into(),
     });
     config
 }
@@ -53,7 +65,7 @@ impl Adapter for EffectFixture {
             application: None,
             receiver: None,
             origin: Some("https://fixture.example".into()),
-            device: Some("device".into()),
+            device: Some(self.device.clone()),
             local_client: None,
         })
     }
@@ -756,6 +768,215 @@ async fn resource_receipts_resume_upload_and_publish_in_order() {
     publish.finish(confirmed("submitted-message"));
     phase(&reopened, id, 4, "sent").await;
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn provisioned_destination_requires_exact_owner_binding_and_survives_restart() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "provision-account", true);
+    let another = Driver::new(Transport::Push, "other-account", true);
+    let config = |driver: &Driver, device, name: &str| {
+        let mut config = stock_on_device(
+            driver,
+            policy(),
+            EffectCapabilities {
+                prepare_resources: true,
+                ..EffectCapabilities::default()
+            },
+            device,
+            |intent| {
+                if intent.room.kind != RoomKind::Group || intent.room.thread.is_some() {
+                    return vec![part(intent, Effect::default())];
+                }
+                vec![
+                    part(
+                        intent,
+                        Effect {
+                            operation: EffectOperation::Provision {
+                                resource: ProvisionResource::Topic,
+                            },
+                            ..Effect::default()
+                        },
+                    ),
+                    part(
+                        intent,
+                        Effect {
+                            operation: EffectOperation::Publish {
+                                using: vec![EffectDependency {
+                                    part: 0,
+                                    kind: ReceiptKind::Destination,
+                                }],
+                            },
+                            ..Effect::default()
+                        },
+                    ),
+                ]
+            },
+        );
+        config.name = name.to_owned();
+        config
+    };
+    let before = model
+        .gateway(root.path(), vec![config(&driver, "device", "fixture")])
+        .await;
+    let first = driver.ready().await;
+    let mut event = dm("provision-request", "group", "open a topic");
+    event.room.kind = RoomKind::Group;
+    let parent = driver.push(event.clone()).await.route.unwrap();
+    let provision = driver.sent().await;
+    let delivery_id = provision.attempt.delivery_id.clone();
+    let part = provision.attempt.part;
+    let attempt = provision.attempt.attempt;
+    let connection = first.connection.clone();
+    assert!(matches!(
+        provision.attempt.payload.effect.operation,
+        EffectOperation::Provision { .. }
+    ));
+    provision.finish(typed(ReceiptKind::File, "wrong-receipt-kind"));
+    let recorded = phase(&before, &delivery_id, part, "uncertain").await;
+    let session = input(&recorded, &event.id).unwrap()["session"].clone();
+    assert!(session.is_string());
+    assert!(
+        before
+            .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt)
+            .await
+            .is_err()
+    );
+    let uncertain = first.uncertain_deliveries().await.unwrap().pop().unwrap();
+    before.shutdown().await.unwrap();
+
+    let changed = model
+        .gateway(
+            root.path(),
+            vec![config(&driver, "replacement-device", "fixture")],
+        )
+        .await;
+    let replacement = driver.ready().await;
+    assert_eq!(replacement.connection, connection);
+    assert!(
+        !replacement
+            .reconcile_delivery(
+                uncertain.clone(),
+                typed(ReceiptKind::Destination, "unsafe-topic")
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        changed
+            .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt)
+            .await
+            .is_err()
+    );
+    changed.shutdown().await.unwrap();
+
+    let owner = model
+        .gateway(
+            root.path(),
+            vec![
+                config(&driver, "device", "fixture"),
+                config(&another, "device", "second"),
+            ],
+        )
+        .await;
+    let ingress = driver.ready().await;
+    let wrong_account = another.ready().await;
+    assert!(
+        !wrong_account
+            .reconcile_delivery(
+                uncertain.clone(),
+                typed(ReceiptKind::Destination, "wrong-scope")
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        ingress
+            .reconcile_delivery(uncertain, typed(ReceiptKind::Destination, "exact-topic"))
+            .await
+            .unwrap()
+    );
+    phase(&owner, &delivery_id, part, "sent").await;
+    let publication = driver.sent().await;
+    assert_eq!(
+        publication.attempt.effect.dependencies[0].1.id,
+        "exact-topic"
+    );
+    publication.finish(confirmed("provisioned-message"));
+    phase(&owner, &delivery_id, part + 1, "sent").await;
+    assert!(
+        owner
+            .bind_messaging_provisioned_destination(
+                &wrong_account.connection,
+                &delivery_id,
+                part,
+                attempt
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        owner
+            .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt + 1)
+            .await
+            .is_err()
+    );
+
+    let mut child = dm("provisioned-input", "group", "reply in the topic");
+    child.room.kind = RoomKind::Group;
+    child.room.thread = Some("exact-topic".into());
+    let expected = store::Route::new(&connection, child.room.clone(), Some("alice")).unwrap();
+    assert!(ingress.store.route(&expected.id).unwrap().is_none());
+    let mut revoked = policy();
+    revoked.scope.denied_users.insert("alice".into());
+    owner.set_adapter_policy("fixture", revoked).await.unwrap();
+    assert!(
+        owner
+            .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt)
+            .await
+            .is_err()
+    );
+    assert!(ingress.store.route(&expected.id).unwrap().is_none());
+    owner.set_adapter_policy("fixture", policy()).await.unwrap();
+    let bound = owner
+        .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt)
+        .await
+        .unwrap();
+    assert_eq!(bound, expected.id);
+    owner.shutdown().await.unwrap();
+
+    let restored = model
+        .gateway(root.path(), vec![config(&driver, "device", "fixture")])
+        .await;
+    let ingress = driver.ready().await;
+    assert_eq!(
+        restored
+            .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt)
+            .await
+            .unwrap(),
+        bound,
+    );
+    assert_eq!(
+        driver.push(child.clone()).await.route.as_deref(),
+        Some(bound.as_str())
+    );
+    let reply = driver.sent().await;
+    assert_eq!(reply.attempt.payload.room, child.room);
+    let child_delivery = reply.attempt.delivery_id.clone();
+    reply.finish(confirmed("topic-message"));
+    let after = phase(&restored, &child_delivery, 0, "sent").await;
+    assert_eq!(input(&after, &child.id).unwrap()["session"], session);
+
+    ingress.store.block_route(&parent).unwrap();
+    assert!(restored.restore_messaging_route(parent).await.unwrap());
+    assert!(
+        restored
+            .bind_messaging_provisioned_destination(&connection, &delivery_id, part, attempt)
+            .await
+            .is_err()
+    );
+    restored.shutdown().await.unwrap();
 }
 
 fn presentation_plan(intent: &DeliveryIntent) -> Vec<DeliveryPart> {

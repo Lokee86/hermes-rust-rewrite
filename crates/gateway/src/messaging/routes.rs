@@ -4,7 +4,7 @@ use super::{
     types::*,
 };
 use anyhow::{Result, ensure};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 pub(super) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_route_bindings (
@@ -53,64 +53,20 @@ impl Ingress {
 
 impl Store {
     pub(super) fn conversation(&self, route: &Route) -> Result<Route> {
-        self.read(|db| {
-            let binding = db
-                .query_row(
-                    "SELECT binding FROM messaging_route_bindings WHERE destination = ?1",
-                    [&route.id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            match binding {
-                Some(id) => read_route(db, &id)?
-                    .ok_or_else(|| anyhow::anyhow!("Messaging session binding was removed")),
-                None => Ok(route.clone()),
-            }
-        })
+        self.read(|db| conversation(db, route))
     }
 
-    /// Only destinations without an established session can join another
-    /// binding. A previously admitted turn remains with its original owner.
     pub(super) fn share_conversation(&self, destination: &Route, binding: &Route) -> Result<()> {
-        ensure!(
-            destination.connection == binding.connection && destination.id != binding.id,
-            "Messaging session binding must stay within one verified account"
-        );
-        self.write(|tx| {
-            let current = tx.query_row(
-                "SELECT binding FROM messaging_route_bindings WHERE destination = ?1",
-                [&destination.id], |row| row.get::<_, String>(0),
-            ).optional()?;
-            if current.as_deref() == Some(binding.id.as_str()) {
-                return Ok(());
-            }
-            ensure!(current.is_none(), "The destination already shares a conversation");
-            let valid = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?1 AND session IS NULL AND blocked = 0)
-                  AND NOT EXISTS(SELECT 1 FROM messaging_route_bindings WHERE destination = ?2 OR binding = ?1)
-                  AND NOT EXISTS(SELECT 1 FROM messaging_ingress WHERE route = ?1 AND stage NOT IN ('refused','done'))
-                  AND EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?2 AND blocked = 0)",
-                params![destination.id,binding.id], |row| row.get::<_,bool>(0),
-            )?;
-            ensure!(valid, "Both bindings must be available and the destination must be idle and unbound");
-            tx.execute(
-                "INSERT INTO messaging_route_bindings(destination,binding) VALUES (?1,?2)",
-                params![destination.id,binding.id],
-            )?;
-            Ok(())
-        })
+        self.write(|tx| share_conversation(tx, destination, binding))
+    }
+
+    pub(super) fn allows_notification(&self, route: &str, now: i64) -> Result<bool> {
+        self.read(|db| allows_notification(db, route, now))
     }
 
     fn verify_destination(&self, route: &Route, expires_ms: i64) -> Result<()> {
         self.write(|tx| {
-            tx.execute(
-                "INSERT OR IGNORE INTO messaging_routes(id,connection,room) VALUES (?1,?2,?3)",
-                params![
-                    route.id,
-                    route.connection,
-                    serde_json::to_string(&route.room)?
-                ],
-            )?;
+            insert_route(tx, route)?;
             tx.execute(
                 "INSERT INTO messaging_verified_destinations(route,expires) VALUES (?1,?2)
                  ON CONFLICT(route) DO UPDATE SET expires = excluded.expires",
@@ -118,13 +74,6 @@ impl Store {
             )?;
             Ok(())
         })
-    }
-
-    pub(super) fn allows_notification(&self, route: &str, now: i64) -> Result<bool> {
-        self.read(|db| Ok(db.query_row(
-            "SELECT COALESCE((SELECT expires > ?2 FROM messaging_verified_destinations WHERE route = ?1), 1)",
-            params![route,now], |row| row.get(0),
-        )?))
     }
 
     pub(super) fn notification(
@@ -150,4 +99,81 @@ impl Store {
         )?;
         Ok(id)
     }
+}
+
+pub(super) fn insert_route(tx: &Transaction<'_>, route: &Route) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO messaging_routes(id,connection,room) VALUES (?1,?2,?3)",
+        params![
+            route.id,
+            route.connection,
+            serde_json::to_string(&route.room)?
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn allows_notification(db: &Connection, route: &str, now: i64) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT COALESCE((SELECT expires > ?2 FROM messaging_verified_destinations WHERE route = ?1), 1)",
+        params![route,now], |row| row.get(0),
+    )?)
+}
+
+pub(super) fn conversation(db: &Connection, route: &Route) -> Result<Route> {
+    let binding = db
+        .query_row(
+            "SELECT binding FROM messaging_route_bindings WHERE destination = ?1",
+            [&route.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match binding {
+        Some(id) => read_route(db, &id)?
+            .ok_or_else(|| anyhow::anyhow!("Messaging session binding was removed")),
+        None => Ok(route.clone()),
+    }
+}
+
+/// Only destinations without an established session can join another
+/// binding. A previously admitted turn remains with its original owner.
+pub(super) fn share_conversation(
+    tx: &Transaction<'_>,
+    destination: &Route,
+    binding: &Route,
+) -> Result<()> {
+    ensure!(
+        destination.connection == binding.connection && destination.id != binding.id,
+        "Messaging session binding must stay within one verified account"
+    );
+    let current = tx
+        .query_row(
+            "SELECT binding FROM messaging_route_bindings WHERE destination = ?1",
+            [&destination.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(binding.id.as_str()) {
+        return Ok(());
+    }
+    ensure!(
+        current.is_none(),
+        "The destination already shares a conversation"
+    );
+    let valid = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?1 AND session IS NULL AND blocked = 0)
+                  AND NOT EXISTS(SELECT 1 FROM messaging_route_bindings WHERE destination = ?2 OR binding = ?1)
+                  AND NOT EXISTS(SELECT 1 FROM messaging_ingress WHERE route = ?1 AND stage NOT IN ('refused','done'))
+                  AND EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?2 AND blocked = 0)",
+                params![destination.id,binding.id], |row| row.get::<_,bool>(0),
+            )?;
+    ensure!(
+        valid,
+        "Both bindings must be available and the destination must be idle and unbound"
+    );
+    tx.execute(
+        "INSERT INTO messaging_route_bindings(destination,binding) VALUES (?1,?2)",
+        params![destination.id, binding.id],
+    )?;
+    Ok(())
 }

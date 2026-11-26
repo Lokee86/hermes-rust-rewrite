@@ -1,6 +1,6 @@
 use super::{PendingDelivery, Store, enqueue, key, read_route};
 use crate::messaging::{
-    ConsentUpdate, DeliveryBody, DeliveryIntent, DeliveryPart, EffectDependency, EffectIdentity,
+    profile::VerifiedInstallation, provision::ProvisionScope, ConsentUpdate, DeliveryBody, DeliveryIntent, DeliveryPart, EffectDependency, EffectIdentity,
     EffectObservation, EffectOperation, EffectReceipt, EffectTransportPin, EffectTransportRef,
     EffectVisibility, MarkerRef, ObservationResult, PresentationPhase, ProviderDeliveryState,
     ReceiptKind, RecipientOutcome, RecipientResults, ReplayScope, ReplyGrant, ReplyOperation,
@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS messaging_effect_markers (
 /// Authorization captured from current, host-owned profile policy under the lease.
 pub(in crate::messaging) struct OutboundPolicy {
     pub now: i64,
+    pub installation: Option<VerifiedInstallation>,
     pub visibility: EffectVisibility,
     pub protection: Option<String>,
     pub submitted: bool,
@@ -420,6 +421,38 @@ fn protection_proof(
     ).optional()?.flatten())
 }
 
+pub(in crate::messaging) fn delivery_protected(
+    db: &Connection,
+    connection: &str,
+    generation: &str,
+    room: &Room,
+    required: [Option<&str>; 2],
+) -> Result<bool> {
+    if required == [None, None] {
+        return Ok(true);
+    }
+    let current = protection_proof(db, connection, generation, room)?;
+    Ok(required.into_iter().flatten().all(|class| current.as_deref() == Some(class)))
+}
+
+pub(in crate::messaging) fn eligible_consent(
+    db: &Connection,
+    connection: &str,
+    room: &Room,
+    required: bool,
+) -> Result<bool> {
+    let consent = db
+        .query_row(
+            "SELECT evidence FROM messaging_effect_consent WHERE connection=?1 AND destination=?2",
+            params![connection, destination(room)?],
+            |row| row.get(0),
+        )
+        .optional()?
+        .map(json::<ConsentUpdate>)
+        .transpose()?;
+    Ok(consent.map_or(!required, |update| update.eligible))
+}
+
 /// Effects remain pending (or uncertain) after a policy failure so a verified renewal can unblock them.
 pub(super) fn block(tx: &Transaction<'_>, id: &str, part: u32, reason: &str) -> Result<()> {
     tx.execute(
@@ -472,27 +505,12 @@ fn authorize_effect(
     {
         return Ok(Err("eligibility_visibility"));
     }
-    let protection = protection_proof(tx, connection, generation, &part.room)?;
-    if [effect.protection.as_deref(), policy.protection.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|requirement| protection.as_deref() != Some(requirement))
+    if !delivery_protected(tx, connection, generation, &part.room,
+        [effect.protection.as_deref(), policy.protection.as_deref()])?
     {
         return Ok(Err("eligibility_protection"));
     }
-    let consent = tx
-        .query_row(
-            "SELECT evidence FROM messaging_effect_consent WHERE connection=?1 AND destination=?2",
-            params![connection, destination(&part.room)?],
-            |r| r.get(0),
-        )
-        .optional()?
-        .map(json::<ConsentUpdate>)
-        .transpose()?;
-    if consent
-        .map(|update| !update.eligible)
-        .unwrap_or(effect.consent_required)
-    {
+    if !eligible_consent(tx, connection, &part.room, effect.consent_required)? {
         return Ok(Err("eligibility_consent"));
     }
     if let Some(grant_id) = &effect.reply_grant {
@@ -546,12 +564,13 @@ fn authorize_effect(
                 params![marker.delivery, marker.part],
                 |row| row.get(0),
             )?)?;
-            if original
-                .effect
-                .protection
-                .as_deref()
-                .is_some_and(|required| protection.as_deref() != Some(required))
-            {
+            if !delivery_protected(
+                tx,
+                connection,
+                generation,
+                &part.room,
+                [original.effect.protection.as_deref(), None],
+            )? {
                 return Ok(Err("eligibility_protection"));
             }
             Some(receipt)
@@ -781,6 +800,16 @@ pub(super) fn claim(
             return Ok(None);
         }
     };
+    let provision = if matches!(payload.effect.operation, EffectOperation::Provision { .. }) {
+        let current = ProvisionScope::capture(tx, &pending.route, connection, &payload.room, policy.installation.as_ref())?;
+        if current.is_none() || retransmission && current != ProvisionScope::for_attempt(tx, id, ordinal, old_attempt)? {
+            block(tx, id, ordinal, "eligibility_provision_scope")?;
+            return Ok(None);
+        }
+        current
+    } else {
+        None
+    };
     let recipients = retry_recipients(tx, id, ordinal, &payload)?;
     if !payload.effect.recipients.is_empty() && recipients.is_empty() {
         return Ok(None);
@@ -806,6 +835,9 @@ pub(super) fn claim(
          ON CONFLICT(delivery,ordinal,attempt) DO UPDATE SET lease=excluded.lease,retransmission=excluded.retransmission",
         params![id,ordinal,attempt,data,generation,retransmission,policy.now,policy.submitted,policy.subsets],
     )?;
+    if let Some(scope) = provision {
+        scope.record(tx, id, ordinal, attempt)?;
+    }
     if let Some(pin) = &policy.transport {
         tx.execute(
             "INSERT OR IGNORE INTO messaging_effect_pins (delivery,ordinal,attempt,receipt) VALUES (?1,?2,?3,?4)",
@@ -858,6 +890,12 @@ pub(super) fn recheck(
             || replay_proof(tx, connection, generation)?.as_ref() != Some(&guarantee.scope))
     {
         return Ok(false);
+    }
+    if matches!(part.effect.operation, EffectOperation::Provision { .. }) {
+        let current = ProvisionScope::capture(tx, &pending.route, connection, &part.room, policy.installation.as_ref())?;
+        if current.is_none() || current != ProvisionScope::for_attempt(tx, &send.delivery_id, send.part, send.attempt)? {
+            return Ok(false);
+        }
     }
     Ok(authorize_effect(
         tx, connection, generation, pending, send.part, &part, policy,

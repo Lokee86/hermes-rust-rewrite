@@ -2,7 +2,7 @@ use super::{RecipientOutcome, types::*};
 
 #[path = "store_effects.rs"]
 mod effect_store;
-pub(super) use effect_store::OutboundPolicy;
+pub(super) use effect_store::{OutboundPolicy, delivery_protected, eligible_consent};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS messaging_cooldowns (
 
 pub(super) struct Store(pub(super) Mutex<Connection>, pub(super) super::media::ProfileAudio);
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct Route {
     pub id: String,
     pub connection: String,
@@ -217,6 +217,7 @@ impl Store {
         connection.execute_batch(super::profile::SCHEMA)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
+        connection.execute_batch(super::provision::TABLES)?;
         connection.execute_batch(super::transport::SCHEMA)?;
         connection.execute_batch(super::wake::TABLES)?;
         connection.execute("DELETE FROM messaging_enrollment", [])?;
@@ -678,7 +679,12 @@ impl Store {
 
 
     pub fn reconcile(
-        &self, connection: &str, delivery: &UncertainDelivery, result: DeliveryResult, now: i64,
+        &self,
+        connection: &str,
+        installation: Option<&super::VerifiedInstallation>,
+        delivery: &UncertainDelivery,
+        result: DeliveryResult,
+        now: i64,
     ) -> Result<bool> {
         self.write(|tx| {
             let part: Option<DeliveryPart> = tx.query_row(
@@ -687,7 +693,15 @@ impl Store {
                 params![connection,delivery.delivery_id,delivery.part,delivery.attempt],
                 |row| decode(row,0),
             ).optional()?;
-            if part.is_none_or(|part| part.room!=delivery.room) { return Ok(false) }
+            let Some(part) = part.filter(|part| part.room == delivery.room) else {
+                return Ok(false);
+            };
+            if matches!(part.effect.operation, super::EffectOperation::Provision { .. })
+                && !super::provision::ProvisionScope::for_attempt(tx, &delivery.delivery_id, delivery.part, delivery.attempt)?
+                    .is_some_and(|scope| scope.allows_installation(installation))
+            {
+                return Ok(false);
+            }
             effect_store::record(tx,connection,None,&delivery.delivery_id,(delivery.part,delivery.attempt),result,now)
         })
     }

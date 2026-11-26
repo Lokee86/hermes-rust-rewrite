@@ -1246,6 +1246,7 @@ async fn reopens_durable_intake_queue_claim_and_committed_result() {
     assert_eq!(
         db.claim(&connection, "crashed-generation", &pending, &store::OutboundPolicy {
             now: 1,
+            installation: None,
             visibility: EffectVisibility::default(),
             protection: None,
             submitted: false,

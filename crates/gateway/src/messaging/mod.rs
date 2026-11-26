@@ -9,6 +9,7 @@ mod media;
 mod observations;
 mod policy;
 mod profile;
+mod provision;
 mod receiver;
 mod repair;
 mod routes;
