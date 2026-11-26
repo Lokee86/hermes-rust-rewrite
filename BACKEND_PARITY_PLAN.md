@@ -71,6 +71,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 24. Implement Email and verify IMAP mailbox epochs, authenticated sender intake, MIME and threaded SMTP delivery. [Email spec](crates/gateway/EMAIL_ADAPTER_SPEC.md)
 25. Implement Twilio SMS and verify signed inbound SMS, consent and opt-out policy, ordered text parts and exact provider status. [Twilio SMS spec](crates/gateway/SMS_ADAPTER_SPEC.md)
 26. Implement ntfy and verify hosted and self-hosted topic routing, cached stream recovery, safe same-topic replies and publish-only notifications. [ntfy spec](crates/gateway/NTFY_ADAPTER_SPEC.md)
+27. Implement Raft and verify the content-free wake bridge, native restart handling, scoped CLI effects and activity drain. [Raft spec](crates/gateway/RAFT_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 

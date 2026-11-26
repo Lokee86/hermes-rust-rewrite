@@ -1,6 +1,6 @@
 # ntfy stock plugin implementation spec
 
-Register ntfy as a bundled Rust adapter with platform key `ntfy`. Start after Twilio SMS and the shared gate. A headless profile can receive text on an approved ntfy topic, reply to its configured audience, and publish routine or manual notifications. Use the same plugin for explicitly publish-only installations. Support hosted and self-hosted servers through the documented HTTP interface. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Twilio SMS spec](SMS_ADAPTER_SPEC.md) · [Hermes ntfy guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/ntfy.md)
+Register ntfy as a bundled Rust adapter with platform key `ntfy`. Start after Twilio SMS and the shared gate. A headless profile can receive text on an approved ntfy topic, reply to its configured audience, and publish routine or manual notifications. Use the same plugin for explicitly publish-only installations. Support hosted and self-hosted servers through the documented HTTP interface. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Twilio SMS spec](SMS_ADAPTER_SPEC.md) · [Hermes ntfy guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/ntfy.md) · [Next adapter, Raft](RAFT_ADAPTER_SPEC.md)
 
 ## Registration and topic authorization
 
