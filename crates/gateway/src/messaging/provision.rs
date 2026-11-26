@@ -173,6 +173,7 @@ impl Store {
         authorized: &ProvisionedDestination,
         destination: &Route,
         generation: &str,
+        transport_scope: &str,
         policy: &AccessPolicy,
     ) -> Result<()> {
         self.write(|tx| {
@@ -184,7 +185,7 @@ impl Store {
             );
             let parent = &authorized.parent;
             ensure!(
-                authorized.sender.is_some() || routes::allows_notification(tx, &parent.id, now())?,
+                authorized.sender.is_some() || routes::destination_permission(tx, &parent.id, now(), transport_scope)?.unwrap_or(true),
                 "The parent destination write permission expired"
             );
             for (room, required) in [

@@ -8,6 +8,7 @@ mod intake;
 mod media;
 mod observations;
 mod policy;
+mod producer_results;
 mod profile;
 mod protection;
 mod provision;

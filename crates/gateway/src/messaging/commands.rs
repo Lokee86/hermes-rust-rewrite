@@ -382,7 +382,7 @@ pub(super) fn execute(
                 Operation::Output(queue)
             }
             Command::SelectModel { model } => Operation::SelectModel(model),
-            Command::SetHome => Operation::Home,
+            Command::SetHome => Operation::Home(scope.transport_scope()?),
             Command::FetchResult { action } => Operation::Fetch(action),
             Command::UseSkill { .. } => Operation::Output(InvocationOutcome::Unsupported),
         }
@@ -395,7 +395,7 @@ pub(super) fn execute(
 enum Operation<'a> {
     Output(InvocationOutcome),
     SelectModel(&'a str),
-    Home,
+    Home(String),
     Fetch(&'a str),
 }
 
@@ -479,11 +479,8 @@ impl Store {
                                 ON CONFLICT(route) DO UPDATE SET model = excluded.model", params![route.id,model])?;
                     InvocationOutcome::Applied
                 }
-                Operation::Home => {
-                    if tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM messaging_verified_destinations WHERE route = ?1 AND expires > ?2)",
-                        params![route.id, chrono::Utc::now().timestamp_millis()], |r| r.get::<_,bool>(0),
-                    )? {
+                Operation::Home(scope) => {
+                    if super::routes::destination_permission(tx, &route.id, super::runtime::now(), &scope)? == Some(true) {
                         tx.execute("INSERT INTO messaging_home_routes(connection,route) VALUES (?1,?2)
                                   ON CONFLICT(connection) DO UPDATE SET route = excluded.route", params![route.connection,route.id])?;
                         InvocationOutcome::Applied

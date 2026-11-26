@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS messaging_verified_destinations (
     route TEXT PRIMARY KEY REFERENCES messaging_routes(id),
     expires INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS messaging_destination_scope (
+    route TEXT PRIMARY KEY REFERENCES messaging_verified_destinations(route), scope TEXT NOT NULL
+);
 ";
 
 impl Ingress {
@@ -43,7 +46,7 @@ impl Ingress {
                     return Err(GatewayError::Forbidden);
                 }
                 let route = db(Route::new(&scope.connection, room, None))?;
-                db(scope.store.verify_destination(&route, expires_ms))?;
+                db(scope.store.verify_destination(&route, expires_ms, &scope.transport_scope()?))?;
                 Ok(route.id)
             })
         })
@@ -60,17 +63,22 @@ impl Store {
         self.write(|tx| share_conversation(tx, destination, binding))
     }
 
-    pub(super) fn allows_notification(&self, route: &str, now: i64) -> Result<bool> {
-        self.read(|db| allows_notification(db, route, now))
+    pub(super) fn allows_notification(&self, route: &str, now: i64, scope: &str) -> Result<bool> {
+        self.read(|db| Ok(destination_permission(db, route, now, scope)?.unwrap_or(true)))
     }
 
-    fn verify_destination(&self, route: &Route, expires_ms: i64) -> Result<()> {
+    fn verify_destination(&self, route: &Route, expires_ms: i64, scope: &str) -> Result<()> {
         self.write(|tx| {
             insert_route(tx, route)?;
             tx.execute(
                 "INSERT INTO messaging_verified_destinations(route,expires) VALUES (?1,?2)
                  ON CONFLICT(route) DO UPDATE SET expires = excluded.expires",
                 params![route.id, expires_ms],
+            )?;
+            tx.execute(
+                "INSERT INTO messaging_destination_scope(route,scope) VALUES (?1,?2)
+                 ON CONFLICT(route) DO UPDATE SET scope=excluded.scope",
+                params![route.id,scope],
             )?;
             Ok(())
         })
@@ -113,11 +121,12 @@ pub(super) fn insert_route(tx: &Transaction<'_>, route: &Route) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn allows_notification(db: &Connection, route: &str, now: i64) -> Result<bool> {
+pub(super) fn destination_permission(db: &Connection, route: &str, now: i64, scope: &str) -> Result<Option<bool>> {
     Ok(db.query_row(
-        "SELECT COALESCE((SELECT expires > ?2 FROM messaging_verified_destinations WHERE route = ?1), 1)",
-        params![route,now], |row| row.get(0),
-    )?)
+        "SELECT d.expires > ?2 AND COALESCE(s.scope, '') = ?3 FROM messaging_verified_destinations d
+         LEFT JOIN messaging_destination_scope s USING(route) WHERE d.route = ?1",
+        params![route,now,scope], |row| row.get(0),
+    ).optional()?)
 }
 
 pub(super) fn conversation(db: &Connection, route: &Route) -> Result<Route> {

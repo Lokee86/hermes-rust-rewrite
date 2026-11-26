@@ -397,6 +397,74 @@ async fn repair_merges_live_and_history_in_source_order_after_restart() {
 }
 
 #[tokio::test]
+async fn attributed_producer_result_keeps_its_original_audience() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "attributed-results", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    let input = driver
+        .push(dm("original", "private", "scoped result"))
+        .await;
+    let source_route = input.route.unwrap();
+    let source = driver.sent().await.attempt.delivery_id;
+    status(&gateway, |state| {
+        delivery(state, &source, 0).is_some_and(|row| row["part_state"] == "sent")
+    })
+    .await;
+    let other = dm("other", "different", "unrelated");
+    let other_route = ingress
+        .verify_destination(other.room.clone(), expires())
+        .await
+        .unwrap();
+
+    let withheld = gateway
+        .publish_messaging_result(&source, &other_route, "external-audience")
+        .unwrap();
+    assert_eq!(
+        gateway
+            .publish_messaging_result(&source, &other_route, "external-audience")
+            .unwrap(),
+        withheld
+    );
+    let published = gateway
+        .publish_messaging_result(&source, &source_route, "original-audience")
+        .unwrap();
+    let delivery = driver.sent().await;
+    assert_eq!(delivery.attempt.delivery_id, published);
+    assert_eq!(delivery.attempt.payload.room.chat, "private");
+    assert_eq!(reply(&delivery.attempt), "answer scoped result");
+    driver.push(other).await;
+    assert_eq!(reply(&driver.sent().await.attempt), "answer unrelated");
+    gateway.shutdown().await.unwrap();
+
+    let driver = Driver::new(Transport::Push, "attributed-results", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    driver.ready().await;
+    assert_eq!(
+        gateway
+            .publish_messaging_result(&source, &other_route, "external-audience")
+            .unwrap(),
+        withheld
+    );
+    let state = gateway.messaging_status().await.unwrap();
+    let held = state["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == withheld)
+        .unwrap();
+    assert_eq!(held["state"], "blocked");
+    assert_eq!(held["error"], "source_audience_unauthorized");
+    assert_eq!(model.requests().len(), 2);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn verified_input_aliases_share_one_receipt_and_cannot_merge_unrelated_inputs() {
     let root = TempDir::new().unwrap();
     let model = Model::new().await;

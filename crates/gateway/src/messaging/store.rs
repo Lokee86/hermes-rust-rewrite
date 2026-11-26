@@ -215,6 +215,7 @@ impl Store {
         connection.execute_batch(super::receiver::TABLES)?;
         connection.execute_batch(super::timed::TABLES)?;
         connection.execute_batch(super::input_aliases::TABLES)?;
+        connection.execute_batch(super::producer_results::TABLES)?;
         connection.execute_batch(super::protection::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
         connection.execute_batch(super::repair::TABLES)?;
@@ -1015,7 +1016,7 @@ pub(super) fn set_input(
     Ok(())
 }
 
-fn enqueue(
+pub(super) fn enqueue(
     db: &Connection,
     route: &Route,
     sender: Option<&Sender>,

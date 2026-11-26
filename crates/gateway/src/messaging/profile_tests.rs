@@ -807,6 +807,9 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
         Err(GatewayError::Forbidden)
     ));
     use_.actor = address.actor.clone();
+    let expires = super::profile::time_ms() + 60_000;
+    let destination = ingress.verify_destination(room("device-destination"), expires).await.unwrap();
+    let home = ingress.verify_destination(room("device-home"), expires).await.unwrap();
     let source = message("device-message", principal("canonical"), address.room.clone().unwrap());
     let cursor = Advance { stream: "history".into(), previous: None, checkpoint: "token".into() };
     assert_eq!(ingress.submit(vec![source.clone()], Some(cursor.clone())).await.unwrap().receipts[0].disposition,
@@ -829,11 +832,17 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
     );
     assert_eq!(ingress.checkpoint(cursor.stream.clone()).await.unwrap().as_deref(), Some("token"));
     assert_eq!(ingress.pending_repairs().await.unwrap().len(), 1);
+    assert!(ingress.store.allows_notification(&destination, super::profile::time_ms(), &ingress.transport_scope().unwrap()).unwrap());
     gateway.shutdown().await.unwrap();
 
     factory.proof.device = Some("device-two".into());
     let gateway = open(temp.path(), &[factory], &policy).await;
     let ingress = ready(&queue).await;
+    assert!(gateway.bind_messaging_conversation(&destination, &home).await.is_err());
+    assert!(!ingress.store.allows_notification(&destination, super::profile::time_ms(), &ingress.transport_scope().unwrap()).unwrap());
+    assert_eq!(ingress.verify_destination(room("device-destination"), expires).await.unwrap(), destination);
+    assert_eq!(ingress.verify_destination(room("device-home"), expires).await.unwrap(), home);
+    gateway.bind_messaging_conversation(&destination, &home).await.unwrap();
     assert!(matches!(
         ingress.transport_authority(&use_).await,
         Err(GatewayError::Forbidden)

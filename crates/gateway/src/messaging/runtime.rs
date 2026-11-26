@@ -919,6 +919,13 @@ impl Host {
                 && state.policy.room_policy(&binding.room).is_some(),
             "Messaging conversation policy changed"
         );
+        let transport = transport_scope(state.installation.as_ref())?;
+        self.store.read(|db| {
+            ensure!(super::routes::destination_permission(db, &destination.id, now(), &transport)? == Some(true)
+                && super::routes::destination_permission(db, &binding.id, now(), &transport)?.unwrap_or(true),
+                "Verified messaging destination permission expired or changed");
+            Ok(())
+        })?;
         self.store.share_conversation(&destination, &binding)
     }
 
@@ -992,7 +999,7 @@ impl Host {
         }
         let destination = store::Route::new(connection, child.clone(), participant)?;
         self.store.bind_provisioned_destination(
-            delivery, (part, attempt), &provisioned, &destination, generation, policy,
+            delivery, (part, attempt), &provisioned, &destination, generation, &scope.transport_scope()?, policy,
         )?;
         slot.changed.notify_waiters();
         Ok(destination.id)
@@ -1013,6 +1020,11 @@ impl Host {
         ensure!(!route.blocked, "Messaging destination is blocked");
         let producer = store::key("manual", &(&route.id, request))?;
         self.store.notification(&route, &producer, text)
+    }
+
+    pub fn attributed_result(&self, source: &str, route: &str, request: &str) -> Result<String> {
+        ensure!(valid_id(source) && valid_id(route) && valid_id(request), "Invalid messaging result identity");
+        self.store.enqueue_attributed_result(source, route, request)
     }
 
     pub async fn restore_route(&self, route: String) -> Result<bool> {
@@ -1446,7 +1458,7 @@ fn delivery_authorized(
                 && current.id == route.id,
         );
     }
-    db(scope.store.allows_notification(&route.id, now()))
+    db(scope.store.allows_notification(&route.id, now(), &scope.transport_scope()?))
 }
 
 fn outbound_policy(

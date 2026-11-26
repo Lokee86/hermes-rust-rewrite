@@ -250,6 +250,10 @@ impl RunningGateway {
     pub fn send_messaging_notification(&self, route: &str, request: &str, text: String) -> Result<String> {
         self.shared.messaging.manual_notification(route,request,text)
     }
+    /// Publish a committed native reply with its source and audience retained.
+    pub fn publish_messaging_result(&self, source: &str, route: &str, request: &str) -> Result<String> {
+        self.shared.messaging.attributed_result(source, route, request)
+    }
     pub async fn restore_messaging_route(&self, route: String) -> Result<bool> {
         self.shared.messaging.restore_route(route).await
     }
