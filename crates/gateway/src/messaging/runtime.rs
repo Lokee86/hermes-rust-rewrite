@@ -306,7 +306,7 @@ impl Ingress {
             }
             InboundBody::Control(_) => {}
             InboundBody::Command(command) => {
-                if !caps.text_intake {
+                if !caps.text_intake || matches!(command, super::Command::FetchResult { .. }) && !caps.interactive_prompts {
                     return Ok(Err(Disposition::Unsupported));
                 }
                 if !command.valid() {

@@ -830,8 +830,27 @@ async fn prompt_decision_is_durable_and_reuse_checks_the_current_route_policy() 
     let gateway = model
         .gateway(root.path(), vec![driver.config(policy.clone())])
         .await;
-    driver.ready().await;
-    assert!(driver.push(approve).await.repeated);
+    let ingress = driver.ready().await;
+    assert!(driver.push(approve.clone()).await.repeated);
+    assert_eq!(
+        ingress
+            .callback_outcome(
+                approve.id.clone(),
+                approve.room.clone(),
+                approve.sender.clone(),
+                expires()
+            )
+            .await
+            .unwrap(),
+        Some(InvocationOutcome::Applied)
+    );
+    assert_eq!(
+        ingress
+            .callback_outcome(approve.id, approve.room, approve.sender, 1)
+            .await
+            .unwrap(),
+        Some(InvocationOutcome::Expired)
+    );
     driver.push(dm("second", "one", "approval")).await;
     let second = driver.sent().await;
     assert!(matches!(

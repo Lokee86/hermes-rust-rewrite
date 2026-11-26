@@ -557,6 +557,7 @@ impl Store {
                 params![action.id, serde_json::to_string(response)?],
             )? == 1, "Messaging prompt was already decided");
             super::approvals::record(tx, route, action, response, policy)?;
+            super::commands::record_invocation(tx, route, event, &action.recipient, super::InvocationOutcome::Applied)?;
             set_input(tx, route, event, "done", Some("applied"))
         })
     }

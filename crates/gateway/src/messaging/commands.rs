@@ -38,10 +38,30 @@ pub enum Command {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentKind {
+    Identifier,
+    Text,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CommandArgument {
+    pub name: &'static str,
+    pub kind: ArgumentKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationAudience {
+    Requester,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CommandDescriptor {
     pub name: &'static str,
-    pub arguments: &'static [&'static str],
+    pub arguments: &'static [CommandArgument],
     pub operator: bool,
+    pub audience: InvocationAudience,
 }
 
 pub(super) const COMMANDS: [CommandDescriptor; 6] = [
@@ -49,31 +69,52 @@ pub(super) const COMMANDS: [CommandDescriptor; 6] = [
         name: "status",
         arguments: &[],
         operator: false,
+        audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
         name: "queue",
         arguments: &[],
         operator: false,
+        audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
         name: "model",
-        arguments: &["model"],
+        arguments: &[CommandArgument {
+            name: "model",
+            kind: ArgumentKind::Identifier,
+        }],
         operator: true,
+        audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
         name: "skill",
-        arguments: &["skill", "input"],
+        arguments: &[
+            CommandArgument {
+                name: "skill",
+                kind: ArgumentKind::Identifier,
+            },
+            CommandArgument {
+                name: "input",
+                kind: ArgumentKind::Text,
+            },
+        ],
         operator: false,
+        audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
         name: "set-home",
         arguments: &[],
         operator: true,
+        audience: InvocationAudience::Requester,
     },
     CommandDescriptor {
         name: "fetch-result",
-        arguments: &["action"],
+        arguments: &[CommandArgument {
+            name: "action",
+            kind: ArgumentKind::Identifier,
+        }],
         operator: false,
+        audience: InvocationAudience::Requester,
     },
 ];
 
@@ -108,6 +149,7 @@ pub enum InvocationOutcome {
     ResultReady { delivery: String },
     AlreadyClaimed,
     Expired,
+    Stale,
     Forbidden,
     Unsupported,
 }
@@ -138,23 +180,63 @@ impl Ingress {
             }
             let operator = self.authorize_operator(&state.policy, &event.room, &event.sender)?;
             let turn = state.policy.turn_policy(&event.room);
+            let individual = self
+                .authorized_identity(&state.policy, &event.room, &event.sender)?
+                .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
+            let tools = state
+                .policy
+                .room_policy(&event.room)
+                .is_some_and(|policy| policy.tools);
             Ok(COMMANDS
                 .iter()
                 .copied()
-                .filter(|item| (!item.operator || operator)
-                    && (item.name != "skill" || turn.skills.as_ref().is_some_and(|skills| !skills.is_empty()))
-                    && (item.name != "fetch-result" || self.capabilities().interactive_prompts))
+                .filter(|item| {
+                    (individual || item.name == "status")
+                        && (!item.operator || operator)
+                        && (item.name != "skill"
+                            || tools
+                                && turn
+                                    .skills
+                                    .as_ref()
+                                    .is_some_and(|skills| !skills.is_empty()))
+                        && (item.name != "fetch-result" || self.capabilities().interactive_prompts)
+                })
                 .collect())
         })
     }
 
-    /// Read the durable invocation receipt for the original actor and room.
+    /// Read the durable command or control receipt for the original actor and room.
     pub async fn invocation_outcome(
         &self,
         event_id: String,
         room: Room,
         sender: Sender,
     ) -> Result<Option<InvocationOutcome>, GatewayError> {
+        self.read_invocation(event_id, room, sender, None).await
+    }
+
+    /// Read an outcome for an authenticated provider callback before its deadline.
+    pub async fn callback_outcome(
+        &self,
+        event_id: String,
+        room: Room,
+        sender: Sender,
+        expires_ms: i64,
+    ) -> Result<Option<InvocationOutcome>, GatewayError> {
+        self.read_invocation(event_id, room, sender, Some(expires_ms))
+            .await
+    }
+
+    async fn read_invocation(
+        &self,
+        event_id: String,
+        room: Room,
+        sender: Sender,
+        expires_ms: Option<i64>,
+    ) -> Result<Option<InvocationOutcome>, GatewayError> {
+        if !valid_id(&event_id) {
+            return Err(GatewayError::Invalid);
+        }
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |state| {
@@ -170,6 +252,9 @@ impl Ingress {
                     return Err(GatewayError::Forbidden);
                 };
                 scope.normalize_event(&mut event)?;
+                if expires_ms.is_some_and(|end| end <= super::runtime::now()) {
+                    return Ok(Some(InvocationOutcome::Expired));
+                }
                 db(scope.store.invocation(&route, &event.id, &event.sender.id))
             })
         })
@@ -314,6 +399,27 @@ enum Operation<'a> {
     Fetch(&'a str),
 }
 
+pub(super) fn record_invocation(
+    tx: &rusqlite::Connection,
+    route: &Route,
+    event: &str,
+    actor: &str,
+    outcome: InvocationOutcome,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO messaging_native_invocations(connection,event,route,actor,outcome)
+         VALUES (?1,?2,?3,?4,?5)",
+        params![
+            route.connection,
+            event,
+            route.id,
+            actor,
+            serde_json::to_string(&outcome)?
+        ],
+    )?;
+    Ok(())
+}
+
 impl Store {
     pub(super) fn route_model(&self, route: &str) -> Result<Option<String>> {
         self.read(|db| {
@@ -385,10 +491,7 @@ impl Store {
                 }
                 Operation::Fetch(action) => claim_result(tx, route, event, action)?,
             };
-            tx.execute(
-                "INSERT INTO messaging_native_invocations(connection,event,route,actor,outcome) VALUES (?1,?2,?3,?4,?5)",
-                params![route.connection,event.id,route.id,event.sender.id,serde_json::to_string(&outcome)?],
-            )?;
+            record_invocation(tx, route, &event.id, &event.sender.id, outcome)?;
             store::set_input(tx, route, &event.id, "done", Some("command_complete"))
         })
     }

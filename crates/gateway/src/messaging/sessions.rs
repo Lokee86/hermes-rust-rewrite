@@ -545,7 +545,7 @@ async fn apply_control(
                 );
             }
             if action.expires <= chrono::Utc::now().timestamp_millis() {
-                return finish_control(scope, work, "stale");
+                return finish_control(scope, work, "expired");
             }
             if !super::approvals::permits(response, state.policy.turn_policy(&work.event.room).approval_reuse) {
                 return finish_control(scope, work, "forbidden");
@@ -605,9 +605,16 @@ fn outcome(result: crate::RpcResult) -> Result<&'static str, GatewayError> {
 }
 
 fn finish_control(scope: &Ingress, work: &PendingInput, result: &str) -> Result<(), GatewayError> {
-    db(scope
-        .store
-        .mark(&work.route, &work.event.id, "done", Some(result)))
+    let outcome = match result {
+        "applied" => super::InvocationOutcome::Applied,
+        "expired" => super::InvocationOutcome::Expired,
+        "forbidden" => super::InvocationOutcome::Forbidden,
+        _ => super::InvocationOutcome::Stale,
+    };
+    db(scope.store.write(|tx| {
+        super::commands::record_invocation(tx, &work.route, &work.event.id, &work.event.sender.id, outcome)?;
+        store::set_input(tx, &work.route, &work.event.id, "done", Some(result))
+    }))
 }
 
 fn capture(
