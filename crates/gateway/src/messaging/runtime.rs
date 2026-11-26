@@ -33,8 +33,12 @@ pub(crate) fn valid_id(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
 }
 
+fn transport_scope(installation: Option<&VerifiedInstallation>) -> Result<String> {
+    installation.map_or_else(|| Ok(String::new()), |proof| store::key("transport-scope", proof))
+}
+
 pub(super) fn valid_input_id(value: &str) -> bool {
-    valid_id(value) && !super::profile::resource_event_id(value)
+    valid_id(value) && !super::profile::resource_event_id(value) && !super::observations::is_observation(value)
 }
 
 pub(super) fn valid_advance(advance: Option<&Advance>) -> bool {
@@ -166,6 +170,25 @@ impl Ingress {
         self.slot.changed.notify_one();
     }
 
+    pub(super) fn transport_scope(&self) -> Result<String, GatewayError> {
+        db(transport_scope(self.installation()))
+    }
+
+    pub(super) fn scoped_transport_key(&self, kind: &str, value: &str) -> Result<String, GatewayError> {
+        let scope = self.transport_scope()?;
+        if scope.is_empty() {
+            return Ok(value.to_owned());
+        }
+        db(store::key(kind, &(scope, value)))
+    }
+
+    pub(super) fn scoped_advance(&self, advance: Option<Advance>) -> Result<Option<Advance>, GatewayError> {
+        advance.map(|mut advance| {
+            advance.stream = self.scoped_transport_key("checkpoint-stream", &advance.stream)?;
+            Ok(advance)
+        }).transpose()
+    }
+
     pub async fn checkpoint(&self, stream: String) -> Result<Option<String>, GatewayError> {
         if !valid_id(&stream) {
             return Err(GatewayError::Invalid);
@@ -173,6 +196,7 @@ impl Ingress {
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |_| {
+                let stream = scope.scoped_transport_key("checkpoint-stream", &stream)?;
                 db(scope.store.checkpoint(&scope.connection, &stream))
             })
         })
@@ -199,6 +223,7 @@ impl Ingress {
                     scope.normalize_event(&mut event)?;
                     candidates.push(Candidate { event, decision });
                 }
+                let advance = scope.scoped_advance(advance)?;
                 db(scope.store.intake(
                     &scope.connection,
                     state.revision,
@@ -1035,6 +1060,8 @@ async fn supervise(
                     Ok(Some(_lease)) => {
                         let Ok(gap) = store
                             .recover_sends(&identity)
+                            .and_then(|()| transport_scope(installation.as_ref()))
+                            .and_then(|scope| store.retire_foreign_repairs(&identity, &scope))
                             .and_then(|()| store.gap(&identity))
                         else {
                             lock(&slot.state).health = Health::Backoff;

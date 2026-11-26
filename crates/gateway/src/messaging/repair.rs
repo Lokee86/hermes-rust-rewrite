@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 pub(super) const TABLES: &str = "
 CREATE TABLE IF NOT EXISTS messaging_repairs (
     connection TEXT NOT NULL, id TEXT NOT NULL, stream TEXT NOT NULL, room TEXT NOT NULL,
-    window TEXT NOT NULL, page TEXT, staged INTEGER NOT NULL DEFAULT 0, disposition TEXT,
+    window TEXT NOT NULL, transport_scope TEXT NOT NULL, page TEXT,
+    staged INTEGER NOT NULL DEFAULT 0, disposition TEXT,
     PRIMARY KEY(connection,id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS messaging_active_repairs ON messaging_repairs(connection,room)
@@ -90,7 +91,15 @@ impl Ingress {
                 {
                     return Err(GatewayError::Forbidden);
                 }
-                db(scope.store.begin_repair(&scope.connection, window))?
+                let id = scope.scoped_transport_key("repair-window", &window.id)?;
+                let stream = scope.scoped_transport_key("checkpoint-stream", &window.stream)?;
+                db(scope.store.begin_repair(
+                    &scope.connection,
+                    &id,
+                    &stream,
+                    &scope.transport_scope()?,
+                    window,
+                ))?
             })
         })
         .await
@@ -121,8 +130,9 @@ impl Ingress {
         let scope = self.clone();
         blocking(move || {
             scope.checked(true, |state| {
-                let progress = db(scope.store.repair(&scope.connection, &window))?
-                    .ok_or(GatewayError::Invalid)?;
+                let id = scope.scoped_transport_key("repair-window", &window)?;
+                let progress =
+                    db(scope.store.repair(&scope.connection, &id))?.ok_or(GatewayError::Invalid)?;
                 if state.policy.room_policy(&progress.window.room).is_none()
                     || page
                         .items
@@ -133,7 +143,7 @@ impl Ingress {
                 }
                 db(scope
                     .store
-                    .stage_repair_page(&scope.connection, progress, page))?
+                    .stage_repair_page(&scope.connection, &id, progress, page))?
             })
         })
         .await
@@ -152,6 +162,7 @@ impl Ingress {
         let scope = self.clone();
         let result = blocking(move || {
             scope.checked(true, |state| {
+                let id = scope.scoped_transport_key("repair-window", &id)?;
                 if let Some(result) = db(scope.store.repair_result(&scope.connection, &id))? {
                     if result.gap != advance.is_none()
                         || advance
@@ -178,6 +189,7 @@ impl Ingress {
                     scope.normalize_event(&mut event)?;
                     candidates.push(Candidate { event, decision });
                 }
+                let advance = scope.scoped_advance(advance)?;
                 db(scope.store.finish_repair(
                     &scope.connection,
                     state.revision,
@@ -222,6 +234,28 @@ pub(super) fn blocks_intake(
 }
 
 impl Store {
+    pub(super) fn retire_foreign_repairs(&self, connection: &str, scope: &str) -> Result<()> {
+        self.write(|tx| {
+            let gap = RepairResult {
+                receipts: Vec::new(),
+                checkpoint: None,
+                gap: true,
+            };
+            let retired = tx.execute(
+                "UPDATE messaging_repairs SET disposition=?3
+                 WHERE connection=?1 AND transport_scope<>?2 AND disposition IS NULL",
+                params![connection, scope, serde_json::to_string(&gap)?],
+            )?;
+            if retired > 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO messaging_gaps(connection) VALUES (?1)",
+                    [connection],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     fn repair(&self, connection: &str, id: &str) -> Result<Option<RepairProgress>> {
         self.read(|db| Ok(db.query_row(
             "SELECT window,page,staged FROM messaging_repairs WHERE connection = ?1 AND id = ?2 AND disposition IS NULL",
@@ -242,21 +276,25 @@ impl Store {
     fn begin_repair(
         &self,
         connection: &str,
+        id: &str,
+        stream: &str,
+        scope: &str,
         window: RepairWindow,
     ) -> Result<Result<RepairProgress, GatewayError>> {
         self.write(|tx| {
             if let Some(old) = tx.query_row(
                 "SELECT window,page,staged FROM messaging_repairs WHERE connection = ?1 AND id = ?2",
-                params![connection,window.id],progress,
+                params![connection,id],progress,
             ).optional()? {
                 return Ok(if old.window == window { Ok(old) } else { Err(GatewayError::Conflict) });
             }
-            if store::read_checkpoint(tx, connection, &window.stream)?.as_deref() != Some(window.last_committed.as_str()) {
+            if store::read_checkpoint(tx, connection, stream)?.as_deref() != Some(window.last_committed.as_str()) {
                 return Ok(Err(GatewayError::CheckpointChanged));
             }
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO messaging_repairs(connection,id,stream,room,window) VALUES (?1,?2,?3,?4,?5)",
-                params![connection,window.id,window.stream,serde_json::to_string(&window.room)?,serde_json::to_string(&window)?],
+                "INSERT OR IGNORE INTO messaging_repairs(connection,id,stream,room,window,transport_scope)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![connection,id,stream,serde_json::to_string(&window.room)?,serde_json::to_string(&window)?,scope],
             )?;
             Ok(if inserted == 1 { Ok(RepairProgress {window,last_page:None,staged:0}) }
                 else { Err(GatewayError::Conflict) })
@@ -266,6 +304,7 @@ impl Store {
     fn stage_repair_page(
         &self,
         connection: &str,
+        id: &str,
         mut state: RepairProgress,
         page: RepairPage,
     ) -> Result<Result<RepairProgress, GatewayError>> {
@@ -282,7 +321,6 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         let fingerprint = store::key("repair-page", &(&page.previous, identities))?;
         self.write(|tx| {
-            let id = &state.window.id;
             if let Some(old) = tx.query_row(
                 "SELECT fingerprint FROM messaging_repair_pages WHERE connection = ?1 AND repair = ?2 AND page = ?3",
                 params![connection,id,page.id], |row| row.get::<_,String>(0),

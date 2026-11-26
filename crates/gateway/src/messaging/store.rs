@@ -130,6 +130,8 @@ pub(super) struct DeliveryStatus {
 #[derive(Serialize)]
 pub(super) struct InputStatus {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<&'static str>,
     pub connection: String,
     pub route: Option<String>,
     pub session: Option<String>,
@@ -210,6 +212,8 @@ impl Store {
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
         connection.execute_batch(super::receiver::TABLES)?;
+        connection.execute_batch(super::timed::TABLES)?;
+        connection.execute_batch(super::input_aliases::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
@@ -793,8 +797,10 @@ impl Store {
         )?;
         Ok(query
             .query_map([], |row| {
+                let id: String = row.get(0)?;
                 Ok(InputStatus {
-                    id: row.get(0)?,
+                    provenance: super::observations::is_observation(&id).then_some("connection_observation"),
+                    id,
                     connection: row.get(1)?,
                     route: row.get(2)?,
                     session: row.get(3)?,
@@ -879,7 +885,10 @@ pub(super) fn append(
     candidate: Candidate,
     preparing: bool,
 ) -> Result<IntakeReceipt> {
-    let Candidate { event, decision } = candidate;
+    let Candidate { mut event, decision } = candidate;
+    if let Some(id) = super::input_aliases::event_target(tx, connection, &event.id)? {
+        event.id = id;
+    }
     let identity = fingerprint(&event)?;
     let existing = tx.query_row(
         "SELECT fingerprint,route,disposition FROM messaging_ingress WHERE connection = ?1 AND event = ?2",

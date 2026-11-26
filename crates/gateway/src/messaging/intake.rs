@@ -107,6 +107,8 @@ impl Ingress {
         let result = blocking(move || {
             scope.checked(true, |state| {
                 let Handoff { id, items, advance } = handoff;
+                let id = scope.scoped_transport_key("transport-handoff", &id)?;
+                let advance = scope.scoped_advance(advance)?;
                 let mut candidates = Vec::with_capacity(items.len());
                 for mut item in items {
                     let decision = scope.route_candidate(

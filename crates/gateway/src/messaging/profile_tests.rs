@@ -594,6 +594,55 @@ async fn verified_aliases_route_together_and_membership_changes_fence_access() {
 }
 
 #[tokio::test]
+async fn connection_observations_use_weak_provenance_without_merging_identical_text() {
+    let temp = TempDir::new().unwrap();
+    let (factory, queue) = fixture("weak-provenance", "tenant");
+    let mut policy = owner_policy();
+    policy.users.insert("socket-principal".into());
+    policy.operators.insert("socket-principal".into());
+    let gateway = open(temp.path(), &[factory.clone()], &policy).await;
+    let ingress = ready(&queue).await;
+    let topic = room("topic");
+    ingress.record_actor(ActorEvidence {
+        kind: ActorKind::Connection,
+        ..person("socket-principal", topic.clone())
+    }).await.unwrap();
+    ingress.record_actor(person("canonical", topic.clone())).await.unwrap();
+    let observe = |ordinal, actor: &str| ConnectionObservation {
+        ordinal, room: topic.clone(), principal: principal(actor),
+        mentioned: true, message: Message::text("same text"),
+    };
+    assert_eq!(
+        ingress.submit_observation(observe(0, "canonical")).await,
+        Err(GatewayError::Forbidden)
+    );
+    let first = ingress.submit_observation(observe(1, "socket-principal")).await.unwrap();
+    let second = ingress.submit_observation(observe(2, "socket-principal")).await.unwrap();
+    assert_eq!(first.disposition, Disposition::Accepted);
+    assert_eq!(second.disposition, Disposition::Accepted);
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.route, second.route);
+    assert!(ingress.submit_observation(observe(1, "socket-principal")).await.unwrap().repeated);
+    assert_eq!(
+        ingress.submit(vec![message(&first.id, principal("canonical"), topic.clone())], None).await,
+        Err(GatewayError::Invalid)
+    );
+    assert!(!ingress.authorize_operator(&policy, &topic, &principal("socket-principal")).unwrap());
+    gateway.shutdown().await.unwrap();
+
+    let gateway = open(temp.path(), &[factory], &policy).await;
+    let ingress = ready(&queue).await;
+    let next = ingress.submit_observation(observe(1, "socket-principal")).await.unwrap();
+    assert!(!next.repeated);
+    assert_ne!(next.id, first.id);
+    let state = gateway.messaging_status().await.unwrap();
+    let inputs = state["input"].as_array().unwrap();
+    assert_eq!(inputs.len(), 3);
+    assert!(inputs.iter().all(|row| row["provenance"] == "connection_observation"));
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn scoped_pairing_and_shared_principals_do_not_grant_control() {
     let temp = TempDir::new().unwrap();
     let (factory, queue) = fixture("pairing", "tenant");
@@ -758,6 +807,14 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
         Err(GatewayError::Forbidden)
     ));
     use_.actor = address.actor.clone();
+    let source = message("device-message", principal("canonical"), address.room.clone().unwrap());
+    let cursor = Advance { stream: "history".into(), previous: None, checkpoint: "token".into() };
+    assert_eq!(ingress.submit(vec![source.clone()], Some(cursor.clone())).await.unwrap().receipts[0].disposition,
+        Disposition::Accepted);
+    ingress.begin_repair(RepairWindow {
+        id: "device-window".into(), stream: cursor.stream.clone(), room: source.room.clone(),
+        last_committed: cursor.checkpoint.clone(), expires_ms: super::profile::time_ms() + 60_000, limit: 10,
+    }).await.unwrap();
     gateway.shutdown().await.unwrap();
 
     let gateway = open(temp.path(), &[factory.clone()], &policy).await;
@@ -770,6 +827,8 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
             .credential(),
         Some("actor-credential")
     );
+    assert_eq!(ingress.checkpoint(cursor.stream.clone()).await.unwrap().as_deref(), Some("token"));
+    assert_eq!(ingress.pending_repairs().await.unwrap().len(), 1);
     gateway.shutdown().await.unwrap();
 
     factory.proof.device = Some("device-two".into());
@@ -780,6 +839,9 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
         Err(GatewayError::Forbidden)
     ));
     let room = address.room.as_ref().unwrap();
+    assert!(ingress.checkpoint(cursor.stream.clone()).await.unwrap().is_none());
+    assert!(ingress.pending_repairs().await.unwrap().is_empty());
+    assert_eq!(gateway.messaging_status().await.unwrap()["connections"][0]["gap"], true);
     assert!(
         !ingress
             .authorize_sender(&policy, room, &principal("canonical"))
@@ -794,6 +856,7 @@ async fn delegated_authority_pins_actor_resource_origin_and_device_across_restar
             .authorize_sender(&policy, room, &principal("canonical"))
             .unwrap()
     );
+    assert!(ingress.submit(vec![source], Some(cursor)).await.unwrap().receipts[0].repeated);
     address.revision += 1;
     ingress
         .record_transport_address(address.clone(), Some(secret))

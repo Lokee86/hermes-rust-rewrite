@@ -1040,6 +1040,7 @@ impl Ingress {
                     provider_event: event.id.clone(),
                 };
                 event.id = db(key(RESOURCE_EVENT, &evidence))?;
+                let advance = scope.scoped_advance(advance)?;
                 db(scope.store.intake_resource(
                     &scope.connection,
                     state.revision,

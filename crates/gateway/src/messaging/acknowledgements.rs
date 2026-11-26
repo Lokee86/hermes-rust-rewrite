@@ -121,6 +121,7 @@ impl LeasedAcknowledgement {
         let scope = self.ingress.clone();
         let event = self.reservation.event.clone();
         let id = self.reservation.id.clone();
+        let receipt_event = self.receipt.id.clone();
         let conflict = self.receipt.disposition == Disposition::Conflict;
         let usable = blocking(move || {
             scope.checked(true, |state| {
@@ -135,7 +136,7 @@ impl LeasedAcknowledgement {
                 }
                 let receipt = db(scope
                     .store
-                    .read(|tx| store::intake_receipt(tx, &scope.connection, &event)))?;
+                    .read(|tx| store::intake_receipt(tx, &scope.connection, &receipt_event)))?;
                 let Some(receipt) = receipt else {
                     return Ok(false);
                 };
@@ -143,7 +144,7 @@ impl LeasedAcknowledgement {
                 match operation {
                     AcknowledgementOperation::Acknowledge => Ok(!pending),
                     AcknowledgementOperation::Extend => {
-                        Ok(pending && scope.can_prepare(state, &event)?)
+                        Ok(pending && scope.can_prepare(state, &receipt_event)?)
                     }
                 }
             })
@@ -160,6 +161,7 @@ impl LeasedAcknowledgement {
         let scope = self.ingress.clone();
         let event = self.reservation.event.clone();
         let id = self.reservation.id.clone();
+        let receipt_event = self.receipt.id.clone();
         blocking(move || {
             scope.checked(true, |state| {
                 let book = scope.acknowledgements();
@@ -170,7 +172,7 @@ impl LeasedAcknowledgement {
                 if entry.id != id
                     || entry.expires <= now()
                     || expires_ms <= entry.expires
-                    || !scope.can_prepare(state, &event)?
+                    || !scope.can_prepare(state, &receipt_event)?
                 {
                     return Ok(false);
                 }

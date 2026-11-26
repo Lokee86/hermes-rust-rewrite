@@ -395,6 +395,154 @@ async fn repair_merges_live_and_history_in_source_order_after_restart() {
 }
 
 #[tokio::test]
+async fn verified_input_aliases_share_one_receipt_and_cannot_merge_unrelated_inputs() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Push, "logical-inputs", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    let observe = |id| {
+        let mut event = dm(id, "chat", "same text");
+        event.reply_anchor = Some("verified-anchor".into());
+        event
+    };
+    let logical = InputAlias {
+        namespace: "message".into(),
+        id: "message-one".into(),
+    };
+    let first = ingress
+        .submit_aliased(observe("received"), vec![logical.clone()], None)
+        .await
+        .unwrap();
+    let first = &first.receipts[0];
+    assert_eq!(first.disposition, Disposition::Accepted);
+    let first_send = driver.sent().await;
+    status(&gateway, |state| {
+        delivery(state, &first_send.attempt.delivery_id, 0)
+            .is_some_and(|row| row["part_state"] == "sent")
+    })
+    .await;
+    let repeat = ingress
+        .submit_aliased(observe("published"), vec![logical.clone()], None)
+        .await
+        .unwrap();
+    assert!(repeat.receipts[0].repeated);
+    assert_eq!(repeat.receipts[0].id, first.id);
+    gateway.shutdown().await.unwrap();
+
+    let driver = Driver::new(Transport::Push, "logical-inputs", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    assert!(driver.push(observe("published")).await.repeated);
+    assert_eq!(
+        driver.push(observe("separate")).await.disposition,
+        Disposition::Accepted
+    );
+    let other = driver.sent().await;
+    assert_eq!(reply(&other.attempt), "answer same text");
+    let conflict = || ingress.submit_aliased(observe("separate"), vec![logical.clone()], None);
+    let first_conflict = conflict().await.unwrap();
+    assert_eq!(
+        first_conflict.receipts[0].disposition,
+        Disposition::Conflict
+    );
+    assert!(!first_conflict.receipts[0].repeated);
+    assert!(conflict().await.unwrap().receipts[0].repeated);
+    assert_eq!(model.requests().len(), 2);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn timed_poll_reopens_an_inclusive_boundary_and_keeps_saturation_visible() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let driver = Driver::new(Transport::Poll, "time-poll", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    let item = |timestamp_ms, id: &str| TimedEvent {
+        timestamp_ms,
+        event: dm(id, "room", id),
+    };
+    let checkpoint = ingress
+        .open_time_checkpoint("timed-inbox".into(), 100, 15)
+        .await
+        .unwrap();
+    let first = ingress
+        .submit_timed(
+            "timed-inbox".into(),
+            checkpoint,
+            vec![item(110, "first"), item(99, "historical")],
+            TimeCoverage::Complete { through_ms: 110 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.receipts[0].disposition, Disposition::Historical);
+    assert_eq!(first.checkpoint.boundary_ids, ["first".to_owned()].into());
+    assert_eq!(first.checkpoint.discovery_baseline_ms, 100);
+    let send = driver.sent().await;
+    assert_eq!(reply(&send.attempt), "answer first");
+    status(&gateway, |state| {
+        delivery(state, &send.attempt.delivery_id, 0).is_some_and(|row| row["part_state"] == "sent")
+    })
+    .await;
+    gateway.shutdown().await.unwrap();
+
+    let driver = Driver::new(Transport::Poll, "time-poll", false);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy())])
+        .await;
+    let ingress = driver.ready().await;
+    let old = ingress
+        .open_time_checkpoint("timed-inbox".into(), 100, 15)
+        .await
+        .unwrap();
+    assert_eq!(old, first.checkpoint);
+    let live = item(110, "live");
+    let duplicate = item(110, "first");
+    driver.push(live.event.clone()).await;
+    assert_eq!(reply(&driver.sent().await.attempt), "answer live");
+    let saturated = ingress
+        .submit_timed(
+            "timed-inbox".into(),
+            old.clone(),
+            vec![live.clone(), duplicate.clone()],
+            TimeCoverage::Saturated,
+        )
+        .await
+        .unwrap();
+    assert!(saturated.gap);
+    assert_eq!(saturated.checkpoint, old);
+    assert!(saturated.receipts.iter().all(|receipt| receipt.repeated));
+    let merged = ingress
+        .submit_timed(
+            "timed-inbox".into(),
+            old,
+            vec![live, duplicate, item(110, "another")],
+            TimeCoverage::Complete { through_ms: 110 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.checkpoint.boundary_ids,
+        ["another".to_owned(), "first".to_owned(), "live".to_owned()].into()
+    );
+    assert_eq!(merged.receipts.iter().filter(|r| !r.repeated).count(), 1);
+    assert_eq!(reply(&driver.sent().await.attempt), "answer another");
+    assert_eq!(model.requests().len(), 3);
+    assert_eq!(
+        gateway.messaging_status().await.unwrap()["connections"][0]["gap"],
+        true
+    );
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn shared_conversation_keeps_destinations_and_command_outcomes_scoped() {
     let root = TempDir::new().unwrap();
     let model = Model::new().await;

@@ -315,6 +315,7 @@ pub enum Disposition {
     Deferred,
     Expired,
     Coalesced,
+    Historical,
     Forbidden,
     Unsupported,
     Invalid,
