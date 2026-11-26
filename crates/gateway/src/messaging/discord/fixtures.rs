@@ -1,0 +1,563 @@
+use super::{DiscordFactory, DiscordSettings};
+use crate::{
+    RunningGateway,
+    messaging::{AdapterConfig, EnrollmentCredential, conformance::Model, runtime::now},
+};
+use axum::{
+    Json, Router,
+    body::to_bytes,
+    extract::{
+        Request, State, WebSocketUpgrade,
+        ws::{CloseFrame, Message, WebSocket},
+    },
+    http::{Method, StatusCode},
+    response::{IntoResponse, Response},
+};
+use reqwest::Url;
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc,
+    time::{Instant, sleep, timeout},
+};
+
+const LIMIT: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+struct Server {
+    gateway: String,
+    incoming: mpsc::Sender<Wire>,
+    writes: mpsc::Sender<Write>,
+    counter: Arc<AtomicU64>,
+    messages: Arc<Mutex<BTreeMap<(String, String), Value>>>,
+}
+
+struct Wire {
+    to_bot: mpsc::Sender<WireEvent>,
+    from_bot: mpsc::Receiver<Value>,
+}
+
+enum WireEvent {
+    Json(Value),
+    NoHeartbeatAcks,
+    Close(u16),
+}
+
+impl Wire {
+    async fn data(&self, value: Value) {
+        self.to_bot.send(WireEvent::Json(value)).await.unwrap();
+    }
+
+    async fn dispatch(&self, sequence: u64, kind: &str, data: Value) {
+        self.data(json!({"op":0,"t":kind,"s":sequence,"d":data}))
+            .await;
+    }
+
+    async fn authentication(&mut self, code: u64) -> Value {
+        timeout(LIMIT, async {
+            while let Some(event) = self.from_bot.recv().await {
+                if event["op"] == code {
+                    return event;
+                }
+            }
+            panic!("Discord did not authenticate");
+        })
+        .await
+        .unwrap()
+    }
+}
+
+enum Write {
+    Message {
+        channel: String,
+        payload: Value,
+        id: String,
+    },
+    Callback(Value),
+    Followup(Value),
+}
+
+struct Fixtures {
+    transport: Server,
+    api: Url,
+    wires: mpsc::Receiver<Wire>,
+    writes: mpsc::Receiver<Write>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Fixtures {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Fixtures {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (incoming, wires) = mpsc::channel(16);
+        let (writes_tx, writes) = mpsc::channel(32);
+        let transport = Server {
+            gateway: format!("ws://{address}/"),
+            incoming,
+            writes: writes_tx,
+            counter: Arc::new(AtomicU64::new(500)),
+            messages: Arc::default(),
+        };
+        let endpoint = transport.clone();
+        let router = Router::new()
+            .route("/", axum::routing::get(upgrade))
+            .fallback(rest)
+            .with_state(endpoint);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self {
+            transport,
+            api: Url::parse(&format!("http://{address}/api/v10/")).unwrap(),
+            wires,
+            writes,
+            task,
+        }
+    }
+
+    async fn wire(&mut self) -> Wire {
+        timeout(LIMIT, self.wires.recv())
+            .await
+            .expect("Discord socket connection")
+            .unwrap()
+    }
+
+    async fn write(&mut self) -> Write {
+        timeout(LIMIT, self.writes.recv())
+            .await
+            .expect("Discord REST write")
+            .unwrap()
+    }
+
+    async fn ready(&self, wire: &Wire, id: &str) {
+        wire.dispatch(
+            1,
+            "READY",
+            json!({
+                "user":{"id":"9","bot":true},"application":{"id":"90"},
+                "session_id":id,"resume_gateway_url":self.transport.gateway,
+            }),
+        )
+        .await;
+    }
+
+    fn configuration(&self, root: &Path) -> AdapterConfig {
+        let settings: DiscordSettings = serde_json::from_value(json!({
+            "grants":{"users":["7"]},
+            "operators":["7"],
+            "direct":{"rules":{"turn":{"tools":true,"approval":"manual"}}},
+            "guilds":{"11":{"channels":{"21":{"threads":{"22":{}}}}}},
+            "commands":{"enabled":true,"sync":false},
+        }))
+        .unwrap();
+        AdapterConfig {
+            name: "fixture-discord".into(),
+            policy: settings.host_policy(),
+            factory: Arc::new(
+                DiscordFactory::for_fixture(root.to_owned(), settings, self.api.clone()).unwrap(),
+            ),
+        }
+    }
+
+    async fn activate(&self, gateway: &RunningGateway) {
+        let enrollment = gateway
+            .begin_adapter_enrollment("fixture-discord", Duration::from_secs(30))
+            .await
+            .unwrap();
+        gateway
+            .complete_adapter_enrollment(
+                "fixture-discord",
+                &enrollment.id,
+                EnrollmentCredential::new("fixture-bot-secret".into()).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn upgrade(State(state): State<Server>, websocket: WebSocketUpgrade) -> Response {
+    websocket.on_upgrade(move |socket| run_wire(state, socket))
+}
+
+async fn run_wire(state: Server, mut socket: WebSocket) {
+    let (to_bot, mut outbound) = mpsc::channel(16);
+    let (inbound, from_bot) = mpsc::channel(16);
+    if state
+        .incoming
+        .send(Wire { to_bot, from_bot })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let hello = json!({"op":10,"d":{"heartbeat_interval":125}});
+    if socket
+        .send(Message::Text(hello.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut ack = true;
+    loop {
+        tokio::select! {
+            operation = outbound.recv() => match operation {
+                Some(WireEvent::Json(value)) => {
+                    if socket.send(Message::Text(value.to_string().into())).await.is_err() { return }
+                }
+                Some(WireEvent::NoHeartbeatAcks) => ack = false,
+                Some(WireEvent::Close(code)) => {
+                    let _ = socket.send(Message::Close(Some(CloseFrame { code, reason: "fixture".into() }))).await;
+                    return;
+                }
+                None => return,
+            },
+            received = socket.recv() => match received {
+                Some(Ok(Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event["op"] == 1 {
+                        if ack && socket.send(Message::Text(r#"{"op":11,"d":null}"#.into())).await.is_err() { return }
+                    } else if inbound.send(event).await.is_err() { return }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                _ => {},
+            }
+        }
+    }
+}
+
+async fn rest(State(state): State<Server>, request: Request) -> Response {
+    let path = request
+        .uri()
+        .path()
+        .strip_prefix("/api/v10/")
+        .unwrap_or("")
+        .to_owned();
+    let method = request.method().clone();
+    let auth = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if path.starts_with("interactions/") || path.starts_with("webhooks/") {
+        assert!(
+            auth.is_none(),
+            "Discord bot token must stay out of callback requests"
+        );
+        let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
+        let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+        let sent = if path.starts_with("interactions/") {
+            Write::Callback(payload)
+        } else {
+            Write::Followup(payload)
+        };
+        let _ = state.writes.send(sent).await;
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if auth != Some("Bot fixture-bot-secret") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let segments = path.split('/').collect::<Vec<_>>();
+    let document = match (method, segments.as_slice()) {
+        (Method::GET, ["users", "@me"]) => json!({"id":"9","bot":true}),
+        (Method::GET, ["applications", "@me"]) => {
+            json!({"id":"90","bot":{"id":"9"},"flags":786432})
+        }
+        (Method::GET, ["gateway", "bot"]) => json!({
+            "url":state.gateway,"shards":1,
+            "session_start_limit":{"total":1000,"remaining":1000,"reset_after":1000,"max_concurrency":1}
+        }),
+        (Method::GET, ["channels", "20"]) => json!({"id":"20","type":1}),
+        (Method::GET, ["channels", "21"]) => json!({"id":"21","type":0,"guild_id":"11"}),
+        (Method::GET, ["channels", "22"]) => {
+            json!({"id":"22","type":11,"guild_id":"11","parent_id":"21"})
+        }
+        (Method::GET, ["channels", _, "messages"]) => json!([]),
+        (Method::GET, ["channels", channel, "messages", id]) => {
+            let message = crate::lock(&state.messages)
+                .get(&(channel.to_string(), id.to_string()))
+                .cloned();
+            let Some(message) = message else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            message
+        }
+        (Method::POST, ["channels", channel, "messages"]) => {
+            let bytes = to_bytes(request.into_body(), 256 * 1024).await.unwrap();
+            let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+            let id = state.counter.fetch_add(1, Ordering::SeqCst).to_string();
+            let message = json!({"id":id,"channel_id":channel,"author":{"id":"9","bot":true},
+                "nonce":payload["nonce"],"content":payload["content"]});
+            crate::lock(&state.messages).insert((channel.to_string(), id.clone()), message.clone());
+            let _ = state
+                .writes
+                .send(Write::Message {
+                    channel: channel.to_string(),
+                    payload,
+                    id,
+                })
+                .await;
+            message
+        }
+        (Method::PATCH, ["channels", channel, "messages", id]) => {
+            let bytes = to_bytes(request.into_body(), 256 * 1024).await.unwrap();
+            let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
+            let message = json!({"id":id,"channel_id":channel,"author":{"id":"9","bot":true},"content":payload["content"]});
+            crate::lock(&state.messages)
+                .insert((channel.to_string(), id.to_string()), message.clone());
+            let _ = state
+                .writes
+                .send(Write::Message {
+                    channel: channel.to_string(),
+                    payload,
+                    id: id.to_string(),
+                })
+                .await;
+            message
+        }
+        (Method::DELETE, ["channels", channel, "messages", id]) => {
+            crate::lock(&state.messages).remove(&(channel.to_string(), id.to_string()));
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    Json(document).into_response()
+}
+
+fn message(id: &str, channel: &str, content: &str, mentioned: bool) -> Value {
+    let mut event = json!({"id":id,"channel_id":channel,"content":content,"author":{"id":"7"},"type":0,
+        "mentions":if mentioned { vec![json!({"id":"9","bot":true})] } else { Vec::new() }});
+    if channel != "20" {
+        event["guild_id"] = json!("11");
+        event["member"] = json!({"roles":[]});
+    }
+    event
+}
+
+async fn wait_status(gateway: &RunningGateway, condition: impl Fn(&Value) -> bool) -> Value {
+    timeout(LIMIT, async {
+        loop {
+            let status = gateway.messaging_status().await.unwrap();
+            if condition(&status) {
+                return status;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("gateway status transition")
+}
+
+async fn wait_sent(gateway: &RunningGateway, count: usize) {
+    wait_status(gateway, |state| {
+        state["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|delivery| delivery["state"] == "sent")
+            .count()
+            >= count
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn discord_identifies_resumes_deduplicates_and_routes_threads_through_the_native_gateway() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let gateway = model
+        .gateway(root.path(), vec![fixture.configuration(root.path())])
+        .await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    assert_eq!(
+        wire.authentication(2).await["d"]["token"],
+        "fixture-bot-secret"
+    );
+    assert_eq!(
+        gateway.messaging_status().await.unwrap()["connections"][0]["health"],
+        "connecting"
+    );
+    fixture.ready(&wire, "durable-session").await;
+    wire.dispatch(2, "MESSAGE_CREATE", message("100", "20", "first", false))
+        .await;
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.write().await
+    else {
+        panic!("expected direct reply")
+    };
+    assert_eq!(channel, "20");
+    assert_eq!(payload["content"], "answer first");
+    assert_eq!(payload["allowed_mentions"]["parse"], json!([]));
+    wire.dispatch(
+        3,
+        "MESSAGE_CREATE",
+        message("101", "22", "not addressed", false),
+    )
+    .await;
+    wire.dispatch(
+        4,
+        "MESSAGE_CREATE",
+        message("102", "22", "<@9> threaded", true),
+    )
+    .await;
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.write().await
+    else {
+        panic!("expected thread reply")
+    };
+    assert_eq!(channel, "22");
+    assert_eq!(payload["content"], "answer threaded");
+    wait_sent(&gateway, 2).await;
+    gateway.shutdown().await.unwrap();
+
+    let gateway = model
+        .gateway(root.path(), vec![fixture.configuration(root.path())])
+        .await;
+    let mut wire = fixture.wire().await;
+    let resume = wire.authentication(6).await;
+    assert_eq!(resume["d"]["session_id"], "durable-session");
+    assert_eq!(resume["d"]["seq"], 4);
+    wire.dispatch(5, "RESUMED", json!({})).await;
+    wire.dispatch(6, "MESSAGE_CREATE", message("100", "20", "first", false))
+        .await;
+    wire.dispatch(7, "MESSAGE_CREATE", message("103", "20", "next", false))
+        .await;
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.write().await
+    else {
+        panic!("expected second direct reply")
+    };
+    assert_eq!(channel, "20");
+    assert_eq!(payload["content"], "answer next");
+    assert_eq!(model.requests().len(), 3);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_missing_heartbeat_ack_resumes_then_invalid_session_reports_gap() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let gateway = model
+        .gateway(root.path(), vec![fixture.configuration(root.path())])
+        .await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "before-gap").await;
+    wait_status(&gateway, |state| {
+        state["connections"][0]["health"] == "ready"
+    })
+    .await;
+    wire.to_bot.send(WireEvent::NoHeartbeatAcks).await.unwrap();
+
+    let mut resumed = fixture.wire().await;
+    assert_eq!(resumed.authentication(6).await["d"]["seq"], 1);
+    resumed.data(json!({"op":9,"d":false})).await;
+    let mut fresh = fixture.wire().await;
+    fresh.authentication(2).await;
+    fixture.ready(&fresh, "after-gap").await;
+    wait_status(&gateway, |state| {
+        state["connections"][0]["health"] == "ready" && state["connections"][0]["gap"] == true
+    })
+    .await;
+    fresh.to_bot.send(WireEvent::Close(4014)).await.unwrap();
+    wait_status(&gateway, |state| {
+        state["connections"][0]["health"] == "configuration"
+    })
+    .await;
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_control() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let gateway = model
+        .gateway(root.path(), vec![fixture.configuration(root.path())])
+        .await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "approvals").await;
+    wire.dispatch(2, "MESSAGE_CREATE", message("200", "20", "approval", false))
+        .await;
+    let Write::Message { payload, id, .. } = fixture.write().await else {
+        panic!("expected an approval prompt")
+    };
+    wait_sent(&gateway, 1).await;
+    let button = payload["components"][0]["components"][0]["custom_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id_base = ((now() - 1_420_070_400_000) as u64) << 22;
+    let click = |id: u64, message: &str| {
+        json!({
+            "id":id.to_string(),"application_id":"90","token":format!("callback-{id}"),"type":3,
+            "channel_id":"20","user":{"id":"7"},"data":{"custom_id":button},
+            "message":{"id":message,"author":{"id":"9","bot":true}}
+        })
+    };
+    wire.dispatch(3, "INTERACTION_CREATE", click(id_base + 1, "888"))
+        .await;
+    let Write::Callback(rejected) = fixture.write().await else {
+        panic!("expected private refusal")
+    };
+    assert_eq!(rejected["type"], 4);
+    assert_eq!(rejected["data"]["flags"], 64);
+    let event = id_base + 2;
+    wire.dispatch(4, "INTERACTION_CREATE", click(event, &id))
+        .await;
+    let mut acknowledged = false;
+    let mut applied = false;
+    let mut replied = false;
+    while !acknowledged || !applied || !replied {
+        match fixture.write().await {
+            Write::Callback(value) => {
+                assert_eq!(value["type"], 5);
+                let status = gateway.messaging_status().await.unwrap();
+                assert!(
+                    status["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|input| input["id"] == format!("discord-interaction-{event}"))
+                );
+                acknowledged = true;
+            }
+            Write::Followup(value) => {
+                assert_eq!(value["content"], "Applied.");
+                applied = true;
+            }
+            Write::Message {
+                channel, payload, ..
+            } => {
+                assert_eq!(channel, "20");
+                assert!(payload["content"].as_str().unwrap().starts_with("answer"));
+                replied = true;
+            }
+        }
+    }
+    assert_eq!(model.requests().len(), 2);
+    gateway.shutdown().await.unwrap();
+}

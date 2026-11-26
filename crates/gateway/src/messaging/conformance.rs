@@ -274,7 +274,7 @@ struct ModelState {
     steer_release: Arc<Semaphore>,
 }
 
-struct Model {
+pub(super) struct Model {
     state: ModelState,
     url: String,
     task: JoinHandle<()>,
@@ -287,7 +287,7 @@ impl Drop for Model {
 }
 
 impl Model {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let state = ModelState {
             requests: Arc::default(),
             steer_release: Arc::new(Semaphore::new(0)),
@@ -303,7 +303,7 @@ impl Model {
         Self { state, url, task }
     }
 
-    async fn gateway(&self, root: &Path, adapters: Vec<AdapterConfig>) -> RunningGateway {
+    pub(super) async fn gateway(&self, root: &Path, adapters: Vec<AdapterConfig>) -> RunningGateway {
         let mut config = GatewayConfig::new(
             root,
             Config {
@@ -316,7 +316,7 @@ impl Model {
         Gateway::start(config).await.unwrap()
     }
 
-    fn requests(&self) -> Vec<Value> {
+    pub(super) fn requests(&self) -> Vec<Value> {
         self.state.requests.lock().unwrap().clone()
     }
 }

@@ -2,6 +2,7 @@
 mod acknowledgements;
 mod approvals;
 mod commands;
+pub mod discord;
 mod effects;
 mod input_aliases;
 mod intake;

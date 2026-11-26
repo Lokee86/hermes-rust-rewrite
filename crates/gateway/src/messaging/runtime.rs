@@ -65,6 +65,7 @@ struct Managed {
 struct Slot {
     name: String,
     descriptor: Descriptor,
+    owner: Weak<Shared>,
     state: Mutex<State>,
     acknowledgements: Arc<Mutex<Acknowledgements>>,
     changed: Notify,
@@ -168,6 +169,38 @@ impl Ingress {
 
     pub(super) fn notify(&self) {
         self.slot.changed.notify_one();
+    }
+
+    /// Resolve a native stop or correction against the currently owned turn.
+    pub(crate) async fn active_execution(&self, room: &Room, sender: &Sender) -> Result<Option<u64>, GatewayError> {
+        let session = self.checked(true, |state| {
+            if !self.authorize_operator(&state.policy, room, sender)? {
+                return Err(GatewayError::Forbidden);
+            }
+            let event = InboundEvent { id: "active-execution".into(), room: room.clone(), sender: sender.clone(),
+                reply_anchor: None, mentioned: true, body: InboundBody::Command(super::Command::Status) };
+            let Ok(route) = self.route_event(&state.policy, &event)? else { return Err(GatewayError::Forbidden) };
+            let route = db(self.store.conversation(&route))?;
+            Ok(route.session.filter(|_| !route.blocked))
+        })?;
+        let Some(id) = session else { return Ok(None) };
+        let owner = self.slot.owner.upgrade().ok_or(GatewayError::StaleConnection)?;
+        let session = owner.sessions.lock().await.get(&id).cloned();
+        self.checked(true, |_| Ok(session.and_then(|session| {
+            let view = lock(&session.view);
+            view.running.then_some(view.generation)
+        })))
+    }
+
+    pub fn report_transport_ready(&self, ready: bool) -> Result<(), GatewayError> {
+        let mut state = lock(&self.slot.state);
+        if !state.accepting || state.generation.as_deref() != Some(self.generation.as_str()) {
+            return Err(GatewayError::StaleConnection);
+        }
+        state.health = if ready { Health::Ready } else { Health::Connecting };
+        drop(state);
+        self.notify();
+        Ok(())
     }
 
     pub(super) fn transport_scope(&self) -> Result<String, GatewayError> {
@@ -545,6 +578,7 @@ impl Host {
         let slot = Arc::new(Slot {
             name: saved.name.clone(),
             descriptor,
+            owner: Arc::downgrade(owner),
             state: Mutex::new(State {
                 policy: saved.policy,
                 revision: saved.revision as i64,
@@ -1185,7 +1219,7 @@ async fn supervise(
                             state.installation = installation;
                             state.generation = Some(ingress.generation.clone());
                             state.accepting = true;
-                            state.health = Health::Ready;
+                            state.health = if adapter.initial_transport_ready() { Health::Ready } else { Health::Connecting };
                             state.gap = gap;
                         }
                         let result =
@@ -1274,6 +1308,9 @@ async fn work_loop(
             }
             _ = scope.slot.changed.notified() => {}
             _ = tick.tick() => {}
+        }
+        if lock(&scope.slot.state).health != Health::Ready {
+            continue;
         }
         let Some(shared) = owner.upgrade() else {
             break Ok(());
@@ -1424,6 +1461,9 @@ fn delivery_authorized(
     state: &State,
     pending: &PendingDelivery,
 ) -> Result<bool, GatewayError> {
+    if state.health != Health::Ready {
+        return Ok(false);
+    }
     let Some(policy) = state.policy.room_policy(&pending.intent.room) else {
         return Ok(false);
     };

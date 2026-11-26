@@ -208,6 +208,8 @@ impl Store {
         let connection = hermes_engine::db::open(root)?;
         connection.execute_batch(TABLES)?;
         connection.execute_batch(super::media::TABLES)?;
+        connection.execute_batch(super::discord::MESSAGE_TABLES)?;
+        connection.execute_batch(super::discord::RECOVERY_TABLES)?;
         connection.execute_batch(effect_store::TABLES)?;
         connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;

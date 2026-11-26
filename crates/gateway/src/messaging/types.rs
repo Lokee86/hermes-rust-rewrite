@@ -98,6 +98,11 @@ pub struct VerifiedAdapter {
 }
 
 pub trait Adapter: Send + Sync {
+    /// Some transports must verify an additional authenticated session before work can start.
+    fn initial_transport_ready(&self) -> bool {
+        true
+    }
+
     /// Installation scope verified as part of this authenticated connection.
     fn verified_installation(&self) -> Option<VerifiedInstallation> {
         None
