@@ -36,7 +36,24 @@ fn attachment_identity_excludes_signed_url_and_binds_exact_cdn_path() {
     assert_eq!(attachment_sources(&current).unwrap(), expected);
     assert!(!serde_json::to_string(&expected).unwrap().contains("https"));
     assert!(!within_inbound_limit(&expected, 3));
-    current["attachments"][0]["size"] = json!(MAX_FILE + 1);
+    let default_limit =
+        crate::messaging::discord::settings::DiscordMediaSettings::default().max_inbound_bytes;
+    current["attachments"][0]["size"] = json!(default_limit);
+    let at_limit = attachment_sources(&current).unwrap();
+    assert!(within_inbound_limit(&at_limit, default_limit));
+    assert!(within_inbound_limit(
+        &vec![at_limit[0].clone(); 4],
+        default_limit
+    ));
+    assert!(!within_inbound_limit(
+        &vec![at_limit[0].clone(); 5],
+        default_limit
+    ));
+    current["attachments"][0]["size"] = json!(default_limit + 1);
+    let over_default = attachment_sources(&current).unwrap();
+    assert!(!within_inbound_limit(&over_default, default_limit));
+    assert!(within_inbound_limit(&over_default, default_limit + 1));
+    current["attachments"][0]["size"] = json!(DISCORD_FILE_CEILING + 1);
     assert!(!within_inbound_limit(
         &attachment_sources(&current).unwrap(),
         u64::MAX
@@ -89,7 +106,8 @@ async fn only_authorized_event_opens_scoped_discord_attachment() {
             "11",
             Message::text(""),
             &expected,
-            open
+            32 * 1024 * 1024,
+            open,
         )
         .await
         .unwrap_err(),
@@ -105,6 +123,7 @@ async fn only_authorized_event_opens_scoped_discord_attachment() {
         "11",
         Message::text(""),
         &expected,
+        32 * 1024 * 1024,
         open,
     )
     .await
@@ -113,6 +132,45 @@ async fn only_authorized_event_opens_scoped_discord_attachment() {
     assert_eq!(captures.load(Ordering::SeqCst), 1);
     assert_eq!(message.attachments[0].name(), "sample.txt");
     serving.abort();
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_audio_remains_an_authorized_opaque_file() {
+    let (_root, gateway, ingress, _) = fixtures::profile().await;
+    let source = MediaSource {
+        event_id: "discord-message-audio".into(),
+        room: fixtures::room(),
+        sender: fixtures::actor("10"),
+        mentioned: true,
+    };
+    let audio = b"fLaC\0synthetic";
+    let grant = ingress
+        .authorize_discord_media(
+            source,
+            AttachmentManifest {
+                name: "fixture.flac".into(),
+                size: Some(audio.len()),
+                sha256: None,
+            },
+            MediaPurpose::VoiceNote,
+            Duration::from_secs(30),
+            DISCORD_FILE_CEILING,
+        )
+        .await
+        .unwrap();
+    let prepared = ingress
+        .prepare_discord_audio(
+            grant,
+            || async { Ok(io::Cursor::new(audio)) },
+            decode_voice_note,
+        )
+        .await
+        .unwrap();
+    let PreparedAudio::Attachment(file) = prepared else {
+        panic!("expected opaque audio")
+    };
+    assert_eq!(file.name(), "fixture.flac");
     gateway.shutdown().await.unwrap();
 }
 
@@ -142,9 +200,9 @@ fn normalizes_ogg_opus_into_scoped_profile_wav() {
         .write_packet(packet, 1, PacketWriteEndInfo::EndStream, 960)
         .unwrap();
     let original = writer.into_inner().into_inner();
-    let wav = decode_voice_note(original).unwrap();
+    let wav = decode_voice_note(&original).unwrap();
     assert_eq!(&wav[..4], b"RIFF");
     assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
     assert_eq!(wav.len(), 44 + 640);
-    assert!(decode_voice_note(b"not an Opus file".to_vec()).is_err());
+    assert!(decode_voice_note(b"not an Opus file").is_err());
 }

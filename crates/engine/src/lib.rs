@@ -1,5 +1,7 @@
 mod attachment;
 pub use attachment::Attachment;
+mod channel_attachments;
+pub use channel_attachments::{ChannelAttachment, ChannelAttachments, MAX_CHANNEL_ATTACHMENT_READ};
 pub mod herdr;
 mod history;
 pub mod db;
@@ -88,6 +90,7 @@ pub struct ChannelTurnPolicy {
     pub skills: Option<std::collections::BTreeSet<String>>,
     pub selected_skill: Option<String>,
     pub quote: Option<ChannelContextSource>,
+    pub attachments: Option<ChannelAttachments>,
 }
 
 /// Resolves a quotation immediately before each channel provider request.
@@ -299,6 +302,9 @@ impl Session {
         self.reasoning_summaries.clear();
         let allow_tools = !self.channel || controls.channel_tools;
         let channel_policy = self.channel.then_some(&controls.channel_policy);
+        let channel_attachments = channel_policy.and_then(|policy| policy.attachments.as_ref());
+        let attachment_tool = allow_tools && channel_attachments.is_some()
+            && self.settings.tool_enabled(channel_attachments::TOOL);
         let allowed_skills = channel_policy.and_then(|policy| policy.skills.as_ref());
         let selected_skill = channel_policy.and_then(|policy| policy.selected_skill.as_deref())
             .map(|name| {
@@ -346,6 +352,12 @@ impl Session {
             }
             if self.processes.is_some() { specs.extend(processes::specs()); }
         }
+        if channel_policy.is_some() {
+            specs.retain(|spec| spec["function"]["name"] != channel_attachments::TOOL);
+            if attachment_tool {
+                specs.push(channel_attachments::spec());
+            }
+        }
         let clarify = controls.clarify && self.settings.tool_enabled("clarify");
         if clarify {
             specs.push(turn_controls::clarification_spec());
@@ -370,6 +382,7 @@ impl Session {
                 || native_memory::MemoryTool::from_name(name).is_none())
         }));
         let mut pending = Vec::new();
+        let mut attachment_reads = Vec::new();
         'round: for round in 0..=self.settings.max_turns {
             self.apply_corrections(index, controls, &mut pending, events)?;
             let size = context::conversation_size(&self.history, &specs);
@@ -433,6 +446,8 @@ impl Session {
             } else {
                 python_results.clear();
             }
+            let current_entries = self.history.turns[index].entries.len();
+            let disclosures = std::mem::take(&mut attachment_reads);
             self.history.turns[index].entries.push(Entry::Assistant { text: String::new(), calls: vec![] });
             self.publish(events)?;
             let mut saved = Instant::now();
@@ -446,9 +461,15 @@ impl Session {
             let mut retried = false;
             let output = loop {
                 let mut request = messages.clone();
-                if let Some(resolve_quote) = channel_policy.and_then(|policy| policy.quote.as_ref()) {
+                let quote = channel_policy.and_then(|policy| policy.quote.as_ref());
+                if let Some(resolve_quote) = quote {
                     resolve_quote()?.append_to_request(&mut request)?;
-                    if self.settings.redact_secrets {privacy::redact_messages(&mut request);}
+                }
+                if let Some(attachments) = channel_attachments {
+                    attachments.append_to_request(&mut request, current_entries, &disclosures, attachment_tool)?;
+                }
+                if self.settings.redact_secrets && (quote.is_some() || channel_attachments.is_some()) {
+                    privacy::redact_messages(&mut request);
                 }
                 let request_size = context::estimate(&request, &advertised);
                 let mut streamed = false;
@@ -533,6 +554,25 @@ impl Session {
                     turn_controls::clarify(&call, events, self.settings.approval_timeout).await?
                 } else if !allow_tools {
                     (false, json!({"error":"Tools are disabled for this channel"}).to_string())
+                } else if call.name == channel_attachments::TOOL && channel_policy.is_some() {
+                    if let Some(attachments) = channel_attachments.filter(|_| attachment_tool) {
+                        match attachments.parse(&call) {
+                            Ok(read) if attachment_reads.is_empty() => {
+                                if self.settings.needs_approval(&call.name, false, false)
+                                    && !request_approval(call.clone(), events, self.settings.approval_timeout).await?
+                                {
+                                    denied()
+                                } else {
+                                    attachment_reads.push((self.history.turns[index].entries.len(), read));
+                                    (true, json!({"status":"Attachment opened for the active request"}).to_string())
+                                }
+                            }
+                            Ok(_) => (false, json!({"error":"Read one attachment page per tool round"}).to_string()),
+                            Err(error) => (false, json!({"error":error.to_string()}).to_string()),
+                        }
+                    } else {
+                        (false, json!({"error":"Channel attachment reads are unavailable"}).to_string())
+                    }
                 } else if call.name == "skill_view"
                     && let Some(scope) = allowed_skills
                     && !serde_json::from_str::<Value>(&call.arguments).ok()

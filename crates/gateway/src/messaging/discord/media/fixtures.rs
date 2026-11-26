@@ -83,19 +83,25 @@ impl Adapter for Fixture {
     }
 }
 
-pub(crate) async fn profile() -> (
+type ProfileFixture = (
     TempDir,
     RunningGateway,
     Ingress,
     async_channel::Receiver<i16>,
-) {
+);
+
+pub(crate) async fn profile() -> ProfileFixture {
+    profile_with_model("http://127.0.0.1:9".into(), false).await
+}
+
+pub(super) async fn profile_with_model(base_url: String, tools: bool) -> ProfileFixture {
     let profile = TempDir::new().unwrap();
     let (ready, connected) = async_channel::bounded(4);
     let (audio, spoken) = async_channel::bounded(8);
     let mut config = GatewayConfig::new(
         profile.path(),
         Config {
-            base_url: "http://127.0.0.1:9".into(),
+            base_url,
             model: "fixture".into(),
             api_key: String::new(),
         },
@@ -106,7 +112,30 @@ pub(crate) async fn profile() -> (
         factory: Arc::new(Fixture(ready)),
         policy: AccessPolicy {
             users: ["10".into(), "20".into()].into_iter().collect(),
-            rooms: [("42".into(), RoomPolicy::default())].into_iter().collect(),
+            rooms: [(
+                "42".into(),
+                RoomPolicy {
+                    tools,
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            scope: ScopePolicy {
+                rooms: [(
+                    "42".into(),
+                    RoomRules {
+                        turn: TurnPolicy {
+                            approval: Some(ApprovalPolicy::Off),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
             ..Default::default()
         },
     });

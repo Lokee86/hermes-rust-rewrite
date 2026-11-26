@@ -284,13 +284,14 @@ impl DiscordAdapter {
         };
         let client = self.client.clone();
         let bot = self.bot.bot_id.clone();
+        let max_inbound_bytes = self.settings.media.max_inbound_bytes;
         let ingress = ingress.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
             let _worker = lease;
             tokio::select! {
                 _ = cancel.cancelled() => {},
-                _ = hydrate(&client, &bot, &ingress, input, manifest) => {},
+                _ = hydrate(&client, &bot, &ingress, input, manifest, max_inbound_bytes) => {},
             }
         });
     }
@@ -313,6 +314,7 @@ async fn hydrate(
     ingress: &Ingress,
     mut input: DeferredInput,
     manifest: Manifest,
+    max_inbound_bytes: u64,
 ) -> Result<(), GatewayError> {
     if let Some(thread) = &manifest.thread {
         match ingress
@@ -357,7 +359,10 @@ async fn hydrate(
                 let message = if manifest.attachments.is_empty() {
                     None
                 } else {
-                    Some(media_body(client, ingress, &source, &manifest, body).await?)
+                    Some(
+                        media_body(client, ingress, &source, &manifest, body, max_inbound_bytes)
+                            .await?,
+                    )
                 };
                 let quote = get_quote(client, &manifest.channel, requested).await?;
                 Ok(QuoteHydration {
@@ -371,13 +376,14 @@ async fn hydrate(
         ingress
             .authorize_preparation(event.clone(), token.clone())
             .await?;
-        let message = match media_body(client, ingress, &source, &manifest, body).await {
-            Ok(message) => message,
-            Err(GatewayError::Invalid | GatewayError::Unsupported | GatewayError::Forbidden) => {
-                Message::text("")
-            }
-            Err(error) => return Err(error),
-        };
+        let message =
+            match media_body(client, ingress, &source, &manifest, body, max_inbound_bytes).await {
+                Ok(message) => message,
+                Err(
+                    GatewayError::Invalid | GatewayError::Unsupported | GatewayError::Forbidden,
+                ) => Message::text(""),
+                Err(error) => return Err(error),
+            };
         ingress
             .complete_preparation(event.clone(), token.clone(), message)
             .await?;
@@ -391,6 +397,7 @@ async fn media_body(
     source: &MediaSource,
     manifest: &Manifest,
     body: Message,
+    max_inbound_bytes: u64,
 ) -> Result<Message, GatewayError> {
     if manifest.attachments.is_empty() {
         return Ok(body);
@@ -403,6 +410,7 @@ async fn media_body(
         &manifest.message,
         body,
         &manifest.attachments,
+        max_inbound_bytes,
     )
     .await
 }

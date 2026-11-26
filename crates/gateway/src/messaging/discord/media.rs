@@ -1,6 +1,7 @@
 use super::client::{DiscordClient, RestFailure};
 use crate::messaging::{
-    AttachmentManifest, GatewayError, Ingress, MediaPurpose, MediaSource, Message, media::MAX_FILE,
+    AttachmentManifest, GatewayError, Ingress, MediaPurpose, MediaSource, Message,
+    media::{DISCORD_FILE_CEILING, DISCORD_INPUT_BUDGET, MAX_FILE, PreparedAudio, valid_name},
 };
 use futures_util::TryStreamExt;
 use reqwest::{StatusCode, Url};
@@ -11,12 +12,13 @@ use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
 #[cfg(test)]
+mod artifact_tests;
+#[cfg(test)]
 pub(super) mod fixtures;
 #[cfg(test)]
 mod tests;
 
 const MAX_ATTACHMENTS: usize = 8;
-const MAX_INPUT: usize = 8 * 1024 * 1024;
 const VOICE_MESSAGE: u64 = 1 << 13;
 const MEDIA_LIFETIME: Duration = Duration::from_secs(90);
 const SAMPLE_RATE: usize = 16_000;
@@ -58,12 +60,7 @@ pub(super) fn attachment_sources(message: &Value) -> Result<Vec<AttachmentSource
             }
             let filename = item["filename"]
                 .as_str()
-                .filter(|name| {
-                    !name.is_empty()
-                        && name.len() <= 1024
-                        && !name.contains(['/', '\\'])
-                        && !name.chars().any(char::is_control)
-                })
+                .filter(|name| valid_name(name))
                 .ok_or(GatewayError::Invalid)?;
             let size = item["size"]
                 .as_u64()
@@ -84,13 +81,12 @@ pub(super) fn attachment_sources(message: &Value) -> Result<Vec<AttachmentSource
 }
 
 pub(super) fn within_inbound_limit(attachments: &[AttachmentSource], max_per_file: u64) -> bool {
-    attachments
+    attachments.iter().all(|file| {
+        file.size != 0 && file.size as u64 <= max_per_file && file.size <= DISCORD_FILE_CEILING
+    }) && attachments
         .iter()
-        .all(|file| file.size != 0 && file.size as u64 <= max_per_file && file.size <= MAX_FILE)
-        && attachments
-            .iter()
-            .try_fold(0usize, |total, file| total.checked_add(file.size))
-            .is_some_and(|total| total <= MAX_INPUT)
+        .try_fold(0usize, |total, file| total.checked_add(file.size))
+        .is_some_and(|total| total <= DISCORD_INPUT_BUDGET)
 }
 
 fn gateway_failure(error: RestFailure) -> GatewayError {
@@ -134,6 +130,7 @@ pub(super) async fn hydrate_attachments(
     message: &str,
     body: Message,
     expected: &[AttachmentSource],
+    max_inbound_bytes: u64,
 ) -> Result<Message, GatewayError> {
     hydrate_with(
         client,
@@ -143,6 +140,7 @@ pub(super) async fn hydrate_attachments(
         message,
         body,
         expected,
+        max_inbound_bytes,
         |url, size| open_cdn(client, url, size),
     )
     .await
@@ -156,6 +154,7 @@ async fn hydrate_with<S, Open, Opened>(
     message: &str,
     mut body: Message,
     expected: &[AttachmentSource],
+    max_inbound_bytes: u64,
     open: Open,
 ) -> Result<Message, GatewayError>
 where
@@ -174,7 +173,7 @@ where
     if expected.is_empty() {
         return Ok(body);
     }
-    if !within_inbound_limit(expected, MAX_FILE as u64) {
+    if !within_inbound_limit(expected, max_inbound_bytes) {
         return Err(GatewayError::Unsupported);
     }
 
@@ -182,7 +181,7 @@ where
     for attachment in expected {
         grants.push(
             ingress
-                .authorize_media(
+                .authorize_discord_media(
                     source.clone(),
                     AttachmentManifest {
                         name: attachment.filename.clone(),
@@ -195,6 +194,7 @@ where
                         MediaPurpose::Attachment
                     },
                     MEDIA_LIFETIME,
+                    usize::try_from(max_inbound_bytes).map_err(|_| GatewayError::Invalid)?,
                 )
                 .await?,
         );
@@ -226,15 +226,20 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     for ((attachment, grant), url) in expected.iter().zip(grants).zip(urls) {
         if attachment.voice {
-            let spoken = ingress
-                .transcribe_encoded_voice(grant, || open(url, attachment.size), decode_voice_note)
-                .await?;
-            if !body.text.is_empty() {
-                body.text.push_str("\n\nVoice note:\n");
-            }
-            body.text.push_str(&spoken);
-            if body.text.len() > crate::messaging::runtime::MAX_TEXT {
-                return Err(GatewayError::Invalid);
+            match ingress
+                .prepare_discord_audio(grant, || open(url, attachment.size), decode_voice_note)
+                .await?
+            {
+                PreparedAudio::Transcript(spoken) => {
+                    if !body.text.is_empty() {
+                        body.text.push_str("\n\nVoice note:\n");
+                    }
+                    body.text.push_str(&spoken);
+                    if body.text.len() > crate::messaging::runtime::MAX_TEXT {
+                        return Err(GatewayError::Invalid);
+                    }
+                }
+                PreparedAudio::Attachment(file) => body.attachments.push(file),
             }
         } else {
             body.attachments.push(
@@ -286,9 +291,13 @@ async fn open_cdn(
 
 /// Voice notes are Ogg Opus. Apply pre-skip and the ending granule at
 /// the output sample rate and bound decoded PCM independently of file size.
-fn decode_voice_note(bytes: Vec<u8>) -> Result<Vec<u8>, GatewayError> {
+fn decode_voice_note(bytes: &[u8]) -> Result<Vec<u8>, GatewayError> {
     if bytes.starts_with(b"RIFF") {
-        return Ok(bytes);
+        return if bytes.len() <= MAX_FILE {
+            Ok(bytes.to_vec())
+        } else {
+            Err(GatewayError::Unsupported)
+        };
     }
     let mut reader = ogg::PacketReader::new(io::Cursor::new(bytes));
     let head = reader

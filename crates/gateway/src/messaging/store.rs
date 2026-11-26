@@ -100,6 +100,7 @@ pub(super) struct Candidate {
     pub protection: Option<String>,
 }
 
+#[derive(Clone)]
 pub(super) struct PendingInput {
     pub event: InboundEvent,
     pub route: Route,

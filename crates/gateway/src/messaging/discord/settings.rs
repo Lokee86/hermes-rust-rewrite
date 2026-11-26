@@ -471,7 +471,7 @@ impl DiscordSettings {
         );
         ensure!(
             (1..=32).contains(&self.delivery.max_inline_parts)
-                && (1..=100 * 1024 * 1024).contains(&self.media.max_inbound_bytes),
+                && (1..=super::super::media::DISCORD_FILE_CEILING as u64).contains(&self.media.max_inbound_bytes),
             "Invalid Discord attachment or delivery limit"
         );
         if let Some(name) = &self.deployment_secret {

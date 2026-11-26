@@ -202,7 +202,7 @@ async fn advance_message(
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
                 }
-                capture(scope, &session.dir, &message.attachments)
+                capture(scope, &session.dir, &work.event, &message.attachments)
                     .map(Some)
                     .map_err(|_| GatewayError::Invalid)
             }) {
@@ -218,9 +218,13 @@ async fn advance_message(
                 }
                 Err(error) => return Err(error),
             };
-            let result = owner
-                .submit_channel(session, message.text.clone(), attachments, native_id)
-                .await;
+            let (attachments, opaque) = attachments;
+            let text = if opaque && message.text.trim().is_empty() && attachments.is_empty() {
+                "A file was attached.".to_owned()
+            } else {
+                message.text.clone()
+            };
+            let result = owner.submit_channel(session, text, attachments, native_id).await;
             if let Err(error) = result {
                 return match error.data["reason"].as_str() {
                     Some("admission_conflict") => {
@@ -276,6 +280,7 @@ async fn advance_message(
                     return Ok(None);
                 }
                 let quote = scope.quote_context_source(state, &work.event, &work.route)?;
+                let attachments = attachment_context(scope, &work)?;
                 let individual = wake || scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
                     .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
                 let resource = super::profile::resource_event_id(&work.event.id);
@@ -317,6 +322,7 @@ async fn advance_message(
                             skills: policy.skills,
                             selected_skill,
                             quote,
+                            attachments,
                         },
                     },
                 ))
@@ -648,14 +654,79 @@ fn finish_control(scope: &Ingress, work: &PendingInput, result: &str) -> Result<
 fn capture(
     scope: &Ingress,
     session: &Path,
+    event: &InboundEvent,
     refs: &[AttachmentRef],
-) -> anyhow::Result<Vec<Attachment>> {
-    refs.iter()
-        .map(|reference| {
-            let bytes = scope.store.attachment(&scope.connection, reference)?;
-            Attachment::capture_bytes(session, reference.name.clone(), &bytes)
-        })
-        .collect()
+) -> anyhow::Result<(Vec<Attachment>, bool)> {
+    let media = scope.store.read(|db| super::media::input_media(db, &scope.connection, event, refs))?
+        .ok_or_else(|| anyhow::anyhow!("Attachment source is not available"))?;
+    let mut files = Vec::new();
+    let mut opaque = false;
+    for entry in media {
+        if entry.preview {
+            let bytes = scope.store.attachment(&scope.connection, &entry.file)?;
+            files.push(Attachment::capture_bytes(session, entry.file.name, &bytes)?);
+        } else {
+            opaque = true;
+        }
+    }
+    Ok((files, opaque))
+}
+
+fn attachment_context(
+    scope: &Ingress,
+    work: &PendingInput,
+) -> Result<Option<hermes_engine::ChannelAttachments>, GatewayError> {
+    let InboundBody::Message(message) = &work.event.body else { return Ok(None) };
+    if message.attachments.is_empty() {
+        return Ok(None);
+    }
+    let media = db(scope.store.read(|tx| {
+        super::media::input_media(tx, &scope.connection, &work.event, &message.attachments)
+    }))?.ok_or(GatewayError::Forbidden)?;
+    let mut files = Vec::new();
+    let mut refs = std::collections::BTreeMap::new();
+    for (index, entry) in media.into_iter().enumerate() {
+        if !entry.preview {
+            let id = db(store::key("input-attachment", &(&scope.connection, &work.event.id, index)))?;
+            files.push(hermes_engine::ChannelAttachment {
+                id: id.clone(),
+                filename: entry.file.name.clone(),
+                bytes: entry.size,
+            });
+            refs.insert(id, entry.file);
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let work = Arc::new(work.clone());
+    let (check_scope, check_work) = (scope.clone(), work.clone());
+    let recheck = Arc::new(move || check_scope.checked(true, |state| {
+        if !authorized(&check_scope, state, &check_work)? {
+            return Err(GatewayError::Forbidden);
+        }
+        Ok(())
+    }).map_err(Into::into));
+    let reader = scope.clone();
+    let read = Arc::new(move |id: &str, offset, limit| -> anyhow::Result<Vec<u8>> {
+        let reference = refs.get(id).ok_or(GatewayError::Forbidden)?;
+        anyhow::ensure!(limit > 0 && limit <= hermes_engine::MAX_CHANNEL_ATTACHMENT_READ,
+            "Invalid attachment range");
+        Ok(reader.checked(true, |state| {
+            if !authorized(&reader, state, &work)?
+                || !state.policy.room_policy(&work.event.room).is_some_and(|room| room.tools)
+                || !reader.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
+                    .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
+            {
+                return Err(GatewayError::Forbidden);
+            }
+            db(reader.store.read(|tx| {
+                super::media::read_input_artifact(tx, &reader.connection, &work.event, reference, offset, limit)
+            }))?.ok_or(GatewayError::Forbidden)
+        })?)
+    });
+    Ok(Some(hermes_engine::ChannelAttachments { files, recheck, read }))
 }
 
 fn outbound_message(scope: &Ingress, session: &Path, text: &str, tools: bool) -> Message {
