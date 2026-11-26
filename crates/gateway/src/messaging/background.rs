@@ -1,6 +1,6 @@
 use super::InvocationOutcome;
 use crate::messaging::{
-    AccessPolicy, ActorKind, GatewayError, InboundEvent, Ingress, Room, Sender,
+    GatewayError, InboundEvent, Ingress, Room,
     runtime::{State, db},
     store::{self, PendingDelivery, Route},
 };
@@ -39,19 +39,6 @@ impl Ingress {
         })
     }
 
-    pub(in crate::messaging) fn authorize_background(
-        &self,
-        policy: &AccessPolicy,
-        room: &Room,
-        sender: &Sender,
-    ) -> Result<bool, GatewayError> {
-        Ok(self
-            .authorized_identity(policy, room, sender)?
-            .is_some_and(|(actor, kind)| {
-                kind == ActorKind::Person && policy.allows_background_command(room, &actor)
-            }))
-    }
-
     pub(super) fn background_outcome(
         &self,
         state: &State,
@@ -60,7 +47,7 @@ impl Ingress {
         let route = self.background_route(&event.room, &event.sender.id, &event.id)?;
         let outcome = db(self.store.invocation(&route, &event.id, &event.sender.id))?;
         if outcome.is_some()
-            && !self.authorize_background(&state.policy, &event.room, &event.sender)?
+            && !self.authorize_scoped_command(&state.policy, &event.room, &event.sender)?
         {
             return Ok(Some(InvocationOutcome::Forbidden));
         }
@@ -76,7 +63,7 @@ impl Ingress {
         let Some(sender) = &delivery.sender else {
             return Ok(false);
         };
-        if !self.authorize_background(&state.policy, &route.room, sender)? {
+        if !self.authorize_scoped_command(&state.policy, &route.room, sender)? {
             return Ok(false);
         }
         // The ingress payload is removed at completion. Keep the original

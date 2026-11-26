@@ -2,6 +2,7 @@ use super::{
     super::{
         Advance, Command, ConnectionFailure, Control, DeliveryBody, DeliveryIntent, Disposition,
         GatewayError, InboundBody, InboundEvent, InvocationOutcome, Prompt, Response, Room, Sender,
+        SpokenReplyChange, SpokenReplyMode,
         commands::{COMMANDS, RequesterCommand, RequesterInvocation},
         runtime::{db, now, valid_id},
         store,
@@ -455,21 +456,31 @@ impl DiscordAdapter {
                         text,
                     }))
                 }),
-            "voice" if self.settings.voice_enabled => {
-                if !ingress.checked(true, |state| {
-                    ingress.authorize_operator(&state.policy, room, sender)
-                })? {
-                    return Ok(None);
+            "voice" if self.settings.voice_enabled || self.settings.sends_voice_notes() => {
+                let action = option("action");
+                match action.as_deref() {
+                    Some("channel" | "join" | "leave") if self.settings.voice_enabled => {
+                        let operator = ingress.checked(true, |state| {
+                            ingress.authorize_operator(&state.policy, room, sender)
+                        })?;
+                        interaction.guild_id.clone().filter(|_| operator).map(|guild| Action::Voice {
+                            guild,
+                            leave: action.as_deref() == Some("leave"),
+                        })
+                    }
+                    Some("status") => command(Command::SpokenReplies { change: SpokenReplyChange::Status }),
+                    change if self.settings.sends_voice_notes() => {
+                        let change = match change {
+                            None => SpokenReplyChange::Toggle,
+                            Some("on") => SpokenReplyChange::Set(SpokenReplyMode::VoiceNotes),
+                            Some("off") => SpokenReplyChange::Set(SpokenReplyMode::Off),
+                            Some("tts") => SpokenReplyChange::Set(SpokenReplyMode::Always),
+                            _ => return Ok(None),
+                        };
+                        command(Command::SpokenReplies { change })
+                    }
+                    _ => None,
                 }
-                interaction
-                    .guild_id
-                    .clone()
-                    .zip(option("action"))
-                    .filter(|(_, action)| action == "join" || action == "leave")
-                    .map(|(guild, action)| Action::Voice {
-                        guild,
-                        leave: action == "leave",
-                    })
             }
             _ => None,
         };
@@ -831,6 +842,11 @@ fn outcome_text(outcome: InvocationOutcome) -> String {
             format!("**You**\n{}\n**Mercury**\n{}", turn.prompt, turn.reply)
         }).collect::<Vec<_>>().join("\n\n"),
         InvocationOutcome::HistoryCursor(_) => "The history is unavailable.".into(),
+        InvocationOutcome::SpokenReplies { mode } => match mode {
+            SpokenReplyMode::Off => "Voice replies are off.",
+            SpokenReplyMode::VoiceNotes => "Voice replies follow incoming voice notes.",
+            SpokenReplyMode::Always => "Mercury will speak channel replies.",
+        }.into(),
         InvocationOutcome::Applied => "Applied.".into(),
         InvocationOutcome::PendingResult => "The result is still pending.".into(),
         InvocationOutcome::Busy => {
@@ -853,6 +869,7 @@ pub(super) async fn synchronize(
     application: &str,
     guild: Option<&str>,
     voice: bool,
+    voice_notes: bool,
 ) -> Result<(), RestFailure> {
     let mut collection = vec!["applications", application];
     if let Some(guild) = guild {
@@ -898,8 +915,14 @@ pub(super) async fn synchronize(
                     {"name":"3 days","value":4320},{"name":"7 days","value":10080}]}),
         ], false),
     ]);
-    if voice {
-        catalogue.push(("voice", vec![option("action")], true));
+    if voice || voice_notes {
+        let mut choices = vec!["status"];
+        if voice_notes { choices.extend(["on", "off", "tts"]); }
+        if voice { choices.extend(["join", "leave"]); }
+        let mut action = option("action");
+        action["required"] = json!(false);
+        action["choices"] = json!(choices.into_iter().map(|name| json!({"name":name,"value":name})).collect::<Vec<_>>());
+        catalogue.push(("voice", vec![action], true));
     }
     for (name, options, operator) in catalogue {
         if !names.insert(name) {

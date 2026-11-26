@@ -58,6 +58,110 @@ pub(super) async fn record_voice(state: &Server, channel: &str, request: Request
     }
 }
 
+async fn voice_mode_command(
+    wire: &Wire,
+    fixture: &mut Fixtures,
+    sequence: u64,
+    action: &str,
+    expected: &str,
+) {
+    let id = (((now() as u64 - DISCORD_EPOCH) << 22) | sequence).to_string();
+    wire.dispatch(sequence, "INTERACTION_CREATE", json!({
+        "id": id, "application_id":"90","channel_id":"20","type":2,"token":format!("voice-mode-{id}"),
+        "user":{"id":"7"},"data":{"name":"voice","options":[{"name":"action","value":action}]}
+    })).await;
+    let Write::Callback(value) = fixture
+        .next_write("a private voice acknowledgement", |write| {
+            matches!(write, Write::Callback(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(value, json!({"type":5,"data":{"flags":64}}));
+    let Write::Followup(value) = fixture
+        .next_write("a private voice mode", |write| {
+            matches!(write, Write::Followup(_))
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(value["content"], expected);
+}
+
+#[tokio::test]
+async fn voice_reply_mode_is_private_and_survives_a_discord_owner_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    fixture
+        .transport
+        .suppress_progress
+        .store(true, Ordering::SeqCst);
+    let speech = Arc::new(Speech::default());
+    let configure = |fixture: &Fixtures| {
+        fixture.configuration_with(
+            root.path(),
+            json!({
+                "grants":{"users":["7"]},"operators":["7"],
+                "media":{"spoken_replies":"always"},"commands":{"sync":false},
+            }),
+        )
+    };
+    let gateway = model
+        .gateway_with_audio(root.path(), vec![configure(&fixture)], Some(speech.clone()))
+        .await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "voice-mode").await;
+    voice_mode_command(&wire, &mut fixture, 2, "off", "Voice replies are off.").await;
+    gateway.shutdown().await.unwrap();
+
+    let gateway = model
+        .gateway_with_audio(root.path(), vec![configure(&fixture)], Some(speech.clone()))
+        .await;
+    let mut wire = fixture.wire().await;
+    assert_eq!(wire.authentication(6).await["d"]["seq"], 2);
+    wire.dispatch(3, "RESUMED", json!({})).await;
+    voice_mode_command(&wire, &mut fixture, 4, "status", "Voice replies are off.").await;
+    wire.dispatch(
+        5,
+        "MESSAGE_CREATE",
+        message("229", "20", "remain text", false),
+    )
+    .await;
+    let Write::Message { payload, .. } = fixture.reply().await else {
+        unreachable!()
+    };
+    assert_eq!(payload["content"], "answer remain text");
+    wait_reply(&gateway, "discord-message-229").await;
+    assert!(crate::lock(&speech.spoken).is_empty());
+
+    voice_mode_command(
+        &wire,
+        &mut fixture,
+        6,
+        "tts",
+        "Mercury will speak channel replies.",
+    )
+    .await;
+    wire.dispatch(
+        7,
+        "MESSAGE_CREATE",
+        message("230", "20", "speak again", false),
+    )
+    .await;
+    voice_write(&mut fixture).await;
+    wait_reply(&gateway, "discord-message-230").await;
+    assert_eq!(
+        crate::lock(&speech.spoken).as_slice(),
+        ["answer speak again"]
+    );
+    gateway.shutdown().await.unwrap();
+}
+
 #[derive(Default)]
 struct Speech {
     heard: AtomicU64,
@@ -104,7 +208,10 @@ impl AudioService for Speech {
 
 fn configuration(fixture: &Fixtures, root: &Path, mode: &str) -> AdapterConfig {
     // Exercise the voice-first plan without an editable progress message.
-    fixture.transport.suppress_progress.store(true, Ordering::SeqCst);
+    fixture
+        .transport
+        .suppress_progress
+        .store(true, Ordering::SeqCst);
     fixture.configuration_with(
         root,
         json!({

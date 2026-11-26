@@ -1,4 +1,4 @@
-use super::types::{AccessPolicy, Room, RoomKind, RoomPolicy, Sender};
+use super::{SpokenReplyMode, types::{AccessPolicy, Room, RoomKind, RoomPolicy, Sender}};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +13,9 @@ pub struct ScopePolicy {
     pub rooms: BTreeMap<String, RoomRules>,
     pub threads: BTreeMap<String, BTreeMap<String, RoomRules>>,
     pub require_actor_evidence: bool,
-    pub background_commands_disabled: bool,
+    #[serde(alias = "background_commands_disabled")]
+    pub scoped_commands_disabled: bool,
+    pub spoken_reply_default: Option<SpokenReplyMode>,
     pub pair_direct: bool,
     pub events: BTreeMap<String, ResourcePolicy>,
 }
@@ -119,6 +121,11 @@ pub struct ResourcePolicy {
 }
 
 impl AccessPolicy {
+    pub(super) fn spoken_reply_default(&self, room: &Room) -> Option<SpokenReplyMode> {
+        self.room_policy(room).filter(|policy| policy.spoken_replies)?;
+        self.scope.spoken_reply_default
+    }
+
     fn rules(&self, room: &Room) -> impl Iterator<Item = &RoomRules> {
         (room.kind == RoomKind::Direct)
             .then_some(&self.scope.direct)
@@ -200,8 +207,8 @@ impl AccessPolicy {
             && self.rules(room).all(|rule| !rule.denied_users.contains(actor))
     }
 
-    pub(super) fn allows_background_command(&self, room: &Room, actor: &Sender) -> bool {
-        !self.scope.background_commands_disabled
+    pub(super) fn allows_scoped_command(&self, room: &Room, actor: &Sender) -> bool {
+        !self.scope.scoped_commands_disabled
             && self.requester_commands_for(room).is_none_or(|grant| {
                 grant.users.contains(&actor.id) || !grant.roles.is_disjoint(&actor.roles)
             })

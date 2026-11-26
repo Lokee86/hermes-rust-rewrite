@@ -190,7 +190,7 @@ async fn dispatch(
         return retire(client, bot_id, attempt, channel).await;
     }
     if sends_voice_note(attempt) {
-        return publish_voice_note(client, bot_id, attempt, ingress, channel).await;
+        return publish_voice_note(client, bot_id, attempt, ingress, channel, adapter).await;
     }
     if let Some(adapter) = adapter
         && matches!(attempt.payload.body, DeliveryBody::Progress { .. })
@@ -307,6 +307,7 @@ async fn publish_voice_note(
     attempt: &SendAttempt,
     ingress: &Ingress,
     channel: &str,
+    adapter: Option<&DiscordAdapter>,
 ) -> SendResult<DeliveryResult> {
     let Some(key) = attempt.payload.effect.operation_key.as_deref().filter(|key| is_voice_nonce(key))
     else { return Err(DeliveryResult::Rejected) };
@@ -329,6 +330,11 @@ async fn publish_voice_note(
     let audio = multipart::Part::bytes(note.bytes).file_name(voice_note::FILENAME)
         .mime_str(voice_note::MIME).map_err(|_| DeliveryResult::AttachmentNotPublished)?;
     let form = multipart::Form::new().text("payload_json", payload.to_string()).part("files[0]", audio);
+    if adapter.is_some_and(|adapter| {
+        !adapter.should_send_voice_note(ingress, &attempt.delivery_id, &attempt.payload.room)
+    }) {
+        return Err(DeliveryResult::AttachmentNotPublished);
+    }
     let publication = client.execute(
         client.bot(Method::POST, &["channels", channel, "messages"]).multipart(form),
         Call::Mutation,

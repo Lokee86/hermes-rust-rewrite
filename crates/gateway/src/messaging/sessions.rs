@@ -516,6 +516,7 @@ async fn apply_command(
             _ => true,
         },
         scope.authorize_operator(&state.policy, &work.event.room, &work.event.sender)?,
+        state.policy.spoken_reply_default(&work.event.room),
     ))
 }
 

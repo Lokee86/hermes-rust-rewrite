@@ -23,7 +23,7 @@ pub use settings::{DiscordConnectionSettings, DiscordSettings};
 use super::{
     Adapter, AdapterFuture, ConnectionFailure, DeliveryBody, DeliveryIntent, DeliveryPart,
     DeliveryResult, Effect, Ingress, Message, PreparationFailure, Room, RoomKind, SendAttempt,
-    Sender, VerifiedInstallation,
+    Sender, SpokenReplyMode, VerifiedInstallation,
 };
 use channels::Channel;
 use client::DiscordClient;
@@ -99,11 +99,12 @@ impl DiscordAdapter {
             let application = self.bot.application_id.clone();
             let guild = self.settings.commands.test_guild.clone();
             let voice = self.settings.voice_enabled;
+            let voice_notes = self.settings.sends_voice_notes();
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cancel.cancelled() => {},
-                    _ = interactions::synchronize(&client, &application, guild.as_deref(), voice) => {}
+                    _ = interactions::synchronize(&client, &application, guild.as_deref(), voice, voice_notes) => {}
                 }
             });
         }
@@ -155,11 +156,10 @@ impl DiscordAdapter {
         delivery: &str,
         room: &Room,
     ) -> bool {
-        match self.settings.media.spoken_replies {
-            settings::DiscordSpokenReplies::Off => false,
-            settings::DiscordSpokenReplies::VoiceNotes =>
-                voice_note::spoken_source(ingress, delivery, room).unwrap_or(false),
-            settings::DiscordSpokenReplies::Always => voice_note::channel_reply(ingress, delivery, room).unwrap_or(false),
+        match ingress.spoken_reply_mode(room).unwrap_or(SpokenReplyMode::Off) {
+            SpokenReplyMode::Off => false,
+            SpokenReplyMode::VoiceNotes => voice_note::spoken_source(ingress, delivery, room).unwrap_or(false),
+            SpokenReplyMode::Always => voice_note::channel_reply(ingress, delivery, room).unwrap_or(false),
         }
     }
 }

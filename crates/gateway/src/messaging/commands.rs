@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS messaging_route_model_scopes (
 CREATE TABLE IF NOT EXISTS messaging_home_routes (
     connection TEXT PRIMARY KEY, route TEXT NOT NULL REFERENCES messaging_routes(id)
 );
+CREATE TABLE IF NOT EXISTS messaging_spoken_reply_modes (
+    connection TEXT NOT NULL, room TEXT NOT NULL, mode TEXT NOT NULL,
+    PRIMARY KEY(connection,room)
+);
 CREATE TABLE IF NOT EXISTS messaging_fetch_actions (
     id TEXT PRIMARY KEY, connection TEXT NOT NULL, route TEXT NOT NULL, actor TEXT NOT NULL,
     input TEXT NOT NULL, delivery TEXT NOT NULL UNIQUE, expires INTEGER NOT NULL,
@@ -51,6 +55,7 @@ pub enum Command {
     Status,
     Queue,
     History,
+    SpokenReplies { change: SpokenReplyChange },
     Reset,
     SelectModel { model: String },
     SelectProfileModel { model: String },
@@ -60,6 +65,22 @@ pub enum Command {
     Background { text: String },
     SetHome,
     FetchResult { action: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpokenReplyMode {
+    Off,
+    VoiceNotes,
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpokenReplyChange {
+    Status,
+    Toggle,
+    Set(SpokenReplyMode),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -165,9 +186,14 @@ pub(super) const COMMANDS: &[CommandDescriptor] = &[
 ];
 
 impl Command {
+    pub(super) fn uses_scoped_grant(&self) -> bool {
+        matches!(self, Self::Background { .. } | Self::History | Self::SpokenReplies { .. })
+    }
+
     pub(super) fn operator(&self) -> bool {
         matches!(self, Self::SelectModel { .. } | Self::SelectProfileModel { .. }
-            | Self::ModelPicker | Self::ChooseProfileModel { .. } | Self::SetHome | Self::Reset)
+            | Self::ModelPicker | Self::ChooseProfileModel { .. } | Self::SetHome | Self::Reset
+            | Self::SpokenReplies { change: SpokenReplyChange::Toggle | SpokenReplyChange::Set(_) })
     }
 
     pub(super) fn uses_profile_model(&self) -> bool {
@@ -202,6 +228,7 @@ pub enum InvocationOutcome {
     Queue { pending: usize, running: bool },
     HistoryCursor(HistoryCursor),
     History { turns: Vec<HistoryTurn> },
+    SpokenReplies { mode: SpokenReplyMode },
     Applied,
     PendingResult,
     Busy,
@@ -243,7 +270,8 @@ impl Ingress {
             let individual = self
                 .authorized_identity(&state.policy, &event.room, &event.sender)?
                 .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
-            let background = self.authorize_background(&state.policy, &event.room, &event.sender)?;
+            let scoped_command =
+                self.authorize_scoped_command(&state.policy, &event.room, &event.sender)?;
             let tools = state
                 .policy
                 .room_policy(&event.room)
@@ -260,11 +288,25 @@ impl Ingress {
                                     .skills
                                     .as_ref()
                                     .is_some_and(|skills| !skills.is_empty()))
-                        && (item.name != "bg" || background && self.capabilities().text_delivery)
+                        && (!matches!(item.name, "bg" | "history") || scoped_command)
+                        && (item.name != "bg" || self.capabilities().text_delivery)
                         && (item.name != "fetch-result" || self.capabilities().interactive_prompts)
                 })
                 .collect())
         })
+    }
+
+    pub(super) fn authorize_scoped_command(
+        &self,
+        policy: &AccessPolicy,
+        room: &Room,
+        sender: &Sender,
+    ) -> Result<bool, GatewayError> {
+        Ok(self
+            .authorized_identity(policy, room, sender)?
+            .is_some_and(|(actor, kind)| {
+                kind == super::ActorKind::Person && policy.allows_scoped_command(room, &actor)
+            }))
     }
 
     /// Read the durable command or control receipt for the original actor and room.
@@ -318,6 +360,13 @@ impl Ingress {
                     return Ok(Some(InvocationOutcome::Expired));
                 }
                 let outcome = db(scope.store.invocation(&route, &event.id, &event.sender.id))?;
+                if matches!(
+                    &outcome,
+                    Some(InvocationOutcome::HistoryCursor(_) | InvocationOutcome::SpokenReplies { .. })
+                ) && !scope.authorize_scoped_command(&state.policy, &event.room, &event.sender)?
+                {
+                    return Ok(Some(InvocationOutcome::Forbidden));
+                }
                 if let Some(InvocationOutcome::ModelPicker(picker)) = &outcome {
                     return scope.current_model_picker(state, &route, &event.sender, picker);
                 }
@@ -415,6 +464,15 @@ impl Ingress {
         Ok(changed)
     }
 
+    pub(super) fn spoken_reply_mode(&self, room: &Room) -> Result<SpokenReplyMode, GatewayError> {
+        self.checked(true, |state| {
+            let Some(default) = state.policy.spoken_reply_default(room) else {
+                return Ok(SpokenReplyMode::Off);
+            };
+            db(self.store.read(|tx| read_spoken_mode(tx, &self.connection, room, default)))
+        })
+    }
+
     pub fn home_destination(&self) -> Result<Option<String>, GatewayError> {
         self.checked(true, |_| db(self.store.home(&self.connection)))
     }
@@ -427,6 +485,7 @@ pub(super) fn execute(
     session: Option<&LiveSession>,
     allowed: bool,
     operator: bool,
+    spoken_default: Option<SpokenReplyMode>,
 ) -> Result<(), GatewayError> {
     let operation = if !allowed || command.operator() && !operator {
         Operation::Output(InvocationOutcome::Forbidden)
@@ -454,6 +513,7 @@ pub(super) fn execute(
                 Operation::Output(queue)
             }
             Command::History => Operation::Output(history::snapshot(scope, &work.route)?),
+            Command::SpokenReplies { change } => Operation::SpokenReplies(*change, spoken_default),
             Command::Reset => Operation::Reset,
             Command::SelectModel { model } => Operation::SelectModel(model),
             Command::SetHome => Operation::Home(scope.transport_scope()?),
@@ -473,6 +533,7 @@ enum Operation<'a> {
     Reset,
     SelectModel(&'a str),
     Home(String),
+    SpokenReplies(SpokenReplyChange, Option<SpokenReplyMode>),
     Fetch(&'a str),
 }
 
@@ -575,6 +636,7 @@ impl Store {
                         InvocationOutcome::Applied
                     } else { InvocationOutcome::Forbidden }
                 }
+                Operation::SpokenReplies(change, default) => change_spoken_mode(tx, route, change, default)?,
                 Operation::Fetch(action) => claim_result(tx, route, event, action)?,
             };
             record_invocation(tx, route, &event.id, &event.sender.id, outcome)?;
@@ -642,6 +704,45 @@ impl Store {
             params![connection,delivery], |r| r.get(0),
         )?))
     }
+}
+
+fn read_spoken_mode(
+    tx: &rusqlite::Connection,
+    connection: &str,
+    room: &Room,
+    default: SpokenReplyMode,
+) -> Result<SpokenReplyMode> {
+    Ok(tx.query_row(
+        "SELECT mode FROM messaging_spoken_reply_modes WHERE connection=?1 AND room=?2",
+        params![connection,serde_json::to_string(room)?], |row| store::decode(row,0),
+    ).optional()?.unwrap_or(default))
+}
+
+fn change_spoken_mode(
+    tx: &rusqlite::Connection,
+    route: &Route,
+    change: SpokenReplyChange,
+    default: Option<SpokenReplyMode>,
+) -> Result<InvocationOutcome> {
+    let Some(default) = default else {
+        return Ok(match change {
+            SpokenReplyChange::Status => InvocationOutcome::SpokenReplies { mode: SpokenReplyMode::Off },
+            _ => InvocationOutcome::Unsupported,
+        });
+    };
+    let current = read_spoken_mode(tx, &route.connection, &route.room, default)?;
+    let mode = match change {
+        SpokenReplyChange::Status => return Ok(InvocationOutcome::SpokenReplies { mode: current }),
+        SpokenReplyChange::Set(mode) => mode,
+        SpokenReplyChange::Toggle if current == SpokenReplyMode::Off => SpokenReplyMode::VoiceNotes,
+        SpokenReplyChange::Toggle => SpokenReplyMode::Off,
+    };
+    tx.execute(
+        "INSERT INTO messaging_spoken_reply_modes(connection,room,mode) VALUES (?1,?2,?3)
+         ON CONFLICT(connection,room) DO UPDATE SET mode=excluded.mode",
+        params![route.connection,serde_json::to_string(&route.room)?,serde_json::to_string(&mode)?],
+    )?;
+    Ok(InvocationOutcome::SpokenReplies { mode })
 }
 
 fn reset_route(tx: &rusqlite::Connection, route: &Route, request: &str) -> Result<InvocationOutcome> {

@@ -370,6 +370,11 @@ impl Ingress {
                 if !command.valid() {
                     return Ok(Err(Disposition::Invalid));
                 }
+                if command.uses_scoped_grant()
+                    && !policy.allows_scoped_command(&event.room, &sender)
+                {
+                    return Ok(Err(Disposition::Forbidden));
+                }
                 if let super::Command::UseSkill { skill, .. } = command
                     && (!room.tools || !policy.turn_policy(&event.room).skills.is_some_and(|skills| skills.contains(skill)))
                 {
@@ -391,9 +396,6 @@ impl Ingress {
             }
             if event.reply_anchor.is_some() {
                 return Ok(Err(Disposition::Invalid));
-            }
-            if !policy.allows_background_command(&event.room, &sender) {
-                return Ok(Err(Disposition::Forbidden));
             }
             return self.background_route(&event.room, &sender.id, &event.id).map(Ok);
         }
