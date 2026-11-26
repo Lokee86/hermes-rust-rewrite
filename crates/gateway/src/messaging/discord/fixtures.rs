@@ -59,6 +59,7 @@ const LIMIT: Duration = Duration::from_secs(15);
 #[derive(Clone)]
 struct Server {
     gateway: String,
+    heartbeat_interval_ms: u64,
     incoming: mpsc::Sender<Wire>,
     writes: mpsc::Sender<Write>,
     counter: Arc<AtomicU64>,
@@ -159,12 +160,17 @@ impl Drop for Fixtures {
 
 impl Fixtures {
     async fn start() -> Self {
+        Self::start_with_heartbeat(5_000).await
+    }
+
+    async fn start_with_heartbeat(heartbeat_interval_ms: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (incoming, wires) = mpsc::channel(16);
         let (writes_tx, writes) = mpsc::channel(32);
         let transport = Server {
             gateway: format!("ws://{address}/"),
+            heartbeat_interval_ms,
             incoming,
             writes: writes_tx,
             counter: Arc::new(AtomicU64::new(500)),
@@ -300,7 +306,7 @@ async fn run_wire(state: Server, mut socket: WebSocket) {
     {
         return;
     }
-    let hello = json!({"op":10,"d":{"heartbeat_interval":125}});
+    let hello = json!({"op":10,"d":{"heartbeat_interval":state.heartbeat_interval_ms}});
     if socket
         .send(Message::Text(hello.to_string().into()))
         .await
@@ -980,7 +986,7 @@ async fn discord_auto_thread_uses_inline_only_for_a_definite_refusal() {
 async fn discord_missing_heartbeat_ack_resumes_then_invalid_session_reports_gap() {
     let root = tempfile::tempdir().unwrap();
     let model = Model::new().await;
-    let mut fixture = Fixtures::start().await;
+    let mut fixture = Fixtures::start_with_heartbeat(125).await;
     let gateway = model
         .gateway(root.path(), vec![fixture.configuration(root.path())])
         .await;
@@ -1053,18 +1059,20 @@ async fn discord_fresh_sessions_repair_bounded_history_without_admitting_overlap
     let mut replacement = fixture.wire().await;
     replacement.authentication(2).await;
     fixture.ready(&replacement, "after-history").await;
-    let Write::Message {
-        channel, payload, ..
-    } = fixture.reply().await
-    else {
-        panic!("expected reply to recovered Discord history")
-    };
-    assert_eq!(channel, "21");
-    assert_eq!(payload["content"], "answer recovered");
+    let mut remaining = BTreeMap::from([
+        ("21", "answer recovered"),
+        ("29", "answer recovered active thread"),
+    ]);
+    for _ in 0..remaining.len() {
+        let Write::Message { channel, payload, .. } = fixture.reply().await else {
+            panic!("expected reply to recovered Discord history")
+        };
+        let expected = remaining
+            .remove(channel.as_str())
+            .expect("one reply per recovered destination");
+        assert_eq!(payload["content"], expected);
+    }
     wait_reply(&gateway, &format!("discord-message-{missing_id}")).await;
-    let Write::Message { channel, payload, .. } = fixture.reply().await else { unreachable!() };
-    assert_eq!(channel, "29");
-    assert_eq!(payload["content"], "answer recovered active thread");
     wait_reply(&gateway, &format!("discord-message-{thread_id}")).await;
     assert_eq!(model.requests().len(), 3);
     assert_eq!(
