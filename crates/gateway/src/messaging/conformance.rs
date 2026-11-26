@@ -27,6 +27,8 @@ use tokio::{
 
 #[path = "conformance_stock.rs"]
 mod stock;
+#[path = "conformance_quotes.rs"]
+mod quote_conformance;
 #[path = "media_conformance.rs"]
 mod media_conformance;
 #[path = "protection_conformance.rs"]

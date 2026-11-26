@@ -172,6 +172,8 @@ pub(super) fn share_conversation(
     let valid = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?1 AND session IS NULL AND blocked = 0)
                   AND NOT EXISTS(SELECT 1 FROM messaging_route_bindings WHERE destination = ?2 OR binding = ?1)
+                  AND NOT EXISTS(SELECT 1 FROM messaging_quoted_context
+                    WHERE route IN (?1, ?2) AND context IS NOT NULL)
                   AND NOT EXISTS(SELECT 1 FROM messaging_ingress WHERE route = ?1 AND stage NOT IN ('refused','done'))
                   AND EXISTS(SELECT 1 FROM messaging_routes WHERE id = ?2 AND blocked = 0)",
                 params![destination.id,binding.id], |row| row.get::<_,bool>(0),

@@ -134,7 +134,8 @@ fn authorized(
     }
     Ok(scope
         .route_event(&state.policy, &work.event)?
-        .is_ok_and(|route| route.id == work.route.id))
+        .is_ok_and(|route| route.id == work.route.id)
+        && scope.recheck_quote(state, &work.event, &work.route)?)
 }
 
 async fn advance_message(
@@ -145,17 +146,23 @@ async fn advance_message(
     let wake = matches!(work.event.body, InboundBody::Wake);
     let unadmitted = matches!(work.stage.as_str(), "pending" | "admitting");
     let allowed = scope.checked(true, |state| authorized(scope, state, &work))?;
-    let Some(session) = session_for(
-        owner,
-        scope,
-        &work.route,
-        allowed && unadmitted,
-    )
-    .await?
-    else {
+    let quote_revoked = !allowed
+        && !scope.checked(true, |state| scope.recheck_quote(state, &work.event, &work.route))?;
+    let session = session_for(owner, scope, &work.route, allowed && unadmitted).await?;
+    let native_id = submission(&work.route, &work.event.id)?;
+    if quote_revoked {
+        let settled = match &session {
+            Some(session) => db(owner.retire_channel_submission(session, &native_id))?,
+            None => work.route.session.is_none() && unadmitted,
+        };
+        if settled {
+            db(scope.store.refuse_quoted_input(&work.route, &work.event.id))?;
+        }
+        return Ok(());
+    }
+    let Some(session) = session else {
         return Ok(());
     };
-    let native_id = submission(&work.route, &work.event.id)?;
     let receipt = match owner.submission_receipt(&session, &native_id) {
         Some(receipt) => receipt,
         None if !unadmitted => {
@@ -267,6 +274,7 @@ async fn advance_message(
                 if !authorized(scope, state, &work)? {
                     return Ok(None);
                 }
+                let quote = scope.quote_context_source(state, &work.event, &work.route)?;
                 let individual = wake || scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
                     .is_some_and(|(_, kind)| kind == super::ActorKind::Person);
                 let resource = super::profile::resource_event_id(&work.event.id);
@@ -305,6 +313,7 @@ async fn advance_message(
                             approval_mode,
                             skills: policy.skills,
                             selected_skill,
+                            quote,
                         },
                     },
                 ))
@@ -376,7 +385,12 @@ async fn advance_message(
                         edit_target: None,
                         body: DeliveryBody::Reply(message),
                     };
-                    return db(scope.store.publish_reply(&work.route, &work.event, &intent));
+                    return scope.checked(true, |state| {
+                        if !scope.recheck_quote(state, &work.event, &work.route)? {
+                            return Ok(());
+                        }
+                        db(scope.store.publish_reply(&work.route, &work.event, &intent))
+                    });
                 }
             }
             db(scope.store.mark(&work.route, &work.event.id, "done", None))?;

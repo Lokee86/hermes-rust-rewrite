@@ -1432,6 +1432,7 @@ fn delivery_authorized(
     };
     if route.blocked || route.connection != scope.connection || route.room != pending.intent.room
         || !db(scope.store.result_released(&scope.connection, &pending.intent.id))?
+        || !scope.recheck_quote_delivery(state, &route, &pending.intent.id)?
     {
         return Ok(false);
     }

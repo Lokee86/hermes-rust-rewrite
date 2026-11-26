@@ -404,6 +404,30 @@ impl Shared {
         self.claim_pending(session, Some((id, permissions)))
     }
 
+    /// Settle a withdrawn channel input without claiming a turn. A running
+    /// receipt must settle through its own worker.
+    pub(super) fn retire_channel_submission(&self, session: &LiveSession, id: &str) -> Result<bool> {
+        ensure!(lock(&session.settings).channel_route.is_some(), "Expected a channel session");
+        let mut view = lock(&session.view);
+        let mut next = view.authority.clone();
+        let Some(receipt) = next.receipts.iter_mut().find(|receipt| receipt.input_id.as_deref() == Some(id)) else {
+            return Ok(true);
+        };
+        match receipt.status.as_str() {
+            "queued" => {
+                receipt.status = "terminal".into();
+                receipt.outcome = Some("cancelled".into());
+                receipt.result = Some(json!({"status":"cancelled","reason":"Channel source authorization changed"}));
+            }
+            "terminal" => return Ok(true),
+            _ => return Ok(false),
+        }
+        next.persist(&session.writer, None)?;
+        view.authority = next;
+        view.revision += 1;
+        Ok(true)
+    }
+
     pub(crate) fn submission_receipt(&self, session: &LiveSession, submission_id: &str) -> Option<Value> {
         let sid = lock(&session.summary).id.clone();
         lock(&session.view).authority.receipts.iter().find(|r|r.input_id.as_deref()==Some(submission_id)).map(|r|r.value(&self.profile_id, &sid, self.authority_epoch, true))

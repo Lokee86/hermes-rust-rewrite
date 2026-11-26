@@ -1,4 +1,5 @@
 use super::{
+    quotes::{QuoteCommit, QuoteReference, stage_quote},
     runtime::{Ingress, MAX_BATCH, State, blocking, db, now, valid_advance, valid_id},
     store::{self, Candidate, Store},
     types::*,
@@ -47,7 +48,7 @@ pub struct Preparation {
     pub protection: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreparationPurpose {
     Body,
@@ -55,6 +56,7 @@ pub enum PreparationPurpose {
     ProtectedContent,
     Context,
     Burst,
+    Quote(QuoteReference),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +74,7 @@ impl HandoffItem {
                     && preparation.expires_ms > 0
                     && preparation.protection.as_deref().is_none_or(valid_id)
                     && matches!(self.event.body, InboundBody::Message(_))
+                    && !matches!(&preparation.purpose, PreparationPurpose::Quote(source) if !source.valid())
             })
     }
 }
@@ -131,6 +134,12 @@ impl Ingress {
                     {
                         candidate.decision = candidate.decision.and(Err(Disposition::Invalid));
                     }
+                    if let (Some(PreparationPurpose::Quote(source)), Ok(route)) =
+                        (item.preparation.as_ref().map(|p| &p.purpose), &candidate.decision)
+                        && !scope.allows_quote(state, &candidate.event, &route.id, source)?
+                    {
+                        candidate.decision = Err(Disposition::Forbidden);
+                    }
                     candidates.push((candidate, item.preparation));
                 }
                 db(scope.store.handoff(
@@ -140,6 +149,7 @@ impl Ingress {
                     candidates,
                     advance.as_ref(),
                     merge,
+                    &scope.quote_transport()?,
                 ))?
             })
         })
@@ -154,7 +164,7 @@ impl Ingress {
             scope.checked(true, |state| {
                 let mut pending = Vec::new();
                 for (route, input) in db(scope.store.preparations(&scope.connection))? {
-                    if scope.allows_preparation(state, &input.event, &route)? {
+                    if scope.allows_preparation(state, &input.event, &route, &input.preparation.purpose)? {
                         pending.push(input);
                     }
                 }
@@ -176,6 +186,7 @@ impl Ingress {
                 let staged = db(scope.store.preparation(&scope.connection, &event))?;
                 if let Some(staged) = staged
                     && staged.token == token
+                    && !matches!(staged.purpose, PreparationPurpose::Quote(_))
                     && scope.pending_authorized(state, &staged)?
                     && let Some(event) = &staged.event
                 {
@@ -199,7 +210,7 @@ impl Ingress {
             && staged.receipt.disposition == Disposition::Deferred
             && let (Some(event), Some(route)) = (&staged.event, &staged.receipt.route)
         {
-            return self.allows_preparation(state, event, route);
+            return self.allows_preparation(state, event, route, &staged.purpose);
         }
         Ok(false)
     }
@@ -209,7 +220,11 @@ impl Ingress {
         state: &State,
         event: &InboundEvent,
         route: &str,
+        purpose: &PreparationPurpose,
     ) -> Result<bool, GatewayError> {
+        if let PreparationPurpose::Quote(source) = purpose {
+            return self.quote_preparation_allowed(state, event, route, source);
+        }
         Ok(self
             .route_candidate(&state.policy, event, true)?
             .is_ok_and(|current| current.id == route))
@@ -234,6 +249,9 @@ impl Ingress {
                     .ok_or(GatewayError::Invalid)?;
                 if token != staged.token {
                     return Err(GatewayError::Forbidden);
+                }
+                if matches!(staged.purpose, PreparationPurpose::Quote(_)) {
+                    return Err(GatewayError::Unsupported);
                 }
                 if let Some(finished) = staged.finished {
                     return if finished == content {
@@ -261,8 +279,8 @@ impl Ingress {
                     else { scope.route_event(&state.policy, &event)? };
                 let candidate = scope.intake_candidate(&state.policy, event, decision, None)?;
                 db(scope.store.finish_preparation(
-                    &scope.connection, &event_id, &token, &content, candidate,
-                ))
+                    &scope.connection, &event_id, &token, &content, candidate, None,
+                ))?
             })
         })
         .await?;
@@ -271,12 +289,13 @@ impl Ingress {
     }
 }
 
-struct Staged {
-    token: String,
-    expires_ms: i64,
+pub(super) struct Staged {
+    pub(super) token: String,
+    pub(super) purpose: PreparationPurpose,
+    pub(super) expires_ms: i64,
     finished: Option<String>,
-    receipt: IntakeReceipt,
-    event: Option<InboundEvent>,
+    pub(super) receipt: IntakeReceipt,
+    pub(super) event: Option<InboundEvent>,
 }
 
 impl Store {
@@ -288,6 +307,7 @@ impl Store {
         candidates: Vec<(Candidate, Option<Preparation>)>,
         advance: Option<&Advance>,
         merge: bool,
+        quote_transport: &str,
     ) -> Result<Result<IntakeResult, GatewayError>> {
         let identities = candidates
             .iter()
@@ -365,6 +385,11 @@ impl Store {
                         params![connection, receipt.id, preparation.token,
                             serde_json::to_string(&preparation.purpose)?, preparation.expires_ms],
                     )?;
+                    if matches!(preparation.purpose, PreparationPurpose::Quote(_)) {
+                        let route = receipt.route.as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("Quote preparation has no route"))?;
+                        stage_quote(tx, connection, &receipt.id, route, quote_transport)?;
+                    }
                 }
                 receipts.push(receipt);
             }
@@ -430,41 +455,43 @@ impl Store {
         })
     }
 
-    fn preparation(&self, connection: &str, event: &str) -> Result<Option<Staged>> {
+    pub(super) fn preparation(&self, connection: &str, event: &str) -> Result<Option<Staged>> {
         self.read(|db| Ok(db.query_row(
-            "SELECT p.token,p.expires,p.finished,i.route,i.disposition,i.input FROM messaging_preparation p
+            "SELECT p.token,p.expires,p.finished,i.route,i.disposition,i.input,p.purpose FROM messaging_preparation p
              JOIN messaging_ingress i USING(connection,event) WHERE p.connection = ?1 AND p.event = ?2",
             params![connection,event],
             |row| Ok(Staged { token: row.get(0)?, expires_ms: row.get(1)?, finished: row.get(2)?,
                 receipt: IntakeReceipt { id: event.to_owned(), route: row.get(3)?,
                     disposition: store::decode(row, 4)?, repeated: false },
                 event: store::optional_decode(row, 5)?,
+                purpose: store::decode(row, 6)?,
             }),
         ).optional()?))
     }
 
-    fn finish_preparation(
+    pub(super) fn finish_preparation(
         &self,
         connection: &str,
         id: &str,
         token: &str,
         fingerprint: &str,
         candidate: Candidate,
-    ) -> Result<IntakeReceipt> {
+        quote: Option<QuoteCommit>,
+    ) -> Result<Result<IntakeReceipt, GatewayError>> {
         self.write(|tx| {
             let old = store::intake_receipt(tx, connection, id)?
                 .ok_or_else(|| anyhow::anyhow!("Deferred input disappeared"))?;
             if old.disposition != Disposition::Deferred {
-                return Ok(old);
+                return Ok(Ok(old));
             }
-            let finished = tx.execute(
-                "UPDATE messaging_preparation SET finished = ?4
-                 WHERE connection = ?1 AND event = ?2 AND token = ?3 AND finished IS NULL",
-                params![connection, id, token, fingerprint],
-            )?;
-            ensure!(finished == 1, "Preparation changed before commit");
-            let decision =
+            let mut decision =
                 store::attachment_decision(tx, connection, &candidate.event, candidate.decision)?;
+            if decision.is_ok()
+                && let Some(quote) = &quote
+                && !quote.binding_current(tx)?
+            {
+                decision = Err(Disposition::Forbidden);
+            }
             let (disposition, body, stage) = match decision {
                 Ok(route) if old.route.as_deref() == Some(route.id.as_str()) => {
                     let event = &candidate.event;
@@ -476,6 +503,18 @@ impl Store {
                 Ok(_) => (Disposition::Forbidden, None, "refused"),
                 Err(disposition) => (disposition, None, "refused"),
             };
+            if disposition == Disposition::Accepted
+                && let Some(quote) = &quote
+                && !quote.checkpoint_current(tx, connection)?
+            {
+                return Ok(Err(GatewayError::CheckpointChanged));
+            }
+            let finished = tx.execute(
+                "UPDATE messaging_preparation SET finished = ?4
+                 WHERE connection = ?1 AND event = ?2 AND token = ?3 AND finished IS NULL",
+                params![connection, id, token, fingerprint],
+            )?;
+            ensure!(finished == 1, "Preparation changed before commit");
             tx.execute(
                 "UPDATE messaging_ingress SET stage = ?3, disposition = ?4, input = ?5
                  WHERE connection = ?1 AND event = ?2 AND stage = 'preparing'",
@@ -487,7 +526,10 @@ impl Store {
                     body
                 ],
             )?;
-            Ok(IntakeReceipt { disposition, ..old })
+            if disposition == Disposition::Accepted && let Some(quote) = quote {
+                quote.persist(tx, connection, id)?;
+            }
+            Ok(Ok(IntakeReceipt { disposition, ..old }))
         })
     }
 
