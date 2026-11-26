@@ -140,6 +140,9 @@ pub const METHODS: &[&str] = &[
     "messaging.wake_target",
     "messaging.send",
     "messaging.profile.settings",
+    "messaging.profile.discord.list",
+    "messaging.profile.discord.create",
+    "messaging.profile.discord.update",
     "messaging.profile.enrollment_begin",
     "messaging.profile.enrollment_complete",
     "messaging.profile.enable",
@@ -354,6 +357,7 @@ impl Gateway {
         for config in config.adapters {
             shared.messaging.restore(&shared, config).await?;
         }
+        shared.messaging.restore_discord(&shared).await?;
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
         if stock_plugins::has_memory_plugin() {
             let owner = shared.clone();
@@ -1080,6 +1084,25 @@ impl Shared {
                 Err(RpcError::new(4403, "permission_denied", "Messaging operations require the private profile client"))
             }
             "messaging.profile.settings" => Ok(json!({"connections":self.messaging.settings().await.map_err(RpcError::internal)?})),
+            "messaging.profile.discord.list" => Ok(json!({
+                "connections": self.messaging.discord_connections().await.map_err(RpcError::internal)?
+            })),
+            "messaging.profile.discord.create" | "messaging.profile.discord.update" => {
+                let name = required_string(params, "name")?;
+                let settings = serde_json::from_value(params["settings"].clone())
+                    .map_err(|_| RpcError::invalid("Invalid Discord settings"))?;
+                let result = if method.ends_with(".create") {
+                    let enabled = match params.get("enabled") {
+                        Some(value) => value.as_bool().ok_or_else(|| RpcError::invalid("Invalid enabled state"))?,
+                        None => false,
+                    };
+                    self.messaging.create_discord(self, name, enabled, settings).await
+                } else {
+                    let revision = params["revision"].as_u64().ok_or_else(|| RpcError::invalid("revision is required"))?;
+                    self.messaging.update_discord(self, name, revision, settings).await
+                };
+                Ok(json!(result.map_err(RpcError::internal)?))
+            }
             "messaging.profile.enrollment_begin" => {
                 let name = required_string(params, "name")?;
                 let ttl = params["ttl_ms"].as_i64().unwrap_or(300_000);

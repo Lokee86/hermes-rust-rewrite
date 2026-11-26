@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct ScopePolicy {
     pub denied_users: BTreeSet<String>,
     pub denied_roles: BTreeSet<String>,
+    pub denied_destinations: BTreeSet<String>,
     pub direct: RoomRules,
     pub rooms: BTreeMap<String, RoomRules>,
     pub threads: BTreeMap<String, BTreeMap<String, RoomRules>>,
@@ -25,10 +26,22 @@ pub struct RoomRules {
     pub roles: Option<BTreeSet<String>>,
     pub denied_users: BTreeSet<String>,
     pub denied_roles: BTreeSet<String>,
+    /// The nearest explicit grant replaces broader allow choices. Denials and
+    /// inherited restrictions still apply.
+    pub grant: Option<RoomGrant>,
     pub mention_required: Option<bool>,
     pub per_participant: Option<bool>,
     pub turn: TurnPolicy,
     pub delivery: Option<DeliveryPolicy>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoomGrant {
+    pub open: bool,
+    pub paired: bool,
+    pub users: BTreeSet<String>,
+    pub roles: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,6 +53,23 @@ pub struct TurnPolicy {
     pub tools: Option<bool>,
     pub approval: Option<ApprovalPolicy>,
     pub approval_reuse: Option<ApprovalReuse>,
+}
+
+impl TurnPolicy {
+    pub(super) fn overlay(&mut self, next: &Self) {
+        if next.model.is_some() {
+            self.model.clone_from(&next.model);
+        }
+        if next.prompt.is_some() {
+            self.prompt.clone_from(&next.prompt);
+        }
+        if next.skills.is_some() {
+            self.skills.clone_from(&next.skills);
+        }
+        self.tools = next.tools.or(self.tools);
+        self.approval = next.approval.or(self.approval);
+        self.approval_reuse = next.approval_reuse.or(self.approval_reuse);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -90,6 +120,11 @@ impl AccessPolicy {
     }
 
     pub(super) fn room_policy(&self, room: &Room) -> Option<RoomPolicy> {
+        if self.scope.denied_destinations.contains(&room.chat)
+            || room.thread.as_ref().is_some_and(|thread| self.scope.denied_destinations.contains(thread))
+        {
+            return None;
+        }
         let mut current = match room.kind {
             RoomKind::Direct => RoomPolicy {
                 tools: self.direct_tools,
@@ -122,10 +157,16 @@ impl AccessPolicy {
     }
 
     pub(super) fn grants_sender(&self, room: &Room, sender: &Sender, paired: bool) -> bool {
+        let grant = self.rules(room).filter_map(|rule| rule.grant.as_ref()).last();
+        let allowed = grant.map_or_else(
+            || paired || self.allows(sender),
+            |grant| grant.open || (grant.paired && paired) || grant.users.contains(&sender.id)
+                || !grant.roles.is_disjoint(&sender.roles),
+        );
         self.room_policy(room).is_some()
             && (!self.scope.denied_users.contains(&sender.id)
                 && self.scope.denied_roles.is_disjoint(&sender.roles))
-            && (paired || self.allows(sender))
+            && allowed
             && self.rules(room).all(|rules| {
                 !rules.denied_users.contains(&sender.id)
                     && rules.denied_roles.is_disjoint(&sender.roles)
@@ -144,19 +185,7 @@ impl AccessPolicy {
     pub fn turn_policy(&self, room: &Room) -> TurnPolicy {
         let mut result = TurnPolicy::default();
         for rules in self.rules(room) {
-            let next = &rules.turn;
-            if next.model.is_some() {
-                result.model.clone_from(&next.model);
-            }
-            if next.prompt.is_some() {
-                result.prompt.clone_from(&next.prompt);
-            }
-            if next.skills.is_some() {
-                result.skills.clone_from(&next.skills);
-            }
-            result.tools = next.tools.or(result.tools);
-            result.approval = next.approval.or(result.approval);
-            result.approval_reuse = next.approval_reuse.or(result.approval_reuse);
+            result.overlay(&rules.turn);
         }
         result
     }

@@ -1,5 +1,7 @@
 use super::{
-    EffectTransportRef, EffectVisibility, acknowledgements::Acknowledgements, effects::valid_effect_plan,
+    EffectTransportRef, EffectVisibility, acknowledgements::Acknowledgements,
+    discord::settings::{DiscordConnectionSettings, DiscordFactory, DiscordSettings},
+    effects::valid_effect_plan,
     profile::{
         AccountBinding, ConnectionSettings, EnrollmentCredential, EnrollmentLease,
         VerifiedInstallation,
@@ -582,6 +584,8 @@ impl Host {
         let descriptor = Self::validate(&config)?;
         let mut slots = self.slots.lock().await;
         ensure!(!owner.shutdown.is_cancelled(), "Gateway is shutting down");
+        ensure!(self.store.discord_settings(&config.name)?.is_none(),
+            "Use the owner-managed settings for this Discord connection");
         let mut saved =
             self.store
                 .register_connection(&config.name, &descriptor.platform, &config.policy)?;
@@ -605,6 +609,76 @@ impl Host {
         self.activate(owner, &mut slots, config.factory, descriptor, saved)
             .await;
         Ok(())
+    }
+
+    pub(crate) async fn create_discord(
+        &self,
+        owner: &Arc<Shared>,
+        name: &str,
+        enabled: bool,
+        settings: DiscordSettings,
+    ) -> Result<DiscordConnectionSettings> {
+        self.save_discord(owner, name, enabled, None, settings).await
+    }
+
+    pub(crate) async fn update_discord(
+        &self,
+        owner: &Arc<Shared>,
+        name: &str,
+        revision: u64,
+        settings: DiscordSettings,
+    ) -> Result<DiscordConnectionSettings> {
+        self.save_discord(owner, name, false, Some(revision), settings).await
+    }
+
+    async fn save_discord(
+        &self,
+        owner: &Arc<Shared>,
+        name: &str,
+        enabled: bool,
+        revision: Option<u64>,
+        settings: DiscordSettings,
+    ) -> Result<DiscordConnectionSettings> {
+        ensure!(valid_id(name), "Invalid Discord connection name");
+        let factory = Arc::new(DiscordFactory::new(owner.library.root().to_owned(), settings.clone())?);
+        let mut slots = self.slots.lock().await;
+        ensure!(!owner.shutdown.is_cancelled(), "Gateway is shutting down");
+        if let Some(revision) = revision {
+            let mut state = slots.get(name).map(|managed| lock(&managed.slot.state));
+            self.store.update_discord(name, revision, &settings)?;
+            if let Some(state) = &mut state {
+                state.generation = None;
+                state.accepting = false;
+            }
+        } else {
+            self.store.create_discord(name, enabled, &settings)?;
+        }
+        let connection = self.store.connection_setting(name)?.context("Discord connection is unavailable")?;
+        let descriptor = factory.descriptor();
+        lock(&self.factories).insert(name.to_owned(), factory.clone());
+        self.activate(owner, &mut slots, factory, descriptor, connection.clone()).await;
+        Ok(DiscordConnectionSettings { connection, settings })
+    }
+
+    pub(crate) async fn restore_discord(&self, owner: &Arc<Shared>) -> Result<()> {
+        let mut slots = self.slots.lock().await;
+        for (name, settings) in self.store.discord_connections()? {
+            let connection = self.store.connection_setting(&name)?.context("Discord connection is unavailable")?;
+            let factory = Arc::new(DiscordFactory::new(owner.library.root().to_owned(), settings)?);
+            let descriptor = factory.descriptor();
+            ensure!(connection.platform == descriptor.platform, "Invalid saved Discord connection platform");
+            lock(&self.factories).insert(name, factory.clone());
+            self.activate(owner, &mut slots, factory, descriptor, connection).await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn discord_connections(&self) -> Result<Vec<DiscordConnectionSettings>> {
+        let _slots = self.slots.lock().await;
+        self.store.discord_connections()?.into_iter().map(|(name, settings)| {
+            let connection = self.store.connection_setting(&name)?.context("Discord connection is unavailable")?;
+            Ok(DiscordConnectionSettings { connection, settings })
+        }).collect()
     }
 
     async fn activate(
@@ -896,6 +970,8 @@ impl Host {
 
     pub async fn policy(&self, name: &str, policy: AccessPolicy) -> Result<()> {
         let slots = self.slots.lock().await;
+        ensure!(self.store.discord_settings(name)?.is_none(),
+            "Use the owner-managed settings for this Discord connection");
         if let Some(managed) = slots.get(name) {
             let mut state = lock(&managed.slot.state);
             state.revision = self.store.set_connection_policy(name, &policy)?;
@@ -973,9 +1049,13 @@ impl Host {
                 });
             }
         }
-        Ok(
-            serde_json::json!({"profile_id":profile,"connections":connections,"input":input,"deliveries":deliveries}),
-        )
+        let verification: BTreeMap<_, _> = lock(&self.factories).iter()
+            .filter_map(|(name, factory)| factory.verification_status().map(|status| (name.clone(), status)))
+            .collect();
+        Ok(serde_json::json!({
+            "profile_id":profile,"connections":connections,"input":input,"deliveries":deliveries,
+            "verification":verification,
+        }))
     }
 
     pub async fn resolve(

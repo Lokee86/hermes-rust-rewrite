@@ -221,6 +221,7 @@ impl Store {
         connection.execute_batch(super::producer_results::TABLES)?;
         connection.execute_batch(super::protection::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
+        connection.execute_batch(super::discord::settings::TABLES)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
         connection.execute_batch(super::provision::TABLES)?;

@@ -65,6 +65,11 @@ pub struct AdapterConfig {
 
 pub trait AdapterFactory: Send + Sync {
     fn descriptor(&self) -> Descriptor;
+
+    /// Owner-facing verification diagnostics. Only include public account
+    /// identifiers and fixed status values.
+    fn verification_status(&self) -> Option<serde_json::Value> { None }
+
     /// Authenticate the configured account and return its stable platform ID.
     fn connect(
         &self,
