@@ -4,7 +4,7 @@ use super::{
     routes,
     runtime::{now, valid_id},
     store::{
-        Route, Store, decode, delivery_protected, eligible_consent, optional_decode, read_route,
+        Route, Store, decode, eligible_consent, optional_decode, protection_matches, read_route,
     },
     types::{AccessPolicy, DeliveryPart, Room, Sender},
 };
@@ -201,7 +201,7 @@ impl Store {
                         connection,
                         room,
                         required && authorized.effect.consent_required
-                    )? && delivery_protected(
+                    )? && protection_matches(
                         tx,
                         connection,
                         generation,

@@ -141,9 +141,20 @@ impl Ingress {
                 {
                     return Err(GatewayError::Forbidden);
                 }
+                let mut protection = Vec::with_capacity(page.items.len());
+                for item in &page.items {
+                    let event = &item.event;
+                    let identity = scope.authorized_identity(&state.policy, &event.room, &event.sender)?;
+                    let actor = identity.as_ref().map_or(event.sender.id.as_str(), |(sender, _)| sender.id.as_str());
+                    let class = scope.check_source_protection(&state.policy, &event.room, actor, &event.id)?;
+                    if class.is_some() && identity.is_none() {
+                        return Err(GatewayError::Forbidden);
+                    }
+                    protection.push(class.map(|class| (actor.to_owned(), class)));
+                }
                 db(scope
                     .store
-                    .stage_repair_page(&scope.connection, &id, progress, page))?
+                    .stage_repair_page(&scope.connection, &id, progress, page, protection))?
             })
         })
         .await
@@ -184,10 +195,12 @@ impl Ingress {
                     return Err(GatewayError::CheckpointChanged);
                 }
                 let mut candidates = Vec::new();
-                for mut event in db(scope.store.repair_items(&scope.connection, &id))? {
+                for event in db(scope.store.repair_items(&scope.connection, &id))? {
                     let decision = scope.route_event(&state.policy, &event)?;
-                    scope.normalize_event(&mut event)?;
-                    candidates.push(Candidate { event, decision });
+                    if decision.as_ref().err() == Some(&Disposition::ProtectionUnavailable) {
+                        return Err(GatewayError::ProtectionUnavailable);
+                    }
+                    candidates.push(scope.intake_candidate(&state.policy, event, decision, None)?);
                 }
                 let advance = scope.scoped_advance(advance)?;
                 db(scope.store.finish_repair(
@@ -307,6 +320,7 @@ impl Store {
         id: &str,
         mut state: RepairProgress,
         page: RepairPage,
+        protection: Vec<Option<(String, String)>>,
     ) -> Result<Result<RepairProgress, GatewayError>> {
         let identities = page
             .items
@@ -333,7 +347,7 @@ impl Store {
             // Returning an error from the transaction rolls back the entire
             // page. A bad or overflowing page cannot partially advance it.
             let write = (|| -> Result<(), RepairWrite> {
-                for row in page.items {
+                for (row, protection) in page.items.into_iter().zip(protection) {
                     let hash = store::fingerprint(&row.event)?;
                     if let Some(old) = tx.query_row(
                         "SELECT source_order,fingerprint FROM messaging_repair_items WHERE connection = ?1 AND repair = ?2 AND id = ?3",
@@ -352,6 +366,9 @@ impl Store {
                          VALUES (?1,?2,?3,?4,?5,?6)",
                         params![connection,id,row.event.id,row.source_order,hash,serde_json::to_string(&row.event).map_err(anyhow::Error::from)?],
                     )?;
+                    if let Some((actor, class)) = protection {
+                        super::protection::pin_input(tx, connection, &row.event.id, &row.event.room, &actor, &class)?;
+                    }
                     state.staged += 1;
                 }
                 Ok(())

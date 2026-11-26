@@ -313,6 +313,7 @@ pub struct IntakeReceipt {
 pub enum Disposition {
     Accepted,
     Deferred,
+    ProtectionUnavailable,
     Expired,
     Coalesced,
     Historical,
@@ -459,6 +460,7 @@ pub enum GatewayError {
     StaleConnection,
     CheckpointChanged,
     Conflict,
+    ProtectionUnavailable,
     TemporarilyUnavailable,
 }
 
@@ -471,6 +473,7 @@ impl std::fmt::Display for GatewayError {
             Self::StaleConnection => "Adapter connection was replaced",
             Self::CheckpointChanged => "Adapter checkpoint changed",
             Self::Conflict => "Adapter input identity was reused with different data",
+            Self::ProtectionUnavailable => "Required transport protection or audience trust is unavailable",
             Self::TemporarilyUnavailable => "Gateway messaging store unavailable",
         })
     }

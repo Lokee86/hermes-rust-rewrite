@@ -2,7 +2,7 @@ use super::{RecipientOutcome, types::*};
 
 #[path = "store_effects.rs"]
 mod effect_store;
-pub(super) use effect_store::{OutboundPolicy, delivery_protected, eligible_consent};
+pub(super) use effect_store::{OutboundPolicy, eligible_consent, protection_matches};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -97,6 +97,7 @@ impl Route {
 pub(super) struct Candidate {
     pub event: InboundEvent,
     pub decision: Result<Route, Disposition>,
+    pub protection: Option<String>,
 }
 
 pub(super) struct PendingInput {
@@ -214,6 +215,7 @@ impl Store {
         connection.execute_batch(super::receiver::TABLES)?;
         connection.execute_batch(super::timed::TABLES)?;
         connection.execute_batch(super::input_aliases::TABLES)?;
+        connection.execute_batch(super::protection::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
@@ -899,7 +901,7 @@ pub(super) fn append(
     candidate: Candidate,
     preparing: bool,
 ) -> Result<IntakeReceipt> {
-    let Candidate { mut event, decision } = candidate;
+    let Candidate { mut event, decision, protection } = candidate;
     if let Some(id) = super::input_aliases::event_target(tx, connection, &event.id)? {
         event.id = id;
     }
@@ -936,6 +938,9 @@ pub(super) fn append(
     };
     let (route, disposition, input, stage) = match decision {
         Ok(route) => {
+            if let Some(class) = &protection {
+                super::protection::pin_input(tx, connection, &event.id, &event.room, &event.sender.id, class)?;
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO messaging_routes (id,connection,room) VALUES (?1,?2,?3)",
                 params![route.id, connection, serde_json::to_string(&route.room)?],

@@ -2,7 +2,7 @@ use super::{
     ActorKind, GatewayError, InboundBody, InboundEvent, Ingress, IntakeReceipt, Message, Room,
     Sender,
     runtime::{blocking, db},
-    store::{self, Candidate},
+    store,
 };
 
 const OBSERVATION: &str = "connection-observation";
@@ -35,7 +35,7 @@ impl Ingress {
                 {
                     return Err(GatewayError::Forbidden);
                 }
-                let mut event = InboundEvent {
+                let event = InboundEvent {
                     id: db(store::key(
                         OBSERVATION,
                         &(&scope.generation, observation.ordinal),
@@ -47,11 +47,11 @@ impl Ingress {
                     body: InboundBody::Message(observation.message),
                 };
                 let decision = scope.route_event(&state.policy, &event)?;
-                scope.normalize_event(&mut event)?;
+                let candidate = scope.intake_candidate(&state.policy, event, decision, None)?;
                 let result = db(scope.store.intake(
                     &scope.connection,
                     state.revision,
-                    vec![Candidate { event, decision }],
+                    vec![candidate],
                     None,
                 ))?
                 .ok_or(GatewayError::CheckpointChanged)?;

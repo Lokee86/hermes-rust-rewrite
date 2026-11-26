@@ -421,20 +421,6 @@ fn protection_proof(
     ).optional()?.flatten())
 }
 
-pub(in crate::messaging) fn delivery_protected(
-    db: &Connection,
-    connection: &str,
-    generation: &str,
-    room: &Room,
-    required: [Option<&str>; 2],
-) -> Result<bool> {
-    if required == [None, None] {
-        return Ok(true);
-    }
-    let current = protection_proof(db, connection, generation, room)?;
-    Ok(required.into_iter().flatten().all(|class| current.as_deref() == Some(class)))
-}
-
 pub(in crate::messaging) fn eligible_consent(
     db: &Connection,
     connection: &str,
@@ -451,6 +437,21 @@ pub(in crate::messaging) fn eligible_consent(
         .map(json::<ConsentUpdate>)
         .transpose()?;
     Ok(consent.map_or(!required, |update| update.eligible))
+}
+
+pub(in crate::messaging) fn protection_matches<'a>(
+    tx: &Connection,
+    connection: &str,
+    generation: &str,
+    room: &Room,
+    requirements: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<bool> {
+    let mut requirements = requirements.into_iter().flatten().peekable();
+    if requirements.peek().is_none() {
+        return Ok(true);
+    }
+    let proof = protection_proof(tx, connection, generation, room)?;
+    Ok(requirements.all(|class| proof.as_deref() == Some(class)))
 }
 
 /// Effects remain pending (or uncertain) after a policy failure so a verified renewal can unblock them.
@@ -505,9 +506,12 @@ fn authorize_effect(
     {
         return Ok(Err("eligibility_visibility"));
     }
-    if !delivery_protected(tx, connection, generation, &part.room,
-        [effect.protection.as_deref(), policy.protection.as_deref()])?
-    {
+    let original = super::super::protection::delivery_protection(tx, connection, id)?;
+    if original.as_ref().is_some_and(|pin| {
+        pin.room != part.room || effect.protection.as_deref() != Some(pin.class.as_str())
+    }) || !protection_matches(tx, connection, generation, &part.room, [
+        effect.protection.as_deref(), policy.protection.as_deref(),
+    ])? {
         return Ok(Err("eligibility_protection"));
     }
     if !eligible_consent(tx, connection, &part.room, effect.consent_required)? {
@@ -564,13 +568,8 @@ fn authorize_effect(
                 params![marker.delivery, marker.part],
                 |row| row.get(0),
             )?)?;
-            if !delivery_protected(
-                tx,
-                connection,
-                generation,
-                &part.room,
-                [original.effect.protection.as_deref(), None],
-            )? {
+            if !protection_matches(tx, connection, generation, &part.room, [original.effect.protection.as_deref()])?
+            {
                 return Ok(Err("eligibility_protection"));
             }
             Some(receipt)

@@ -127,7 +127,7 @@ impl Ingress {
                     next.boundary_ids.clear();
                 }
                 let mut candidates = Vec::with_capacity(items.len());
-                for mut item in items {
+                for item in items {
                     let decision = if item.timestamp_ms < floor {
                         Err(Disposition::Historical)
                     } else {
@@ -136,11 +136,7 @@ impl Ingress {
                     if item.timestamp_ms == next.through_ms {
                         next.boundary_ids.insert(item.event.id.clone());
                     }
-                    scope.normalize_event(&mut item.event)?;
-                    candidates.push(Candidate {
-                        event: item.event,
-                        decision,
-                    });
+                    candidates.push(scope.intake_candidate(&state.policy, item.event, decision, None)?);
                 }
                 let gap = !matches!(coverage, TimeCoverage::Complete { .. })
                     || next.boundary_ids.len() > MAX_BOUNDARY_EVENTS;

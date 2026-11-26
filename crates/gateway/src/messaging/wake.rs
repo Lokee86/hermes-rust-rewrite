@@ -167,7 +167,7 @@ impl Store {
                    AND stage = 'pending' ORDER BY position LIMIT 1",
                 params![connection,route.id], |row| row.get::<_,String>(0),
             ).optional()?;
-            let mut receipt = store::append(tx, connection, revision, Candidate { event, decision: Ok(route) }, false)?;
+            let mut receipt = store::append(tx, connection, revision, Candidate { event, decision: Ok(route), protection: None }, false)?;
             if !receipt.repeated && receipt.disposition == Disposition::Accepted
                 && let Some(covering) = covering
             {

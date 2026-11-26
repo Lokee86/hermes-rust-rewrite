@@ -42,6 +42,9 @@ pub struct Preparation {
     pub token: String,
     pub purpose: PreparationPurpose,
     pub expires_ms: i64,
+    /// The protection class of a delayed input. This contains no key material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +70,7 @@ impl HandoffItem {
             && self.preparation.as_ref().is_none_or(|preparation| {
                 valid_id(&preparation.token)
                     && preparation.expires_ms > 0
+                    && preparation.protection.as_deref().is_none_or(valid_id)
                     && matches!(self.event.body, InboundBody::Message(_))
             })
     }
@@ -110,20 +114,24 @@ impl Ingress {
                 let id = scope.scoped_transport_key("transport-handoff", &id)?;
                 let advance = scope.scoped_advance(advance)?;
                 let mut candidates = Vec::with_capacity(items.len());
-                for mut item in items {
+                for item in items {
                     let decision = scope.route_candidate(
                         &state.policy,
                         &item.event,
                         item.preparation.is_some(),
                     )?;
-                    scope.normalize_event(&mut item.event)?;
-                    candidates.push((
-                        Candidate {
-                            event: item.event,
-                            decision,
-                        },
-                        item.preparation,
-                    ));
+                    let declared = item.preparation.as_ref().and_then(|p| p.protection.as_deref());
+                    let mut candidate = scope.intake_candidate(&state.policy, item.event, decision, declared)?;
+                    if let Some(preparation) = &item.preparation
+                        && (preparation.purpose == PreparationPurpose::ProtectedContent
+                            || candidate.protection.is_some())
+                        && (candidate.protection.is_none()
+                            || !matches!(&candidate.event.body, InboundBody::Message(message)
+                                if message.text.is_empty() && message.attachments.is_empty()))
+                    {
+                        candidate.decision = candidate.decision.and(Err(Disposition::Invalid));
+                    }
+                    candidates.push((candidate, item.preparation));
                 }
                 db(scope.store.handoff(
                     &scope.connection,
@@ -169,8 +177,9 @@ impl Ingress {
                 if let Some(staged) = staged
                     && staged.token == token
                     && scope.pending_authorized(state, &staged)?
+                    && let Some(event) = &staged.event
                 {
-                    return Ok(());
+                    return scope.check_input_protection(&state.policy, event);
                 }
                 Err(GatewayError::Forbidden)
             })
@@ -243,18 +252,16 @@ impl Ingress {
                     });
                 }
                 let mut event = staged.event.ok_or(GatewayError::Invalid)?;
+                let expired = staged.expires_ms <= chrono::Utc::now().timestamp_millis();
+                if !expired {
+                    scope.check_input_protection(&state.policy, &event)?;
+                }
                 event.body = InboundBody::Message(message);
-                let decision = if staged.expires_ms <= chrono::Utc::now().timestamp_millis() {
-                    Err(Disposition::Expired)
-                } else {
-                    scope.route_event(&state.policy, &event)?
-                };
+                let decision = if expired { Err(Disposition::Expired) }
+                    else { scope.route_event(&state.policy, &event)? };
+                let candidate = scope.intake_candidate(&state.policy, event, decision, None)?;
                 db(scope.store.finish_preparation(
-                    &scope.connection,
-                    &event_id,
-                    &token,
-                    &content,
-                    Candidate { event, decision },
+                    &scope.connection, &event_id, &token, &content, candidate,
                 ))
             })
         })
@@ -323,7 +330,9 @@ impl Store {
                     return Ok(Err(GatewayError::TemporarilyUnavailable));
                 }
             }
-            let merge_event = if merge && candidates.len() > 1 {
+            let merge_event = if merge && candidates.len() > 1
+                && candidates.iter().all(|(candidate, _)| candidate.protection == candidates[0].0.protection)
+            {
                 let mut event = candidates[0].0.event.clone();
                 let merged = candidates.iter().filter_map(|(candidate,_)| match &candidate.event.body {
                     InboundBody::Message(message) => Some(message.text.as_str()),
@@ -389,8 +398,9 @@ impl Store {
     fn preparations(&self, connection: &str) -> Result<Vec<(String, DeferredInput)>> {
         self.read(|db| {
             let mut query = db.prepare(
-                "SELECT i.input,p.token,p.purpose,p.expires,i.route FROM messaging_preparation p
+                "SELECT i.input,p.token,p.purpose,p.expires,i.route,protection.class FROM messaging_preparation p
                  JOIN messaging_ingress i USING(connection,event)
+                 LEFT JOIN messaging_input_protection protection USING(connection,event)
                  WHERE p.connection = ?1 AND i.stage = 'preparing' AND p.expires > ?2
                  ORDER BY i.position LIMIT ?3",
             )?;
@@ -410,6 +420,7 @@ impl Store {
                                     token: row.get(1)?,
                                     purpose: store::decode(row, 2)?,
                                     expires_ms: row.get(3)?,
+                                    protection: row.get(5)?,
                                 },
                             },
                         ))
@@ -455,11 +466,13 @@ impl Store {
             let decision =
                 store::attachment_decision(tx, connection, &candidate.event, candidate.decision)?;
             let (disposition, body, stage) = match decision {
-                Ok(route) if old.route.as_deref() == Some(route.id.as_str()) => (
-                    Disposition::Accepted,
-                    Some(serde_json::to_string(&candidate.event)?),
-                    "pending",
-                ),
+                Ok(route) if old.route.as_deref() == Some(route.id.as_str()) => {
+                    let event = &candidate.event;
+                    if let Some(class) = &candidate.protection {
+                        super::protection::pin_input(tx, connection, id, &event.room, &event.sender.id, class)?;
+                    }
+                    (Disposition::Accepted, Some(serde_json::to_string(event)?), "pending")
+                }
                 Ok(_) => (Disposition::Forbidden, None, "refused"),
                 Err(disposition) => (disposition, None, "refused"),
             };

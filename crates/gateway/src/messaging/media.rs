@@ -104,6 +104,7 @@ pub struct MediaRead {
     manifest: AttachmentManifest,
     purpose: MediaPurpose,
     expires_ms: i64,
+    protection: Option<String>,
 }
 
 /// A profile's speech service. Adapters normalize voice data to 16 kHz mono
@@ -193,6 +194,7 @@ struct ScopedEffect {
     sender: Option<Sender>,
     blocked: bool,
     body: DeliveryBody,
+    protection: Option<String>,
 }
 
 impl Ingress {
@@ -224,7 +226,7 @@ impl Ingress {
                 let (verified, _) = scope.effective_sender(&state.policy, &source.room, &source.sender)?
                     .ok_or(GatewayError::Forbidden)?;
                 source.sender = verified;
-                scope.media_allowed(state, &source, purpose)?;
+                let protection = scope.media_allowed(state, &source, purpose)?;
                 let token = crate::new_id();
                 let now = now();
                 let reserved = db(scope.store.write(|tx| {
@@ -253,6 +255,7 @@ impl Ingress {
                     manifest,
                     purpose,
                     expires_ms,
+                    protection,
                 })
             })
         })
@@ -525,11 +528,18 @@ impl Ingress {
         self.checked(true, |state| {
             self.recheck_media(state, grant)?;
             let consumed = db(self.store.write(|tx| {
-                Ok(tx.execute(
+                let claimed = tx.execute(
                     "UPDATE messaging_media_reads SET claimed = 1
                      WHERE token = ?1 AND connection = ?2 AND generation = ?3 AND expires_ms > ?4 AND claimed = 0",
                     params![grant.token, self.connection, self.generation, now()],
-                )? == 1)
+                )? == 1;
+                if claimed && let Some(class) = &grant.protection {
+                    let source = &grant.source;
+                    super::protection::pin_input(
+                        tx, &self.connection, &source.event_id, &source.room, &source.sender.id, class,
+                    )?;
+                }
+                Ok(claimed)
             }))?;
             if consumed { Ok(()) } else { Err(GatewayError::Forbidden) }
         })
@@ -550,7 +560,7 @@ impl Ingress {
         state: &State,
         source: &MediaSource,
         purpose: MediaPurpose,
-    ) -> Result<(), GatewayError> {
+    ) -> Result<Option<String>, GatewayError> {
         let policy = &state.policy;
         let room = policy
             .room_policy(&source.room)
@@ -571,7 +581,7 @@ impl Ingress {
         {
             return Err(GatewayError::Forbidden);
         }
-        Ok(())
+        self.check_source_protection(policy, &source.room, &source.sender.id, &source.event_id)
     }
 
     fn recheck_media(&self, state: &State, grant: &MediaRead) -> Result<(), GatewayError> {
@@ -579,7 +589,10 @@ impl Ingress {
             return Err(GatewayError::Forbidden);
         }
         remaining(grant.expires_ms)?;
-        self.media_allowed(state, &grant.source, grant.purpose)
+        if self.media_allowed(state, &grant.source, grant.purpose)? != grant.protection {
+            return Err(GatewayError::ProtectionUnavailable);
+        }
+        Ok(())
     }
 
     /// Read the exact attachment named in the active prepared send. Recheck
@@ -797,6 +810,9 @@ impl Ingress {
         {
             return Err(GatewayError::Forbidden);
         }
+        self.check_delivery_protection(
+            &state.policy, room, &identity.delivery, effect.protection.as_deref(),
+        )?;
         Ok(effect)
     }
 
@@ -908,6 +924,7 @@ impl Store {
             sender,
             blocked,
             body: part.body,
+            protection: part.effect.protection,
         }))
     }
 

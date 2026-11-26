@@ -34,8 +34,9 @@ async fn durable_preparation_orders_routes_and_reopens_before_hydration() {
     );
     batch.items[0].preparation = Some(Preparation {
         token: "source-transfer".into(),
-        purpose: PreparationPurpose::ProtectedContent,
+        purpose: PreparationPurpose::Body,
         expires_ms: expires(),
+        protection: None,
     });
     let staged = ingress.stage_handoff(batch.clone()).await.unwrap();
     assert_eq!(staged.checkpoint.as_deref(), Some("next"));
@@ -124,6 +125,7 @@ async fn leased_acknowledgement_waits_for_preparation_and_uses_the_latest_token(
             token: "stable-source".into(),
             purpose: PreparationPurpose::Body,
             expires_ms: expires(),
+            protection: None,
         }),
     };
     let lease = |token: &str, bytes| AcknowledgementLease {

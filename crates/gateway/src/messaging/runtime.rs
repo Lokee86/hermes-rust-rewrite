@@ -5,7 +5,7 @@ use super::{
         VerifiedInstallation,
     },
     sessions,
-    store::{self, Candidate, OutboundPolicy, PendingDelivery, Store},
+    store::{self, OutboundPolicy, PendingDelivery, Store},
     transport::{InstallationKey, SharedReceiver},
     types::*,
 };
@@ -218,10 +218,9 @@ impl Ingress {
         let result = blocking(move || {
             scope.checked(true, |state| {
                 let mut candidates = Vec::with_capacity(events.len());
-                for mut event in events {
+                for event in events {
                     let decision = scope.route_event(&state.policy, &event)?;
-                    scope.normalize_event(&mut event)?;
-                    candidates.push(Candidate { event, decision });
+                    candidates.push(scope.intake_candidate(&state.policy, event, decision, None)?);
                 }
                 let advance = scope.scoped_advance(advance)?;
                 db(scope.store.intake(
@@ -320,6 +319,13 @@ impl Ingress {
                 }
             }
             InboundBody::Wake => return Ok(Err(Disposition::Unsupported)),
+        }
+        if !preparing {
+            match self.check_source_protection(policy, &event.room, &sender.id, &event.id) {
+                Ok(_) => {}
+                Err(GatewayError::ProtectionUnavailable) => return Ok(Err(Disposition::ProtectionUnavailable)),
+                Err(error) => return Err(error),
+            }
         }
         let participant = room.per_participant.then_some(sender.id.as_str());
         let route = db(store::Route::new(
@@ -1302,7 +1308,7 @@ async fn deliver(
             }
             let plan = adapter.prepare(&pending.intent).and_then(|mut parts| {
                 let protection = scope.checked(true, |state| {
-                    Ok(state.policy.delivery_policy(&pending.intent.room).protection)
+                    scope.delivery_protection(&state.policy, &pending.intent.room, &pending.intent.id)
                 }).map_err(|_| PreparationFailure::Rejected)?;
                 for part in &mut parts {
                     if let Some(required) = &protection {

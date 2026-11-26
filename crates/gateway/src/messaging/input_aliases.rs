@@ -35,7 +35,7 @@ pub struct InputAlias {
 impl Ingress {
     pub async fn submit_aliased(
         &self,
-        mut event: InboundEvent,
+        event: InboundEvent,
         mut aliases: Vec<InputAlias>,
         advance: Option<Advance>,
     ) -> Result<IntakeResult, GatewayError> {
@@ -61,12 +61,12 @@ impl Ingress {
         let result = blocking(move || {
             scope.checked(true, |state| {
                 let decision = scope.route_event(&state.policy, &event)?;
-                scope.normalize_event(&mut event)?;
+                let candidate = scope.intake_candidate(&state.policy, event, decision, None)?;
                 let advance = scope.scoped_advance(advance)?;
                 db(scope.store.intake_aliases(
                     &scope.connection,
                     state.revision,
-                    Candidate { event, decision },
+                    candidate,
                     &aliases,
                     advance.as_ref(),
                 ))?

@@ -29,6 +29,8 @@ use tokio::{
 mod stock;
 #[path = "media_conformance.rs"]
 mod media_conformance;
+#[path = "protection_conformance.rs"]
+mod protection_conformance;
 #[path = "effects_conformance.rs"]
 mod effects_conformance;
 
@@ -1166,6 +1168,7 @@ async fn reopens_durable_intake_queue_claim_and_committed_result() {
             .map(|(event, route)| store::Candidate {
                 event,
                 decision: Ok(route),
+                protection: None,
             })
             .collect(),
         Some(&advance(None, "5")),

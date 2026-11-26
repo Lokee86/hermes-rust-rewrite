@@ -1034,17 +1034,17 @@ impl Ingress {
                 } else {
                     Err(Disposition::Forbidden)
                 };
-                scope.normalize_event(&mut event)?;
                 let evidence = ResourceEvidence {
                     source,
                     provider_event: event.id.clone(),
                 };
                 event.id = db(key(RESOURCE_EVENT, &evidence))?;
                 let advance = scope.scoped_advance(advance)?;
+                let candidate = scope.intake_candidate(&state.policy, event, decision, None)?;
                 db(scope.store.intake_resource(
                     &scope.connection,
                     state.revision,
-                    Candidate { event, decision },
+                    candidate,
                     &evidence,
                     advance.as_ref(),
                 ))?
