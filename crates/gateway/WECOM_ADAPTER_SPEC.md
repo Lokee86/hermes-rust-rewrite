@@ -1,6 +1,6 @@
 # WeCom stock plugin implementation spec
 
-Bundle WeCom as one Rust stock plugin with two adapter registrations. `wecom` serves WeCom AI Bots over WebSocket. `wecom_callback` serves self-built enterprise apps through encrypted HTTP callbacks. Start after DingTalk and the shared contract pass their gates. Qualify both modes separately before Weixin starts. Each has its own setup, identity, lease, policies, delivery limits and acceptance. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [DingTalk spec](DINGTALK_ADAPTER_SPEC.md) · [Hermes WeCom manifest](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/plugins/platforms/wecom/plugin.yaml)
+Bundle WeCom as one Rust stock plugin with two adapter registrations. `wecom` serves WeCom AI Bots over WebSocket. `wecom_callback` serves self-built enterprise apps through encrypted HTTP callbacks. Start after DingTalk and the shared contract pass their gates. Qualify both modes separately before Weixin starts. Each has its own setup, identity, lease, policies, delivery limits and acceptance. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [DingTalk spec](DINGTALK_ADAPTER_SPEC.md) · [Hermes WeCom manifest](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/plugins/platforms/wecom/plugin.yaml) · [Next adapter, Weixin](WEIXIN_ADAPTER_SPEC.md)
 
 ## Registration and ownership
 

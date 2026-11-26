@@ -60,6 +60,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 13. Implement Feishu/Lark and verify both regions and intake modes, chat and card actions, scoped document comments, meeting-invite handoff, media and recovery. [Feishu/Lark spec](crates/gateway/FEISHU_ADAPTER_SPEC.md)
 14. Implement DingTalk and verify Stream Mode, expiring reply grants, AI Card recovery and authorized scheduled delivery. [DingTalk spec](crates/gateway/DINGTALK_ADAPTER_SPEC.md)
 15. Implement WeCom and pass separate acceptance gates for AI Bot WebSocket and self-built app Callback, including multi-app isolation. [WeCom spec](crates/gateway/WECOM_ADAPTER_SPEC.md)
+16. Implement Weixin and verify iLink enrollment, durable polling, peer-scoped context, encrypted media and qualified delivery. [Weixin spec](crates/gateway/WEIXIN_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 
