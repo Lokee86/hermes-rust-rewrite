@@ -39,6 +39,7 @@ pub struct TurnPolicy {
     pub skills: Option<BTreeSet<String>>,
     pub tools: Option<bool>,
     pub approval: Option<ApprovalPolicy>,
+    pub approval_reuse: Option<ApprovalReuse>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,6 +48,13 @@ pub enum ApprovalPolicy {
     Manual,
     Smart,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReuse {
+    Session,
+    Persistent,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -148,6 +156,7 @@ impl AccessPolicy {
             }
             result.tools = next.tools.or(result.tools);
             result.approval = next.approval.or(result.approval);
+            result.approval_reuse = next.approval_reuse.or(result.approval_reuse);
         }
         result
     }

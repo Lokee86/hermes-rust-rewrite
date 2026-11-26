@@ -1,4 +1,5 @@
 //! Native gateway contract for messaging adapters.
+mod approvals;
 mod commands;
 mod effects;
 mod intake;
@@ -20,6 +21,7 @@ mod conformance;
 #[cfg(test)]
 mod profile_tests;
 
+pub(crate) use approvals::{ToolApprovalContext, tool_key};
 pub use commands::*;
 pub use intake::*;
 pub use policy::*;

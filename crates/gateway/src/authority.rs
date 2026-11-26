@@ -18,6 +18,8 @@ pub(super) struct ChannelExecution {
     pub model: Option<String>,
     #[serde(skip)]
     pub policy: hermes_engine::ChannelTurnPolicy,
+    #[serde(skip)]
+    pub approval_context: Option<messaging::ToolApprovalContext>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -147,6 +147,8 @@ pub(super) struct Action {
     pub generation: u64,
     pub request: String,
     pub kind: String,
+    pub expires: i64,
+    pub tool: Option<String>,
     pub resolved: Option<Response>,
 }
 
@@ -204,6 +206,7 @@ impl Store {
         connection.execute_batch(TABLES)?;
         connection.execute_batch(super::media::TABLES)?;
         connection.execute_batch(effect_store::TABLES)?;
+        connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
         connection.execute_batch(super::intake::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
@@ -487,6 +490,10 @@ impl Store {
             )? == 0 {
                 return Ok(());
             }
+            tx.execute(
+                "INSERT INTO messaging_action_authority(id,expires,tool) VALUES (?1,?2,?3)",
+                params![action.id,action.expires,action.tool],
+            )?;
             let intent = DeliveryIntent {
                 id: action.id.clone(),
                 room: route.room.clone(),
@@ -503,8 +510,9 @@ impl Store {
         let db = crate::lock(&self.0);
         Ok(db
             .query_row(
-                "SELECT session,recipient,generation,request,type,resolved FROM messaging_actions
-             WHERE id = ?1 AND route = ?2 AND connection = ?3",
+                "SELECT a.session,a.recipient,a.generation,a.request,a.type,a.resolved,COALESCE(p.expires,0),p.tool
+                 FROM messaging_actions a LEFT JOIN messaging_action_authority p ON a.id = p.id
+                 WHERE a.id = ?1 AND a.route = ?2 AND a.connection = ?3",
                 params![id, route.id, route.connection],
                 |row| {
                     Ok(Action {
@@ -516,6 +524,8 @@ impl Store {
                         request: row.get(3)?,
                         kind: row.get(4)?,
                         resolved: optional_decode(row, 5)?,
+                        expires: row.get(6)?,
+                        tool: row.get(7)?,
                     })
                 },
             )
@@ -528,12 +538,14 @@ impl Store {
         event: &str,
         action: &Action,
         response: &Response,
+        policy: &str,
     ) -> Result<()> {
         self.write(|tx| {
-            tx.execute(
+            ensure!(tx.execute(
                 "UPDATE messaging_actions SET resolved = ?2 WHERE id = ?1 AND resolved IS NULL",
                 params![action.id, serde_json::to_string(response)?],
-            )?;
+            )? == 1, "Messaging prompt was already decided");
+            super::approvals::record(tx, route, action, response, policy)?;
             set_input(tx, route, event, "done", Some("applied"))
         })
     }

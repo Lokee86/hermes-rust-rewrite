@@ -286,6 +286,8 @@ pub enum Control {
 #[serde(rename_all = "snake_case")]
 pub enum Response {
     Approve,
+    ApproveForSession,
+    ApprovePersistently,
     Deny,
     Clarify(String),
 }
@@ -350,6 +352,10 @@ pub enum DeliveryBody {
 pub enum Prompt {
     Approval {
         text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_session: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_persistent: bool,
     },
     Clarification {
         question: String,

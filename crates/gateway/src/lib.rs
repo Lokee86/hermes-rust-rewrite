@@ -545,10 +545,13 @@ struct View {
 
 struct Clarification {
     payload: Value,
+    expires_ms: i64,
     answer: async_channel::Sender<String>,
 }
 struct Approval {
     payload: Value,
+    tool: Option<String>,
+    expires_ms: i64,
     answer: async_channel::Sender<bool>,
     timeout: CancellationToken,
 }
@@ -1801,6 +1804,7 @@ impl Shared {
             channel_policy: admission.channel.as_ref().map(|channel| channel.policy.clone()).unwrap_or_default(),
         };
         let mut stream = TurnStream {
+            approval_context: admission.channel.as_ref().and_then(|channel| channel.approval_context.clone()),
             unattended: admission.unattended || admission.channel.as_ref().is_some_and(|policy| !policy.interactive),
             id: admission.id.clone(),
             segment: 0,
@@ -1992,7 +1996,9 @@ impl Shared {
                 let mut view = lock(&session.view);
                 let payload = json!({"kind":"clarification","request_id":request,"execution_generation":view.generation,
                     "question":question,"choices":choices});
-                view.clarifications.insert(request, Clarification { payload:payload.clone(), answer });
+                view.clarifications.insert(request, Clarification {
+                    payload:payload.clone(), expires_ms:chrono::Utc::now().timestamp_millis() + 300_000, answer,
+                });
                 drop(view);
                 self.emit(session, "clarify.request", payload);
             }
@@ -2039,6 +2045,14 @@ impl Shared {
             }
             Event::Approval { call, answer } => {
                 if stream.unattended { let _ = answer.try_send(false); return; }
+                let tool = messaging::tool_key(&call.name, &call.arguments).ok();
+                if let (Some(context), Some(tool)) = (&stream.approval_context, &tool)
+                    && context.authorized(tool)
+                {
+                    let _ = answer.try_send(true);
+                    return;
+                }
+                let expires_ms = chrono::Utc::now().timestamp_millis() + 300_000;
                 let id = new_id();
                 let timeout = CancellationToken::new();
                 let mut command = format!("{}({})", call.name, call.arguments);
@@ -2054,6 +2068,8 @@ impl Shared {
                     id.clone(),
                     Approval {
                         payload: payload.clone(),
+                        tool,
+                        expires_ms,
                         answer,
                         timeout: timeout.clone(),
                     },
@@ -2085,6 +2101,7 @@ impl Shared {
 
 struct TurnStream {
     unattended: bool,
+    approval_context: Option<messaging::ToolApprovalContext>,
     id: String,
     segment: u64,
     offset: usize,

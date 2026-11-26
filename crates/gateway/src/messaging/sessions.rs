@@ -288,6 +288,13 @@ async fn advance_message(
                         tools,
                         interactive: individual && scope.capabilities().interactive_prompts,
                         model,
+                        approval_context: (individual && !wake && tools).then(|| super::ToolApprovalContext {
+                            ingress: scope.clone(),
+                            route: work.route.id.clone(),
+                            room: work.event.room.clone(),
+                            actor: work.event.sender.clone(),
+                            session: lock(&session.summary).id.clone(),
+                        }),
                         policy: hermes_engine::ChannelTurnPolicy {
                             prompt: policy.prompt,
                             approval_mode,
@@ -323,7 +330,8 @@ async fn advance_message(
                 if caps.interactive_prompts && scope.authorized_identity(&state.policy, &work.event.room, &work.event.sender)?
                     .is_some_and(|(_, kind)| kind == super::ActorKind::Person)
                 {
-                    publish_prompts(scope, &session, &work, &receipt)?;
+                    publish_prompts(scope, &session, &work, &receipt,
+                        state.policy.turn_policy(&work.event.room).approval_reuse)?;
                 }
                 Ok(())
             })?;
@@ -378,6 +386,7 @@ fn publish_prompts(
     session: &LiveSession,
     work: &PendingInput,
     receipt: &Value,
+    reuse: Option<super::ApprovalReuse>,
 ) -> Result<(), GatewayError> {
     let generation = receipt["execution_generation"]
         .as_u64()
@@ -396,7 +405,10 @@ fn publish_prompts(
                     .as_str()
                     .unwrap_or("Approve this tool call?")
                     .to_owned();
-                (id.clone(), "approval", Prompt::Approval { text })
+                (id.clone(), "approval", pending.expires_ms, pending.tool.clone(), Prompt::Approval {
+                    text, allow_session: reuse.is_some(),
+                    allow_persistent: reuse == Some(super::ApprovalReuse::Persistent),
+                })
             });
         let clarifications = view
             .clarifications
@@ -412,13 +424,15 @@ fn publish_prompts(
                 (
                     id.clone(),
                     "clarification",
+                    pending.expires_ms,
+                    None,
                     Prompt::Clarification { question, choices },
                 )
             });
         approvals.chain(clarifications).collect::<Vec<_>>()
     };
     let session_id = lock(&session.summary).id.clone();
-    for (request, kind, prompt) in prompt_list {
+    for (request, kind, expires, tool, prompt) in prompt_list {
         let action = Action {
             id: db(store::key(
                 "action",
@@ -430,6 +444,8 @@ fn publish_prompts(
             generation,
             request,
             kind: kind.into(),
+            expires,
+            tool,
             resolved: None,
         };
         db(scope
@@ -523,21 +539,22 @@ async fn apply_control(
                     if old == response { "applied" } else { "stale" },
                 );
             }
-            let result = outcome(owner.answer_prompt(
+            if action.expires <= chrono::Utc::now().timestamp_millis() {
+                return finish_control(scope, work, "stale");
+            }
+            if !super::approvals::permits(response, state.policy.turn_policy(&work.event.room).approval_reuse) {
+                return finish_control(scope, work, "forbidden");
+            }
+            let policy = db(store::key("approval-policy", &(&state.policy, state.revision, scope.installation())))?;
+            let result = outcome(owner.answer_prompt_checked(
                 session,
                 &action.request,
                 action.generation,
                 response,
+                || scope.store.settle_action(&work.route, &work.event.id, &action, response, &policy)
+                    .map_err(crate::RpcError::internal),
             ))?;
-            if result == "applied" {
-                return db(scope.store.settle_action(
-                    &work.route,
-                    &work.event.id,
-                    &action,
-                    response,
-                ));
-            }
-            return finish_control(scope, work, result);
+            return if result == "applied" { Ok(()) } else { finish_control(scope, work, result) };
         }
         if !operator {
             return finish_control(scope, work, "forbidden");

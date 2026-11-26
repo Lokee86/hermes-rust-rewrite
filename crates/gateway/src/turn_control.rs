@@ -187,25 +187,41 @@ impl Shared {
         generation: u64,
         response: &messaging::Response,
     ) -> RpcResult {
+        self.answer_prompt_checked(session, request, generation, response, || Ok(()))
+    }
+
+    pub(super) fn answer_prompt_checked(
+        &self,
+        session: &LiveSession,
+        request: &str,
+        generation: u64,
+        response: &messaging::Response,
+        before: impl FnOnce() -> Result<(), RpcError>,
+    ) -> RpcResult {
         let settled = {
             let mut view = lock(&session.view);
             Self::check_generation(&view, generation)?;
-            match response {
-                messaging::Response::Approve | messaging::Response::Deny => Self::answer_approval(
-                    &mut view,
-                    request,
-                    matches!(response, messaging::Response::Approve),
-                ),
+            let now = chrono::Utc::now().timestamp_millis();
+            let live = match response {
                 messaging::Response::Clarify(answer) => {
                     if answer.trim().is_empty() || answer.len() > MAX_PROMPT_BYTES {
-                        return Err(RpcError::invalid(
-                            "Enter a clarification answer within the prompt limit",
-                        ));
+                        return Err(RpcError::invalid("Enter a clarification answer within the prompt limit"));
                     }
+                    view.clarifications.get(request).is_some_and(|ask| !ask.answer.is_closed() && ask.expires_ms > now)
+                }
+                _ => view.approvals.get(request).is_some_and(|ask| !ask.answer.is_closed() && ask.expires_ms > now),
+            };
+            if !live {
+                return Err(RpcError::new(4001, "prompt_stale", "This prompt is no longer waiting"));
+            }
+            before()?;
+            match response {
+                messaging::Response::Clarify(answer) => {
                     view.clarifications
                         .remove(request)
                         .is_some_and(|ask| ask.answer.try_send(answer.clone()).is_ok())
                 }
+                _ => Self::answer_approval(&mut view, request, !matches!(response, messaging::Response::Deny)),
             }
         };
         if !settled {

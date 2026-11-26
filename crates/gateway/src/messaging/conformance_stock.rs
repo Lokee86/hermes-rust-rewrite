@@ -436,3 +436,104 @@ async fn wake_only_recovers_new_work_without_a_message_send() {
     assert!(!ingress.capabilities().text_delivery);
     gateway.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn prompt_decision_is_durable_and_reuse_checks_the_current_route_policy() {
+    let root = TempDir::new().unwrap();
+    let model = Model::new().await;
+    let mut policy = policy();
+    policy.direct_tools = true;
+    policy.scope.direct.turn.approval = Some(ApprovalPolicy::Manual);
+    policy.scope.direct.turn.approval_reuse = Some(ApprovalReuse::Persistent);
+    let driver = Driver::new(Transport::Push, "approval-reuse", true);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy.clone())])
+        .await;
+    driver.ready().await;
+    driver.push(dm("first", "one", "approval")).await;
+    let prompt = driver.sent().await;
+    let id = prompt_id(&prompt.attempt).to_owned();
+    assert!(matches!(
+        prompt.attempt.payload.body,
+        DeliveryBody::Prompt {
+            prompt: Prompt::Approval {
+                allow_session: true,
+                allow_persistent: true,
+                ..
+            },
+            ..
+        }
+    ));
+    prompt.finish(confirmed("approval-card"));
+    let approve = control(
+        "approve",
+        "one",
+        Control::Respond {
+            action_id: id,
+            response: Response::ApprovePersistently,
+        },
+    );
+    driver.push(approve.clone()).await;
+    applied(&gateway, "approve", "applied").await;
+    let first = driver.sent().await;
+    let delivery_id = first.attempt.delivery_id.clone();
+    first.finish(confirmed("first-reply"));
+    status(&gateway, |state| {
+        delivery(state, &delivery_id, 0).is_some_and(|row| row["part_state"] == "sent")
+    }).await;
+    gateway.shutdown().await.unwrap();
+
+    let driver = Driver::new(Transport::Push, "approval-reuse", true);
+    let gateway = model
+        .gateway(root.path(), vec![driver.config(policy.clone())])
+        .await;
+    driver.ready().await;
+    assert!(driver.push(approve).await.repeated);
+    driver.push(dm("second", "one", "approval")).await;
+    let second = driver.sent().await;
+    assert!(matches!(
+        second.attempt.payload.body,
+        DeliveryBody::Reply(_)
+    ));
+    second.finish(confirmed("second-reply"));
+    policy.scope.direct.turn.approval_reuse = Some(ApprovalReuse::Session);
+    gateway.set_adapter_policy("fixture", policy).await.unwrap();
+    driver.push(dm("third", "one", "approval")).await;
+    let prompt = driver.sent().await;
+    let id = prompt_id(&prompt.attempt).to_owned();
+    assert!(matches!(
+        prompt.attempt.payload.body,
+        DeliveryBody::Prompt {
+            prompt: Prompt::Approval {
+                allow_persistent: false,
+                ..
+            },
+            ..
+        }
+    ));
+    prompt.finish(confirmed("next-prompt"));
+    driver
+        .push(control(
+            "too-broad",
+            "one",
+            Control::Respond {
+                action_id: id.clone(),
+                response: Response::ApprovePersistently,
+            },
+        ))
+        .await;
+    applied(&gateway, "too-broad", "forbidden").await;
+    driver
+        .push(control(
+            "deny",
+            "one",
+            Control::Respond {
+                action_id: id,
+                response: Response::Deny,
+            },
+        ))
+        .await;
+    applied(&gateway, "deny", "applied").await;
+    driver.sent().await.finish(confirmed("third-reply"));
+    gateway.shutdown().await.unwrap();
+}

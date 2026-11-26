@@ -375,7 +375,7 @@ fn valid_control(control: &Control) -> bool {
             valid_id(action_id)
                 && match response {
                     Response::Clarify(answer) => valid_text(answer),
-                    Response::Approve | Response::Deny => true,
+                    Response::Approve | Response::ApproveForSession | Response::ApprovePersistently | Response::Deny => true,
                 }
         }
         Control::ReplaceQueued { event_id, text } => valid_id(event_id) && valid_text(text),
