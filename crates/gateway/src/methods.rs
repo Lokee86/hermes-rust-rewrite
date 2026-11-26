@@ -119,7 +119,7 @@ impl Shared {
                     messages += tokens(turn.prompt.len() + turn.context.len());
                     for entry in &turn.entries {
                         match entry {
-                            Entry::Assistant { text, .. } => messages += tokens(text.len()),
+                            Entry::User { text } | Entry::Assistant { text, .. } => messages += tokens(text.len()),
                             Entry::Tool { result, .. } => results += tokens(result.len()),
                         }
                     }
@@ -368,7 +368,14 @@ impl Shared {
         let action = optional_string(params, "action")?.unwrap_or("list").to_owned();
         let name = optional_string(params, "name")?.map(str::to_owned);
         let disabled = params["include_disabled"].as_bool().unwrap_or(true);
+        let deliver = optional_string(params, "deliver")?.unwrap_or("local");
+        if let Some(route) = deliver.strip_prefix("channel:")
+            && !self.messaging.authorized_route(route).map_err(RpcError::internal)?
+        {
+            return Err(RpcError::invalid("Choose a route on this profile's messaging gateway"));
+        }
         let draft = cron::Draft {
+            deliver: deliver.to_owned(),
             name: name.clone().unwrap_or_default(),
             prompt: optional_string(params, "prompt")?.unwrap_or_default().into(),
             schedule: optional_string(params, "schedule")?.unwrap_or("0 9 * * *").into(),

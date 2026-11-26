@@ -596,7 +596,7 @@ impl Scheduled {
                             let _ = answer.try_send(false);
                         }
                     }
-                    Event::Snapshot(_) | Event::Subagent(_) | Event::MemoryRecall(_) => {}
+                    Event::Snapshot(_) | Event::Subagent(_) | Event::MemoryRecall(_) | Event::Clarification { .. } | Event::Correction { .. } => {}
                 }
             }
             Action::Approve(id, approved) => {

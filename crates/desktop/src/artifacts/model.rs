@@ -494,6 +494,7 @@ fn native_messages(history: &History, base_dir: &Path) -> Vec<Message> {
         .flat_map(|turn| {
             turn.entries.iter().map(|entry| {
                 let (role, content, tool_name) = match entry {
+                    Entry::User { text } => ("user", Value::String(text.clone()), String::new()),
                     Entry::Assistant { text, .. } => {
                         ("assistant", Value::String(text.clone()), String::new())
                     }

@@ -106,10 +106,14 @@ impl Attachment {
         Self::capture_bytes(session, name, &data)
     }
 
-    fn capture_bytes(session: &Path, name: String, data: &[u8]) -> Result<Self> {
+    pub fn validate_bytes(name: &str, data: &[u8]) -> Result<&'static str> {
         ensure!(data.len() <= MAX_IMAGE as usize, "Attachments must be 4 MiB or smaller");
         ensure!(!name.is_empty() && name.len() <= 1024 && !name.chars().any(char::is_control), "Unsupported filename");
-        let media_type = media_type(data)?.to_owned();
+        media_type(data)
+    }
+
+    pub fn capture_bytes(session: &Path, name: String, data: &[u8]) -> Result<Self> {
+        let media_type = Self::validate_bytes(&name, data)?.to_owned();
         let key = hash(data);
         let dir = blob_dir(session)?;
         let mut file = NamedTempFile::new_in(&dir)?;

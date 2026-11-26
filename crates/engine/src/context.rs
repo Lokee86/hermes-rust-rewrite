@@ -145,6 +145,7 @@ fn describe(turn: &Turn) -> String {
     let mut out = format!("User: {}\n", clip(&turn.prompt, 8_000));
     for entry in &turn.entries {
         match entry {
+            Entry::User { text } => out.push_str(&format!("User: {}\n", clip(text, 8_000))),
             Entry::Assistant { text, calls } => {
                 if !text.trim().is_empty() {
                     out.push_str(&format!("Agent: {}\n", clip(text, 8_000)));
@@ -169,6 +170,7 @@ fn describe(turn: &Turn) -> String {
 
 fn turn_tokens(turn: &Turn) -> usize {
     let entries: usize = turn.entries.iter().map(|entry| match entry {
+        Entry::User { text } => text.len(),
         Entry::Assistant { text, calls } => text.len() + calls.iter().map(|call| call.arguments.len() + call.name.len()).sum::<usize>(),
         Entry::Tool { result, .. } => result.len(),
     }).sum();

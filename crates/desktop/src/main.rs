@@ -980,6 +980,7 @@ impl Hermes {
                     }
                     Event::Approval { call, answer } => self.approvals.push(Approval { call, generation: id, answer: Some(answer) }),
                     Event::MemoryRecall(status) => self.show_memory_recall(status),
+                    Event::Clarification { .. } | Event::Correction { .. } => {}
                     Event::Subagent(progress) => {
                         let list = &mut self.subagents;
                         match list.iter_mut().find(|p| p.id == progress.id) { Some(slot) => *slot = progress, None => list.push(progress) }

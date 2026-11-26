@@ -175,6 +175,12 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
             }
             let outside_agent = cron::has_preflight(&claim.job);
             if outside_agent && claim.run.status != RunStatus::Claimed {
+                if let Some(route) = claim.job.deliver.strip_prefix("channel:")
+                    && let Some(output) = shared.messaging.notification_text(route, &("cron", &claim.run.id))?
+                {
+                    store.finish(&claim, Outcome::Completed { output }, chrono::Utc::now())?;
+                    return Ok(());
+                }
                 // A started script can have effects without an agent receipt.
                 // Preserve its run identity and never execute it again after recovery.
                 fail_unadmitted(&store, &claim, "Hermes restarted while this job's script was running")?;
@@ -189,6 +195,9 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
                 match cron::preflight_with_cancel(&store, &claim, &shared.shutdown).await {
                     Ok(cron::Preflight::Agent(text)) => prompt = text,
                     Ok(cron::Preflight::Done(output)) => {
+                        if let Some(route) = claim.job.deliver.strip_prefix("channel:") {
+                            shared.messaging.notify_route(route, &("cron", &claim.run.id), output.clone())?;
+                        }
                         store.finish(&claim, Outcome::Completed { output }, chrono::Utc::now())?;
                         return Ok(());
                     }
@@ -252,6 +261,11 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
         None if finished.receipt.outcome.as_deref() == Some("cancelled") => Outcome::Cancelled { reason: "Stopped by the user".into() },
         None => Outcome::Failed { error: "Run ended without a conversation turn".into() },
     };
+    if let Outcome::Completed { output } = &outcome
+        && let Some(route) = claim.job.deliver.strip_prefix("channel:")
+    {
+        shared.messaging.notify_route(route, &("cron", &claim.run.id), output.clone())?;
+    }
     store.finish(&claim, outcome, chrono::Utc::now())?;
     Ok(())
 }

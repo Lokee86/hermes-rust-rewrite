@@ -563,10 +563,9 @@ fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result
         draft.model.as_ref().is_none_or(|model| model.len() <= 256),
         "Model ID is too long"
     );
-    ensure!(
-        draft.deliver == "local",
-        "This native scheduler currently delivers to This desktop"
-    );
+    let channel = draft.deliver.strip_prefix("channel:route-")
+        .is_some_and(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    ensure!(draft.deliver == "local" || channel, "Choose local delivery or a gateway channel route");
     ensure!(
         draft.grace_minutes.is_none_or(|minutes| minutes <= 1440),
         "Catch-up grace must be between 0 and 1440 minutes"

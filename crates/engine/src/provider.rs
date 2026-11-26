@@ -185,6 +185,10 @@ pub(crate) fn messages(history: &History, directory: &std::path::Path) -> Result
         messages.push(json!({"role":"user","content":crate::Attachment::user_content(directory,&prompt,&turn.attachments)?}));
         for entry in &turn.entries {
             match entry {
+                Entry::User { text } => {
+                    answer_unfinished(&mut messages, &mut unanswered);
+                    messages.push(json!({"role":"user","content":text}));
+                }
                 Entry::Assistant { text, calls } => {
                     if stopped.is_some() {
                         answer_unfinished(&mut messages, &mut unanswered);

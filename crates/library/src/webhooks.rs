@@ -21,7 +21,7 @@ pub struct Webhook {
     #[serde(default)] pub prompt: String,
     #[serde(default)] pub events: Vec<String>,
     #[serde(default)] pub skills: Vec<String>,
-    /// "log" (record and run the agent into this webhook's chat) — the only target the Rust gateway delivers to.
+    /// "log" records the local result. "channel:<route>" also queues a gateway delivery.
     #[serde(default = "log")] pub deliver: String,
     /// Record the payload without running the agent.
     #[serde(default)] pub deliver_only: bool,

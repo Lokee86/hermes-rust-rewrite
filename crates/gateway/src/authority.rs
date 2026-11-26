@@ -10,6 +10,12 @@ pub(super) struct GroupMember {
     pub(super) first: bool,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(super) struct ChannelExecution {
+    pub tools: bool,
+    pub interactive: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Receipt {
     pub(super) id: String,
@@ -37,6 +43,8 @@ pub(super) struct Receipt {
     pub(super) python_delivery: Option<python_memory::PythonDelivery>,
     #[serde(default)]
     pub(super) unattended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) channel: Option<ChannelExecution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) capture: Option<PendingMemoryCapture>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -178,6 +186,7 @@ impl Authority {
                 python_selection: None,
                 python_delivery: None,
                 unattended: false,
+                channel: None,
                 ordinary_chat: false,
                 capture: None,
                 group: None,
@@ -262,6 +271,7 @@ struct LegacyEntry {
 enum AdmissionOrigin {
     Chat,
     Background { unattended: bool },
+    Channel,
 }
 
 struct SubmissionFence {
@@ -373,6 +383,21 @@ impl Shared {
         self.admit(session, text, Vec::new(), Some(submission_id), true, AdmissionOrigin::Background { unattended }, None).await
     }
 
+    pub(super) async fn submit_channel(
+        self: &Arc<Self>, session: Arc<LiveSession>, text: String, attachments: Vec<Attachment>, id: String,
+    ) -> RpcResult {
+        Attachment::validate_set(&attachments).map_err(|error| RpcError::invalid(error.to_string()))?;
+        if (text.trim().is_empty() && attachments.is_empty()) || text.len() > MAX_PROMPT_BYTES {
+            return Err(RpcError::invalid("Invalid channel input"));
+        }
+        self.admit(session, text, attachments, Some(id), true, AdmissionOrigin::Channel, None).await
+    }
+
+    pub(super) fn claim_channel(&self, session: &LiveSession, id: &str, permissions: ChannelExecution) -> Result<Option<Receipt>> {
+        ensure!(lock(&session.settings).channel_route.is_some(), "Expected a channel session");
+        self.claim_pending(session, Some((id, permissions)))
+    }
+
     pub(crate) fn submission_receipt(&self, session: &LiveSession, submission_id: &str) -> Option<Value> {
         let sid = lock(&session.summary).id.clone();
         lock(&session.view).authority.receipts.iter().find(|r|r.input_id.as_deref()==Some(submission_id)).map(|r|r.value(&self.profile_id, &sid, self.authority_epoch, true))
@@ -399,7 +424,7 @@ impl Shared {
             id: new_id(), input_id: Some(source), text: turn.prompt.clone(), attachments: turn.attachments.clone(),
             model: turn.model.clone(), options: GenerationOptions::default(), sequence: authority.receipts.len() as u64 + 1,
             generation: authority.generation, owner_epoch: Some(self.authority_epoch), status: "terminal".into(), outcome: Some("published".into()),
-            result: Some(payload), turn_index: Some(turn_index), admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), unattended: true,
+            result: Some(payload), turn_index: Some(turn_index), admitted_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), unattended: true, channel: None,
             committed_ns: None, python_selection: None, python_delivery: None,
             capture: None, ordinary_chat: false, legacy_turn_hint: None, group: None,
         });
@@ -413,6 +438,10 @@ impl Shared {
     }
 
     async fn admit(self: &Arc<Self>, session: Arc<LiveSession>, text:String, attachments:Vec<Attachment>, input:Option<String>, queue: bool, origin: AdmissionOrigin, fence: Option<SubmissionFence>) -> RpcResult {
+        let channel = matches!(origin, AdmissionOrigin::Channel);
+        if channel != lock(&session.settings).channel_route.is_some() {
+            return Err(RpcError::invalid("This channel conversation accepts messages through its owning adapter"));
+        }
         let summary = lock(&session.summary).clone();
         let bot_names = match summary.bot.as_deref() {
             Some(name) if !name.starts_with("group:") => vec![name.to_owned()],
@@ -464,6 +493,7 @@ impl Shared {
             python_selection,
             python_delivery: None,
             unattended: matches!(origin, AdmissionOrigin::Background { unattended: true }),
+            channel: None,
             // Freeze consent at submission, including queued turns that run after a switch.
             ordinary_chat,
             capture: None,
@@ -557,7 +587,7 @@ impl Shared {
                 child.group = Some(GroupMember { round: candidate.id.clone(), name, display, title: summary.title.clone(), first: false });
                 next.receipts.push_back(child);
             }
-            let claim = if view.running {
+            let claim = if view.running || channel {
                 None
             } else {
                 next.claim(view.history.turns.len(), self.authority_epoch)
@@ -588,14 +618,32 @@ impl Shared {
         view.started = Some(now());
         view.cancel = Some(cancel);
         view.current_admission = Some(receipt.id.clone());
+        view.corrections = Some(async_channel::bounded(16));
+        view.correction_receipts.clear();
     }
 
     pub(super) fn claim_next(&self, session: &LiveSession) -> Result<Option<Receipt>> {
+        if lock(&session.settings).channel_route.is_some() {
+            return Ok(None);
+        }
+        self.claim_pending(session, None)
+    }
+
+    fn claim_pending(&self, session: &LiveSession, channel: Option<(&str, ChannelExecution)>) -> Result<Option<Receipt>> {
         let mut view = lock(&session.view);
         if view.running || self.shutdown.is_cancelled() {
             return Ok(None);
         }
         let mut next = view.authority.clone();
+        if let Some((key, permissions)) = channel {
+            let Some(head) = next.receipts.iter_mut().find(|receipt| receipt.status != "terminal") else {
+                return Ok(None);
+            };
+            if head.status != "queued" || head.input_id.as_deref() != Some(key) {
+                return Ok(None);
+            }
+            head.channel = Some(permissions);
+        }
         let Some(claim) = next.claim(view.history.turns.len(), self.authority_epoch) else {
             return Ok(None);
         };
@@ -643,6 +691,9 @@ impl Shared {
 
     pub(super) async fn recover_queued(self: &Arc<Self>) -> Result<()> {
         for summary in self.library.authority_sessions()? {
+            if Settings::read(&summary.directory)?.channel_route.is_some() {
+                continue;
+            }
             // Only acquire the session lock for work owned by this gateway.
             let (_, authority) = hermes_engine::read_conversation(&summary.directory)?;
             let authority: Option<Authority> = authority.map(serde_json::from_value).transpose()?;

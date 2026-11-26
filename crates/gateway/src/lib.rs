@@ -4,6 +4,7 @@
 //! not an implementation of the entire upstream dashboard or session authority.
 
 pub mod client;
+pub mod messaging;
 pub mod owner;
 pub mod replay;
 pub mod stock_plugins;
@@ -23,6 +24,7 @@ mod terminal;
 mod authority;
 mod scheduler;
 mod catalog;
+mod turn_control;
 use authority::{Authority, Receipt};
 mod telegram_host;
 use hermes_engine::{
@@ -102,6 +104,10 @@ pub const METHODS: &[&str] = &[
     "prompt.submit",
     "prompt.receipt",
     "prompt.cancel",
+    "prompt.replace_queued",
+    "session.steer",
+    "session.redirect",
+    "clarify.respond",
     "catalog.session.set",
     "catalog.session.delete",
     "catalog.bot.delete",
@@ -126,6 +132,9 @@ pub const METHODS: &[&str] = &[
     "telegram.connect",
     "telegram.disconnect",
     "telegram.send",
+    "messaging.status",
+    "messaging.resolve_delivery",
+    "messaging.restore_route",
 ];
 
 /// Gateway settings. The provider key stays in memory and is never sent to clients.
@@ -135,6 +144,7 @@ pub struct GatewayConfig {
     /// Empty generates a random 256-bit token. Supply a saved token for native clients.
     pub token: String,
     pub provider: Config,
+    pub adapters: Vec<messaging::AdapterConfig>,
 }
 
 impl GatewayConfig {
@@ -144,6 +154,7 @@ impl GatewayConfig {
             library_root: library_root.into(),
             token: String::new(),
             provider,
+            adapters: Vec::new(),
         }
     }
 }
@@ -170,6 +181,27 @@ impl RunningGateway {
     }
     pub fn websocket_url(&self) -> String {
         format!("ws://{}/api/ws", self.address)
+    }
+    pub async fn configure_adapter(&self, config: messaging::AdapterConfig) -> Result<()> {
+        self.shared.messaging.configure(&self.shared, config).await
+    }
+    pub async fn set_adapter_policy(&self, name: &str, policy: messaging::AccessPolicy) -> Result<()> {
+        self.shared.messaging.policy(name, policy).await
+    }
+    pub async fn stop_adapter(&self, name: &str) -> bool {
+        self.shared.messaging.stop(name).await
+    }
+    pub async fn messaging_status(&self) -> Result<Value> {
+        self.shared.messaging.status(&self.shared.profile_id).await
+    }
+    pub async fn resolve_delivery(
+        &self, connection: String, delivery: String, part: u32, attempt: u32,
+        resolution: messaging::DeliveryResolution,
+    ) -> Result<bool> {
+        self.shared.messaging.resolve(connection, delivery, part, attempt, resolution).await
+    }
+    pub async fn restore_messaging_route(&self, route: String) -> Result<bool> {
+        self.shared.messaging.restore_route(route).await
     }
     pub async fn shutdown(mut self) -> Result<()> {
         self.shared.shutdown.cancel();
@@ -209,7 +241,13 @@ impl Gateway {
                 && config.token.bytes().all(|b| b.is_ascii_graphic()),
             "Gateway token must be 32-512 printable ASCII characters without spaces"
         );
+        let mut names = std::collections::HashSet::new();
+        for adapter in &config.adapters {
+            messaging::Host::validate(adapter)?;
+            ensure!(names.insert(adapter.name.clone()), "Duplicate messaging connection name");
+        }
         let library = Library::open(&config.library_root)?;
+        let messaging = messaging::Host::open(library.root())?;
         let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
         let listener = TcpListener::bind(config.bind)
             .await
@@ -244,6 +282,7 @@ impl Gateway {
             auth,
             terminal: terminal::Host::new(),
             telegram,
+            messaging,
             creates: Mutex::new(HashMap::new()),
             catalog_edits: Mutex::new(()),
             admissions: StdMutex::new(()),
@@ -258,6 +297,9 @@ impl Gateway {
         shared.start_python_memory().await;
         webhooks::recover(&shared).await?;
         telegram_host::Host::restore(&shared.telegram);
+        for config in config.adapters {
+            shared.messaging.configure(&shared, config).await?;
+        }
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
         if stock_plugins::has_memory_plugin() {
             let owner = shared.clone();
@@ -300,6 +342,7 @@ impl Gateway {
             .await
             .context("Gateway listener failed");
             on_stop.telegram.shutdown().await;
+            on_stop.messaging.shutdown().await;
             on_stop.stop_turns().await;
             on_stop.gateway_tasks.close();
             on_stop.gateway_tasks.wait().await;
@@ -358,6 +401,7 @@ struct Shared {
     auth: auth::Auth,
     terminal: terminal::Host,
     telegram: Arc<telegram_host::Host>,
+    messaging: messaging::Host,
     creates: Mutex<HashMap<String, (String, String)>>,
     catalog_edits: Mutex<()>,
     // Serialize the final admission commit with an idle provider restart.
@@ -386,6 +430,8 @@ struct Peer {
 struct Settings {
     #[serde(default)]
     source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel_route: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -447,6 +493,9 @@ struct View {
     started: Option<f64>,
     cancel: Option<CancellationToken>,
     current_admission: Option<String>,
+    corrections: Option<(async_channel::Sender<hermes_engine::TurnCorrection>, async_channel::Receiver<hermes_engine::TurnCorrection>)>,
+    correction_receipts: VecDeque<(String, ring::digest::Digest)>,
+    clarifications: BTreeMap<String, Clarification>,
     approvals: BTreeMap<String, Approval>,
     authority: Authority,
     sequence: u64,
@@ -456,6 +505,10 @@ struct View {
     mutations: VecDeque<(String, String, Value)>,
 }
 
+struct Clarification {
+    payload: Value,
+    answer: async_channel::Sender<String>,
+}
 struct Approval {
     payload: Value,
     answer: async_channel::Sender<bool>,
@@ -623,7 +676,12 @@ impl Shared {
             }
             Some(guard)
         } else { None };
-        let dir = self.library.session_dir(id).map_err(RpcError::internal)?;
+        let dir = self.library.session_dir(id).map_err(|error| {
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+                return RpcError::new(4004, "not_found", "The conversation directory is missing");
+            }
+            RpcError::internal(error)
+        })?;
         let mut settings = Settings::read(&dir).map_err(RpcError::internal)?;
         let workspace = self
             .library
@@ -635,7 +693,12 @@ impl Shared {
             Some(name) if !name.starts_with("group:") => self.library.bot_profile(name).map_err(RpcError::internal)?,
             _ => self.library.root().to_owned(),
         };
-        let engine = if settings.source == "scheduled" {
+        let engine = if settings.channel_route.is_some() {
+            if !hermes_engine::has_conversation(&dir).map_err(RpcError::internal)? {
+                return Err(RpcError::new(4004, "not_found", "The channel conversation is missing"));
+            }
+            Session::open_channel(&dir, &profile)
+        } else if settings.source == "scheduled" {
             Session::open_scheduled(&dir, &actual_workspace, &profile)
         } else {
             let enrolled = profile == self.library.root() && self.selected_memory().await.native();
@@ -681,6 +744,9 @@ impl Shared {
                 started: None,
                 cancel: None,
                 current_admission: None,
+                corrections: None,
+                correction_receipts: VecDeque::new(),
+                clarifications: BTreeMap::new(),
                 approvals: BTreeMap::new(),
                 authority,
                 sequence: 0,
@@ -757,7 +823,7 @@ impl Shared {
         let prompts: Vec<_> = view.approvals.values().map(|p| p.payload.clone()).collect();
         let mut result = json!({"session_id":id,"stored_session_id":id,"message_count":messages.len(),
             "messages":if omit {vec![]} else {messages},"info":info,"running":view.running,
-            "messages_omitted":omit,"open_requests":[],"pending_approval":prompts.first(),
+            "messages_omitted":omit,"open_requests":view.clarifications.values().map(|question|&question.payload).collect::<Vec<_>>(),"pending_approval":prompts.first(),
             "turn_started_at":view.started});
         if peer.canonical {
             result["authority_epoch"] = json!(self.authority_epoch);
@@ -800,7 +866,7 @@ impl Shared {
                 json!({"instance_id":self.instance_id,"profile_id":self.profile_id,"authority_epoch":self.authority_epoch,"capabilities":RUNTIME_CAPABILITIES,"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
             ),
             "rpc.discover" => Ok(
-                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).collect::<Vec<_>>(),"limitations":["one running turn per session","steer and redirect are not implemented","event replay is bounded to the current process"]}),
+                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).collect::<Vec<_>>(),"limitations":["one running turn per session","event replay is bounded to the current process"]}),
             ),
             "gateway.capabilities" => Ok(json!({"per_session_exclusive_submit":true})),
             "client.capabilities" => Ok(
@@ -869,6 +935,9 @@ impl Shared {
             "prompt.submit" => self.submit(params, peer).await,
             "prompt.resume_parked" => self.resume_parked(params, peer).await,
             "prompt.resolve_unknown" => self.resolve_unknown(params, peer).await,
+            "prompt.replace_queued" | "session.steer" | "session.redirect" | "clarify.respond" => {
+                self.native_turn_control(method, params, peer).await
+            }
             "prompt.receipt" => {
                 let session = self.attached(params, peer).await?;
                 let id = required_string(params, "admission_id")?;
@@ -950,6 +1019,29 @@ impl Shared {
                 Ok(json!({"acknowledged":lock(&session.view).approvals.contains_key(id)}))
             }
             "approval.respond" => self.respond(params, peer).await,
+            "messaging.status" | "messaging.resolve_delivery" | "messaging.restore_route" if !peer.local_native => {
+                Err(RpcError::new(4403, "permission_denied", "Messaging operations require the private profile client"))
+            }
+            "messaging.status" => self.messaging.status(&self.profile_id).await.map_err(RpcError::internal),
+            "messaging.restore_route" => {
+                let route = required_string(params, "route")?.to_owned();
+                let restored = self.messaging.restore_route(route).await.map_err(RpcError::internal)?;
+                Ok(json!({"restored":restored}))
+            }
+            "messaging.resolve_delivery" => {
+                let connection = required_string(params, "connection")?.to_owned();
+                let delivery = required_string(params, "delivery")?.to_owned();
+                let id = |name| params[name].as_u64().and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| RpcError::invalid(format!("{name} is required")));
+                let resolution = match required_string(params, "resolution")? {
+                    "delivered" => messaging::DeliveryResolution::Delivered,
+                    "discard" => messaging::DeliveryResolution::Discard,
+                    _ => return Err(RpcError::invalid("resolution must be delivered or discard")),
+                };
+                let resolved = self.messaging.resolve(connection, delivery, id("part")?, id("attempt")?, resolution)
+                    .await.map_err(RpcError::internal)?;
+                Ok(json!({"resolved":resolved}))
+            }
             "telegram.status" | "telegram.connect" | "telegram.disconnect" | "telegram.send" if !peer.local_native => {
                 Err(RpcError::new(4403, "permission_denied", "Telegram setup and manual replies require the private profile client"))
             }
@@ -1080,9 +1172,15 @@ impl Shared {
         if source.len() > 64 {
             return Err(RpcError::invalid("source is limited to 64 bytes"));
         }
+        if source == "channel" {
+            return Err(RpcError::invalid("Channel sessions are created by the messaging gateway"));
+        }
         let key = optional_string(params, "request_id")?
             .or(optional_string(params, "idempotency_key")?)
             .map(str::to_owned);
+        if key.as_deref().is_some_and(|id| id.starts_with("channel-session-")) {
+            return Err(RpcError::invalid("Request identity is reserved by the messaging gateway"));
+        }
         if matches!(&key,Some(k) if k.is_empty() || k.len()>256) {
             return Err(RpcError::invalid(
                 "request identity must contain 1-256 bytes",
@@ -1141,7 +1239,7 @@ impl Shared {
                 ));
             }
             let mut prepared = Settings {
-                source: source.into(), model, cwd, creation_key: key.clone(),
+                source: source.into(), channel_route: None, model, cwd, creation_key: key.clone(),
                 creation_fingerprint: Some(fingerprint.clone()), metadata_revision: 0,
                 execution_generation: 0, generation_options: options, memory_binding: None, shell_policy: None,
             };
@@ -1375,16 +1473,7 @@ impl Shared {
             }
         }
         let interrupted = view.running;
-        if !admission && interrupted && view.authority.receipts.iter().any(|r| r.status=="queued") {
-            let mut next = view.authority.clone();
-            for r in &mut next.receipts { if r.status=="queued" { r.status="parked".into(); } }
-            next.persist(&session.writer,None).map_err(RpcError::internal)?;
-            view.authority = next;
-            view.revision += 1;
-        }
-        if let Some(cancel) = &view.cancel {
-            cancel.cancel();
-        }
+        Self::stop_active_turn(&session, &mut view, !admission)?;
         if admission {
             let receipt = view.authority
                 .receipts
@@ -1440,11 +1529,8 @@ impl Shared {
         };
         let mut resolved = Vec::new();
         for id in ids {
-            if let Some(approval) = view.approvals.remove(&id) {
-                approval.timeout.cancel();
-                if approval.answer.try_send(choice == "once").is_ok() {
-                    resolved.push(id);
-                }
+            if Self::answer_approval(&mut view, &id, choice == "once") {
+                resolved.push(id);
             }
         }
         if peer.canonical && resolved.is_empty() {
@@ -1614,8 +1700,13 @@ impl Shared {
     ) -> bool {
         config.model.clone_from(&admission.model);
         let id = lock(&session.summary).id.clone();
+        let controls = hermes_engine::TurnControls {
+            corrections: lock(&session.view).corrections.as_ref().map(|(_, receiver)| receiver.clone()),
+            clarify: admission.channel.is_some_and(|policy| policy.interactive),
+            channel_tools: admission.channel.is_some_and(|policy| policy.tools),
+        };
         let mut stream = TurnStream {
-            unattended: admission.unattended,
+            unattended: admission.unattended || admission.channel.is_some_and(|policy| !policy.interactive),
             id: admission.id.clone(),
             segment: 0,
             offset: 0,
@@ -1670,7 +1761,7 @@ impl Shared {
             self.selected_memory().await.configure_turn(target, &self.library, &session, &mut admission);
             target.set_python_memory(python.clone());
             let result = {
-                let future = target.run_admitted_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone());
+                let future = target.run_controlled_turn(config, admission.options.clone(), prompt, admission.attachments.clone(), tx, cancel.clone(), controls);
                 tokio::pin!(future);
                 loop {
                     tokio::select! {
@@ -1761,6 +1852,8 @@ impl Shared {
             }
             view.history = history;
             view.authority = authority;
+            view.clarifications.clear();
+            view.corrections = None;
             let approvals = std::mem::take(&mut view.approvals);
             for approval in approvals.values() {
                 approval.timeout.cancel();
@@ -1799,6 +1892,20 @@ impl Shared {
         match event {
             Event::Subagent(progress) => self.emit(session, "subagent.progress", serde_json::to_value(&progress).unwrap_or_default()),
             Event::MemoryRecall(status) => self.emit(session, "memory.recall", serde_json::to_value(status).unwrap_or_default()),
+            Event::Clarification { question, choices, answer } => {
+                let request = new_id();
+                let mut view = lock(&session.view);
+                let payload = json!({"kind":"clarification","request_id":request,"execution_generation":view.generation,
+                    "question":question,"choices":choices});
+                view.clarifications.insert(request, Clarification { payload:payload.clone(), answer });
+                drop(view);
+                self.emit(session, "clarify.request", payload);
+            }
+            Event::Correction { text } => {
+                self.emit(session,"message.correction",json!({"text":text,"turn_id":stream.id,"segment":stream.segment}));
+                stream.segment += 1;
+                stream.offset = 0;
+            }
             Event::Text(text) => {
                 self.emit(session,"message.delta",json!({"text":text,"turn_id":stream.id,"segment":stream.segment,"offset":stream.offset}));
                 stream.offset += text.encode_utf16().count();
@@ -1807,6 +1914,7 @@ impl Shared {
                 if let Some(turn) = history.turns.last() {
                     for (index, entry) in turn.entries.iter().enumerate() {
                         match entry {
+                            Entry::User { .. } => {}
                             Entry::Assistant { text, calls } => {
                                 if !calls.is_empty()
                                     && !text.is_empty()
@@ -1975,6 +2083,7 @@ fn transcript(sid: &str, history: &History, authority: Option<&Authority>) -> Ve
             "turn_index":turn_index,"attachments":turn.attachments,"model":turn.model,"status":turn.status}));
         for entry in &turn.entries {
             match entry {
+                Entry::User { text } => messages.push(json!({"role":"user","text":text,"content":text,"row_id":messages.len()+1})),
                 Entry::Assistant{text,calls}=>{
                     let mut message=json!({"role":"assistant","text":text,"content":text,"row_id":messages.len()+1});
                     if !calls.is_empty() {message["tool_calls"]=json!(calls.iter().map(|call|json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}})).collect::<Vec<_>>());}
