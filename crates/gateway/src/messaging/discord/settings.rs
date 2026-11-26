@@ -35,13 +35,13 @@ const DIRECT_MESSAGES: u64 = 1 << 12;
 const MESSAGE_CONTENT: u64 = 1 << 15;
 const MEMBERS_FLAGS: u64 = (1 << 14) | (1 << 15);
 const CONTENT_FLAGS: u64 = (1 << 18) | (1 << 19);
-const SEE_CHANNEL: u64 = 1 << 10;
-const SEND_MESSAGES: u64 = 1 << 11;
+pub(super) const SEE_CHANNEL: u64 = 1 << 10;
+pub(super) const SEND_MESSAGES: u64 = 1 << 11;
 const ATTACH_FILES: u64 = 1 << 15;
-const READ_MESSAGE_HISTORY: u64 = 1 << 16;
+pub(super) const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 const CONNECT_AND_SPEAK: u64 = (1 << 20) | (1 << 21);
-const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
-const SEND_IN_THREADS: u64 = 1 << 38;
+pub(super) const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
+pub(super) const SEND_IN_THREADS: u64 = 1 << 38;
 const MAX_DEPLOYMENT_SECRET_BYTES: u64 = 8192;
 
 pub(crate) const TABLES: &str = "
@@ -732,7 +732,7 @@ impl DiscordSettings {
                 editing: true,
                 progress: true,
                 effects: EffectCapabilities {
-                    prepare_resources: self.auto_thread || self.delivery.forum_posts,
+                    prepare_resources: self.commands.enabled || self.auto_thread || self.delivery.forum_posts,
                     durable_presentation: true,
                     ..Capabilities::TEXT.effects
                 },
@@ -748,7 +748,7 @@ impl DiscordSettings {
             if self.delivery.uploads {
                 permissions |= ATTACH_FILES;
             }
-            if self.auto_thread || self.delivery.forum_posts {
+            if self.commands.enabled || self.auto_thread || self.delivery.forum_posts {
                 permissions |= CREATE_PUBLIC_THREADS;
             }
         }
@@ -1141,6 +1141,7 @@ impl DiscordFactory {
         let permissions = effective_permissions(
             &target.guild,
             bot,
+            true,
             &guild,
             &member,
             &roles,
@@ -1217,15 +1218,54 @@ struct PermissionOverwrite {
     deny: String,
 }
 
+pub(super) async fn thread_permissions(
+    client: &DiscordClient,
+    guild: &str,
+    parent: &str,
+    bot: &str,
+    actor: &str,
+    bot_permissions: u64,
+    actor_permissions: u64,
+) -> Result<Option<BTreeSet<String>>, RestFailure> {
+    let channel_path = ["channels", parent];
+    let guild_path = ["guilds", guild];
+    let bot_path = ["guilds", guild, "members", bot];
+    let requester_path = ["guilds", guild, "members", actor];
+    let roles_path = ["guilds", guild, "roles"];
+    let requests = tokio::try_join!(
+        client.get::<RemoteChannel>(&channel_path),
+        client.get::<RemoteGuild>(&guild_path),
+        client.get::<RemoteMember>(&bot_path),
+        client.get::<RemoteMember>(&requester_path),
+        client.get::<Vec<RemoteRole>>(&roles_path),
+    );
+    let (channel, installed, bot_member, requester, roles) = match requests {
+        Ok(result) => result,
+        Err(RestFailure::Forbidden | RestFailure::Missing | RestFailure::Invalid) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if channel.id != parent || channel.guild_id != guild || !matches!(channel.kind, 0 | 5)
+        || requester.roles.len() > 128 || requester.roles.iter().any(|role| !snowflake(role))
+    {
+        return Ok(None);
+    }
+    let bot_access = effective_permissions(guild, bot, true, &installed, &bot_member, &roles, &channel.overwrites);
+    let actor_access = effective_permissions(guild, actor, false, &installed, &requester, &roles, &channel.overwrites);
+    Ok((bot_access.is_some_and(|bits| bits & bot_permissions == bot_permissions)
+        && actor_access.is_some_and(|bits| bits & actor_permissions == actor_permissions))
+        .then_some(requester.roles))
+}
+
 fn effective_permissions(
     guild: &str,
-    bot: &str,
+    actor: &str,
+    bot: bool,
     installed: &RemoteGuild,
     member: &RemoteMember,
     roles: &[RemoteRole],
     overwrites: &[PermissionOverwrite],
 ) -> Option<u64> {
-    if installed.id != guild || member.user.id != bot || !member.user.bot {
+    if installed.id != guild || member.user.id != actor || member.user.bot != bot {
         return None;
     }
     let everyone = roles.iter().find(|role| role.id == guild)?;
@@ -1240,7 +1280,7 @@ fn effective_permissions(
         base |= permissions;
     }
     const ADMINISTRATOR: u64 = 1 << 3;
-    if installed.owner_id == bot || base & ADMINISTRATOR != 0 {
+    if installed.owner_id == actor || base & ADMINISTRATOR != 0 {
         return Some(u64::MAX);
     }
 
@@ -1251,7 +1291,7 @@ fn effective_permissions(
         let mask = match overwrite.kind {
             0 if overwrite.id == guild => &mut everyone_mask,
             0 if member.roles.contains(&overwrite.id) => &mut role_mask,
-            1 if overwrite.id == bot => &mut member_mask,
+            1 if overwrite.id == actor => &mut member_mask,
             0 | 1 => continue,
             _ => return None,
         };

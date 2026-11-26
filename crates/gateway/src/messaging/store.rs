@@ -213,6 +213,7 @@ impl Store {
         connection.execute_batch(super::discord::RECOVERY_TABLES)?;
         connection.execute_batch(super::discord::SOCKET_TABLES)?;
         connection.execute_batch(super::discord::DELIVERY_RATE_TABLES)?;
+        connection.execute_batch(super::discord::MANUAL_THREAD_TABLES)?;
         connection.execute_batch(effect_store::TABLES)?;
         connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;

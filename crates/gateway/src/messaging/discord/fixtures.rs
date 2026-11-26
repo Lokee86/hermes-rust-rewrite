@@ -40,6 +40,8 @@ mod history_fixtures;
 mod command_fixtures;
 #[path = "background_fixtures.rs"]
 mod background_fixtures;
+#[path = "manual_thread_fixtures.rs"]
+mod manual_thread_fixtures;
 
 const LIMIT: Duration = Duration::from_secs(15);
 
@@ -53,6 +55,8 @@ struct Server {
     history: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
     threads: Arc<Mutex<BTreeMap<String, Value>>>,
     thread_creates: Arc<AtomicU64>,
+    thread_requester_permissions: Arc<Mutex<Option<u64>>>,
+    callback_paths: Arc<Mutex<Vec<String>>>,
 }
 
 struct Wire {
@@ -101,6 +105,7 @@ enum Write {
     Thread {
         parent: String,
         starter: String,
+        payload: Value,
     },
 }
 
@@ -133,6 +138,8 @@ impl Fixtures {
             history: Arc::default(),
             threads: Arc::default(),
             thread_creates: Arc::default(),
+            thread_requester_permissions: Arc::default(),
+            callback_paths: Arc::default(),
         };
         let endpoint = transport.clone();
         let router = Router::new()
@@ -301,6 +308,7 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             auth.is_none(),
             "Discord bot token must stay out of callback requests"
         );
+        crate::lock(&state.callback_paths).push(path.clone());
         let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
         let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
         let has_model_picker =
@@ -332,9 +340,15 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         }),
         (Method::GET, ["guilds", "11"]) => json!({"id":"11","owner_id":"99"}),
         (Method::GET, ["guilds", "11", "members", "9"]) => {
-            json!({"user":{"id":"9","bot":true},"roles":[]})
+            json!({"user":{"id":"9","bot":true},"roles":["80"]})
         }
-        (Method::GET, ["guilds", "11", "roles"]) => json!([{"id":"11","permissions":"8"}]),
+        (Method::GET, ["guilds", "11", "members", "7"]) => {
+            json!({"user":{"id":"7","bot":false},"roles":[]})
+        }
+        (Method::GET, ["guilds", "11", "roles"]) => {
+            let requester = crate::lock(&state.thread_requester_permissions).unwrap_or(8);
+            json!([{"id":"11","permissions":requester.to_string()},{"id":"80","permissions":"8"}])
+        }
         (Method::GET, ["channels", "20"]) => json!({"id":"20","type":1}),
         (Method::GET, ["channels", "21"]) => json!({"id":"21","type":0,"guild_id":"11"}),
         (Method::GET, ["channels", "22"]) => {
@@ -349,12 +363,15 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             found
         }
         (Method::POST, ["channels", parent, "messages", starter, "threads"]) => {
+            let bytes = to_bytes(request.into_body(), 64 * 1024).await.unwrap();
+            let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
             state.thread_creates.fetch_add(1, Ordering::SeqCst);
             let _ = state
                 .writes
                 .send(Write::Thread {
                     parent: parent.to_string(),
                     starter: starter.to_string(),
+                    payload,
                 })
                 .await;
             match *starter {
@@ -714,6 +731,7 @@ async fn discord_auto_thread_converges_after_an_unknown_create_and_restart() {
     let Write::Thread {
         parent,
         starter: requested,
+        ..
     } = fixture
         .next_write("a thread provision attempt", |write| {
             matches!(write, Write::Thread { .. })

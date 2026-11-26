@@ -5,6 +5,7 @@ mod client;
 mod delivery;
 mod dispatch;
 mod interactions;
+mod manual_thread;
 mod media;
 mod messages;
 mod recovery;
@@ -35,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use voice::Voice;
 
 pub(super) use delivery::DELIVERY_RATE_TABLES;
+pub(super) use manual_thread::TABLES as MANUAL_THREAD_TABLES;
 pub(super) use messages::MESSAGE_TABLES;
 pub(super) use recovery::RECOVERY_TABLES;
 pub(super) use socket::SOCKET_TABLES;
@@ -46,6 +48,7 @@ pub(super) struct DiscordAdapter {
     channels: Mutex<BTreeMap<String, Channel>>,
     callbacks: Arc<Semaphore>,
     preparations: Arc<Mutex<BTreeSet<String>>>,
+    manual_recovery: Arc<Semaphore>,
     voice: Voice,
 }
 
@@ -59,6 +62,7 @@ impl DiscordAdapter {
             channels: Mutex::default(),
             callbacks: Arc::new(Semaphore::new(32)),
             preparations: Arc::default(),
+            manual_recovery: Arc::new(Semaphore::new(1)),
             voice,
         }
     }
@@ -221,7 +225,7 @@ impl Adapter for DiscordAdapter {
             if Voice::playback(&attempt) {
                 return self.voice.play(&ingress, &attempt).await;
             }
-            delivery::send(&self.client, &self.bot.bot_id, attempt, ingress, cancel).await
+            delivery::send_as(self, attempt, ingress, cancel).await
         })
     }
 }

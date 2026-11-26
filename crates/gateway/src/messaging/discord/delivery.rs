@@ -7,7 +7,10 @@ pub use render::ReplyMode;
 pub(crate) use render::prepare;
 pub(crate) use render::{DeliverySurface, PlanOptions, prepare_with};
 
-use super::DiscordClient;
+use super::{
+    DiscordAdapter, DiscordClient,
+    manual_thread::{Reservation, verified_thread},
+};
 use crate::messaging::{
     DeliveryBody, DeliveryResult, EffectIdentity, EffectObservation, EffectOperation,
     EffectReceipt, GatewayError, Ingress, ProviderDeliveryState, ProvisionResource, ReceiptKind,
@@ -28,6 +31,28 @@ const THREAD_EXISTS: u64 = 160_004;
 const MAX_JSON: usize = 2 * 1024 * 1024;
 const MAX_UPLOAD: usize = 24 * 1024 * 1024;
 
+pub(super) fn manual_nonce(delivery: &str, ordinal: u32) -> String {
+    nonce(delivery, ordinal, false)
+}
+
+pub(super) async fn send_as(
+    adapter: &DiscordAdapter,
+    attempt: SendAttempt,
+    ingress: Ingress,
+    cancel: CancellationToken,
+) -> DeliveryResult {
+    send_inner(
+        &adapter.client,
+        &adapter.bot.bot_id,
+        attempt,
+        ingress,
+        cancel,
+        Some(adapter),
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn send(
     client: &DiscordClient,
     bot_id: &str,
@@ -35,10 +60,21 @@ pub(crate) async fn send(
     ingress: Ingress,
     cancel: CancellationToken,
 ) -> DeliveryResult {
+    send_inner(client, bot_id, attempt, ingress, cancel, None).await
+}
+
+async fn send_inner(
+    client: &DiscordClient,
+    bot_id: &str,
+    attempt: SendAttempt,
+    ingress: Ingress,
+    cancel: CancellationToken,
+    adapter: Option<&DiscordAdapter>,
+) -> DeliveryResult {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => DeliveryResult::Uncertain,
-        result = dispatch(client, bot_id, &attempt, &ingress) => {
+        result = dispatch(client, bot_id, &attempt, &ingress, adapter) => {
             match result { Ok(evidence) | Err(evidence) => evidence }
         }
     }
@@ -80,6 +116,7 @@ async fn dispatch(
     bot_id: &str,
     attempt: &SendAttempt,
     ingress: &Ingress,
+    adapter: Option<&DiscordAdapter>,
 ) -> SendResult<DeliveryResult> {
     let room = &attempt.payload.room;
     if !snowflake(bot_id)
@@ -90,11 +127,19 @@ async fn dispatch(
     }
 
     let destination = resolved_room(attempt)?;
+    let reservation = ingress
+        .manual_thread_delivery(&attempt.delivery_id)
+        .map_err(|_| retry(Duration::from_millis(500), RetryScope::Part))?;
+    let manual = match reservation.as_ref() {
+        Some(reservation) => Some((adapter.ok_or(DeliveryResult::Rejected)?, reservation)),
+        None => None,
+    };
     let client = &Rest {
         client,
         ingress,
         attempt,
         destination: &destination,
+        manual,
     };
     match &attempt.payload.effect.operation {
         EffectOperation::Provision { resource } => {
@@ -290,6 +335,51 @@ async fn provision(
         return Err(DeliveryResult::Rejected);
     }
     let thread = match resource {
+        ProvisionResource::ThreadFromMessage { starter }
+            if matches!(verified["type"].as_u64(), Some(0 | 5)) =>
+        {
+            let (_, reservation) = client.manual.ok_or(DeliveryResult::Rejected)?;
+            let request = &reservation.request;
+            if verified["guild_id"].as_str() != Some(&request.guild) {
+                return Err(DeliveryResult::Rejected);
+            }
+            let [(_, receipt)] = attempt.effect.dependencies.as_slice() else {
+                return Err(DeliveryResult::Rejected);
+            };
+            if attempt.effect.dependencies[0].0 != starter
+                || receipt.kind != ReceiptKind::Message
+                || !snowflake(&receipt.id)
+            {
+                return Err(DeliveryResult::Rejected);
+            }
+            let anchor = receipt.id.as_str();
+            if let Some(exists) = known_thread(client, parent, anchor, bot_id).await? {
+                return Ok(destination_receipt(exists));
+            }
+            match read_message(client, parent, anchor).await {
+                Ok(message) if own_message(&message, bot_id, parent) == Some(anchor) => {}
+                Ok(_) | Err(DeliveryResult::EditNotPublished) => {
+                    return Err(DeliveryResult::Rejected);
+                }
+                Err(other) => return Err(other),
+            }
+            let created = client.execute(
+                client.bot(Method::POST, &["channels", parent, "messages", anchor, "threads"])
+                    .json(&json!({"name":request.spec.name, "auto_archive_duration":request.spec.archive})),
+                Call::Mutation,
+            ).await?;
+            if created.body["code"].as_u64() == Some(THREAD_EXISTS) {
+                return known_thread(client, parent, anchor, bot_id)
+                    .await?
+                    .map(destination_receipt)
+                    .ok_or(DeliveryResult::Uncertain);
+            }
+            let body = created.into_json(Call::Mutation)?;
+            if !verified_thread(&body, request, anchor, bot_id) {
+                return Err(DeliveryResult::Uncertain);
+            }
+            body
+        }
         ProvisionResource::Thread if matches!(verified["type"].as_u64(), Some(0 | 5)) => {
             let anchor = attempt
                 .reply_anchor
@@ -370,7 +460,11 @@ async fn known_thread<'a>(
         return Ok(None);
     }
     let value = response.into_json(Call::Read)?;
-    if verified_owned_thread(&value, parent, bot_id) == Some(id) {
+    if verified_owned_thread(&value, parent, bot_id) == Some(id)
+        && client.manual.is_none_or(|(_, reservation)| {
+            verified_thread(&value, &reservation.request, id, bot_id)
+        })
+    {
         Ok(Some(id))
     } else {
         Err(DeliveryResult::Rejected)
@@ -618,6 +712,7 @@ struct Rest<'a> {
     ingress: &'a Ingress,
     attempt: &'a SendAttempt,
     destination: &'a Room,
+    manual: Option<(&'a DiscordAdapter, &'a Reservation)>,
 }
 
 impl Rest<'_> {
@@ -636,6 +731,16 @@ impl Rest<'_> {
             return Err(retry(delay, scope));
         }
         if matches!(call, Call::Edit | Call::Mutation) {
+            if let Some((adapter, reservation)) = self.manual {
+                adapter
+                    .recheck_manual_thread(
+                        self.ingress,
+                        self.attempt,
+                        self.destination,
+                        reservation,
+                    )
+                    .await?;
+            }
             check_authority(self.ingress, self.attempt, self.destination).await?;
         }
         let mut response = client

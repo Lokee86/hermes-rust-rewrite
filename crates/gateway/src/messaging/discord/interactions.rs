@@ -10,6 +10,7 @@ use super::{
     channels::{Member, User, read_id, snowflake, snowflake_timestamp},
     client::{DiscordClient, RestFailure, json_response},
     dispatch::{refuse, skip},
+    manual_thread::{ManualThread, ThreadOutcome, ThreadSpec, has_permissions},
     socket::{Dispatch, intake_failure},
 };
 use reqwest::Method;
@@ -29,6 +30,7 @@ const EPHEMERAL: u32 = 64;
 #[derive(Deserialize)]
 struct Invoker {
     user: User,
+    permissions: Option<String>,
     #[serde(flatten)]
     membership: Member,
 }
@@ -55,6 +57,7 @@ enum Action {
     Identity,
     Modal { id: String, question: String },
     Voice { guild: String, leave: bool },
+    Thread(ThreadSpec),
 }
 
 impl Action {
@@ -78,6 +81,7 @@ impl Action {
 enum Presentation {
     Text(String),
     Requester(RequesterInvocation),
+    ManualThread(ManualThread),
     Deferred {
         input: String,
         room: Room,
@@ -131,6 +135,7 @@ impl DiscordAdapter {
             );
             return Ok(());
         };
+        let actor_permissions = input.member.as_ref().and_then(|member| member.permissions.clone());
         let (user, membership) = match input.member.take() {
             Some(member) => (Some(member.user), Some(member.membership)),
             None => (input.user.take(), None),
@@ -206,6 +211,40 @@ impl DiscordAdapter {
             );
             return Ok(());
         };
+        if let Action::Thread(spec) = &action {
+            let parent = crate::lock(&self.channels)
+                .get(&route.room.chat).is_some_and(|channel| matches!(channel.kind, 0 | 5));
+            let valid_surface = route.room.thread.is_none() && parent && route.guild.is_some();
+            let allowed = has_permissions(input.app_permissions.as_deref(), spec.bot_permissions())
+                && has_permissions(actor_permissions.as_deref(), spec.actor_permissions());
+            if !valid_surface || !allowed {
+                let refusal = if valid_surface { Disposition::Forbidden } else { Disposition::Unsupported };
+                refuse(ingress, event, refusal, advance).await?;
+                let text = if valid_surface {
+                    "Discord thread permissions are missing."
+                } else {
+                    "Run /thread in a guild text or announcement channel."
+                };
+                self.respond(ingress, input, Presentation::Text(text.into()), frame.received, cancel);
+                return Ok(());
+            }
+            let request = ManualThread {
+                event: event_id,
+                guild: route.guild.unwrap(),
+                room: route.room,
+                sender,
+                spec: spec.clone(),
+                created_ms: snowflake_timestamp(&input.id).ok_or(ConnectionFailure::Retryable)?,
+            };
+            let accepted = ingress.commit_manual_thread(request.clone(), advance).await.map_err(intake_failure)?;
+            let presentation = if accepted == Disposition::Accepted {
+                Presentation::ManualThread(request)
+            } else {
+                Presentation::Text("The gateway refused this thread request.".into())
+            };
+            self.respond(ingress, input, presentation, frame.received, cancel);
+            return Ok(());
+        }
         if self.settings.commands.has_explicit_grants()
             && let Some(command) = action.requester_command()
             && ingress
@@ -282,6 +321,7 @@ impl DiscordAdapter {
                         "Accepted. The result will arrive in this conversation.".into(),
                     )
                 }
+                Action::Thread(_) => unreachable!("thread command uses its dedicated receipt"),
                 Action::Native(_) => Presentation::Deferred {
                     input: event_id,
                     room: route.room,
@@ -352,6 +392,7 @@ impl DiscordAdapter {
             "skill" => option("skill")
                 .zip(option("input"))
                 .and_then(|(skill, input)| command(Command::UseSkill { skill, input })),
+            "thread" => ThreadSpec::parse(&interaction.data).map(Action::Thread),
             "sethome" => {
                 let required = if room.thread.is_some() {
                     1 << 38
@@ -620,7 +661,8 @@ impl DiscordAdapter {
                     };
                     json!({"type":4,"data":private_text(&text)})
                 }
-                Presentation::Deferred { .. } => json!({"type":5,"data":{"flags":EPHEMERAL}}),
+                Presentation::Deferred { .. } | Presentation::ManualThread(_) =>
+                    json!({"type":5,"data":{"flags":EPHEMERAL}}),
                 Presentation::Modal { id, question } => json!({"type":9,"data":{
                     "custom_id":id,"title":question.chars().take(45).collect::<String>(),
                     "components":[{"type":1,"components":[{"type":4,"custom_id":"answer",
@@ -647,13 +689,12 @@ impl DiscordAdapter {
                     return;
                 }
             }
-            let Presentation::Deferred {
-                input: event,
-                room,
-                sender,
-            } = presentation
-            else {
-                return;
+            let (event, room, sender, thread) = match presentation {
+                Presentation::Deferred { input, room, sender } => (input, room, sender, None),
+                Presentation::ManualThread(request) => (
+                    request.event.clone(), request.room.clone(), request.sender.clone(), Some(request),
+                ),
+                _ => return,
             };
             let Some(expires_ms) = deadline(&input.id, CALLBACK_MS) else {
                 return;
@@ -663,14 +704,28 @@ impl DiscordAdapter {
                 if now() >= expires_ms || cancel.is_cancelled() {
                     return;
                 }
-                let outcome = ingress
-                    .callback_outcome(event.clone(), room.clone(), sender.clone(), expires_ms)
-                    .await;
+                let outcome = if let Some(request) = &thread {
+                    ingress.manual_thread_outcome(request, expires_ms).await.map(|outcome| match outcome {
+                        ThreadOutcome::Pending => None,
+                        ThreadOutcome::Refused => Some((response_content("The thread was not created."), false)),
+                        ThreadOutcome::Created { id, starter_failed } => {
+                            let text = if starter_failed {
+                                format!("Created <#{id}>. Discord refused the starter message.")
+                            } else {
+                                format!("Created <#{id}>.")
+                            };
+                            Some((response_content(&text), false))
+                        }
+                    })
+                } else {
+                    ingress.callback_outcome(event.clone(), room.clone(), sender.clone(), expires_ms).await
+                        .map(|outcome| outcome.map(|outcome| match outcome {
+                            InvocationOutcome::ModelPicker(picker) => (model_picker_payload(&event, &picker.choices), true),
+                            outcome => (response_content(&outcome_text(outcome)), false),
+                        }))
+                };
                 let (payload, is_picker) = match outcome {
-                    Ok(Some(InvocationOutcome::ModelPicker(picker))) => {
-                        (model_picker_payload(&event, &picker.choices), true)
-                    }
-                    Ok(Some(outcome)) => (response_content(&outcome_text(outcome)), false),
+                    Ok(Some(outcome)) => outcome,
                     Ok(None) if Instant::now() < until => {
                         tokio::select! {
                             _ = cancel.cancelled() => return,
@@ -834,6 +889,13 @@ pub(super) async fn synchronize(
         ("steer", vec![option("text")], true),
         ("redirect", vec![option("text")], true),
         ("edit", vec![option("message"), option("text")], false),
+        ("thread", vec![
+            json!({"name":"name","description":"Thread title","type":3,"required":true,"min_length":1,"max_length":100}),
+            json!({"name":"message","description":"Optional message posted inside the thread","type":3,"required":false,"max_length":2000}),
+            json!({"name":"auto_archive_duration","description":"Minutes of inactivity before archive","type":4,"required":false,
+                "choices":[{"name":"1 hour","value":60},{"name":"1 day","value":1440},
+                    {"name":"3 days","value":4320},{"name":"7 days","value":10080}]}),
+        ], false),
     ]);
     if voice {
         catalogue.push(("voice", vec![option("action")], true));
@@ -845,8 +907,11 @@ pub(super) async fn synchronize(
         let mut desired = json!({"name":name,"type":1,"description":format!("Mercury {name}"),
             "options":options,"default_member_permissions":if operator { Some("0") } else { None }});
         if guild.is_none() {
-            desired["contexts"] = json!([0, 1]);
+            desired["contexts"] = if name == "thread" { json!([0]) } else { json!([0, 1]) };
             desired["integration_types"] = json!([0]);
+        }
+        if name == "thread" {
+            desired["default_member_permissions"] = json!(super::settings::CREATE_PUBLIC_THREADS.to_string());
         }
         let mut path = collection.clone();
         let method = if let Some(existing) = old.iter().find(|item| {

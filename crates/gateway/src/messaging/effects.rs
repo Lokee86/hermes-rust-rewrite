@@ -72,6 +72,8 @@ pub enum EffectOperation {
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionResource {
     Thread,
+    /// Create a thread from the exact previously published starter message.
+    ThreadFromMessage { starter: u32 },
     Topic,
 }
 
@@ -280,6 +282,9 @@ impl EffectOperation {
     pub(super) fn dependencies(&self) -> Vec<EffectDependency> {
         let dependency = |part, kind| EffectDependency { part, kind };
         match self {
+            Self::Provision { resource: ProvisionResource::ThreadFromMessage { starter } } => {
+                vec![dependency(*starter, ReceiptKind::Message)]
+            }
             Self::Upload {
                 step: UploadStep::Chunk { begin, .. },
                 ..
