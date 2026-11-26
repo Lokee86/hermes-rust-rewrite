@@ -605,29 +605,8 @@ fn authorized(ingress: &Ingress, room: &Room, actor: &Sender) -> Result<bool, Ga
 }
 
 fn playback_input(bytes: &[u8]) -> Option<songbird::input::Input> {
-    if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
-        return None;
-    }
-    let mut chunks = bytes.get(12..)?;
-    let mut rate = None;
-    let mut samples = None;
-    while !chunks.is_empty() {
-        let header = chunks.get(..8)?;
-        let size = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
-        let end = 8usize.checked_add(size)?;
-        let data = chunks.get(8..end)?;
-        match &header[..4] {
-            b"fmt " if data.get(..4)? == [1, 0, 1, 0] && data.get(14..16)? == [16, 0] => {
-                rate = Some(u32::from_le_bytes(data.get(4..8)?.try_into().ok()?));
-            }
-            b"data" if !data.is_empty() && data.len().is_multiple_of(2) => samples = Some(data),
-            _ => {}
-        }
-        chunks = chunks.get(end + size % 2..)?;
-    }
-    let rate = rate.filter(|rate| (8_000..=192_000).contains(rate))?;
-    let samples = samples?;
-    if samples.len() as u64 / 2 > u64::from(rate) * PLAY_LIMIT.as_secs() {
+    let (rate, samples) = super::voice_note::wav_pcm(bytes)?;
+    if samples.len() as u64 / 2 > rate as u64 * PLAY_LIMIT.as_secs() {
         return None;
     }
     let float_pcm: Vec<u8> = samples
@@ -636,7 +615,7 @@ fn playback_input(bytes: &[u8]) -> Option<songbird::input::Input> {
             (f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0).to_le_bytes()
         })
         .collect();
-    Some(RawAdapter::new(Cursor::new(float_pcm), rate, 1).into())
+    Some(RawAdapter::new(Cursor::new(float_pcm), rate as u32, 1).into())
 }
 
 async fn playback_completed(

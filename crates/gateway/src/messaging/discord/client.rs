@@ -109,6 +109,12 @@ impl DiscordClient {
         self.http.request(method, url)
     }
 
+    #[cfg(test)]
+    pub(super) fn fixture_media_url(&self, url: &Url) -> bool {
+        self.fixture && url.scheme() == "http" && loopback(url)
+            && url.origin() == self.api.origin()
+    }
+
     pub(super) fn public_get(&self, url: Url) -> RequestBuilder {
         self.http.get(url)
     }

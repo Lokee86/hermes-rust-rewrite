@@ -5,10 +5,10 @@ pub(in crate::messaging) use buckets::TABLES as DELIVERY_RATE_TABLES;
 pub use render::ReplyMode;
 #[cfg(test)]
 pub(crate) use render::prepare;
-pub(crate) use render::{DeliverySurface, PlanOptions, prepare_with};
+pub(crate) use render::{DeliverySurface, PlanOptions, add_voice_note, prepare_with};
 
 use super::{
-    DiscordAdapter, DiscordClient,
+    DiscordAdapter, DiscordClient, voice_note,
     manual_thread::{Reservation, verified_thread},
 };
 use crate::messaging::{
@@ -17,7 +17,8 @@ use crate::messaging::{
     RetryScope, Room, RoomKind, SendAttempt,
 };
 use render::{
-    CONTENT_LIMIT, is_nonce, limit, measure, nonce, prompt_payload, references_message, snowflake,
+    CONTENT_LIMIT, is_nonce, is_voice_nonce, limit, measure, nonce, prompt_payload,
+    references_message, snowflake,
 };
 use reqwest::{Method, RequestBuilder, StatusCode, multipart};
 use serde_json::{Value, json};
@@ -80,6 +81,10 @@ async fn send_inner(
     }
 }
 
+pub(crate) fn sends_voice_note(attempt: &SendAttempt) -> bool {
+    attempt.payload.effect.operation_key.as_deref().is_some_and(is_voice_nonce)
+}
+
 pub(crate) async fn observe_create(
     ingress: &Ingress,
     bot_id: &str,
@@ -90,6 +95,9 @@ pub(crate) async fn observe_create(
         return Ok(());
     };
     let channel = room.thread.as_deref().unwrap_or(&room.chat);
+    if is_voice_nonce(key) && !voice_note::accepted_note(dispatch) {
+        return Ok(());
+    }
     let Some(id) = own_message(dispatch, bot_id, channel) else {
         return Ok(());
     };
@@ -178,6 +186,9 @@ async fn dispatch(
         EffectOperation::Retire { .. }
     ) {
         return retire(client, bot_id, attempt, channel).await;
+    }
+    if sends_voice_note(attempt) {
+        return publish_voice_note(client, bot_id, attempt, ingress, channel).await;
     }
     publish(client, bot_id, attempt, ingress, channel).await
 }
@@ -280,6 +291,51 @@ async fn publish(
         DeliveryBody::Progress { .. } | DeliveryBody::Prompt { .. }
     );
     Ok(confirmed(id, marker))
+}
+
+async fn publish_voice_note(
+    client: &Rest<'_>,
+    bot_id: &str,
+    attempt: &SendAttempt,
+    ingress: &Ingress,
+    channel: &str,
+) -> SendResult<DeliveryResult> {
+    let Some(key) = attempt.payload.effect.operation_key.as_deref().filter(|key| is_voice_nonce(key))
+    else { return Err(DeliveryResult::Rejected) };
+    if attempt.payload.edit_target.is_some()
+        || !matches!(&attempt.payload.body, DeliveryBody::Reply(message) if message.attachments.is_empty())
+    {
+        return Err(DeliveryResult::Rejected);
+    }
+    // No provider mutation has occurred if synthesis, reading or encoding fails.
+    let file = ingress.synthesize_reply(attempt).await.map_err(|_| DeliveryResult::AttachmentNotPublished)?;
+    let wav = ingress.reply_artifact(attempt, &file).await.map_err(|_| DeliveryResult::AttachmentNotPublished)?;
+    let note = crate::messaging::runtime::blocking(move || voice_note::encode(&wav))
+        .await.map_err(|_| DeliveryResult::AttachmentNotPublished)?;
+    let flags = voice_note::FLAG
+        | if attempt.payload.effect.visibility.notify { 0 } else { u64::from(QUIET) };
+    let payload = json!({
+        "flags": flags, "nonce":key, "enforce_nonce": true,
+        "attachments":[note.attachment()],
+    });
+    let audio = multipart::Part::bytes(note.bytes).file_name(voice_note::FILENAME)
+        .mime_str(voice_note::MIME).map_err(|_| DeliveryResult::AttachmentNotPublished)?;
+    let form = multipart::Form::new().text("payload_json", payload.to_string()).part("files[0]", audio);
+    let publication = client.execute(
+        client.bot(Method::POST, &["channels", channel, "messages"]).multipart(form),
+        Call::Mutation,
+    ).await?;
+    let created = publication.into_json(Call::Mutation).map_err(|error| match error {
+        DeliveryResult::Rejected => DeliveryResult::AttachmentNotPublished,
+        error => error,
+    })?;
+    if !voice_note::accepted_note(&created)
+        || !created["nonce"].is_null() && created["nonce"].as_str() != Some(key)
+    {
+        return Err(DeliveryResult::Uncertain);
+    }
+    let id = own_message(&created, bot_id, channel).ok_or(DeliveryResult::Uncertain)?;
+    Ok(confirmed(id, false))
 }
 
 async fn retire(

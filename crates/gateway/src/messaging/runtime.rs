@@ -1523,7 +1523,7 @@ async fn deliver(
                     .store
                     .editable_progress(&pending.route, &pending.intent.id))?;
             }
-            let plan = adapter.prepare(&pending.intent).and_then(|mut parts| {
+            let plan = adapter.prepare_with_ingress(&pending.intent, scope).and_then(|mut parts| {
                 let protection = scope.checked(true, |state| {
                     scope.delivery_protection(&state.policy, &pending.intent.room, &pending.intent.id)
                 }).map_err(|_| PreparationFailure::Rejected)?;

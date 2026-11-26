@@ -38,6 +38,7 @@ const CONTENT_FLAGS: u64 = (1 << 18) | (1 << 19);
 pub(super) const SEE_CHANNEL: u64 = 1 << 10;
 pub(super) const SEND_MESSAGES: u64 = 1 << 11;
 const ATTACH_FILES: u64 = 1 << 15;
+const SEND_VOICE_MESSAGES: u64 = 1 << 46;
 pub(super) const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 const CONNECT_AND_SPEAK: u64 = (1 << 20) | (1 << 21);
 pub(super) const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
@@ -380,17 +381,28 @@ impl Default for DiscordDeliverySettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordSpokenReplies {
+    Off,
+    #[default]
+    VoiceNotes,
+    Always,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscordMediaSettings {
     pub attachments: bool,
     pub max_inbound_bytes: u64,
+    pub spoken_replies: DiscordSpokenReplies,
 }
 impl Default for DiscordMediaSettings {
     fn default() -> Self {
         Self {
             attachments: true,
             max_inbound_bytes: 32 * 1024 * 1024,
+            spoken_replies: DiscordSpokenReplies::VoiceNotes,
         }
     }
 }
@@ -653,6 +665,7 @@ impl DiscordSettings {
         };
         policy.scope.require_actor_evidence = true;
         policy.scope.background_commands_disabled = !self.commands.enabled;
+        policy.direct_spoken_replies = self.sends_voice_notes();
         policy.scope.pair_direct = self.direct.pairing;
         policy
             .scope
@@ -696,7 +709,7 @@ impl DiscordSettings {
                 );
                 room.requester_commands = requester_commands.clone();
                 policy.scope.rooms.insert(channel_id.clone(), room);
-                if self.voice_enabled {
+                if self.voice_enabled || self.sends_voice_notes() {
                     policy
                         .rooms
                         .entry(channel_id.clone())
@@ -741,12 +754,20 @@ impl DiscordSettings {
         }
     }
 
+    pub(super) fn sends_voice_notes(&self) -> bool {
+        self.media.attachments && self.delivery.uploads
+            && self.media.spoken_replies != DiscordSpokenReplies::Off
+    }
+
     fn invite_permissions(&self) -> u64 {
         let mut permissions = 0;
         if self.gateway_intents() & GUILD_MESSAGES != 0 {
             permissions |= SEE_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY | SEND_IN_THREADS;
             if self.delivery.uploads {
                 permissions |= ATTACH_FILES;
+            }
+            if self.sends_voice_notes() {
+                permissions |= SEND_VOICE_MESSAGES;
             }
             if self.commands.enabled || self.auto_thread || self.delivery.forum_posts {
                 permissions |= CREATE_PUBLIC_THREADS;
@@ -1170,6 +1191,9 @@ impl DiscordFactory {
         }
         if self.settings.delivery.uploads && permissions & ATTACH_FILES == 0 {
             status.missing_permissions.push("attach_files");
+        }
+        if self.settings.sends_voice_notes() && permissions & SEND_VOICE_MESSAGES == 0 {
+            status.missing_permissions.push("send_voice_messages");
         }
         if !can_deliver {
             status.issue = Some("default_destination_permissions_missing");

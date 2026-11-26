@@ -12,6 +12,7 @@ mod recovery;
 pub mod settings;
 mod socket;
 mod voice;
+pub(super) mod voice_note;
 
 #[cfg(test)]
 mod fixtures;
@@ -146,6 +147,26 @@ impl DiscordAdapter {
     }
 }
 
+impl DiscordAdapter {
+    fn should_send_voice_note(
+        &self,
+        ingress: &Ingress,
+        delivery: &str,
+        room: &Room,
+        anchor: Option<&str>,
+    ) -> bool {
+        if !self.settings.sends_voice_notes() || !anchor.is_some_and(settings::snowflake) {
+            return false;
+        }
+        match self.settings.media.spoken_replies {
+            settings::DiscordSpokenReplies::Off => false,
+            settings::DiscordSpokenReplies::VoiceNotes =>
+                voice_note::spoken_source(ingress, delivery, room).unwrap_or(false),
+            settings::DiscordSpokenReplies::Always => true,
+        }
+    }
+}
+
 struct ResetVoice<'a>(&'a Voice);
 
 impl Drop for ResetVoice<'_> {
@@ -215,6 +236,20 @@ impl Adapter for DiscordAdapter {
         Ok(parts)
     }
 
+    fn prepare_with_ingress(
+        &self,
+        intent: &DeliveryIntent,
+        ingress: &Ingress,
+    ) -> Result<Vec<DeliveryPart>, PreparationFailure> {
+        let mut plan = self.prepare(intent)?;
+        if matches!(intent.body, DeliveryBody::Reply(_))
+            && self.should_send_voice_note(ingress, &intent.id, &intent.room, intent.reply_anchor.as_deref())
+        {
+            delivery::add_voice_note(intent, &mut plan);
+        }
+        Ok(plan)
+    }
+
     fn send(
         &self,
         attempt: SendAttempt,
@@ -224,6 +259,12 @@ impl Adapter for DiscordAdapter {
         Box::pin(async move {
             if Voice::playback(&attempt) {
                 return self.voice.play(&ingress, &attempt).await;
+            }
+            if delivery::sends_voice_note(&attempt)
+                && !self.should_send_voice_note(&ingress, &attempt.delivery_id, &attempt.payload.room,
+                    attempt.reply_anchor.as_deref())
+            {
+                return DeliveryResult::AttachmentNotPublished;
             }
             delivery::send_as(self, attempt, ingress, cancel).await
         })

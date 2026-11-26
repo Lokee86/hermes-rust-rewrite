@@ -162,6 +162,7 @@ async fn unsupported_audio_remains_an_authorized_opaque_file() {
     let prepared = ingress
         .prepare_discord_audio(
             grant,
+            false,
             || async { Ok(io::Cursor::new(audio)) },
             decode_voice_note,
         )

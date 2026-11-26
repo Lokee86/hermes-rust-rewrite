@@ -19,7 +19,6 @@ pub(super) mod fixtures;
 mod tests;
 
 const MAX_ATTACHMENTS: usize = 8;
-const VOICE_MESSAGE: u64 = 1 << 13;
 const MEDIA_LIFETIME: Duration = Duration::from_secs(90);
 const SAMPLE_RATE: usize = 16_000;
 const MAX_VOICE_SAMPLES: usize = 120 * SAMPLE_RATE;
@@ -46,7 +45,7 @@ pub(super) fn attachment_sources(message: &Value) -> Result<Vec<AttachmentSource
     if items.len() > MAX_ATTACHMENTS {
         return Err(GatewayError::Invalid);
     }
-    let flags = message["flags"].as_u64().unwrap_or_default();
+    let voice_note = super::voice_note::is_voice_message(message);
     let mut ids = HashSet::with_capacity(items.len());
     items
         .iter()
@@ -66,7 +65,7 @@ pub(super) fn attachment_sources(message: &Value) -> Result<Vec<AttachmentSource
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or(GatewayError::Invalid)?;
-            let voice = flags & VOICE_MESSAGE != 0
+            let voice = voice_note
                 || item["content_type"]
                     .as_str()
                     .is_some_and(|kind| kind.starts_with("audio/"));
@@ -101,25 +100,37 @@ fn gateway_failure(error: RestFailure) -> GatewayError {
 
 fn verified_cdn_url(url: &str, channel: &str, artifact: &str) -> Result<Url, GatewayError> {
     let url = Url::parse(url).map_err(|_| GatewayError::Invalid)?;
-    let mut path = url.path_segments().ok_or(GatewayError::Forbidden)?;
     if url.scheme() != "https"
         || !matches!(
             url.host_str(),
             Some("cdn.discordapp.com" | "media.discordapp.net")
         )
         || url.port_or_known_default() != Some(443)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || path.next() != Some("attachments")
-        || path.next() != Some(channel)
-        || path.next() != Some(artifact)
-        || path.next().is_none_or(str::is_empty)
-        || path.next().is_some()
+        || !attachment_path(&url, channel, artifact)
     {
         return Err(GatewayError::Forbidden);
     }
     Ok(url)
+}
+
+fn attachment_path(url: &Url, channel: &str, artifact: &str) -> bool {
+    let Some(mut path) = url.path_segments() else { return false };
+    url.username().is_empty() && url.password().is_none() && url.fragment().is_none()
+        && path.next() == Some("attachments") && path.next() == Some(channel)
+        && path.next() == Some(artifact) && path.next().is_some_and(|name| !name.is_empty())
+        && path.next().is_none()
+}
+
+fn attachment_url(
+    _client: &DiscordClient, url: &str, channel: &str, artifact: &str,
+) -> Result<Url, GatewayError> {
+    #[cfg(test)]
+    if let Ok(candidate) = Url::parse(url)
+        && _client.fixture_media_url(&candidate) && attachment_path(&candidate, channel, artifact)
+    {
+        return Ok(candidate);
+    }
+    verified_cdn_url(url, channel, artifact)
 }
 
 pub(super) async fn hydrate_attachments(
@@ -217,7 +228,8 @@ where
         .iter()
         .zip(expected)
         .map(|(item, attachment)| {
-            verified_cdn_url(
+            attachment_url(
+                client,
                 item["url"].as_str().ok_or(GatewayError::Invalid)?,
                 channel,
                 &attachment.id,
@@ -227,7 +239,10 @@ where
     for ((attachment, grant), url) in expected.iter().zip(grants).zip(urls) {
         if attachment.voice {
             match ingress
-                .prepare_discord_audio(grant, || open(url, attachment.size), decode_voice_note)
+                .prepare_discord_audio(
+                    grant, super::voice_note::is_voice_message(&metadata),
+                    || open(url, attachment.size), decode_voice_note,
+                )
                 .await?
             {
                 PreparedAudio::Transcript(spoken) => {

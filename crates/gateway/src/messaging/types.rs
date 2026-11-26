@@ -124,6 +124,15 @@ pub trait Adapter: Send + Sync {
     /// Render the committed intent into bounded platform operations without network effects.
     fn prepare(&self, intent: &DeliveryIntent) -> Result<Vec<DeliveryPart>, PreparationFailure>;
 
+    /// Render with read access to this connection's committed delivery provenance.
+    fn prepare_with_ingress(
+        &self,
+        intent: &DeliveryIntent,
+        _ingress: &Ingress,
+    ) -> Result<Vec<DeliveryPart>, PreparationFailure> {
+        self.prepare(intent)
+    }
+
     /// Execute a single platform operation. The gateway records its attempt before calling.
     fn send(
         &self,

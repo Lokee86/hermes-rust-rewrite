@@ -307,6 +307,15 @@ impl Model {
     }
 
     pub(super) async fn gateway(&self, root: &Path, adapters: Vec<AdapterConfig>) -> RunningGateway {
+        self.gateway_with_audio(root, adapters, None).await
+    }
+
+    pub(super) async fn gateway_with_audio(
+        &self,
+        root: &Path,
+        adapters: Vec<AdapterConfig>,
+        audio: Option<Arc<dyn AudioService>>,
+    ) -> RunningGateway {
         let mut config = GatewayConfig::new(
             root,
             Config {
@@ -316,6 +325,7 @@ impl Model {
             },
         );
         config.adapters = adapters;
+        config.messaging_audio = audio;
         Gateway::start(config).await.unwrap()
     }
 

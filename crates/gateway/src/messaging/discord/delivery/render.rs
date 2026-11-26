@@ -14,6 +14,7 @@ const FILES_PER_MESSAGE: usize = 5;
 const MAX_FENCE_HEADER: usize = 96;
 const NO_REPLY_PREFIX: &str = "m0n";
 const REPLY_PREFIX: &str = "m0r";
+const VOICE_PREFIX: &str = "m0v";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,10 +73,14 @@ pub(super) fn is_nonce(value: &str) -> bool {
     value.len() == 25
         && value
             .get(..3)
-            .is_some_and(|prefix| matches!(prefix, NO_REPLY_PREFIX | REPLY_PREFIX))
+            .is_some_and(|prefix| matches!(prefix, NO_REPLY_PREFIX | REPLY_PREFIX | VOICE_PREFIX))
         && URL_SAFE_NO_PAD
             .decode(&value.as_bytes()[3..])
             .is_ok_and(|hash| hash.len() == 16)
+}
+
+pub(super) fn is_voice_nonce(key: &str) -> bool {
+    key.starts_with(VOICE_PREFIX) && is_nonce(key)
 }
 
 pub(super) fn references_message(key: &str) -> bool {
@@ -232,6 +237,37 @@ pub(crate) fn prepare_with(
         return Err(PreparationFailure::Rejected);
     }
     Ok(plan)
+}
+
+pub(crate) fn add_voice_note(intent: &DeliveryIntent, parts: &mut Vec<DeliveryPart>) {
+    let DeliveryBody::Reply(message) = &intent.body else { return };
+    if message.text.trim().is_empty() || parts.is_empty() || parts.len() >= MAX_PARTS {
+        return;
+    }
+    let provisioned = matches!(parts[0].effect.operation, EffectOperation::Provision { .. });
+    // Files and progress edits already have their own ordering and fallback.
+    let voice_first = parts.len() == 1 && !provisioned && message.attachments.is_empty()
+        && parts[0].edit_target.is_none()
+        && matches!(&parts[0].body, DeliveryBody::Reply(text) if measure(&text.text) <= CONTENT_LIMIT);
+    let ordinal = if voice_first { 0 } else { parts.len() as u32 };
+    let key = nonce(&intent.id, ordinal, false);
+    let mut effect = Effect {
+        operation_key: Some(format!("{VOICE_PREFIX}{}", &key[NO_REPLY_PREFIX.len()..])),
+        ..Effect::default()
+    };
+    if provisioned {
+        effect.operation = publish_using_destination();
+    }
+    let voice = part(intent, DeliveryBody::Reply(Message::text(&message.text)), effect);
+    if voice_first {
+        let text = &mut parts[0];
+        let reply = text.effect.operation_key.as_deref().is_some_and(references_message);
+        text.effect.operation_key = Some(nonce(&intent.id, 1, reply));
+        text.effect.attachment_fallback_for = Some(0);
+        parts.insert(0, voice);
+    } else {
+        parts.push(voice);
+    }
 }
 
 fn publication(

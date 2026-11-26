@@ -5,9 +5,9 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::to_bytes,
+    body::{Bytes, to_bytes},
     extract::{
-        Request, State, WebSocketUpgrade,
+        FromRequest, Multipart, Request, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     http::{Method, StatusCode},
@@ -42,6 +42,8 @@ mod command_fixtures;
 mod background_fixtures;
 #[path = "manual_thread_fixtures.rs"]
 mod manual_thread_fixtures;
+#[path = "voice_note_fixtures.rs"]
+mod voice_note_fixtures;
 
 const LIMIT: Duration = Duration::from_secs(15);
 
@@ -57,6 +59,8 @@ struct Server {
     thread_creates: Arc<AtomicU64>,
     thread_requester_permissions: Arc<Mutex<Option<u64>>>,
     callback_paths: Arc<Mutex<Vec<String>>>,
+    voice_outcome: Arc<AtomicU64>,
+    cdn: Arc<Mutex<BTreeMap<String, Bytes>>>,
 }
 
 struct Wire {
@@ -100,6 +104,12 @@ enum Write {
         payload: Value,
         id: String,
     },
+    VoiceNote {
+        channel: String,
+        payload: Value,
+        audio: Bytes,
+        message: Value,
+    },
     Callback(Value),
     Followup(Value),
     Thread {
@@ -140,6 +150,8 @@ impl Fixtures {
             thread_creates: Arc::default(),
             thread_requester_permissions: Arc::default(),
             callback_paths: Arc::default(),
+            voice_outcome: Arc::default(),
+            cdn: Arc::default(),
         };
         let endpoint = transport.clone();
         let router = Router::new()
@@ -325,6 +337,11 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
         }
         return StatusCode::NO_CONTENT.into_response();
     }
+    if request.uri().path().starts_with("/attachments/") && method == Method::GET {
+        assert!(auth.is_none(), "Discord CDN must not receive bot credentials");
+        let file = crate::lock(&state.cdn).get(request.uri().path()).cloned();
+        return file.map_or_else(|| StatusCode::NOT_FOUND.into_response(), IntoResponse::into_response);
+    }
     if auth != Some("Bot fixture-bot-secret") {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -402,6 +419,12 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
             message
         }
         (Method::POST, ["channels", channel, "messages"]) => {
+            let multipart = request.headers().get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("multipart/form-data"));
+            if multipart {
+                return voice_note_fixtures::record_voice(&state, channel, request).await;
+            }
             let bytes = to_bytes(request.into_body(), 256 * 1024).await.unwrap();
             let payload = serde_json::from_slice::<Value>(&bytes).unwrap();
             let id = state.counter.fetch_add(1, Ordering::SeqCst).to_string();
@@ -1215,6 +1238,7 @@ async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_c
                 }
             }
             Write::Thread { .. } => panic!("approval unexpectedly provisioned a thread"),
+            Write::VoiceNote { .. } => panic!("approval unexpectedly sent a voice note"),
         }
     }
     assert_eq!(model.requests().len(), 2);

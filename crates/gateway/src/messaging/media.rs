@@ -520,6 +520,7 @@ impl Ingress {
     pub(super) async fn prepare_discord_audio<R, Open, Opened>(
         &self,
         grant: MediaRead,
+        voice_note: bool,
         open: Open,
         decode: fn(&[u8]) -> Result<Vec<u8>, GatewayError>,
     ) -> Result<PreparedAudio, GatewayError>
@@ -542,7 +543,17 @@ impl Ingress {
             Err(error) => Err(error),
         };
         match transcript {
-            Ok(text) => Ok(PreparedAudio::Transcript(text)),
+            Ok(text) => {
+                if voice_note {
+                    self.checked(true, |state| {
+                        self.recheck_media(state, &grant)?;
+                        db(self.store.write(|tx| {
+                            super::discord::voice_note::record_source(tx, &self.connection, &grant.source)
+                        }))
+                    })?;
+                }
+                Ok(PreparedAudio::Transcript(text))
+            }
             Err(GatewayError::Invalid | GatewayError::Unsupported) => self
                 .finish_attachment(grant, original).await.map(PreparedAudio::Attachment),
             Err(error) => Err(error),
