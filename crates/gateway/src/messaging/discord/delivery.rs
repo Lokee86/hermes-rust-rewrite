@@ -1,7 +1,9 @@
 mod render;
 
 pub use render::ReplyMode;
-pub(crate) use render::{DeliverySurface, PlanOptions, prepare, prepare_with};
+#[cfg(test)]
+pub(crate) use render::prepare;
+pub(crate) use render::{DeliverySurface, PlanOptions, prepare_with};
 
 use super::DiscordClient;
 use crate::messaging::{

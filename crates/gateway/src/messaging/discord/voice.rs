@@ -256,6 +256,7 @@ impl Voice {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn leave(&self, guild: &str) -> Option<Value> {
         let guild = guild.parse().ok()?;
         let mut state = crate::lock(&self.state);
@@ -344,10 +345,6 @@ impl Voice {
                 .members
                 .get(&(binding.guild, requester))
                 .is_some_and(|member| member.channel == binding.channel)
-    }
-
-    pub(super) fn is_voice_anchor(anchor: &str) -> bool {
-        anchor.starts_with(VOICE_ORIGIN)
     }
 
     pub(super) fn playback_key(&self, intent: &DeliveryIntent) -> Option<String> {

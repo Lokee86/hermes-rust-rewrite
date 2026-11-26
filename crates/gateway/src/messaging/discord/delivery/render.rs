@@ -81,6 +81,7 @@ pub(super) fn references_message(key: &str) -> bool {
     key.starts_with(REPLY_PREFIX)
 }
 
+#[cfg(test)]
 pub(crate) fn prepare(intent: &DeliveryIntent) -> Result<Vec<DeliveryPart>, PreparationFailure> {
     prepare_with(intent, PlanOptions::default())
 }

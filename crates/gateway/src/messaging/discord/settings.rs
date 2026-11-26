@@ -554,6 +554,7 @@ impl DiscordSettings {
             .is_some_and(|rules| rules.mention_required.is_some())
     }
 
+    #[cfg(test)]
     pub(super) fn dm_open(&self) -> bool {
         self.direct.rules.enabled
             && self

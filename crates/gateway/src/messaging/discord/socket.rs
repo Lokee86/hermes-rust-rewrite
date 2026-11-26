@@ -1,5 +1,8 @@
 use super::{
-    super::{Advance, ConnectionFailure, GatewayError},
+    super::{
+        Advance, ConnectionFailure, GatewayError,
+        runtime::{blocking, db, now},
+    },
     DiscordAdapter, Ingress,
     client::DiscordClient,
 };
@@ -22,6 +25,13 @@ const FRESH_SESSION: &str = "fresh";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISPATCH_QUEUE: usize = 128;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const IDENTIFY_INTERVAL_MS: i64 = 5_000;
+
+pub(in crate::messaging) const SOCKET_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS messaging_discord_identify (
+    connection TEXT PRIMARY KEY, next_ms INTEGER NOT NULL
+);
+";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct Cursor {
@@ -146,6 +156,9 @@ async fn run(
             return Err(ConnectionFailure::Retryable);
         }
     }
+    if !resuming {
+        reserve_identify(&ingress, &cancel).await?;
+    }
     let socket = adapter
         .client
         .websocket(&url)
@@ -215,6 +228,48 @@ async fn run(
             .map_err(intake_failure)?;
     }
     Ok(end.failure)
+}
+
+async fn reserve_identify(
+    ingress: &Ingress,
+    cancel: &CancellationToken,
+) -> Result<(), ConnectionFailure> {
+    use rusqlite::{OptionalExtension, params};
+    loop {
+        let scope = ingress.clone();
+        let wait =
+            blocking(move || {
+                scope.checked(true, |_| {
+                    db(scope.store.write(|tx| {
+                        let clock = now();
+                        let next: Option<i64> = tx.query_row(
+                "SELECT next_ms FROM messaging_discord_identify WHERE connection=?1",
+                [&scope.connection], |row| row.get(0),
+            ).optional()?;
+                        if let Some(next) = next
+                            && next > clock
+                        {
+                            return Ok(next.saturating_sub(clock).min(IDENTIFY_INTERVAL_MS));
+                        }
+                        tx.execute(
+                "INSERT INTO messaging_discord_identify(connection,next_ms) VALUES (?1,?2)
+                 ON CONFLICT(connection) DO UPDATE SET next_ms=excluded.next_ms",
+                params![scope.connection, clock.saturating_add(IDENTIFY_INTERVAL_MS)],
+            )?;
+                        Ok(0)
+                    }))
+                })
+            })
+            .await
+            .map_err(intake_failure)?;
+        if wait == 0 {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(ConnectionFailure::Stopped),
+            _ = tokio::time::sleep(Duration::from_millis(wait as u64)) => {},
+        }
+    }
 }
 
 fn authentication(client: &DiscordClient, intents: u64, resume: Option<&Cursor>) -> Value {

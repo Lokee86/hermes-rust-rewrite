@@ -36,7 +36,7 @@ use voice::Voice;
 
 pub(super) use messages::MESSAGE_TABLES;
 pub(super) use recovery::RECOVERY_TABLES;
-pub(super) use settings::DiscordFactory;
+pub(super) use socket::SOCKET_TABLES;
 
 pub(super) struct DiscordAdapter {
     client: DiscordClient,

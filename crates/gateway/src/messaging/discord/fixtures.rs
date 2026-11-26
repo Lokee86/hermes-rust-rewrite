@@ -1,4 +1,4 @@
-use super::{DiscordFactory, DiscordSettings};
+use super::{DiscordSettings, settings::DiscordFactory};
 use crate::{
     RunningGateway,
     messaging::{AdapterConfig, EnrollmentCredential, conformance::Model, runtime::now},
@@ -138,10 +138,26 @@ impl Fixtures {
     }
 
     async fn write(&mut self) -> Write {
-        timeout(LIMIT, self.writes.recv())
-            .await
-            .expect("Discord REST write")
-            .unwrap()
+        self.next_write("Discord REST write", |_| true).await
+    }
+
+    async fn next_write(&mut self, expected: &str, accepts: impl Fn(&Write) -> bool) -> Write {
+        timeout(LIMIT, async {
+            while let Some(write) = self.writes.recv().await {
+                if accepts(&write) {
+                    return write;
+                }
+            }
+            panic!("Discord REST fixture stopped");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Missing {expected}"))
+    }
+
+    async fn reply(&mut self) -> Write {
+        self.next_write("a final Discord reply", |write| {
+            matches!(write, Write::Message { payload, .. } if payload["content"].as_str().is_some_and(|text| text.starts_with("answer")))
+        }).await
     }
 
     async fn ready(&self, wire: &Wire, id: &str) {
@@ -157,14 +173,20 @@ impl Fixtures {
     }
 
     fn configuration(&self, root: &Path) -> AdapterConfig {
-        let settings: DiscordSettings = serde_json::from_value(json!({
-            "grants":{"users":["7"]},
-            "operators":["7"],
-            "direct":{"rules":{"turn":{"tools":true,"approval":"manual"}}},
-            "guilds":{"11":{"channels":{"21":{"threads":{"22":{}}}}}},
-            "commands":{"enabled":true,"sync":false},
-        }))
-        .unwrap();
+        self.configuration_with(
+            root,
+            json!({
+                "grants":{"users":["7"]},
+                "operators":["7"],
+                "direct":{"rules":{"turn":{"tools":true,"approval":"manual"}}},
+                "guilds":{"11":{"channels":{"21":{"threads":{"22":{}}}}}},
+                "commands":{"enabled":true,"sync":false},
+            }),
+        )
+    }
+
+    fn configuration_with(&self, root: &Path, settings: Value) -> AdapterConfig {
+        let settings: DiscordSettings = serde_json::from_value(settings).unwrap();
         AdapterConfig {
             name: "fixture-discord".into(),
             policy: settings.host_policy(),
@@ -275,7 +297,7 @@ async fn rest(State(state): State<Server>, request: Request) -> Response {
     let document = match (method, segments.as_slice()) {
         (Method::GET, ["users", "@me"]) => json!({"id":"9","bot":true}),
         (Method::GET, ["applications", "@me"]) => {
-            json!({"id":"90","bot":{"id":"9"},"flags":786432})
+            json!({"id":"90","bot":{"id":"9"},"flags":835584})
         }
         (Method::GET, ["gateway", "bot"]) => json!({
             "url":state.gateway,"shards":1,
@@ -362,15 +384,23 @@ async fn wait_status(gateway: &RunningGateway, condition: impl Fn(&Value) -> boo
     .expect("gateway status transition")
 }
 
-async fn wait_sent(gateway: &RunningGateway, count: usize) {
+async fn wait_reply(gateway: &RunningGateway, event: &str) {
+    use crate::messaging::store::key;
     wait_status(gateway, |state| {
+        let Some(source) = state["input"]
+            .as_array()
+            .and_then(|inputs| inputs.iter().find(|input| input["id"] == event))
+        else {
+            return false;
+        };
+        let connection = source["connection"].as_str().unwrap();
+        let admission = key("channel-input", &(connection, event)).unwrap();
+        let id = key("reply", &admission).unwrap();
         state["deliveries"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|delivery| delivery["state"] == "sent")
-            .count()
-            >= count
+            .any(|delivery| delivery["id"] == id && delivery["state"] == "sent")
     })
     .await;
 }
@@ -398,7 +428,7 @@ async fn discord_identifies_resumes_deduplicates_and_routes_threads_through_the_
         .await;
     let Write::Message {
         channel, payload, ..
-    } = fixture.write().await
+    } = fixture.reply().await
     else {
         panic!("expected direct reply")
     };
@@ -419,13 +449,13 @@ async fn discord_identifies_resumes_deduplicates_and_routes_threads_through_the_
     .await;
     let Write::Message {
         channel, payload, ..
-    } = fixture.write().await
+    } = fixture.reply().await
     else {
         panic!("expected thread reply")
     };
     assert_eq!(channel, "22");
     assert_eq!(payload["content"], "answer threaded");
-    wait_sent(&gateway, 2).await;
+    wait_reply(&gateway, "discord-message-102").await;
     gateway.shutdown().await.unwrap();
 
     let gateway = model
@@ -442,7 +472,7 @@ async fn discord_identifies_resumes_deduplicates_and_routes_threads_through_the_
         .await;
     let Write::Message {
         channel, payload, ..
-    } = fixture.write().await
+    } = fixture.reply().await
     else {
         panic!("expected second direct reply")
     };
@@ -489,6 +519,112 @@ async fn discord_missing_heartbeat_ack_resumes_then_invalid_session_reports_gap(
 }
 
 #[tokio::test]
+async fn discord_role_updates_revoke_guild_input_without_blocking_an_independent_dm() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let settings = json!({
+        "grants":{"users":["7"]},
+        "guilds":{"11":{"rules":{"grants":{"roles":["41"]}},"channels":{"21":{"threads":{"22":{}}}}}},
+        "commands":{"sync":false}
+    });
+    let gateway = model
+        .gateway(
+            root.path(),
+            vec![fixture.configuration_with(root.path(), settings)],
+        )
+        .await;
+    fixture.activate(&gateway).await;
+    let mut wire = fixture.wire().await;
+    wire.authentication(2).await;
+    fixture.ready(&wire, "role-revision").await;
+    let mut admitted = message("160", "22", "<@9> authorized by guild role", true);
+    admitted["member"]["roles"] = json!(["41"]);
+    wire.dispatch(2, "MESSAGE_CREATE", admitted).await;
+    let Write::Message { channel, .. } = fixture.reply().await else {
+        panic!("expected guild reply")
+    };
+    assert_eq!(channel, "22");
+    wait_reply(&gateway, "discord-message-160").await;
+    wire.dispatch(
+        3,
+        "GUILD_MEMBER_UPDATE",
+        json!({"guild_id":"11","user":{"id":"7"},"roles":[]}),
+    )
+    .await;
+    wire.dispatch(
+        4,
+        "MESSAGE_CREATE",
+        message("161", "22", "<@9> former role", true),
+    )
+    .await;
+    wait_status(&gateway, |state| {
+        state["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|input| input["id"] == "discord-message-161" && input["state"] == "refused")
+    })
+    .await;
+    wire.dispatch(
+        5,
+        "MESSAGE_CREATE",
+        message("162", "20", "independent direct", false),
+    )
+    .await;
+    let Write::Message {
+        channel, payload, ..
+    } = fixture.reply().await
+    else {
+        panic!("expected direct reply")
+    };
+    assert_eq!(channel, "20");
+    assert_eq!(payload["content"], "answer independent direct");
+    assert_eq!(model.requests().len(), 2);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn discord_resume_never_skips_a_dispatch_that_failed_to_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let model = Model::new().await;
+    let mut fixture = Fixtures::start().await;
+    let gateway = model
+        .gateway(root.path(), vec![fixture.configuration(root.path())])
+        .await;
+    fixture.activate(&gateway).await;
+    let mut first = fixture.wire().await;
+    first.authentication(2).await;
+    fixture.ready(&first, "failed-commit").await;
+    wait_status(&gateway, |state| {
+        state["connections"][0]["health"] == "ready"
+    })
+    .await;
+    let db = hermes_engine::db::open(root.path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_test_dispatch BEFORE INSERT ON messaging_ingress
+         WHEN NEW.event = 'discord-message-300'
+         BEGIN SELECT RAISE(ABORT, 'fixture commit interruption'); END;",
+    )
+    .unwrap();
+    let event = message("300", "20", "retry after a failed commit", false);
+    first.dispatch(2, "MESSAGE_CREATE", event.clone()).await;
+    let mut resumed = fixture.wire().await;
+    assert_eq!(resumed.authentication(6).await["d"]["seq"], 1);
+    assert!(model.requests().is_empty());
+    db.execute_batch("DROP TRIGGER reject_test_dispatch;")
+        .unwrap();
+    resumed.dispatch(2, "MESSAGE_CREATE", event).await;
+    resumed.dispatch(3, "RESUMED", json!({})).await;
+    let Write::Message { payload, .. } = fixture.reply().await else {
+        panic!("expected the recovered reply")
+    };
+    assert_eq!(payload["content"], "answer retry after a failed commit");
+    assert_eq!(model.requests().len(), 1);
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_control() {
     let root = tempfile::tempdir().unwrap();
     let model = Model::new().await;
@@ -502,14 +638,24 @@ async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_c
     fixture.ready(&wire, "approvals").await;
     wire.dispatch(2, "MESSAGE_CREATE", message("200", "20", "approval", false))
         .await;
-    let Write::Message { payload, id, .. } = fixture.write().await else {
+    let Write::Message { payload, id, .. } = fixture.next_write("an approval prompt", |write| {
+        matches!(write, Write::Message { payload, .. } if payload["components"][0]["components"][0]["custom_id"].is_string())
+    }).await else {
         panic!("expected an approval prompt")
     };
-    wait_sent(&gateway, 1).await;
     let button = payload["components"][0]["components"][0]["custom_id"]
         .as_str()
         .unwrap()
         .to_owned();
+    let action = button.split(':').nth(1).unwrap();
+    wait_status(&gateway, |state| {
+        state["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delivery| delivery["id"] == action && delivery["state"] == "sent")
+    })
+    .await;
     let id_base = ((now() - 1_420_070_400_000) as u64) << 22;
     let click = |id: u64, message: &str| {
         json!({
@@ -520,7 +666,12 @@ async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_c
     };
     wire.dispatch(3, "INTERACTION_CREATE", click(id_base + 1, "888"))
         .await;
-    let Write::Callback(rejected) = fixture.write().await else {
+    let Write::Callback(rejected) = fixture
+        .next_write("a private component refusal", |write| {
+            matches!(write, Write::Callback(_))
+        })
+        .await
+    else {
         panic!("expected private refusal")
     };
     assert_eq!(rejected["type"], 4);
@@ -553,8 +704,12 @@ async fn discord_approval_is_bound_to_the_exact_bot_message_and_acks_committed_c
                 channel, payload, ..
             } => {
                 assert_eq!(channel, "20");
-                assert!(payload["content"].as_str().unwrap().starts_with("answer"));
-                replied = true;
+                if payload["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("answer"))
+                {
+                    replied = true;
+                }
             }
         }
     }
