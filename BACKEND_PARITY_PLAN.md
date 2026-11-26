@@ -69,6 +69,7 @@ Use a single authoritative writer per session and scope credentials, settings, t
 22. Implement BlueBubbles and verify the self-hosted Mac bridge, GUID and alias routing, native media, scoped helper features and recovery. [BlueBubbles spec](crates/gateway/BLUEBUBBLES_ADAPTER_SPEC.md)
 23. Implement Photon and verify managed Spectrum line enrollment, supervised streaming, native iMessage controls and ordered media. [Photon spec](crates/gateway/PHOTON_ADAPTER_SPEC.md)
 24. Implement Email and verify IMAP mailbox epochs, authenticated sender intake, MIME and threaded SMTP delivery. [Email spec](crates/gateway/EMAIL_ADAPTER_SPEC.md)
+25. Implement Twilio SMS and verify signed inbound SMS, consent and opt-out policy, ordered text parts and exact provider status. [Twilio SMS spec](crates/gateway/SMS_ADAPTER_SPEC.md)
 
 ## Messaging gateway and adapters
 

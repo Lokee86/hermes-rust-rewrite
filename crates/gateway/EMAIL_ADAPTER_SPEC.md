@@ -1,6 +1,6 @@
 # Email stock plugin implementation spec
 
-Register Email as a bundled Rust adapter with platform key `email`. Start after Photon and the shared gate. A dedicated profile mailbox receives authenticated email through IMAP, hands approved mail and attachments to the native session owner, and sends threaded responses or scheduled messages through SMTP. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Photon spec](PHOTON_ADAPTER_SPEC.md) · [Hermes Email guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/email.md)
+Register Email as a bundled Rust adapter with platform key `email`. Start after Photon and the shared gate. A dedicated profile mailbox receives authenticated email through IMAP, hands approved mail and attachments to the native session owner, and sends threaded responses or scheduled messages through SMTP. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Photon spec](PHOTON_ADAPTER_SPEC.md) · [Hermes Email guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/email.md) · [Next adapter, Twilio SMS](SMS_ADAPTER_SPEC.md)
 
 ## Registration and transport
 
