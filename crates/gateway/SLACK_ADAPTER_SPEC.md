@@ -1,6 +1,6 @@
 # Slack stock plugin implementation spec
 
-Slack is the third stock messaging plugin, after Discord and Telegram. Start it after the shared stock-plugin gate and Telegram's live acceptance. The reference is the bundled Slack platform in Hermes v0.23.4 and Slack's current Agent messaging experience. An operator can run a Slack app from a headless Mercury profile, work in multiple authorized Slack workspaces, and resume the same sessions and delivery receipts after a restart. [Shared gateway contract](ADAPTER_CONTRACT.md) · [Telegram spec](TELEGRAM_ADAPTER_SPEC.md) · [Hermes Slack guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/slack.md)
+Slack is the third stock messaging plugin, after Discord and Telegram. Start it after the shared stock-plugin gate and Telegram's live acceptance. The reference is the bundled Slack platform in Hermes v0.23.4 and Slack's current Agent messaging experience. An operator can run a Slack app from a headless Mercury profile, work in multiple authorized Slack workspaces, and resume the same sessions and delivery receipts after a restart. [Shared gateway contract](ADAPTER_CONTRACT.md) · [Telegram spec](TELEGRAM_ADAPTER_SPEC.md) · [Hermes Slack guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/slack.md) · [Next adapter, WhatsApp linked-device](WHATSAPP_ADAPTER_SPEC.md#linked-device-adapter)
 
 ## Target architecture and setup
 
