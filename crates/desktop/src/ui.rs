@@ -451,7 +451,7 @@ impl Hermes {
         }
         if sb.shows("context-usage") {
             let used = self.history.turns.iter().map(|turn| turn.prompt.len() + turn.entries.iter().map(|entry| match entry {
-                Entry::Assistant { text, .. } => text.len(), Entry::Tool { result, .. } => result.len() }).sum::<usize>()).sum::<usize>() as u64 / 4;
+                Entry::User { text } | Entry::Assistant { text, .. } => text.len(), Entry::Tool { result, .. } => result.len() }).sum::<usize>()).sum::<usize>() as u64 / 4;
             let label = match self.models.current_model(&self.config).and_then(|m| m.context_length) {
                 Some(window) if window > 0 => format!("{} / {} · {}%", statusbar::tokens(used), statusbar::tokens(window), (used * 100 / window).min(100)),
                 _ if used > 0 => statusbar::tokens(used),
@@ -628,6 +628,11 @@ impl Hermes {
             }
             for (entry_index, entry) in turn.entries.iter().enumerate() {
                 match entry {
+                    Entry::User { text: body } => {
+                        messages = messages.push(container(text(body).size(appearance::chat_size(13.0)).line_height(1.4))
+                            .padding([9, 12]).width(Fill)
+                            .style(move |_| panel(p.card, 4.0, Some(Color { a: 0.5, ..p.border }))));
+                    }
                     Entry::Assistant { text: body, calls } => {
                         let mut assistant = column![].spacing(12);
                         if body.is_empty() && calls.is_empty() {

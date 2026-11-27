@@ -25,10 +25,6 @@ pub async fn execute(
 /// Validate a frozen job and derive the same provider and workspace used by the runner.
 pub fn prepare_job(store: &Store, claim: &Claim, config: &mut Config) -> Result<std::path::PathBuf> {
     let job = &claim.job;
-    ensure!(
-        job.deliver == "local",
-        "This native scheduler delivers to This desktop only"
-    );
     if let Some(provider) = job
         .provider
         .as_deref()
@@ -79,6 +75,10 @@ async fn execute_inner(
     events: &Sender<Event>,
     cancel: &CancellationToken,
 ) -> Result<Outcome> {
+    ensure!(
+        claim.job.deliver == "local",
+        "Channel delivery requires the gateway owner"
+    );
     store.begin(claim, Utc::now())?;
     let prompt = match super::preflight_with_cancel(store, claim, cancel).await {
         Ok(super::Preflight::Agent(prompt)) => prompt,

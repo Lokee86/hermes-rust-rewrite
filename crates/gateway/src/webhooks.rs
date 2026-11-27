@@ -31,9 +31,13 @@ pub(super) async fn receive(State(shared): State<Arc<Shared>>, Path(name): Path<
         let _ = shared.library.record_delivery_checked(&hook.name, &hook.secret, Delivery { at, event, status: "ignored (event filter)".into(), id: None }, None);
         return (StatusCode::OK, "ignored").into_response();
     }
-    if hook.deliver_only {
-        let _ = shared.library.record_delivery_checked(&hook.name, &hook.secret, Delivery { at, event, status: "logged".into(), id: None }, None);
-        return (StatusCode::ACCEPTED, "logged").into_response();
+    let destination = hook.deliver.strip_prefix("channel:").map(str::to_owned);
+    if let Some(route) = &destination {
+        match shared.messaging.authorized_route(route) {
+            Ok(true) => {}
+            Ok(false) => return (StatusCode::CONFLICT, "channel route unavailable").into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
     }
     // Identified redeliveries reuse their receipt. Without an ID, each
     // request is a distinct event; return the generated identity to the sender.
@@ -46,6 +50,18 @@ pub(super) async fn receive(State(shared): State<Arc<Shared>>, Path(name): Path<
         },
         None => super::new_id(),
     };
+    if hook.deliver_only {
+        if let Some(route) = &destination {
+            let Ok(text) = prompt(&hook, &event, &payload, &body) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+            if shared.messaging.notify_route(route, &("webhook", &hook.name, &delivery_id), text).is_err() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+        let _ = shared.library.record_delivery_checked(&hook.name, &hook.secret, Delivery {
+            at, event, status: "logged".into(), id: Some(delivery_id),
+        }, None);
+        return (StatusCode::ACCEPTED, "logged").into_response();
+    }
     // Serialize chat creation and its mapping. A retry after a crash can find the
     // same session even if the process died before acknowledging admission.
     let summary = match hook.session_id.as_deref() {
@@ -77,7 +93,7 @@ pub(super) async fn receive(State(shared): State<Arc<Shared>>, Path(name): Path<
     let submission_id = format!("webhook:{}:{}", hook.name, delivery_id);
     match shared.submit_background(session.clone(), prompt, submission_id, true).await {
         Ok(receipt) => {
-            watch(&shared, session, hook.name.clone(), hook.secret.clone(), delivery_id.clone()).await;
+            watch(&shared, session, hook.name.clone(), hook.secret.clone(), delivery_id.clone(), destination).await;
             (StatusCode::ACCEPTED, axum::Json(serde_json::json!({"delivery_id":delivery_id,"receipt":receipt}))).into_response()
         },
         Err(error) if error.data["reason"] == "admission_conflict" => (StatusCode::CONFLICT, "delivery ID reused with different content").into_response(),
@@ -113,14 +129,15 @@ pub(super) async fn recover(shared: &Arc<Shared>) -> anyhow::Result<()> {
         for id in pending {
             let submission = format!("webhook:{}:{}", hook.name, id);
             if shared.submission_receipt(&session, &submission).is_some() {
-                watch(shared, session.clone(), hook.name.clone(), hook.secret.clone(), id).await;
+                watch(shared, session.clone(), hook.name.clone(), hook.secret.clone(), id,
+                    hook.deliver.strip_prefix("channel:").map(str::to_owned)).await;
             }
         }
     }
     Ok(())
 }
 
-async fn watch(shared: &Arc<Shared>, session: Arc<super::LiveSession>, name: String, secret: String, id: String) {
+async fn watch(shared: &Arc<Shared>, session: Arc<super::LiveSession>, name: String, secret: String, id: String, destination: Option<String>) {
     let key = (name.clone(), id.clone());
     if !shared.webhook_watches.lock().await.insert(key.clone()) { return; }
     let mut tasks = shared.turns.lock().await;
@@ -133,6 +150,14 @@ async fn watch(shared: &Arc<Shared>, session: Arc<super::LiveSession>, name: Str
             if let Some(receipt) = owner.submission_receipt(&session, &submission) {
                 let state = receipt["status"].as_str().unwrap_or("unknown");
                 let status = if state == "terminal" {
+                    if receipt["outcome"] == "complete"
+                        && let Some(route) = &destination
+                        && let Some(text) = receipt["result"]["text"].as_str()
+                        && owner.messaging.notify_route(route, &("webhook", &name, &id), text.to_owned()).is_err()
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
                     format!("ran ({})", receipt["outcome"].as_str().unwrap_or("unknown"))
                 } else { state.to_owned() };
                 let _ = owner.library.update_delivery_status(&name, &secret, &id, &status);

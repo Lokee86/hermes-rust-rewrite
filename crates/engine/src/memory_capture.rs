@@ -229,6 +229,7 @@ impl PendingMemoryCapture {
         };
         for (index, entry) in turn.entries.iter().enumerate() {
             match entry {
+                Entry::User { .. } => {}
                 Entry::Assistant { text, calls } => {
                     if round > 0 {
                         add(

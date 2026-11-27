@@ -17,6 +17,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Entry {
+    User { text: String },
     Assistant { text: String, calls: Vec<ToolCall> },
     Tool { id: String, name: String, approved: bool, result: String },
 }

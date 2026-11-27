@@ -116,7 +116,7 @@ async fn run_child(goal: String, context: String, progress: &mut Progress, confi
                     live.updated_at = now();
                     let _ = parent.send(Event::Subagent(live.clone())).await;
                 },
-                Event::Text(_) | Event::Subagent(_) | Event::MemoryRecall(_) => {}
+                Event::Text(_) | Event::Subagent(_) | Event::MemoryRecall(_) | Event::Clarification { .. } | Event::Correction { .. } => {}
             }
         }
     });

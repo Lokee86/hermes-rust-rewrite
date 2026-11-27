@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
                 answer.send(line.trim().eq_ignore_ascii_case("y")).await?;
             }
             Event::Subagent(p) => eprintln!("\n[subagent {}/{}] {}: {}", p.task_index + 1, p.task_count, p.status, p.goal),
-            Event::Snapshot(_) | Event::MemoryRecall(_) => {}
+            Event::Snapshot(_) | Event::MemoryRecall(_) | Event::Clarification { .. } | Event::Correction { .. } => {}
         }
     }
     let session = task.await??;
