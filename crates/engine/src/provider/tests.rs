@@ -811,3 +811,51 @@ fn requests_mark_the_stable_prefix_for_caching() {
     cache_openrouter_prefix(&"https://example.com/v1/chat/completions".parse().unwrap(), &mut other);
     assert_eq!(other, plain);
 }
+
+#[tokio::test]
+async fn structured_responses_tool_retains_reasoning_and_correlates_local_result() {
+    let router = Router::new().route(
+        "/responses",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["store"], false);
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["tools"][0]["name"], "measure_summary_tokens");
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            if body["input"].as_array().unwrap().len() == 1 {
+                sse(concat!(
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"fixture-reasoning\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"fixture-call\",\"name\":\"measure_summary_tokens\",\"arguments\":\"{\\\"text\\\":\\\"exact\\\"}\"}}\n\n",
+                    "data: {\"type\":\"response.completed\"}\n\n",
+                ))
+            } else {
+                assert_eq!(body["input"][1]["encrypted_content"], "fixture-reasoning");
+                assert_eq!(body["input"][2]["call_id"], "fixture-call");
+                assert_eq!(body["input"][3], json!({"type":"function_call_output","call_id":"fixture-call","output":"{\"tokens\":5}"}));
+                sse(concat!(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"ok\\\":true}\"}]}]}}\n\n",
+                ))
+            }
+        }),
+    );
+    let (base, server) = serve(router).await;
+    let mut provider = Provider::new(config(&base)).unwrap();
+    provider.protocol = Protocol::Responses;
+    provider.endpoint = format!("{base}/responses").parse().unwrap();
+    let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+    let parameters = json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false});
+    let mut calls = 0;
+    let result = provider.complete_json_with_tool(
+        "system", "input", "terminal", &schema,
+        crate::inference::StructuredTool {
+            name:"measure_summary_tokens",schema:&parameters,max_results:1,max_input_bytes:4096,
+        },
+        &mut |arguments| {
+            assert_eq!(arguments["text"], "exact");
+            calls += 1;
+            Ok(json!({"tokens":5}))
+        },
+    ).await.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(result, json!({"ok":true}));
+    server.abort();
+}

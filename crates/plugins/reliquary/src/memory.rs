@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use hermes_engine::{
     Config, Turn,
     memory_capture::{CaptureBinding, CaptureReceipt, CapturedEchoKind, PendingMemoryCapture},
+    native_ego::{EgoAccess, count_context},
     native_memory::MemoryQuery,
     settings::ProfileSettings,
 };
@@ -12,10 +13,10 @@ use hermes_library::{
     memory_plugin::{MemorySources, MemoryStore, MemoryTurn, UserArchiveHit},
 };
 use reliquary_memory::{
-    Gateway, HermesCopiedEcho, HermesCopiedEchoKind, HermesCopiedMessage, HermesCopiedRole,
-    HermesCopiedSnapshot, HermesCopiedToolOutcome, HermesCopyScope, HostCredentialBinding,
-    Instance, NativeImportPlan, NativeImportState, OwnerGrant, OwnerId, OwnerKind,
-    OwnerProcessingJob, Phylactery, ProcessOptions, Rel, TrustedHostAdmission,
+    EgoWorkerHandle, Gateway, HermesCopiedEcho, HermesCopiedEchoKind, HermesCopiedMessage,
+    HermesCopiedRole, HermesCopiedSnapshot, HermesCopiedToolOutcome, HermesCopyScope,
+    HostCredentialBinding, Instance, NativeImportPlan, NativeImportState, OwnerGrant, OwnerId,
+    OwnerKind, OwnerProcessingJob, Phylactery, ProcessOptions, ProductErrorKind, Rel, TrustedHostAdmission,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -28,16 +29,19 @@ use std::{
 use uuid::Uuid;
 
 pub(super) struct EmbeddedMemory {
+    ego_worker: Mutex<Option<EgoWorkerHandle>>,
+    pub(super) ego_authority: Option<Instance>,
+    pub(super) ego_online: std::sync::atomic::AtomicBool,
     profile_id: String,
     principal_id: String,
     cutoff: f64,
     general: OwnerId,
-    phy: OwnerId,
+    pub(super) phy: OwnerId,
     projects: BTreeMap<String, OwnerId>,
-    instances: BTreeMap<OwnerId, Instance>,
+    pub(super) instances: BTreeMap<OwnerId, Instance>,
     gateway: Gateway,
     _managers: Vec<Instance>,
-    home: PathBuf,
+    pub(super) home: PathBuf,
     directory: PathBuf,
     managed_projects: Option<Vec<Project>>,
     /// The import each owner is processing.
@@ -85,6 +89,7 @@ impl EmbeddedMemory {
         enrollment.validate()?;
         HermesCopyScope::new(topology.profile_id.clone(), "profile-check".into())?;
         let gateway = Gateway::new();
+        let ego = ProfileSettings::load(&home)?.memory_ego_enabled;
         let owner_path = |id: OwnerId, kind: OwnerKind| -> Result<PathBuf> {
             let owner = topology
                 .owners
@@ -95,7 +100,7 @@ impl EmbeddedMemory {
         };
         let phy = gateway.mount_phylactery(
             &Phylactery::open(owner_path(topology.active_phy, OwnerKind::Phylactery)?)?,
-            false,
+            ego,
         )?;
         ensure!(phy == topology.active_phy, "private owner identity changed");
         let projects: BTreeMap<_, _> = topology
@@ -128,13 +133,30 @@ impl EmbeddedMemory {
             ]);
             tokens.insert(id, (token, manager));
         }
+        let ego_token = ego.then(|| Uuid::new_v4().simple().to_string());
+        if let Some(token) = &ego_token {
+            let grants = std::iter::once(OwnerGrant::OperatePhylactery(phy))
+                .chain(tokens.keys().copied().map(OwnerGrant::ViewRel));
+            credentials.push(HostCredentialBinding::new(
+                &topology.principal_id,
+                token,
+                grants,
+            ));
+        }
         let (adapter, _) = TrustedHostAdmission::new(credentials).install(&gateway)?;
+        let ego_authority = ego_token
+            .as_deref()
+            .map(|token| adapter.authenticate(token))
+            .transpose()?;
         let mut managers = Vec::with_capacity(tokens.len());
         for (id, (token, manager)) in tokens {
             instances.insert(id, adapter.authenticate(&token)?);
             managers.push(adapter.authenticate(&manager)?);
         }
         Ok(Self {
+            ego_worker: Mutex::new(None),
+            ego_authority,
+            ego_online: ego.into(),
             profile_id: topology.profile_id,
             principal_id: topology.principal_id,
             cutoff: enrollment.cutoff,
@@ -420,20 +442,68 @@ impl EmbeddedMemory {
 
 impl MemoryStore for EmbeddedMemory {
     fn configure_profile_runtime(&self, config: &Config) -> Result<()> {
+        let mut ego = self.ego_worker.lock().expect("Ego worker lock");
+        ego.take();
         self.gateway.set_perception_runtime(None)?;
-        let Some(endpoint_id) = ProfileSettings::load(&self.home)?.memory_perception_endpoint
-        else {
+        let settings = ProfileSettings::load(&self.home)?;
+        let perception = settings.memory_perception_endpoint;
+        let ego_authority = self
+            .ego_authority
+            .as_ref()
+            .filter(|_| settings.memory_ego_enabled);
+        if perception.is_none() && ego_authority.is_none() {
+            return Ok(());
+        }
+        let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
+            ensure!(
+                perception.is_none(),
+                "Configure the Reliquary embedding route before enabling Perception"
+            );
             return Ok(());
         };
-        let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
-            anyhow::bail!("Configure the Reliquary embedding route before enabling Perception");
+        let runtime = if let Some(endpoint) = &perception {
+            super::hosted::with_native_perception(&self.home, endpoint, runtime)?
+        } else {
+            runtime
         };
-        let runtime = super::hosted::with_native_perception(&self.home, &endpoint_id, runtime)?;
         for (&owner, instance) in &self.instances {
             self.check_embedding_identity(owner, instance, &identity)?;
         }
-        self.gateway.set_perception_runtime(Some(&runtime))?;
+        if perception.is_some() {
+            self.gateway.set_perception_runtime(Some(&runtime))?;
+        }
+        if let Some(authority) = ego_authority {
+            let owners = self.instances.keys().copied().collect::<Vec<_>>();
+            match authority.start_ego_worker(
+                self.phy, &owners, &self.directory, &runtime, |text| count_context(text) as u64,
+            ) {
+                Ok(worker) => *ego = Some(worker),
+                Err(error) if error.kind() == ProductErrorKind::Unavailable => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
+    }
+
+    fn needs_profile_remount(&self) -> Result<bool> {
+        let enabled = ProfileSettings::load(&self.home)?.memory_ego_enabled;
+        Ok(enabled != self.ego_authority.is_some()
+            || enabled && !self.ego_online.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn pause_ego(&self) {
+        self.ego_online
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.ego_worker.lock().expect("Ego worker lock").take();
+    }
+
+    fn ego(
+        self: Arc<Self>,
+        sources: Arc<dyn MemorySources>,
+        session_id: String,
+        binding: Option<CaptureBinding>,
+    ) -> Result<Option<Arc<dyn EgoAccess>>> {
+        super::ego::access(self, sources, session_id, binding)
     }
 
     fn projects_changed(&self, projects: &[Project]) -> bool {
@@ -618,6 +688,7 @@ impl MemoryStore for EmbeddedMemory {
     }
 
     fn stop_processing(&self) {
+        self.pause_ego();
         let _ = self.gateway.set_perception_runtime(None);
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
         for (_, job) in jobs.values() {

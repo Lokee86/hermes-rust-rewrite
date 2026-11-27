@@ -1,6 +1,7 @@
 //! Stock Reliquary memory plugin for Hermes profiles.
 #![cfg(feature = "native")]
 
+mod ego;
 mod hosted;
 mod memory;
 mod query;

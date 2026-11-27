@@ -157,6 +157,16 @@ At first use, any existing `memory_embedding` selection in `agent-settings.json`
 
 The gateway commits the turn and its pending capture together. Archive records the user prompt, assistant commentary, and the final assistant response in order. Echo records bounded, redacted model-round activity, tool calls and results, and provider-supplied reasoning summaries. The background worker records Archive admission and semantic processing separately. Archiving or deleting a source fences future capture. If an open Reliquary import defers its Archive tombstone, the gateway retains the fence and retries the tombstone.
 
+### Reliquary Ego
+
+Enable **Reliquary Ego** in the persistent memory settings for a Reliquary profile. The profile gateway mounts that profile's active PHY with write authority and holds the Ego worker with the native memory mount. General and Embedding support automatic summary updates. Identity review and Pin controls also work when a summary route is unavailable.
+
+Mercury requests the authorized Ego package after assembling the native request and reserving model output room. Mercury uses a conservative UTF-8 byte bound for the Ego package and the same fixed counter for the PHY cap and its compression tool. The approved Identity replaces the `SOUL.md` persona slot for that request. Pins and verified summaries are appended once as standing context. Native Reliquary selection excludes the built-in `MEMORY.md` and `USER.md` notes. Current-chat compaction, transcript storage, and explicit Memory, Archive and Echo tools continue through their existing paths.
+
+Use `/identity` to view the active Identity or `/identity <exact text>` to review a draft. The local profile client approves the exact draft once through the existing approval surface. In normal native chats, `list_pins` finds Pins in an explicit `rel` or `phy` scope even when they did not fit the prompt. Edits and deletion require the listed ID and revision. A reaffirmation or softening can move priority one tier while preserving the instruction.
+
+The native outgoing-capture test mounts a disposable profile and sends ordinary requests to a loopback model. Set `MERCURY_EGO_CAPTURE_FIXTURE` to a disposable Core fixture folder with one verified REL and PHY pair to include both summary forms in the outgoing assertion. Set `MERCURY_EGO_CAPTURE_REQUEST` to write the captured fixture request.
+
 ### Reliquary retrieval
 
 The model can call `memory_query` to search processed memories in the chat's bound General or project REL. `refine_query` and `traverse_graph` use results from the same turn. These tools leave freshness unchanged.

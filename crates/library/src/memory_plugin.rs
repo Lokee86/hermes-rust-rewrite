@@ -5,6 +5,7 @@ use anyhow::Result;
 use hermes_engine::{
     Config, Turn,
     memory_capture::{CaptureBinding, CaptureReceipt, PendingMemoryCapture},
+    native_ego::EgoAccess,
     native_memory::MemoryQuery,
 };
 use std::sync::Arc;
@@ -31,6 +32,22 @@ pub trait MemoryStore: Send + Sync {
     /// Refresh the managed profile runtime independently of a chat turn.
     fn configure_profile_runtime(&self, _config: &Config) -> Result<()> {
         Ok(())
+    }
+
+    /// Does a change in the profile's native admission require new owner mounts?
+    fn needs_profile_remount(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn pause_ego(&self) {}
+
+    fn ego(
+        self: Arc<Self>,
+        _sources: Arc<dyn MemorySources>,
+        _session_id: String,
+        _binding: Option<CaptureBinding>,
+    ) -> Result<Option<Arc<dyn EgoAccess>>> {
+        Ok(None)
     }
 
     /// Called before binding a new chat. Existing chats retain their stored binding.
@@ -103,6 +120,12 @@ pub struct MemoryTurn {
 /// The host verifies current access and receipts against its own conversation log.
 pub trait MemorySources: Send + Sync {
     fn check_session(&self, session_id: &str, binding: &CaptureBinding) -> Result<()>;
+    fn check_ego_session(&self, session_id: &str, binding: Option<&CaptureBinding>) -> Result<()> {
+        match binding {
+            Some(binding) => self.check_session(session_id, binding),
+            None => Ok(()),
+        }
+    }
     /// Local outbox barrier while a committed source change awaits Core.
     fn copied_source_change_pending(&self, session_id: &str) -> Result<bool>;
 }

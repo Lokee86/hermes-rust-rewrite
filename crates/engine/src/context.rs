@@ -102,6 +102,16 @@ pub(crate) fn note_overflow(config: &Config, size: usize) -> usize {
     (*window as f64 * FILL) as usize
 }
 
+/// Bound optional standing context after assembling the native request.
+pub(crate) fn ego_budget(config: &Config, options: &models::GenerationOptions, used: usize) -> usize {
+    let key = (config.base_url.clone(), config.model.clone());
+    let window = WINDOWS.lock().expect("context windows").get(&key).copied()
+        .unwrap_or_else(|| known_window(&config.model));
+    let reserve = (window / 4).max(options.max_output_tokens.unwrap_or_default() as usize);
+    let usable = window.saturating_sub(reserve);
+    (usable / 5).min(usable.saturating_sub(used))
+}
+
 pub(crate) fn is_overflow(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
     ["context length", "context_length", "context window", "context_window", "maximum context", "prompt is too long", "too many tokens", "input is too long", "input token count"]

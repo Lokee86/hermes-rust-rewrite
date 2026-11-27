@@ -697,6 +697,18 @@ impl MemorySources for CaptureSources {
         Ok(())
     }
 
+    fn check_ego_session(&self, session_id: &str, binding: Option<&CaptureBinding>) -> Result<()> {
+        let summary = self.0.session(session_id)?;
+        ensure!(
+            !summary.archived && summary.bot.is_none()
+                && matches!(summary.source, SessionSource::Native)
+                && binding.is_none_or(|binding| eligible_source(&summary, binding))
+                && Settings::read(&summary.directory)?.memory_binding.as_ref() == binding,
+            "Native Ego session binding is unavailable"
+        );
+        Ok(())
+    }
+
     fn copied_source_change_pending(&self, session_id: &str) -> Result<bool> {
         if self
             .0

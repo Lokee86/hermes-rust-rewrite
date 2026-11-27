@@ -62,6 +62,8 @@ pub(super) enum Action {
     SaveSwitchboard,
     #[cfg(feature = "reliquary")]
     SetPerceptionEndpoint(String),
+    #[cfg(feature = "reliquary")]
+    SetEgoEnabled(bool),
     Set(&'static str,String,View), Edit(&'static str,String),Apply(View),Browse,DirectoryChosen(Result<Option<PathBuf>,String>),
     Restore(String),RestoreDone(String,Result<serde_json::Value,String>),Delete(String),DeleteDone(String,Result<serde_json::Value,String>),CancelDelete,ConfirmDelete,Maintain,MaintainDone(Result<serde_json::Value,String>),
 }
@@ -310,7 +312,7 @@ fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
                 )?;
                 Ok((saved, embedding_applied))
             })();
-            let reload = result.is_ok() && state.saved.memory_perception_endpoint.is_some();
+            let reload = result.is_ok() && (state.saved.memory_perception_endpoint.is_some() || state.saved.memory_ego_enabled);
             state.feedback = Some(match result {
                 Ok((saved, embedding_applied)) => {
                     state.switchboard_edits.clear();
@@ -337,6 +339,21 @@ fn update_other(app:&mut Hermes,action:Action)->Task<Message>{
                 Ok(saved) => {
                     state.saved = saved;
                     state.feedback = Some(Ok("Perception decision endpoint saved.".into()));
+                    return app.sync_workspace_memory(lib.root().to_owned());
+                }
+                Err(error) => state.feedback = Some(Err(format!("{error:#}"))),
+            }
+        }
+        #[cfg(feature = "reliquary")]
+        Action::SetEgoEnabled(enabled) => {
+            let changes = serde_json::Map::from_iter([(
+                "memory_ego_enabled".to_owned(),
+                serde_json::json!(enabled),
+            )]);
+            match ProfileSettings::update(lib.root(), &changes) {
+                Ok(saved) => {
+                    state.saved = saved;
+                    state.feedback = Some(Ok("Reliquary Ego settings saved.".into()));
                     return app.sync_workspace_memory(lib.root().to_owned());
                 }
                 Err(error) => state.feedback = Some(Err(format!("{error:#}"))),
@@ -633,8 +650,16 @@ pub(super) fn view(app:&Hermes,page:View)->Element<'_,Message>{
             rows.push(super::settings::card_row("Provider status", reason, Space::new().into(), dark));
         }
         if stock && matches!(saved.memory_provider, Reliquary | Auto) {
-            #[cfg(feature = "reliquary")]
-            rows.extend(switchboard_rows(app));
+            #[cfg(feature = "reliquary")] {
+                rows.push(super::settings::card_row(
+                    "Reliquary Ego",
+                    "Use approved Identity, Pins and verified summaries. Enable writes to this profile's active private PHY.",
+                    super::settings::switch(saved.memory_ego_enabled,
+                        |enabled| Message::ProfileSetting(Action::SetEgoEnabled(enabled)), dark).into(),
+                    dark,
+                ));
+                rows.extend(switchboard_rows(app));
+            }
         }
     }
     for f in FIELDS.iter().filter(|f|f.page==page){

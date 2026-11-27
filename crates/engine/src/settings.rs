@@ -90,6 +90,8 @@ pub struct ProfileSettings {
     pub memory_embedding: Option<MemoryEmbedding>,
     /// Saved endpoint used for native Reliquary Perception decisions.
     pub memory_perception_endpoint: Option<String>,
+    /// Enable the native profile Ego package and writable active PHY.
+    pub memory_ego_enabled: bool,
     pub checkpoints_enabled: bool,
     pub checkpoint_max_snapshots: usize,
     pub redact_secrets: bool,
@@ -132,7 +134,7 @@ pub struct MemoryEmbedding {
     pub dimensions: u32,
 }
 impl Default for ProfileSettings {
-    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, memory_provider_revision: 0, external_memory_connector: false, memory_embedding: None, memory_perception_endpoint: None, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
+    fn default()->Self {Self {memory_provider: MemoryProvider::Auto, memory_provider_revision: 0, external_memory_connector: false, memory_embedding: None, memory_perception_endpoint: None, memory_ego_enabled: false, checkpoints_enabled:false,checkpoint_max_snapshots:20,redact_secrets:true,clock_tools:true,terminal_tools:true,file_tools:true,skill_tools:true,memory_tool:true,mcp_tools:true, personality:"default".into(), timezone:String::new(), default_directory:None,
         memory_enabled:true,user_profile_enabled:true,memory_char_limit:crate::memory::DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit:crate::memory::DEFAULT_USER_CHAR_LIMIT, approval_timeout:300, approval_mode:"smart".into(), max_turns:DEFAULT_MAX_TURNS, settings_version:SETTINGS_VERSION,
         file_read_max_chars:100_000,tool_output_bytes:50000,tool_output_lines:2000,tool_output_line_length:2000,
@@ -232,7 +234,7 @@ impl ProfileSettings {
             "terminal"|"process_manage"=>self.terminal_tools,
             "list_directory"|"read_file"|"write_file"|"search_files"=>self.file_tools,
             "skills_list"|"skill_view"=>self.skill_tools,
-            "memory"|"memory_query"|"refine_query"|"traverse_graph"|"archive_search"|"archive_read"|"echo_read"=>self.memory_tool,
+            "memory"|"memory_query"|"refine_query"|"traverse_graph"|"archive_search"|"archive_read"|"echo_read"|"list_pins"|"pin_anchor"|"modify_anchor"|"delete_anchor"=>self.memory_tool,
             "delegate_task"=>true,
             _=>self.mcp_tools,
         }

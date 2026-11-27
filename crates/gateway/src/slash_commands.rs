@@ -101,6 +101,7 @@ const STOCK: &[&str] = &[
     "footer",
     "gateway",
     "image",
+    "identity",
     "indicator",
     "paste",
     "platforms",
@@ -184,6 +185,13 @@ impl Shared {
             metadata.insert(path.clone(), json!({"description":command.description,"argument_mode":command.argument_mode,"args_hint":command.args_hint,"desktop":null}));
             plugin_commands.insert(name.clone(), json!(command.description));
         }
+        if self.ego_available() {
+            let description = "Review and approve the active Reliquary Ego Identity";
+            pairs.push(json!(["/identity", description]));
+            canon.insert("/identity".into(), "/identity".into());
+            metadata.insert("/identity".into(), json!({"description":description,"argument_mode":"optional","args_hint":"exact text","desktop":null}));
+            plugin_commands.insert("identity".into(), json!(description));
+        }
         let statuses: Vec<Value> = inventory.iter().map(|status| {
             let conflict_names: Vec<_> = conflicts.iter()
                 .filter(|(name, owners)| owners.contains(&status.title) && status.commands.iter().any(|c| canonical(&c.name) == **name))
@@ -196,7 +204,11 @@ impl Shared {
     }
 
     /// Execute a registered handler against an already attached live local session.
-    pub(crate) async fn slash_exec(&self, params: &Value, peer: &Peer) -> RpcResult {
+    pub(crate) async fn slash_exec(
+        self: &std::sync::Arc<Self>,
+        params: &Value,
+        peer: &Peer,
+    ) -> RpcResult {
         if !peer.canonical || !peer.local_native {
             return Err(RpcError::new(
                 4403,
@@ -213,7 +225,7 @@ impl Shared {
         if name.is_empty() {
             return Err(RpcError::invalid("command must name a plugin command"));
         }
-        if STOCK.contains(&name.as_str()) {
+        if name != "identity" && STOCK.contains(&name.as_str()) {
             return Err(RpcError::new(
                 4004,
                 "unknown_command",
@@ -240,6 +252,9 @@ impl Shared {
                 "permission_denied",
                 "Plugin commands are unavailable for this session source",
             ));
+        }
+        if name == "identity" {
+            return self.identity_command(session, peer, arguments).await;
         }
         let inventory = self.plugins.inventory().await;
         let (commands, conflicts) = plugin_claims(&inventory);

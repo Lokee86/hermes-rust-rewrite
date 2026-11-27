@@ -15,6 +15,7 @@ pub mod mcp_oauth;
 pub mod memory;
 pub mod memory_capture;
 pub mod native_memory;
+pub mod native_ego;
 mod python_memory;
 pub use python_memory::RecallStatus;
 pub use context::{compress_history, oneshot, window_for as context_window};
@@ -65,6 +66,7 @@ pub enum Event {
 
 pub struct Session { processes: Option<processes::Registry>, child: bool, profile_root:PathBuf, scheduled:bool, text_only:bool, settings:settings::ProfileSettings, directory: PathBuf, store: Arc<Store>, history: History, tools: tools::Context, memory: Option<memory::MemoryStore>,
     notes_config: memory::MemoryConfig, native_enrolled: bool, native_query: Option<Arc<dyn native_memory::MemoryQuery>>,
+    native_ego: Option<Arc<dyn native_ego::EgoAccess>>,
     plugin_runtime: Option<Arc<plugins::PluginRuntime>>,
     python_memory: Option<plugins::PythonMemory>,
     reasoning_summaries: Vec<memory_capture::CapturedReasoningSummary>,
@@ -107,7 +109,8 @@ impl Session {
         self.native_enrolled = native_enrolled;
         self.native_query = query;
     }
-    pub fn clear_native_query(&mut self) { self.native_query = None; }
+    pub fn set_native_ego(&mut self, ego: Option<Arc<dyn native_ego::EgoAccess>>) { self.native_ego = ego; }
+    pub fn clear_native_query(&mut self) { self.native_query = None; self.native_ego = None; }
     /// Use the profile gateway's shared plugin activations.
     pub fn set_plugin_runtime(&mut self, runtime: Arc<plugins::PluginRuntime>) {
         self.plugin_runtime = Some(runtime);
@@ -146,7 +149,7 @@ impl Session {
         let memory = Self::open_notes(profile_root,config.clone())?;
         let mut tools=tools::Context::new(&workspace)?.with_checkpoints(profile_root,settings.checkpoints_enabled && !text_only,settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
-        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, text_only, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
+        Ok(Self { processes:None, child: false, profile_root:profile_root.into(), scheduled, text_only, settings, directory: dir.into(), store: Arc::new(store), history, tools, memory, notes_config:config, native_enrolled, native_query: None, native_ego: None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() })
     }
     /// Create an independently configured profile view over this session's
     /// exclusive writer and transcript. The caller serializes all turns.
@@ -159,7 +162,7 @@ impl Session {
             .with_checkpoints(profile_root, settings.checkpoints_enabled, settings.checkpoint_max_snapshots)?;
         tools.configure(&settings);
         let mut session = Self { processes: None, child: false, profile_root: profile_root.into(), scheduled: false, text_only: false,
-            settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() };
+            settings, directory: self.directory.clone(), store: self.store.clone(), history: self.history.clone(), tools, memory, notes_config, native_enrolled:false, native_query:None, native_ego:None, plugin_runtime:None, python_memory:None, reasoning_summaries:Vec::new() };
         // Terminals belong to the gateway's authorized profile while tools and
         // memory continue to use the member's profile.
         let mut registry = processes::Registry::new(session.tools.workspace_root(), &session.directory);
@@ -250,6 +253,11 @@ impl Session {
         let native = self.native_query.take().filter(|_| {
             memory_eligible && selected == settings::MemoryProvider::Reliquary && self.settings.memory_tool
         });
+        let ego = self.native_ego.take().filter(|_| {
+            !self.text_only && !self.scheduled && !self.child && self.settings.memory_ego_enabled
+                && selected == settings::MemoryProvider::Reliquary
+        });
+        let ego_query = ego.as_ref().map(|_| turn.prompt.clone()).unwrap_or_default();
         let mut memory_results = Vec::new();
         let mut python_results = Vec::new();
         let mut mcp: Vec<mcp::Mcp> = if !self.text_only && self.settings.connect_profile_mcp() {connector::connect(&self.profile_root).await.context("Could not connect configured MCP server")?.into_iter().collect()}else{vec![]};
@@ -289,9 +297,11 @@ impl Session {
             None
         };
         specs.retain(|spec| spec["function"]["name"].as_str().is_some_and(|name| {
-            self.settings.tool_enabled(name) && (selected != settings::MemoryProvider::Reliquary
+            self.settings.tool_enabled(name) && !(ego.is_some() && native_ego::is_pin_tool(name))
+                && (selected != settings::MemoryProvider::Reliquary
                 || native_memory::MemoryTool::from_name(name).is_none())
         }));
+        if ego.is_some() && self.settings.memory_tool { specs.extend(native_ego::specs()); }
         for round in 0..=self.settings.max_turns {
             let size = context::conversation_size(&self.history, &specs);
             let budget = context::budget(provider.config(), size).await;
@@ -305,8 +315,10 @@ impl Session {
                 messages[0]["content"].as_str().context("Missing system prompt")?.to_owned()
             };
             if let Some(style)=settings::PERSONALITIES.get(&self.settings.personality){prompt.push_str("\n\n");prompt.push_str(style);}
-            // A profile's SOUL.md (Bot Mode persona) is part of its system prompt.
+            // The existing host persona occupies this slot when Ego has no approved Identity.
+            let persona_start = prompt.len();
             if let Ok(soul)=std::fs::read_to_string(self.profile_root.join("SOUL.md")) && !soul.trim().is_empty() {prompt.push_str("\n\n");prompt.push_str(soul.trim());}
+            let persona_slot = native_ego::PersonaSlot(persona_start..prompt.len());
             if let Ok(zone)=self.settings.timezone.parse::<chrono_tz::Tz>() {
                 prompt.push_str(&format!("\nUser timezone: {zone}."));
             } else {
@@ -353,13 +365,23 @@ impl Session {
             self.history.turns[index].entries.push(Entry::Assistant { text: String::new(), calls: vec![] });
             self.publish(events)?;
             let mut saved = Instant::now();
-            if self.settings.redact_secrets {privacy::redact_messages(&mut messages);}
+            let host_prompt = if ego.is_some() {
+                messages[0]["content"].as_str().context("Missing system prompt")?.to_owned()
+            } else {
+                if self.settings.redact_secrets {privacy::redact_messages(&mut messages);}
+                String::new()
+            };
             let native_tools = native.as_ref().map(|query| query.tools()).unwrap_or_default();
             let advertised: Vec<_> = specs.iter().cloned()
                 .chain(active_python.filter(|(_, enabled)| *enabled).into_iter().flat_map(|(memory, _)| memory.tools.iter().cloned()))
                 .chain(native_tools.iter().copied().map(native_memory::MemoryTool::spec)).collect();
             let size = context::estimate(&messages, &advertised);
             context::shorten_tool_results(&mut messages, &advertised, context::budget(provider.config(), size).await);
+            if let Some(ego) = &ego {
+                native_ego::apply(ego, &ego_query, provider.config(), provider.options(),
+                    &self.profile_root, &mut messages, &advertised, &host_prompt, &persona_slot).await;
+                if self.settings.redact_secrets {privacy::redact_messages(&mut messages);}
+            }
             let mut retried = false;
             let output = loop {
                 let mut streamed = false;
@@ -389,6 +411,11 @@ impl Session {
                         earlier[0] = messages.swap_remove(0);
                         messages = earlier.into_iter().chain(current).collect();
                         context::shorten_tool_results(&mut messages, &advertised, budget);
+                        if let Some(ego) = &ego {
+                            native_ego::apply(ego, &ego_query, provider.config(), provider.options(),
+                                &self.profile_root, &mut messages, &advertised, &host_prompt, &persona_slot).await;
+                            if self.settings.redact_secrets {privacy::redact_messages(&mut messages);}
+                        }
                     }
                     reply => break reply?,
                 }
@@ -415,6 +442,12 @@ impl Session {
             for call in calls {
                 let (approved, result) = if let Some(message) = plugin_hooks::pre_tool_call(&mut mcp, &call).await {
                     (false, json!({"error": message}).to_string())
+                } else if ego.is_some() && native_ego::is_pin_tool(&call.name) {
+                    if let Some(ego) = &ego {
+                        native_ego::invoke(ego.clone(), &call, provider.config(), &self.settings, events).await?
+                    } else {
+                        (false, json!({"error":"Native Ego is unavailable"}).to_string())
+                    }
                 } else if selected == settings::MemoryProvider::Reliquary
                     && let Some(tool) = native_memory::MemoryTool::from_name(&call.name)
                 {

@@ -945,6 +945,15 @@ impl Provider {
         response: Response,
         emit: &mut impl FnMut(&str) -> Result<()>,
     ) -> Result<ProviderOutput> {
+        self.read_stream_with_items(response, emit, false).await
+    }
+
+    async fn read_stream_with_items(
+        &self,
+        response: Response,
+        emit: &mut impl FnMut(&str) -> Result<()>,
+        keep_items: bool,
+    ) -> Result<ProviderOutput> {
         let content_type = response
             .headers()
             .get("content-type")
@@ -970,7 +979,7 @@ impl Provider {
         let mut events = bytes.eventsource();
         let mut openai = OpenAiStream::default();
         let mut anthropic = AnthropicStream::default();
-        let mut responses = ResponsesStream::default();
+        let mut responses = ResponsesStream { keep_items, ..ResponsesStream::default() };
         while let Some(event) = events.next().await {
             // Do not expose parser/transport error bodies reflected by a proxy.
             let event = event.map_err(|_| {
@@ -993,12 +1002,13 @@ impl Provider {
             }
         }
         let reasoning_summary = std::mem::take(&mut responses.reasoning_summary);
+        let response_items = std::mem::take(&mut responses.items);
         let calls = match self.protocol {
             Protocol::OpenAi => openai.finish(),
             Protocol::Anthropic => anthropic.finish(),
             Protocol::Responses => responses.finish(),
         }?;
-        Ok(ProviderOutput { calls, reasoning_summary })
+        Ok(ProviderOutput { calls, reasoning_summary, response_items })
     }
 }
 
@@ -1055,15 +1065,29 @@ fn responses_body(model: &str, messages: Vec<Value>, tools: &[Value]) -> Value {
 }
 
 #[derive(Default)]
-struct ResponsesStream { calls: Vec<ToolCall>, content_bytes: usize, done: bool, reasoning_summary: String }
+struct ResponsesStream { calls: Vec<ToolCall>, content_bytes: usize, done: bool, reasoning_summary: String, keep_items: bool, items: Vec<Value> }
 
 pub(crate) struct ProviderOutput {
     pub calls: Vec<ToolCall>,
     pub reasoning_summary: String,
+    response_items: Vec<Value>,
 }
 impl ResponsesStream {
     fn accept(&mut self, data: &str, emit: &mut impl FnMut(&str) -> Result<()>) -> Result<bool> {
         let event: Value = serde_json::from_str(data).map_err(|_| anyhow!("Invalid provider stream event"))?;
+        if self.keep_items {
+            match event["type"].as_str() {
+                Some("response.output_item.done") => {
+                    if let Some(item) = event.get("item") { self.items.push(item.clone()); }
+                }
+                Some("response.completed" | "response.done") => {
+                    if let Some(items) = event.pointer("/response/output").and_then(Value::as_array) {
+                        self.items.clone_from(items);
+                    }
+                }
+                _ => {}
+            }
+        }
         match event["type"].as_str().unwrap_or_default() {
             "response.output_text.delta" => if let Some(delta) = event["delta"].as_str() { emit_text(&mut self.content_bytes, delta, emit)?; },
             "response.reasoning_summary_text.delta" => if let Some(delta) = event["delta"].as_str() {
