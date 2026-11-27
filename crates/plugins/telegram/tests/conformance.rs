@@ -310,6 +310,26 @@ async fn status(gateway: &RunningGateway, test: impl Fn(&Value) -> bool) -> Valu
     }
 }
 
+// The Bot API fixture records requests before the gateway saves their receipts.
+async fn wait_for_sent_replies(gateway: &RunningGateway, count: usize) {
+    status(gateway, |value| {
+        value["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["part"] == 0
+                    && row["state"] == "sent"
+                    && row["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("reply-"))
+            })
+            .count()
+            >= count
+    })
+    .await;
+}
+
 async fn opening() -> (tempfile::TempDir, Model, Fixture, RunningGateway) {
     let root = tempfile::tempdir().unwrap();
     let model = Model::new().await.with_stock_adapter(STOCK_ADAPTER);
@@ -352,41 +372,22 @@ async fn polling_commits_before_advancing_and_recovers_replays_after_restart() {
             .iter()
             .any(|row| row["id"] == "telegram-update-0-21" && row["state"] == "refused")
     );
-    status(&gateway, |_| {
-        fixture
-            .requests("sendMessage")
-            .iter()
-            .any(|call| call["text"] == "answer first")
-    })
-    .await;
+    wait_for_sent_replies(&gateway, 1).await;
     gateway.shutdown().await.unwrap();
 
     let polled = fixture.requests("getUpdates").len();
     fixture.queue(vec![first, message(22, 42, "after restart")]);
     let gateway = model.gateway(root.path(), vec![]).await;
-    until(|| {
-        fixture
-            .requests("sendMessage")
-            .iter()
-            .any(|call| call["text"] == "answer after restart")
-    })
-    .await;
+    wait_for_sent_replies(&gateway, 2).await;
     let polls = fixture.requests("getUpdates");
     assert_eq!(polls[0]["offset"], 0);
     assert_eq!(polls[polled]["offset"], 22);
-    assert_eq!(
-        fixture
-            .requests("sendMessage")
-            .iter()
-            .filter(|call| call["text"] == "answer first")
-            .count(),
-        1
-    );
+    let replies = fixture.requests("sendMessage");
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["text"], "answer first");
+    assert_eq!(replies[1]["text"], "answer after restart");
+    assert_eq!(replies[0]["reply_parameters"]["message_id"], 220);
     assert_eq!(model.requests().len(), 2);
-    assert_eq!(
-        fixture.requests("sendMessage")[0]["reply_parameters"]["message_id"],
-        220
-    );
     gateway.shutdown().await.unwrap();
 }
 
@@ -416,7 +417,8 @@ async fn webhook_authenticates_and_commits_out_of_order_updates_then_switches_to
             StatusCode::NO_CONTENT
         );
     }
-    until(|| fixture.requests("sendMessage").len() >= 2).await;
+    wait_for_sent_replies(&gateway, 2).await;
+    assert_eq!(fixture.requests("sendMessage").len(), 2);
     gateway.shutdown().await.unwrap();
 
     let gateway = model.gateway(root.path(), vec![]).await;
@@ -523,7 +525,7 @@ async fn an_ambiguous_send_blocks_its_route_across_restart_while_another_route_d
 
 #[tokio::test]
 async fn reply_routes_keep_forum_general_group_topic_and_private_topic_separate() {
-    let (_, model, fixture, gateway) = opening().await;
+    let (_root, model, fixture, gateway) = opening().await;
     let addressed = |id, thread, text: &str| {
         let mut item = forum_message(id, thread, text);
         item["message"]["entities"] = json!([{"type":"mention","offset":3,"length":12}]);
@@ -539,7 +541,7 @@ async fn reply_routes_keep_forum_general_group_topic_and_private_topic_separate(
         private,
     ]);
     fixture.create(&gateway, fixture.settings(false)).await;
-    until(|| fixture.requests("sendMessage").len() >= 3).await;
+    wait_for_sent_replies(&gateway, 3).await;
     let writes = fixture.requests("sendMessage");
     let general = writes
         .iter()
@@ -569,7 +571,7 @@ async fn rotation_for_the_same_bot_preserves_admissions_and_does_not_wait_for_it
     let original = message(50, 42, "before rotation");
     fixture.queue(vec![original.clone()]);
     fixture.create(&gateway, fixture.settings(false)).await;
-    until(|| fixture.requests("sendMessage").len() == 1).await;
+    wait_for_sent_replies(&gateway, 1).await;
     fixture.enroll(&gateway, 'b').await;
     fixture.queue(vec![original, message(51, 42, "after rotation")]);
     until(|| {
