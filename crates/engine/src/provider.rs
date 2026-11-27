@@ -1088,7 +1088,12 @@ impl ResponsesStream {
     }
     fn finish(self) -> Result<Vec<ToolCall>> {
         ensure!(self.done, "Provider stream ended before the response completed");
-        Ok(self.calls)
+        // The same contract as the other protocols: a usable answer, and well-formed calls.
+        ensure!(
+            !self.calls.is_empty() || self.content_bytes > 0,
+            "Provider completed without returning a usable answer"
+        );
+        valid_calls(self.calls)
     }
 }
 

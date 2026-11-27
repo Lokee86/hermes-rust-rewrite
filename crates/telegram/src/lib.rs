@@ -3,6 +3,6 @@ pub mod store;
 pub mod telegram;
 pub use store::{ChatMessage, DeliveryOutcome, DeliveryResolution, Inbox, Settings, Store, TurnOutcome, Work, WorkStage};
 pub use telegram::{
-    Client, Error, ErrorKind, Identity, Incoming, Method, PollBatch, Receipt, RequestFuture, Token,
-    Transport, parse_allowlist,
+    Client, Error, ErrorKind, Identity, Incoming, MAX_TEXT_UNITS, Method, PollBatch, Receipt,
+    RequestFuture, Token, Transport, parse_allowlist, text_units,
 };

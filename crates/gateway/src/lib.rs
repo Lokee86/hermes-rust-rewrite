@@ -347,6 +347,16 @@ fn same_secret(left: &str, right: &str) -> bool {
     difference == 0
 }
 
+struct ListFilter {
+    limit: usize,
+    title: Option<String>,
+    query: Option<String>,
+    workspace: Option<PathBuf>,
+    live_only: bool,
+    canonical: bool,
+    compact: bool,
+}
+
 struct Shared {
     authority_epoch: u64,
     profile_id: String,
@@ -1173,8 +1183,11 @@ impl Shared {
                 existing = Some(id.clone());
             } else {
                 for summary in self.library.sessions(None).map_err(RpcError::internal)? {
-                    let settings =
-                        Settings::read(&summary.directory).map_err(RpcError::internal)?;
+                    // An unreadable file cannot prove a match; the catalog's key still
+                    // fences a duplicate, and the create below then reports the damage.
+                    let Ok(settings) = Settings::read(&summary.directory) else {
+                        continue;
+                    };
                     if settings.creation_key.as_ref() == Some(key) {
                         if settings.creation_fingerprint.as_ref() != Some(&fingerprint) {
                             return Err(RpcError::new(
@@ -1245,7 +1258,7 @@ impl Shared {
         Ok(self.snapshot(&session, peer, false))
     }
 
-    async fn list(&self, params: &Value, peer: &Peer, active: bool) -> RpcResult {
+    async fn list(self: &Arc<Self>, params: &Value, peer: &Peer, active: bool) -> RpcResult {
         if params["cursor"].is_string() {
             return Err(RpcError::unsupported(
                 "Cursor pagination is not implemented; use limit",
@@ -1263,32 +1276,61 @@ impl Shared {
         if !matches!(scope, "live" | "stored") {
             return Err(RpcError::invalid("scope must be live or stored"));
         }
+        let filter = ListFilter {
+            limit,
+            title: title.map(str::to_owned),
+            query,
+            workspace,
+            live_only: active || (peer.canonical && scope == "live"),
+            canonical: peer.canonical,
+            compact: active && !peer.canonical,
+        };
+        // Snapshot the live table so disk reads never hold the gateway-wide session lock.
+        let sessions: HashMap<String, Arc<LiveSession>> = self.sessions.lock().await.clone();
+        let shared = Arc::clone(self);
+        let rows = tokio::task::spawn_blocking(move || shared.list_rows(&sessions, &filter))
+            .await
+            .map_err(RpcError::internal)??;
+        if peer.canonical {
+            Ok(json!({"sessions":rows,"scope":scope,"next_cursor":null}))
+        } else {
+            Ok(json!({"sessions":rows}))
+        }
+    }
+
+    /// One unreadable conversation is left out rather than hiding every other row.
+    fn list_rows(
+        &self,
+        sessions: &HashMap<String, Arc<LiveSession>>,
+        filter: &ListFilter,
+    ) -> Result<Vec<Value>, RpcError> {
         let mut rows = Vec::new();
-        let sessions = self.sessions.lock().await;
         for summary in self.library.sessions(None).map_err(RpcError::internal)? {
-            if rows.len() >= limit {
+            if rows.len() >= filter.limit {
                 break;
             }
-            if (active || (peer.canonical && scope == "live"))
-                && !sessions.contains_key(&summary.id)
-            {
+            if filter.live_only && !sessions.contains_key(&summary.id) {
                 continue;
             }
-            if title.is_some_and(|t| t != summary.title) {
+            if filter.title.as_ref().is_some_and(|t| t != &summary.title) {
                 continue;
             }
-            if query.as_ref().is_some_and(|q| {
+            if filter.query.as_ref().is_some_and(|q| {
                 !summary.title.to_lowercase().contains(q) && !summary.id.contains(q)
             }) {
                 continue;
             }
-            let settings = Settings::read(&summary.directory).map_err(RpcError::internal)?;
+            let Ok(settings) = Settings::read(&summary.directory) else {
+                eprintln!("Skipped conversation {} with unreadable gateway settings", summary.id);
+                continue;
+            };
             let cwd = self
                 .library
                 .workspace_for_session(&summary.id)
                 .map_err(RpcError::internal)?
                 .or(settings.cwd);
-            if workspace
+            if filter
+                .workspace
                 .as_ref()
                 .is_some_and(|w| cwd.as_ref().is_none_or(|c| !c.starts_with(w)))
             {
@@ -1298,10 +1340,13 @@ impl Shared {
                 let view = lock(&session.view);
                 (view.history.clone(), view.running)
             } else {
-                (
-                    read_history(&summary.directory).map_err(RpcError::internal)?,
-                    false,
-                )
+                match read_history(&summary.directory) {
+                    Ok(history) => (history, false),
+                    Err(_) => {
+                        eprintln!("Skipped conversation {} with an unreadable transcript", summary.id);
+                        continue;
+                    }
+                }
             };
             let messages = transcript(&summary.id, &history, None);
             let model = settings
@@ -1318,13 +1363,13 @@ impl Shared {
                     _ => None,
                 })
             });
-            if active && !peer.canonical {
+            if filter.compact {
                 rows.push(json!({"current":false,"id":summary.id,"last_active":epoch_time(&summary.updated_at),
                     "message_count":messages.len(),"model":model,"preview":preview,"session_key":summary.id,
                     "source":settings.source,"started_at":epoch_time(&summary.created_at),"status":if running {"running"} else {"idle"},"title":summary.title}));
             } else {
                 let mut row = json!({"id":summary.id,"title":summary.title,"preview":preview,"started_at":epoch_time(&summary.created_at),"message_count":messages.len(),"source":settings.source});
-                if peer.canonical {
+                if filter.canonical {
                     row["session_id"] = json!(summary.id);
                     row["running"] = json!(running);
                     row["model"] = json!(model);
@@ -1336,11 +1381,7 @@ impl Shared {
                 rows.push(row);
             }
         }
-        if peer.canonical {
-            Ok(json!({"sessions":rows,"scope":scope,"next_cursor":null}))
-        } else {
-            Ok(json!({"sessions":rows}))
-        }
+        Ok(rows)
     }
 
     async fn replay(&self, params: &Value, _peer: &Peer) -> RpcResult {

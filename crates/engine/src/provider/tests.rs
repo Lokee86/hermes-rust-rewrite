@@ -811,3 +811,24 @@ fn requests_mark_the_stable_prefix_for_caching() {
     cache_openrouter_prefix(&"https://example.com/v1/chat/completions".parse().unwrap(), &mut other);
     assert_eq!(other, plain);
 }
+
+#[test]
+fn responses_calls_meet_the_same_contract_as_other_protocols() {
+    let call = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"}}"#;
+    let completed = r#"{"type":"response.completed","response":{}}"#;
+    let finish = |events: &[&str]| {
+        let mut stream = ResponsesStream::default();
+        let mut emit = |_: &str| Ok(());
+        for event in events {
+            stream.accept(event, &mut emit).unwrap();
+        }
+        stream.finish()
+    };
+    assert!(finish(&[call, completed]).is_ok());
+    assert!(finish(&[call, call, completed]).is_err(), "duplicate call IDs");
+    assert!(finish(&[completed]).is_err(), "no text and no calls");
+    let unnamed = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"","arguments":"{}"}}"#;
+    assert!(finish(&[unnamed, completed]).is_err());
+    let broken = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{"}}"#;
+    assert!(finish(&[broken, completed]).is_err());
+}
