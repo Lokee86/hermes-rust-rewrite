@@ -169,7 +169,7 @@ The native outgoing-capture test mounts a disposable profile and sends ordinary 
 
 ### Reliquary retrieval
 
-The model can call `memory_query` to search processed memories in the chat's bound General or project REL. `refine_query` and `traverse_graph` use results from the same turn. These tools leave freshness unchanged.
+The model can call `memory_query` to search eligible Memories and current Observations in the chat's bound General or project REL and active private PHY. The result contains one Core ranking, exact owner-qualified Memory references and exact Observation citations. `refine_query` and `traverse_graph` use authorized results from the same turn. These tools leave Freshness unchanged.
 
 `archive_search` accepts a natural-language time reference such as “last Tuesday.” It uses the profile's configured calendar timezone, with UTC as the fallback, and defaults to the date of the original message. Pass `basis: "mentioned"` to filter on dates discussed in the messages. A query without a resolvable time reference returns `temporal_query_required` and suggests `memory_query`. `archive_read` and `echo_read` accept only an exact reference returned to the model during the current turn. Successful retrieval content goes to the requesting model round. The stored tool entry records its result count.
 

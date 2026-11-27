@@ -42,7 +42,7 @@ impl NativeSlot {
             && store.needs_profile_remount()?
         {
             if Arc::strong_count(store) > 1 {
-                store.pause_ego();
+                store.pause_for_remount();
                 return Ok(());
             }
             self.unmount(mounted);

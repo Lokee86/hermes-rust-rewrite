@@ -67,7 +67,7 @@ impl MemoryTool {
         let ids = json!({"type":"array","items":token,"maxItems":10,"uniqueItems":true});
         let (description, properties, required) = match self {
             Self::Query => (
-                "Search processed memories in the assigned REL.",
+                "Search settled Memories and verified Observations in the chat's assigned REL and active private owner.",
                 json!({"query":query}),
                 vec!["query"],
             ),

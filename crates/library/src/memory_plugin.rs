@@ -39,7 +39,8 @@ pub trait MemoryStore: Send + Sync {
         Ok(false)
     }
 
-    fn pause_ego(&self) {}
+    /// Fence results and stop private workers before changing the profile mount.
+    fn pause_for_remount(&self) {}
 
     fn ego(
         self: Arc<Self>,

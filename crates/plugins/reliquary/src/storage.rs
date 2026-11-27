@@ -76,7 +76,7 @@ pub(super) struct RegisteredOwner {
 }
 
 impl Topology {
-    fn read(directory: &Path) -> Result<Self> {
+    pub(super) fn read(directory: &Path) -> Result<Self> {
         let topology: Self = read_state(
             regular_file(&directory.join(TOPOLOGY))?
                 .context("Reliquary profile has no owner topology")?,
