@@ -805,10 +805,13 @@ impl Ingress {
         if effect.blocked || state.policy.room_policy(room).is_none() {
             return Err(GatewayError::Forbidden);
         }
-        if let Some(sender) = &effect.sender
-            && !self.authorize_sender(&state.policy, room, sender)?
-        {
-            return Err(GatewayError::Forbidden);
+        if let Some(sender) = &effect.sender {
+            if !self.authorize_sender(&state.policy, room, sender)? {
+                return Err(GatewayError::Forbidden);
+            }
+            // The resource check an ordinary delivery repeats: a revoked resource must stop an
+            // existing fetch grant too, not only new sends.
+            self.recheck_resource_delivery(&state.policy, &identity.delivery, room, sender)?;
         }
         self.check_delivery_protection(
             &state.policy, room, &identity.delivery, effect.protection.as_deref(),

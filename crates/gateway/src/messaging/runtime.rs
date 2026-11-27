@@ -1045,6 +1045,13 @@ impl Host {
             .notification_text(route, &store::key("notification", producer)?)
     }
 
+    /// The native side settled these requests without a remote answer.
+    pub(crate) fn close_requests(&self, session: &str, requests: &[String]) {
+        if let Err(error) = self.store.close_actions(session, requests) {
+            eprintln!("messaging prompts could not be closed: {error:#}");
+        }
+    }
+
     /// Called by the authoritative durable producer before it records completion.
     pub(crate) fn notify_route(
         &self,

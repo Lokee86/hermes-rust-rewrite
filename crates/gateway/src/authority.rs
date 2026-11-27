@@ -1014,6 +1014,11 @@ mod publication_tests {
         let peer = Peer { id: "legacy-test".into(), tx, stop: CancellationToken::new(), canonical: true, local_native: true };
         lock(&session.peers).insert(peer.id.clone(), peer.clone());
         library.delete_bot("grace").unwrap();
+        // A group saved by an earlier version can still name a bot that is gone.
+        let groups = dir.path().join("groups.json");
+        let mut saved: Value = serde_json::from_slice(&std::fs::read(&groups).unwrap()).unwrap();
+        saved["groups"][0]["members"] = json!(["ada", "grace"]);
+        std::fs::write(&groups, serde_json::to_vec(&saved).unwrap()).unwrap();
         assert!(gateway.shared.resume_parked(&json!({"session_id":chat.id,"admission_id":id}), &peer).await.is_err());
         assert_eq!(lock(&session.view).authority.receipts[1].status, "parked");
         assert_eq!(lock(&session.view).authority.receipts.len(), 2);

@@ -195,8 +195,12 @@ impl Connector {
                     .await;
             }
         };
-        let input = submission_key(self.bot.id, work.update_id);
-        let receipt = match owner.submission_receipt(&session, &input) {
+        let input = submission_key(self.bot.id, work.update_id, &work.message);
+        // A turn submitted before message identities were part of the key keeps its old key.
+        let receipt = owner.submission_receipt(&session, &input).or_else(|| {
+            (work.stage == WorkStage::TurnUnknown).then(|| owner.submission_receipt(&session, &legacy_submission_key(self.bot.id, work.update_id))).flatten()
+        });
+        let receipt = match receipt {
             Some(receipt) => receipt,
             None if work.stage == WorkStage::TurnUnknown => {
                 return self
@@ -210,7 +214,10 @@ impl Connector {
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(error) if error.data["reason"] == "shutdown" => return Ok(()),
+                    // Nothing was admitted: a fault the owner can fix (storage, a restart, a settings
+                    // change) leaves the message to be submitted again, not discarded.
+                    Err(error) if matches!(error.data["reason"].as_str(),
+                        Some("shutdown" | "internal_error" | "owner_changed" | "revision_conflict")) => return Ok(()),
                     Err(error) if error.data["reason"] == "admission_conflict" => {
                         return self
                             .record_turn(work.update_id, TurnOutcome::Blocked("admission_conflict"))
@@ -382,7 +389,10 @@ enum Route {
     Blocked,
 }
 
-pub(crate) fn submission_key(bot: i64, update: i64) -> String {
+pub(crate) fn submission_key(bot: i64, update: i64, message: &str) -> String {
+    format!("telegram:{bot}:{update}:{message}")
+}
+pub(crate) fn legacy_submission_key(bot: i64, update: i64) -> String {
     format!("telegram:{bot}:{update}")
 }
 

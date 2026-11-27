@@ -1,7 +1,7 @@
 //! Shared native Telegram persistence and Bot API client for the Desktop and profile gateway.
 pub mod store;
 pub mod telegram;
-pub use store::{ChatMessage, DeliveryOutcome, DeliveryResolution, Inbox, Settings, Store, TurnOutcome, Work, WorkStage};
+pub use store::{ChatMessage, DeliveryOutcome, DeliveryResolution, Inbox, Settings, Store, TurnOutcome, Work, WorkStage, incoming_identity};
 pub use telegram::{
     Client, Error, ErrorKind, Identity, Incoming, MAX_TEXT_UNITS, Method, PollBatch, Receipt,
     RequestFuture, Token, Transport, parse_allowlist, text_units,

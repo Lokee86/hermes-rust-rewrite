@@ -74,14 +74,12 @@ pub(super) async fn upgrade(
             drop(handler);
         })
 }
+/// Bounded: a viewer that stopped reading must not hold the handler, and so gateway shutdown, open.
 async fn close(ws: &mut WebSocket, code: u16, reason: &'static str) {
-    let _ = ws
-        .send(Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.into(),
-        })))
-        .await;
+    let frame = Message::Close(Some(CloseFrame { code, reason: reason.into() }));
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.send(frame)).await;
 }
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 async fn meta(ws: &mut WebSocket, value: Value) -> bool {
     ws.send(Message::Text(format!("{META}{value}").into()))
         .await

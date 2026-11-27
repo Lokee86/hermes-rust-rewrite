@@ -297,18 +297,31 @@ impl Library {
         roster.profile_deletions.remove(name);
         ensure!(roster.bots.len() < before, "This bot no longer exists");
         atomic_json(&self.roster_path(), &roster)?;
+        // A group keeps working without the bot: admission refuses a turn naming a missing member.
+        let mut groups = self.groups()?;
+        let mut changed = false;
+        for group in &mut groups {
+            let count = group.members.len();
+            group.members.retain(|member| member != name);
+            changed |= group.members.len() != count;
+        }
+        if changed {
+            atomic_json(&self.groups_path(), &Groups { groups })?;
+        }
         Ok(BotDeletion { retained_profile })
     }
 
-    /// Resolve the registry every time: the session titled "Bot Chat" owned by
-    /// this bot. Created (adopt-before-mint, under the catalog lock) when missing.
+    /// Resolve the registry every time: the session this bot owns, whatever it has been renamed
+    /// to. Created (adopt-before-mint, under the catalog lock) when missing.
     pub fn bot_chat(&self, name: &str) -> Result<SessionSummary> {
         let _lock = self.lock_roster()?;
         let roster = self.read_roster()?;
         ensure!(roster.bots.iter().any(|bot| bot.name == name), "This bot no longer exists");
         ensure!(!roster.profile_deletions.contains_key(name), "Retry deleting this bot before opening it");
         self.with_catalog(true, |catalog| {
-            if let Some(record) = catalog.sessions.iter_mut().find(|r| r.bot.as_deref() == Some(name) && r.title == BOT_CHAT_TITLE) {
+            // Only this function gives a session a bot owner, so the one it finds is the bot's chat
+            // even after `/title` renamed it.
+            if let Some(record) = catalog.sessions.iter_mut().find(|r| r.bot.as_deref() == Some(name)) {
                 record.archived = false;
                 let summary = self.summary(record);
                 catalog.active_session = Some(summary.id.clone());
@@ -583,6 +596,20 @@ impl Library {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+    #[test]
+    fn a_deleted_bot_leaves_its_groups_and_a_renamed_bot_chat_keeps_its_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let names: Vec<_> = ["Ada", "Bo", "Cy"].iter().map(|n| library.create_bot(n, "", "", "").unwrap().name).collect();
+        let group = library.create_group("Team", &names).unwrap();
+        library.delete_bot(&names[2]).unwrap();
+        let kept = library.groups().unwrap().into_iter().find(|g| g.id == group.id).unwrap();
+        assert_eq!(kept.members, names[..2].to_vec(), "the group no longer names the deleted bot");
+
+        let chat = library.bot_chat(&names[0]).unwrap();
+        library.rename_session(&chat.id, "Planning").unwrap();
+        assert_eq!(library.bot_chat(&names[0]).unwrap().id, chat.id, "the renamed chat is reopened, not replaced");
+    }
     #[test]
     fn group_needs_two_bots_and_owns_one_hidden_chat() {
         let dir = tempfile::tempdir().unwrap();

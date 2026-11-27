@@ -142,14 +142,16 @@ impl State {
                 if self.dirty && let Err(e) = self.persist(None) { self.note = Some(Err(e)); return; }
                 if !self.configured(platform) { self.note = Some(Err("Fill in the required fields first.".into())); return; }
                 let on = !self.saved.enabled.contains(&platform.id);
-                self.note = Some(self.persist(Some(on)).map(|_| if on { "Enabled. The Hermes backend starts this channel on its next run.".into() } else { "Disabled.".into() }));
+                // Only Telegram has a native adapter in this gateway. Saying the channel starts would
+                // promise replies nothing here delivers.
+                self.note = Some(self.persist(Some(on)).map(|_| if on { "Saved as enabled for a Hermes backend that runs this channel. This app's gateway runs only Telegram, so no replies are sent from here.".into() } else { "Disabled.".into() }));
             }
         }
     }
 }
 
 fn status_label(state: &State, platform: &Platform) -> &'static str {
-    if state.enabled(&platform.id) { "Enabled" } else if state.configured(platform) { "Ready" } else { "Needs setup" }
+    if state.enabled(&platform.id) { "Enabled · not run here" } else if state.configured(platform) { "Ready" } else { "Needs setup" }
 }
 
 /// Rail rows for every catalog platform matching the search.
