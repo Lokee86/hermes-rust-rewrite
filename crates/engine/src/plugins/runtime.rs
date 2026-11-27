@@ -469,6 +469,7 @@ impl Activation {
             &data,
             &packages,
             &self.key.env,
+            (&runtime.root, &runtime.name),
             &prefix(&self.id),
         )
         .await?;

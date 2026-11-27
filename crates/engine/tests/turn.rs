@@ -385,3 +385,60 @@ async fn a_chat_that_outgrows_the_model_is_compressed_and_goes_on() {
     let reopened = Session::open(dir.path()).unwrap();
     assert!(reopened.history().active_summary().is_some());
 }
+
+/// A model that delegates one task, recording which tools each request offered.
+async fn delegating_model(State(requests): State<Requests>, Json(body): Json<Value>) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let messages = body["messages"].as_array().unwrap().clone();
+    let names: Vec<String> = body["tools"].as_array().map(|tools| tools.iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect()).unwrap_or_default();
+    let child = messages.iter().any(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.starts_with("You are a subagent")));
+    requests.lock().unwrap().push(json!({"child": child, "tools": names}));
+    let chunk = if child || messages.last().unwrap()["role"] == "tool" || !names.iter().any(|n| n == "delegate_task") {
+        json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]})
+    } else {
+        let args = json!({"tasks":[{"goal":"build it"}]}).to_string();
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"d1","type":"function","function":{"name":"delegate_task","arguments":args}}]},"finish_reason":"tool_calls"}]})
+    };
+    Sse::new(stream::iter([Ok(SseEvent::default().data(chunk.to_string())), Ok(SseEvent::default().data("[DONE]"))]))
+}
+
+async fn delegating_server() -> (Config, Requests) {
+    let seen = Requests::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let app = Router::new().route("/v1/chat/completions", post(delegating_model)).with_state(seen.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    (Config { base_url, api_key: String::new(), model: "m".into() }, seen)
+}
+
+#[tokio::test]
+async fn a_delegated_child_can_run_commands_when_its_parent_can() {
+    let (config, seen) = delegating_server().await;
+    let dir = tempdir().unwrap();
+    let mut session = Session::open(dir.path()).unwrap();
+    session.enable_local_processes("conversation").unwrap();
+    let (tx, rx) = async_channel::unbounded();
+    let run = tokio::spawn(async move { session.turn(config, "Build and test".into(), tx, CancellationToken::new()).await.unwrap() });
+    while rx.recv().await.is_ok() {}
+    run.await.unwrap();
+    let requests = seen.lock().unwrap();
+    let child: Vec<_> = requests.iter().filter(|r| r["child"] == true).collect();
+    assert!(!child.is_empty(), "the task was delegated");
+    assert!(child.iter().all(|r| r["tools"].as_array().unwrap().iter().any(|t| t == "terminal")), "{child:?}");
+}
+
+#[tokio::test]
+async fn a_channel_turn_does_not_delegate_past_its_limits() {
+    let (config, seen) = delegating_server().await;
+    let dir = tempdir().unwrap();
+    let mut session = Session::open_channel(&dir.path().join("chat"), dir.path()).unwrap();
+    let controls = hermes_engine::TurnControls { channel_tools: true, ..Default::default() };
+    let (tx, rx) = async_channel::unbounded();
+    let run = tokio::spawn(async move {
+        session.run_controlled_turn(config, Default::default(), "Split this work".into(), vec![], tx, CancellationToken::new(), controls).await.unwrap()
+    });
+    while rx.recv().await.is_ok() {}
+    run.await.unwrap();
+    let requests = seen.lock().unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|r| r["child"] == false && !r["tools"].as_array().unwrap().iter().any(|t| t == "delegate_task")), "{requests:?}");
+}

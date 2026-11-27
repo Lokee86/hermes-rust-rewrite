@@ -71,8 +71,9 @@ pub(super) async fn receive(State(shared): State<Arc<Shared>>, Path(name): Path<
             Err(_) => return (StatusCode::CONFLICT, "webhook chat is unavailable").into_response(),
         },
         None => {
-            let result = shared.library.create_session(None, None).and_then(|s|
-                shared.library.rename_session(&s.id, &format!("Webhook · {}", hook.name)));
+            // A background chat never takes over the user's open "New chat" or selection.
+            let result = shared.library.create_background_session(&format!("Webhook · {}", hook.name),
+                &format!("webhook-chat:{}", hook.name), |_| Ok(()));
             match result {
                 Ok(summary) => summary,
                 Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),

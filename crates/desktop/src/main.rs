@@ -152,7 +152,14 @@ enum Screen { Chat, Provider, Workspaces, Tools, Files, Git, Terminal, Import, M
 enum RightPane { Files, Review, Terminal }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Preferences { base_url: String, model: String }
+struct Preferences {
+    base_url: String,
+    model: String,
+    /// The saved endpoint chosen for this URL. Two saved keys can share a URL, so the URL alone
+    /// cannot say which one (and so which account is billed) to use after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+}
 
 impl Preferences {
     fn path() -> Result<PathBuf, String> {
@@ -178,11 +185,17 @@ impl Preferences {
         }
         config
     }
-    fn save(config: &Config) -> Result<(), String> {
+    /// The saved endpoint the last session used, when its URL is still the one being loaded.
+    fn endpoint() -> Option<String> {
+        if std::env::var_os("HERMES_RUST_BASE_URL").is_some() { return None; }
+        let saved: Self = serde_json::from_slice(&std::fs::read(Self::path().ok()?).ok()?).ok()?;
+        saved.endpoint
+    }
+    fn save(config: &Config, endpoint: Option<&str>) -> Result<(), String> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
         // There is deliberately no key field. The secret never enters preferences.
-        let saved = Self { base_url: config.base_url.clone(), model: config.model.clone() };
+        let saved = Self { base_url: config.base_url.clone(), model: config.model.clone(), endpoint: endpoint.map(str::to_owned) };
         let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
         let temp = path.with_extension("tmp");
         std::fs::write(&temp, bytes).map_err(|e| e.to_string())?;
@@ -375,7 +388,7 @@ impl Hermes {
         };
         // Restore private credentials and generation options before any chat
         // connection captures its startup provider configuration.
-        app.models = models::State::open(&mut app.config);
+        app.models = models::State::open(&mut app.config, Preferences::endpoint().as_deref());
         match Library::open_default() {
             Ok(library) => {
                 app.statusbar = statusbar::State::load(library.root());
@@ -1131,7 +1144,7 @@ impl Hermes {
                     Ok(()) => {
                         self.config = self.portal_config();
                         self.models.invalidate();self.models.load_options(&self.config);
-                        if let Err(error) = Preferences::save(&self.config) { self.error(error); }
+                        if let Err(error) = Preferences::save(&self.config, None) { self.error(error); }
                         else {
                             self.note("Signed in with Nous Portal.");
                             if std::mem::take(&mut self.return_to_composer){
@@ -1651,7 +1664,8 @@ mod tests {
     }
     #[test]
     fn preferences_have_no_credential_field() {
-        let value = serde_json::to_value(Preferences { base_url: "https://example.test/v1".into(), model: "example".into() }).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 2); assert!(value.get("api_key").is_none());
+        let value = serde_json::to_value(Preferences { base_url: "https://example.test/v1".into(), model: "example".into(), endpoint: Some("endpoint-1".into()) }).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3); assert!(value.get("api_key").is_none());
+        assert_eq!(value["endpoint"], "endpoint-1", "the endpoint is named by its id, never its key");
     }
 }

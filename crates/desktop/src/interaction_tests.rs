@@ -113,7 +113,7 @@ fn saved_credentials_precede_chat_bootstrap_and_remote_tabs_keep_their_targets()
     let config = Config { base_url: hermes_engine::OPENAI.into(), model: "saved-model".into(), api_key: "synthetic-saved-key".into() };
     let vault = hermes_engine::credentials::EndpointStore::open(&root.join("providers")).unwrap();
     vault.save(None, "Saved provider", &config).unwrap();
-    Preferences::save(&config).unwrap();
+    Preferences::save(&config, None).unwrap();
     let (mut app, boot) = Hermes::new();
     assert!(app.chat.has_startup_provider(&config), "the gateway captures the restored credential");
     drop(boot);
@@ -197,7 +197,7 @@ async fn two_desktop_viewers_resume_the_same_tool_turn() {
     let mut remote_owner = None;
     if let Some(exe) = std::env::var_os("HERMES_TEST_DESKTOP_EXE") {
         use std::process::{Command, Stdio};
-        Preferences::save(&config).unwrap();
+        Preferences::save(&config, None).unwrap();
         let mut command = Command::new(exe);
         command
             .args([
@@ -370,7 +370,7 @@ async fn nous_qwen_send_approve_stream_and_reopen() {
         base_url: portal::INFERENCE.into(),
         model: "qwen/qwen4-max:free".into(),
         api_key: String::new(),
-    })
+    }, None)
     .unwrap();
     let mut a = Window::new();
     a.until(|app| app.chat.ready).await;

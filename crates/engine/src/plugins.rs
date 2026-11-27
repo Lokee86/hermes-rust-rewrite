@@ -598,11 +598,22 @@ async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
     (live, errors)
 }
 
-/// The installed-agent compatibility path serves legacy tools.
-async fn connect_python_bridge(plugin_root: &Path, data: &Path, packages: &Path, config_env: &[(String, String)], prefix: &str) -> Result<Mcp> {
+/// The plugin's environment, bound to the profile that opened it: without `HERMES_HOME` and
+/// `HERMES_PROFILE_NAME` the installed agent falls back to the default profile's data.
+fn bridge_env(plugin_root: &Path, data: &Path, config_env: &[(String, String)], (home, name): (&Path, &str)) -> Vec<(String, String)> {
     let mut env = config_env.to_vec();
-    env.push(("PLUGIN_ROOT".into(), plugin_root.to_string_lossy().into_owned()));
-    env.push(("PLUGIN_DATA".into(), data.to_string_lossy().into_owned()));
+    env.extend([
+        ("PLUGIN_ROOT".into(), plugin_root.to_string_lossy().into_owned()),
+        ("PLUGIN_DATA".into(), data.to_string_lossy().into_owned()),
+        ("HERMES_HOME".into(), home.to_string_lossy().into_owned()),
+        ("HERMES_PROFILE_NAME".into(), name.to_owned()),
+    ]);
+    env
+}
+
+/// The installed-agent compatibility path serves legacy tools.
+async fn connect_python_bridge(plugin_root: &Path, data: &Path, packages: &Path, config_env: &[(String, String)], profile: (&Path, &str), prefix: &str) -> Result<Mcp> {
+    let env = bridge_env(plugin_root, data, config_env, profile);
     let (python, agent) = python_hermes().context("The installed Hermes agent is unavailable")?;
     let bridge = data.join("python_plugin_bridge.py");
     if fs::read_to_string(&bridge).ok().as_deref() != Some(BRIDGE) { fs::create_dir_all(data)?; fs::write(&bridge, BRIDGE)?; }
@@ -614,6 +625,15 @@ async fn connect_python_bridge(plugin_root: &Path, data: &Path, packages: &Path,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_legacy_bridge_runs_in_the_profile_that_opened_it() {
+        let config = vec![("PLUGIN_SETTING".to_owned(), "1".to_owned())];
+        let env = bridge_env(Path::new("/p/plugins/x"), Path::new("/p/plugin-data/x"), &config, (Path::new("/p"), "work"));
+        let get = |key: &str| env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        assert_eq!((get("HERMES_HOME"), get("HERMES_PROFILE_NAME")), (Some("/p"), Some("work")));
+        assert_eq!(get("PLUGIN_SETTING"), Some("1"));
+    }
 
     #[cfg(unix)]
     #[test]

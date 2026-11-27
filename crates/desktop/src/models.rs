@@ -128,25 +128,37 @@ impl Default for State {
         }
     }
 }
+/// The saved endpoint a starting session uses for `config`'s URL, filling in its key. The one the
+/// last session chose wins over the first URL match, because two saved keys (two accounts) can share
+/// one URL.
+fn restore_endpoint(vault: &EndpointStore, endpoints: &[EndpointProfile], config: &mut Config, endpoint: Option<&str>)
+    -> anyhow::Result<Option<EndpointProfile>> {
+    let same_url = |entry: &&EndpointProfile| scope(&entry.base_url).ok() == scope(&config.base_url).ok();
+    let chosen = endpoint.and_then(|id| endpoints.iter().find(|entry| entry.id == id)).filter(same_url);
+    let profile = chosen.or_else(|| endpoints.iter().find(same_url)).cloned();
+    if !portal::is_portal(&config.base_url) && config.api_key.is_empty() {
+        let key = match chosen {
+            Some(profile) => Some(vault.config(&profile.id)?.api_key),
+            None => vault.credential(&config.base_url)?,
+        };
+        if let Some(key) = key {
+            config.api_key = key;
+        }
+    }
+    Ok(profile)
+}
+
 impl State {
-    pub fn open(config: &mut Config) -> Self {
+    /// `endpoint` is the saved endpoint the last session chose.
+    pub fn open(config: &mut Config, endpoint: Option<&str>) -> Self {
         let mut state = Self::default();
         let result = (|| -> anyhow::Result<()> {
             let dir = Session::default_dir()?.join("providers");
             let vault = EndpointStore::open(&dir)?;
             state.endpoints = vault.list()?;
-            if !portal::is_portal(&config.base_url) && config.api_key.is_empty() {
-                if let Some(key) = vault.credential(&config.base_url)? {
-                    config.api_key = key;
-                }
-            }
-            if let Some(profile) = state
-                .endpoints
-                .iter()
-                .find(|entry| scope(&entry.base_url).ok() == scope(&config.base_url).ok())
-            {
-                state.selected_endpoint = Some(profile.id.clone());
-                state.endpoint_name = profile.name.clone();
+            if let Some(profile) = restore_endpoint(&vault, &state.endpoints, config, endpoint)? {
+                state.selected_endpoint = Some(profile.id);
+                state.endpoint_name = profile.name;
             }
             let options = dir.join("model-options.json");
             match std::fs::read(&options) {
@@ -410,7 +422,7 @@ impl Hermes {
                             .unwrap_or_default();
                         self.models.invalidate();
                         self.models.load_options(&self.config);
-                        if let Err(error) = Preferences::save(&self.config) {
+                        if let Err(error) = Preferences::save(&self.config, Some(&id)) {
                             self.models.error = Some(error);
                         }
                         return self.discover_models();
@@ -580,7 +592,7 @@ impl Hermes {
             self.models.selected_endpoint = Some(saved.id);
             self.models.reload_endpoints();
         }
-        Preferences::save(&self.config)?;
+        Preferences::save(&self.config, self.models.selected_endpoint.as_deref())?;
         if close {
             self.screen = Screen::Chat;
             self.models.picker = false;
@@ -942,4 +954,35 @@ fn medium() -> Font {
 struct ModelOption { id: String, label: String }
 impl std::fmt::Display for ModelOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.label) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restart_keeps_the_chosen_key_when_two_share_a_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = EndpointStore::open(dir.path()).unwrap();
+        let url = "https://api.example.com/v1";
+        let key = |api_key: &str| Config { base_url: url.into(), model: "m".into(), api_key: api_key.into() };
+        vault.save(None, "Personal", &key("personal-fixture-key")).unwrap();
+        let work = vault.save(None, "Work", &key("work-fixture-key")).unwrap();
+        let endpoints = vault.list().unwrap();
+
+        let mut config = key("");
+        let restored = restore_endpoint(&vault, &endpoints, &mut config, Some(&work.id)).unwrap().unwrap();
+        assert_eq!((restored.name.as_str(), config.api_key.as_str()), ("Work", "work-fixture-key"));
+
+        // Without a remembered choice, or with one for another URL, the first match is used.
+        for remembered in [None, Some("endpoint-gone")] {
+            let mut config = key("");
+            let restored = restore_endpoint(&vault, &endpoints, &mut config, remembered).unwrap().unwrap();
+            assert_eq!((restored.name.as_str(), config.api_key.as_str()), ("Personal", "personal-fixture-key"));
+        }
+        // An explicit key is never replaced.
+        let mut config = key("explicit-fixture-key");
+        restore_endpoint(&vault, &endpoints, &mut config, Some(&work.id)).unwrap();
+        assert_eq!(config.api_key, "explicit-fixture-key");
+    }
 }
