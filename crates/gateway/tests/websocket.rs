@@ -2290,7 +2290,8 @@ async fn native_gateway_captures_the_verified_ego_package_and_reviews_identity()
         ("ego-atlas","What is the guidance for Atlas payment?"),
     ] {
         chat.ok("prompt.submit", json!({"session_id":sid,"submission_id":submission,"text":query})).await;
-        assert_eq!(chat.event("message.complete").await["payload"]["status"], "complete");
+        let complete = chat.event_with_timeout("message.complete", 65).await;
+        assert_eq!(complete["payload"]["status"], "complete", "{complete}");
     }
     let request = requests.lock().unwrap().last().unwrap().clone();
     let prompt = request["messages"][0]["content"].as_str().unwrap();
