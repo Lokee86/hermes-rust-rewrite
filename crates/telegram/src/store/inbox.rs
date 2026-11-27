@@ -12,6 +12,8 @@ use std::{
 };
 
 const MAX_INBOX_MESSAGES: i64 = 10_000;
+// Settled delivery records kept for duplicate detection and the status view.
+const MAX_SETTLED_UPDATES: i64 = 10_000;
 // Telegram retains updates for at most 24 hours, and can restart update IDs
 // at a lower value after a week of inactivity.
 const CURSOR_IDLE_SECONDS: i64 = 24 * 60 * 60;
@@ -267,6 +269,16 @@ impl Store {
                 let hash = fingerprint(message.chat_id, message.message_id, &message.text);
                 let stage = if settings.agent_replies { "received" } else { "manual" };
                 let text = settings.agent_replies.then_some(message.text.as_str());
+                if offset == 0 {
+                    // Offset 0 follows an idle reset, after which Telegram may reuse an
+                    // update ID. A settled row with a different message is a past epoch.
+                    tx.execute(
+                        "DELETE FROM telegram_updates
+                         WHERE bot_id = ?1 AND update_id = ?2 AND fingerprint <> ?3
+                             AND stage NOT IN ('received','turn_unknown','blocked','pending','sending','unknown')",
+                        params![bot.id, message.update_id, hash.as_ref()],
+                    )?;
+                }
                 let inserted = if message.update_id >= offset {
                     tx.execute(
                         "INSERT OR IGNORE INTO telegram_updates (bot_id,update_id,chat_id,fingerprint,stage,text)
@@ -299,7 +311,7 @@ impl Store {
                  WHERE bot_id = ?1 AND ?2 > ?4 AND (?4 = 0 OR cursor <= ?4)",
                 params![bot.id, next_offset, now, offset],
             )?;
-            Ok(())
+            prune(tx, bot.id)
         })
     }
 
@@ -533,7 +545,28 @@ fn record_echo(
             "UPDATE telegram_inboxes SET revision = revision + 1 WHERE bot_id = ?1",
             [bot_id],
         )?;
+        prune(tx, bot_id)?;
     }
+    Ok(())
+}
+
+/// Bounds both tables. Only acknowledged, settled updates are dropped, so a
+/// redelivery that could still arrive keeps its duplicate check.
+fn prune(tx: &Transaction<'_>, bot_id: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM telegram_messages WHERE bot_id = ?1 AND id <= (
+             SELECT id FROM telegram_messages WHERE bot_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+        params![bot_id, MAX_INBOX_MESSAGES],
+    )?;
+    tx.execute(
+        "DELETE FROM telegram_updates WHERE bot_id = ?1
+             AND stage NOT IN ('received','turn_unknown','blocked','pending','sending','unknown')
+             AND update_id < (SELECT cursor FROM telegram_inboxes WHERE bot_id = ?1)
+             AND ingress_order <= (
+                 SELECT ingress_order FROM telegram_updates WHERE bot_id = ?1
+                 ORDER BY ingress_order DESC LIMIT 1 OFFSET ?2)",
+        params![bot_id, MAX_SETTLED_UPDATES],
+    )?;
     Ok(())
 }
 
@@ -699,5 +732,70 @@ mod tests {
         store.save_settings(&settings).unwrap();
         assert_eq!(store.begin_send(&bot, &token, &head, 100).unwrap(), None);
         assert_eq!(store.work_status(&bot).unwrap()["counts"]["pending"], 1);
+    }
+    #[test]
+    fn a_reused_update_id_after_an_idle_reset_is_a_new_message() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, bot, token) = setup(root.path());
+        store
+            .commit_poll(&bot, &token, &[dm(&bot, 5, "first epoch")], 0, 6, 100)
+            .unwrap();
+        store
+            .record_turn(&bot, 5, TurnOutcome::Failed("fixture"))
+            .unwrap();
+        let later = 100 + CURSOR_IDLE_SECONDS + 1;
+        assert_eq!(store.poll_offset(&bot, later).unwrap(), 0);
+        let mut fresh = dm(&bot, 5, "new epoch message");
+        fresh.message_id = 500;
+        store
+            .commit_poll(&bot, &token, &[fresh.clone()], 0, 6, later)
+            .unwrap();
+        let inbox = store.load_inbox(&bot).unwrap();
+        assert_eq!(inbox.messages.last().unwrap().text, "new epoch message");
+        let ready = store.ready(&bot, later).unwrap();
+        assert_eq!(
+            (ready.len(), ready[0].text.as_str()),
+            (1, "new epoch message")
+        );
+        assert_eq!(store.work_status(&bot).unwrap()["conflicts"], 0);
+        // A redelivery of the same message is still a duplicate.
+        store
+            .commit_poll(&bot, &token, &[fresh], 0, 6, later)
+            .unwrap();
+        assert_eq!(store.load_inbox(&bot).unwrap().messages.len(), 2);
+    }
+
+    #[test]
+    fn the_inbox_keeps_a_bounded_history() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, bot, token) = setup(root.path());
+        // Manual mode settles each update as it arrives.
+        let mut settings = store.load_settings().unwrap().unwrap();
+        settings.agent_replies = false;
+        store.save_settings(&settings).unwrap();
+        let total = MAX_INBOX_MESSAGES + 25;
+        let batch: Vec<_> = (1..=total).map(|id| dm(&bot, id, "note")).collect();
+        store
+            .commit_poll(&bot, &token, &batch, 0, total + 1, 100)
+            .unwrap();
+        let sql = store.open_inbox(&bot).unwrap();
+        let count = |table: &str| -> i64 {
+            sql.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count("telegram_messages"), MAX_INBOX_MESSAGES);
+        assert_eq!(count("telegram_updates"), MAX_SETTLED_UPDATES);
+        assert_eq!(
+            store
+                .load_inbox(&bot)
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .update_id,
+            Some(total)
+        );
     }
 }

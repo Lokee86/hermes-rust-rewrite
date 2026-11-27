@@ -3,7 +3,8 @@ mod tests;
 
 use super::super::{LiveSession, Settings, Shared, TELEGRAM_ROUTE_PREFIX, TELEGRAM_SOURCE, lock};
 use hermes_telegram::{
-    Client, DeliveryOutcome, ErrorKind, Identity, Store, Token, TurnOutcome, Work, WorkStage,
+    Client, DeliveryOutcome, ErrorKind, Identity, MAX_TEXT_UNITS, Store, Token, TurnOutcome, Work,
+    WorkStage, text_units,
 };
 use std::{
     sync::{Arc, Weak},
@@ -390,14 +391,18 @@ fn reply_text(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    const MAX_REPLY_CHARS: usize = 4096;
-    const SUFFIX: &str = "\n… [truncated]";
-    if text.chars().count() <= MAX_REPLY_CHARS {
+    if text_units(text) <= MAX_TEXT_UNITS {
         return Some(text.to_owned());
     }
+    const SUFFIX: &str = "\n… [truncated]";
+    let budget = MAX_TEXT_UNITS - text_units(SUFFIX);
+    let mut used = 0;
     let mut reply: String = text
         .chars()
-        .take(MAX_REPLY_CHARS - SUFFIX.chars().count())
+        .take_while(|c| {
+            used += c.len_utf16();
+            used <= budget
+        })
         .collect();
     reply.push_str(SUFFIX);
     Some(reply)

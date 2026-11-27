@@ -113,7 +113,10 @@ fn read_rows(
     let min_messages = query.min_messages.unwrap_or(0).max(0) as u64;
     let mut rows = Vec::new();
     for summary in catalog {
-        let settings = Settings::read(&summary.directory)?;
+        // One unreadable conversation is left out rather than failing the whole listing.
+        let Ok(settings) = Settings::read(&summary.directory) else {
+            continue;
+        };
         let source = source_for(&summary, &settings);
         let source_match = if let Some(exact) = query.source.as_deref().filter(|s| !s.is_empty()) {
             exact == source
@@ -142,7 +145,10 @@ fn read_rows(
                 let view = lock(&session.view);
                 (view.history.clone(), view.running)
             }
-            None => (read_history(&summary.directory)?, false),
+            None => match read_history(&summary.directory) {
+                Ok(history) => (history, false),
+                Err(_) => continue,
+            },
         };
         let count = history
             .turns

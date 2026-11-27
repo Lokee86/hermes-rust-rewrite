@@ -218,7 +218,7 @@ struct Code {
 struct SignIns {
     browser: HashMap<String, LoginSession>,
     native: HashMap<String, LoginSession>,
-    refresh: HashMap<String, Instant>,
+    refresh: HashMap<String, RefreshGrant>,
     pending: HashMap<String, NativeRequest>,
     codes: HashMap<String, Code>,
     attempts: VecDeque<Instant>,
@@ -229,10 +229,16 @@ impl SignIns {
         let now = Instant::now();
         self.browser.retain(|_, session| session.expires > now);
         self.native.retain(|_, session| session.expires > now);
-        self.refresh.retain(|_, expires| *expires > now);
+        self.refresh.retain(|_, grant| grant.expires > now);
         self.pending.retain(|_, request| request.expires > now);
         self.codes.retain(|_, code| code.expires > now);
     }
+}
+
+struct RefreshGrant {
+    expires: Instant,
+    // The access token this grant issued; a refresh retires it.
+    access: String,
 }
 
 pub(super) struct Auth {
@@ -948,10 +954,14 @@ fn native_tokens(sign_ins: &mut SignIns, password: &Password) -> Response {
         json!({"access_token":access,"refresh_token":refresh,"token_type":"Bearer",
         "expires_at":session.identity.expires_at,"provider":"basic","user_id":session.identity.user}),
     );
-    sign_ins.native.insert(access, session);
-    sign_ins
-        .refresh
-        .insert(refresh, Instant::now() + Duration::from_secs(30 * 86_400));
+    sign_ins.native.insert(access.clone(), session);
+    sign_ins.refresh.insert(
+        refresh,
+        RefreshGrant {
+            expires: Instant::now() + Duration::from_secs(30 * 86_400),
+            access,
+        },
+    );
     response
 }
 
@@ -1008,7 +1018,9 @@ pub(super) async fn native_refresh(
     if body.refresh_token.is_empty() {
         return error(StatusCode::BAD_REQUEST, "refresh_token required");
     }
-    if sign_ins.refresh.remove(&body.refresh_token).is_none() {
+    // Removing the grant and the access token it issued frees the room its
+    // replacement needs, so a full table cannot consume a valid refresh token.
+    let Some(grant) = sign_ins.refresh.remove(&body.refresh_token) else {
         return (
             StatusCode::UNAUTHORIZED,
             [(header::CACHE_CONTROL, "no-store")],
@@ -1018,7 +1030,9 @@ pub(super) async fn native_refresh(
             ),
         )
             .into_response();
-    }
+    };
+    // Connections already open on the old token keep their own revocation.
+    sign_ins.native.remove(&grant.access);
     native_tokens(&mut sign_ins, password)
 }
 

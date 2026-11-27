@@ -560,4 +560,66 @@ mod tests {
         assert_eq!(battery_report(text).unwrap(), json!({"available":true,"percent":87,"plugged":true}));
         assert!(battery_report("Now drawing from 'AC Power'").is_none());
     }
+    #[tokio::test]
+    async fn an_unreadable_conversation_is_left_out_of_the_session_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: "fixture".into(),
+            api_key: String::new(),
+        };
+        let gateway = Gateway::start(GatewayConfig::new(dir.path().join("data"), config))
+            .await
+            .unwrap();
+        let shared = gateway.shared.clone();
+        let local = peer(true);
+        let call =
+            async |method: &str, params: Value| shared.dispatch(method, &params, &local).await;
+        let good = call("session.create", json!({"title":"Good"}))
+            .await
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let bad = call("session.create", json!({"title":"Bad"}))
+            .await
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call("session.close", json!({"session_id":good}))
+            .await
+            .unwrap();
+        call("session.close", json!({"session_id":bad}))
+            .await
+            .unwrap();
+        fs::write(
+            shared
+                .library
+                .session_dir(&bad)
+                .unwrap()
+                .join("gateway.json"),
+            "{not json",
+        )
+        .unwrap();
+
+        let listed = call("session.list", json!({"scope":"stored"}))
+            .await
+            .unwrap();
+        let ids: Vec<_> = listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect();
+        assert_eq!(ids, vec![json!(good)]);
+        // A keyed create still succeeds while another conversation is damaged.
+        call(
+            "session.create",
+            json!({"title":"Keyed","request_id":"fixture-key"}),
+        )
+        .await
+        .unwrap();
+        gateway.shutdown().await.unwrap();
+    }
 }

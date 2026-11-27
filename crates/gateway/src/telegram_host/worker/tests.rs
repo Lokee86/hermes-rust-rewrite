@@ -616,3 +616,14 @@ async fn telegram_retries_explicit_rate_limit_after_restart_without_regenerating
     assert_eq!(model.requests.lock().unwrap().len(), 1);
     restarted.shutdown().await.unwrap();
 }
+
+#[test]
+fn a_long_reply_fits_telegrams_utf16_limit() {
+    let emoji = "😀".repeat(3000);
+    let reply = reply_text(&emoji).unwrap();
+    assert!(text_units(&reply) <= MAX_TEXT_UNITS);
+    assert!(reply.ends_with("[truncated]"));
+    assert!(reply.starts_with('😀'));
+    let exact = "é".repeat(MAX_TEXT_UNITS);
+    assert_eq!(reply_text(&exact).unwrap(), exact);
+}

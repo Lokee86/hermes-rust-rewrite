@@ -616,7 +616,7 @@ impl Messaging {
                     return (Task::none(), vec![]);
                 };
                 let text = self.reply.trim().to_owned();
-                if text.is_empty() || text.chars().count() > 4096 {
+                if text.is_empty() || telegram::text_units(&text) > telegram::MAX_TEXT_UNITS {
                     self.error = Some("Enter a reply of 1–4096 characters.".into());
                     return (Task::none(), vec![]);
                 }

@@ -29,7 +29,7 @@ struct Running {
 impl Running {
     fn row(&self) -> Value {
         let exit = self.done.borrow().clone();
-        let (captured, _) = self.log.lock().expect("process log").snapshot(0);
+        let (captured, _) = self.log.lock().expect("process log").snapshot(0, exit.is_none());
         let mut text = captured["output"].as_str().unwrap_or("").to_owned();
         crate::privacy::redact(&mut text);
         let start = text.char_indices().rev().nth(1999).map_or(0, |(i, _)| i);
