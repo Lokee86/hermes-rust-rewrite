@@ -87,13 +87,26 @@ pub async fn sign_in(data: &Path, server: &str, url: &str, open: impl Fn(&str)) 
         "client_id":client_id,"token_endpoint":token_endpoint.as_str(),"resource":server_url.as_str()}))
 }
 
-/// Wait (up to 5 min) on a loopback listener for `/callback?codefn wait_for_code(listener: TcpListener, state: &str) -> Result<String> {state` and return the code.
+/// Wait (up to 5 min) on a loopback listener for `/callback?code&state` and return the code.
 pub fn wait_for_code(listener: TcpListener, state: &str) -> Result<String> {
-    listener.set_nonblocking(false)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    wait_until(listener, state, std::time::Instant::now() + Duration::from_secs(300))
+}
+
+fn wait_until(listener: TcpListener, state: &str, deadline: std::time::Instant) -> Result<String> {
+    // A closed or abandoned browser tab never calls back, so the wait for a connection itself
+    // has to end at the deadline.
+    listener.set_nonblocking(true)?;
     loop {
-        ensure!(std::time::Instant::now() < deadline, "Sign-in timed out");
-        let (mut stream, _) = listener.accept()?;
+        ensure!(std::time::Instant::now() < deadline, "Sign-in timed out. Start it again to retry.");
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         // Read until the request line is complete: it can arrive in several segments.
         let mut buf = Vec::with_capacity(1024);
@@ -127,6 +140,8 @@ pub(crate) async fn token(data: &Path, server: &str) -> Result<Option<String>> {
         ("client_id", state["client_id"].as_str().unwrap_or_default()), ("resource", state["resource"].as_str().unwrap_or_default())]).send().await?;
     if !response.status().is_success() { return Ok(None); }
     let tokens: Value = response.json().await?;
+    // A reply without a token leaves the saved refresh token to be tried again next time.
+    if !tokens["access_token"].is_string() { return Ok(None); }
     state["access_token"] = tokens["access_token"].clone();
     if tokens["refresh_token"].is_string() { state["refresh_token"] = tokens["refresh_token"].clone(); }
     state["expires_at"] = json!(now() + tokens["expires_in"].as_i64().unwrap_or(3600));
@@ -164,6 +179,36 @@ mod tests {
         sign_in(data.path(), "srv", &format!("{base}/mcp"), open).await.unwrap();
         assert_eq!(token(data.path(), "srv").await.unwrap().as_deref(), Some("fresh"), "an expired token is refreshed");
         assert_eq!(token(data.path(), "other").await.unwrap(), None);
+    }
+
+    #[test]
+    fn an_abandoned_sign_in_gives_up_at_its_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let started = std::time::Instant::now();
+        let waiting = std::thread::spawn(move || wait_until(listener, "s", started + Duration::from_millis(300)));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(waiting.is_finished(), "nobody called back, so the wait must end");
+        let error = waiting.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_reply_without_a_token_is_retried_next_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route("/token", post(move || {
+            let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { if call == 0 { Json(json!({"error": "try later"})) } else { Json(json!({"access_token": "fresh", "expires_in": 3600})) } }
+        }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let data = tempfile::tempdir().unwrap();
+        save(&token_path(data.path(), "srv"), &json!({"access_token": "old", "refresh_token": "r-1", "expires_at": 0,
+            "client_id": "c-1", "token_endpoint": format!("{base}/token"), "resource": "x"})).unwrap();
+        assert_eq!(token(data.path(), "srv").await.unwrap(), None);
+        assert_eq!(token(data.path(), "srv").await.unwrap().as_deref(), Some("fresh"), "the refresh token was kept and tried again");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
     mod reqwest { pub fn blocking_get(url: &str) -> std::io::Result<()> {
         use std::io::{Read, Write};
