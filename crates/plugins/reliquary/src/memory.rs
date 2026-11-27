@@ -96,7 +96,8 @@ impl EmbeddedMemory {
         let gateway = Gateway::new();
         let settings = ProfileSettings::load(&home)?;
         let ego = settings.memory_ego_enabled;
-        let phy_perception = settings.memory_perception_endpoint.is_some();
+        let phy_perception =
+            settings.memory_phy_perception_enabled && settings.memory_perception_endpoint.is_some();
         let owner_path = |id: OwnerId, kind: OwnerKind| -> Result<PathBuf> {
             let owner = topology
                 .owners
@@ -208,13 +209,21 @@ impl EmbeddedMemory {
     }
 
     pub(super) fn check_recall_scope(&self) -> Result<()> {
-        ensure!(
-            self.recall_online
-                .load(std::sync::atomic::Ordering::Acquire)
-                && self.active_phy_unchanged()?,
-            "active private Memory owner changed"
-        );
-        Ok(())
+        if self
+            .recall_online
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.active_phy_unchanged()?
+        {
+            return Ok(());
+        }
+        self.invalidate_recall();
+        anyhow::bail!("active private Memory owner changed")
+    }
+
+    fn invalidate_recall(&self) {
+        self.recall_online
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.recall.invalidate();
     }
 
     fn active_phy_unchanged(&self) -> Result<bool> {
@@ -486,6 +495,7 @@ impl MemoryStore for EmbeddedMemory {
         ego.take();
         self.gateway.set_perception_runtime(None)?;
         let settings = ProfileSettings::load(&self.home)?;
+        let phy_perception = settings.memory_phy_perception_enabled;
         let perception = settings.memory_perception_endpoint;
         let ego_authority = self
             .ego_authority
@@ -511,9 +521,6 @@ impl MemoryStore for EmbeddedMemory {
         }
         if perception.is_some() {
             self.gateway.set_perception_runtime(Some(&runtime))?;
-            if let Some(authority) = &self.phy_perception_authority {
-                *phy = Some(authority.start_phy_perception(self.phy)?);
-            }
         }
         if let Some(authority) = ego_authority {
             let owners = self.instances.keys().copied().collect::<Vec<_>>();
@@ -525,30 +532,39 @@ impl MemoryStore for EmbeddedMemory {
                 Err(error) => return Err(error.into()),
             }
         }
+        if phy_perception
+            && perception.is_some()
+            && let Some(authority) = &self.phy_perception_authority
+        {
+            *phy = Some(authority.start_phy_perception(self.phy)?);
+        }
         Ok(())
     }
 
     fn needs_profile_remount(&self) -> Result<bool> {
         let settings = ProfileSettings::load(&self.home)?;
         let ego = settings.memory_ego_enabled;
+        let phy_perception =
+            settings.memory_phy_perception_enabled && settings.memory_perception_endpoint.is_some();
         Ok(!self.active_phy_unchanged()?
             || !self
                 .recall_online
                 .load(std::sync::atomic::Ordering::Acquire)
             || ego != self.ego_authority.is_some()
             || ego && !self.ego_online.load(std::sync::atomic::Ordering::Acquire)
-            || settings.memory_perception_endpoint.is_some()
-                != self.phy_perception_authority.is_some())
+            || phy_perception != self.phy_perception_authority.is_some())
     }
 
     fn pause_for_remount(&self) {
-        self.recall_online
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.recall.invalidate();
+        self.invalidate_recall();
         self.phy_perception_worker
             .lock()
             .expect("PHY Perception worker lock")
             .take();
+        self.pause_ego();
+    }
+
+    fn pause_ego(&self) {
         self.ego_online
             .store(false, std::sync::atomic::Ordering::Release);
         self.ego_worker.lock().expect("Ego worker lock").take();
@@ -1177,7 +1193,10 @@ mod tests {
         )
         .unwrap();
         assert!(legacy(tmp.path(), "other").is_err());
+        let legacy_routes = json!({"memory_perception_endpoint":"existing-rel-route"});
+        ProfileSettings::update(tmp.path(), legacy_routes.as_object().unwrap()).unwrap();
         let mem = legacy(tmp.path(), "default").unwrap().unwrap();
+        assert!(mem.phy_perception_authority.is_none());
         let library = hermes_library::Library::open(tmp.path().join("library")).unwrap();
         let mut summary = library.create_session(None, Some("native")).unwrap();
         assert_eq!(

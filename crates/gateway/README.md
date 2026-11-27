@@ -171,6 +171,10 @@ The native outgoing-capture test mounts a disposable profile and sends ordinary 
 
 The model can call `memory_query` to search eligible Memories and current Observations in the chat's bound General or project REL and active private PHY. The result contains one Core ranking, exact owner-qualified Memory references and exact Observation citations. `refine_query` and `traverse_graph` use authorized results from the same turn. These tools leave Freshness unchanged.
 
+Private PHY Perception writes are opt-in. Enable **Private PHY Perception** in Persistent memory or set `memory_phy_perception_enabled` for a gateway-only profile with a configured Perception decision endpoint. Recall includes the active PHY on read-only mounts too.
+
+The native mixed-recall test uses disposable Core fixture files `mixed.rel`, `current.phy` and `pending.phy`. Set `MERCURY_PHY_PERCEPTION_FIXTURE` to their folder to exercise ordinary recall, exact references and disclosure across a PHY switch using a loopback decision endpoint.
+
 `archive_search` accepts a natural-language time reference such as “last Tuesday.” It uses the profile's configured calendar timezone, with UTC as the fallback, and defaults to the date of the original message. Pass `basis: "mentioned"` to filter on dates discussed in the messages. A query without a resolvable time reference returns `temporal_query_required` and suggests `memory_query`. `archive_read` and `echo_read` accept only an exact reference returned to the model during the current turn. Successful retrieval content goes to the requesting model round. The stored tool entry records its result count.
 
 In Desktop, `/archive <query>` searches the current General or project Archive. `/archive-tree <query>` includes the related General or project RELs accessible from that scope. The commands accept hybrid search without a time reference and display results in Desktop.

@@ -1,4 +1,7 @@
 //! Explicit read-only model queries against one admitted native conversation.
+#[cfg(test)]
+mod tests;
+
 use super::memory::{EmbeddedMemory, hex};
 use anyhow::{Context, Result, ensure};
 use hermes_engine::{
