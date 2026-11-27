@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS messaging_cooldowns (
 pub(super) struct Store(pub(super) Mutex<Connection>, pub(super) super::media::ProfileAudio);
 
 #[derive(Clone, Eq, PartialEq)]
-pub(super) struct Route {
+pub struct Route {
     pub id: String,
     pub connection: String,
     pub room: Room,
@@ -94,7 +94,7 @@ impl Route {
     }
 }
 
-pub(super) struct Candidate {
+pub struct Candidate {
     pub event: InboundEvent,
     pub decision: Result<Route, Disposition>,
     pub protection: Option<String>,
@@ -143,7 +143,7 @@ pub(super) struct InputStatus {
 }
 
 #[derive(Clone)]
-pub(super) struct Action {
+pub struct Action {
     pub id: String,
     pub route: String,
     pub session: String,
@@ -156,7 +156,7 @@ pub(super) struct Action {
     pub resolved: Option<Response>,
 }
 
-pub(super) fn key(kind: &str, parts: &impl Serialize) -> Result<String> {
+pub fn key(kind: &str, parts: &impl Serialize) -> Result<String> {
     use std::fmt::Write;
     let encoded = serde_json::to_vec(parts)?;
     let digest = ring::digest::digest(&ring::digest::SHA256, &encoded);
@@ -168,7 +168,7 @@ pub(super) fn key(kind: &str, parts: &impl Serialize) -> Result<String> {
     Ok(id)
 }
 
-pub(super) fn decode<T: DeserializeOwned>(
+pub fn decode<T: DeserializeOwned>(
     row: &rusqlite::Row<'_>,
     index: usize,
 ) -> rusqlite::Result<T> {
@@ -182,7 +182,7 @@ pub(super) fn decode<T: DeserializeOwned>(
     })
 }
 
-pub(super) fn optional_decode<T: DeserializeOwned>(
+pub fn optional_decode<T: DeserializeOwned>(
     row: &rusqlite::Row<'_>,
     index: usize,
 ) -> rusqlite::Result<Option<T>> {
@@ -209,14 +209,6 @@ impl Store {
         let connection = hermes_engine::db::open(root)?;
         connection.execute_batch(TABLES)?;
         connection.execute_batch(super::media::TABLES)?;
-        connection.execute_batch(super::discord::MESSAGE_TABLES)?;
-        connection.execute_batch(super::discord::RECOVERY_TABLES)?;
-        connection.execute_batch(super::discord::SOCKET_TABLES)?;
-        connection.execute_batch(super::discord::DELIVERY_RATE_TABLES)?;
-        connection.execute_batch(super::discord::FEEDBACK_TABLES)?;
-        connection.execute_batch(super::discord::MANUAL_THREAD_TABLES)?;
-        connection.execute_batch(super::discord::THREAD_UPDATE_TABLES)?;
-        connection.execute_batch(super::discord::voice_note::TABLES)?;
         connection.execute_batch(effect_store::TABLES)?;
         connection.execute_batch(super::approvals::TABLES)?;
         connection.execute_batch(super::commands::TABLES)?;
@@ -229,7 +221,6 @@ impl Store {
         connection.execute_batch(super::producer_results::TABLES)?;
         connection.execute_batch(super::protection::TABLES)?;
         connection.execute_batch(super::profile::SCHEMA)?;
-        connection.execute_batch(super::discord::settings::TABLES)?;
         connection.execute_batch(super::repair::TABLES)?;
         connection.execute_batch(super::routes::TABLES)?;
         connection.execute_batch(super::provision::TABLES)?;
@@ -239,7 +230,7 @@ impl Store {
         Ok(Self(Mutex::new(connection), super::media::ProfileAudio::new(root, service)))
     }
 
-    pub(super) fn write<T>(&self, change: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, change: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let mut connection = crate::lock(&self.0);
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = change(&transaction)?;
@@ -247,7 +238,7 @@ impl Store {
         Ok(result)
     }
 
-    pub(super) fn read<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         read(&crate::lock(&self.0))
     }
 
@@ -364,7 +355,7 @@ impl Store {
         })
     }
 
-    pub fn inputs(&self, connection: &str) -> Result<Vec<PendingInput>> {
+    pub(super) fn inputs(&self, connection: &str) -> Result<Vec<PendingInput>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
             "WITH route_queue AS (
@@ -602,7 +593,7 @@ impl Store {
         })
     }
 
-    pub fn ready_deliveries(&self, connection: &str, now: i64) -> Result<Vec<PendingDelivery>> {
+    pub(super) fn ready_deliveries(&self, connection: &str, now: i64) -> Result<Vec<PendingDelivery>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
             "SELECT d.intent,d.route,d.sender,d.stage FROM messaging_deliveries d
@@ -651,7 +642,7 @@ impl Store {
         })
     }
 
-    pub fn claim(
+    pub(super) fn claim(
         &self,
         connection: &str,
         generation: &str,
@@ -661,7 +652,7 @@ impl Store {
         self.write(|tx| effect_store::claim(tx,connection,generation,pending,policy))
     }
 
-    pub fn recheck(
+    pub(super) fn recheck(
         &self,
         connection: &str,
         generation: &str,
@@ -802,7 +793,7 @@ impl Store {
         })
     }
 
-    pub fn delivery_status(&self) -> Result<Vec<DeliveryStatus>> {
+    pub(super) fn delivery_status(&self) -> Result<Vec<DeliveryStatus>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
             "SELECT d.id,d.connection,d.route,d.stage,p.ordinal,p.attempt,
@@ -836,7 +827,7 @@ impl Store {
         Ok(items)
     }
 
-    pub fn input_status(&self) -> Result<Vec<InputStatus>> {
+    pub(super) fn input_status(&self) -> Result<Vec<InputStatus>> {
         let db = crate::lock(&self.0);
         let mut query = db.prepare(
             "SELECT i.event,i.connection,r.id,COALESCE(parent.session,r.session),
@@ -866,7 +857,7 @@ impl Store {
     }
 }
 
-pub(super) fn read_route(db: &Connection, id: &str) -> rusqlite::Result<Option<Route>> {
+pub fn read_route(db: &Connection, id: &str) -> rusqlite::Result<Option<Route>> {
     db.query_row(
         "SELECT id,connection,room,session,blocked,revision FROM messaging_routes WHERE id = ?1",
         [id],
@@ -888,7 +879,7 @@ pub(super) fn read_checkpoint(
     .optional()
 }
 
-pub(super) fn check_advance(
+pub fn check_advance(
     db: &Connection,
     connection: &str,
     advance: Option<&Advance>,
@@ -899,7 +890,7 @@ pub(super) fn check_advance(
     })
 }
 
-pub(super) fn write_advance(
+pub fn write_advance(
     db: &Connection,
     connection: &str,
     advance: Option<&Advance>,
@@ -913,7 +904,7 @@ pub(super) fn write_advance(
     Ok(Some(a.checkpoint.clone()))
 }
 
-pub(super) fn intake_receipt(
+pub fn intake_receipt(
     db: &Connection,
     connection: &str,
     event: &str,
@@ -988,7 +979,7 @@ pub(super) fn append(
     })
 }
 
-pub(super) fn ingress_replay(
+pub fn ingress_replay(
     tx: &Connection, connection: &str, event: &str, identity: &str,
 ) -> Result<Option<IntakeReceipt>> {
     let existing = tx.query_row(
@@ -1051,7 +1042,7 @@ pub(super) fn set_input(
     Ok(())
 }
 
-pub(super) fn install_plan(
+pub fn install_plan(
     tx: &Transaction<'_>,
     connection: &str,
     id: &str,
@@ -1075,7 +1066,7 @@ pub(super) fn install_plan(
     Ok(true)
 }
 
-pub(super) fn enqueue(
+pub fn enqueue(
     db: &Connection,
     route: &Route,
     sender: Option<&Sender>,

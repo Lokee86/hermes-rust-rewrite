@@ -19,7 +19,7 @@ pub(super) use profile_models::apply_profile_model;
 
 #[path = "requester_commands.rs"]
 mod requester;
-pub(super) use requester::{RequesterCommand, RequesterInvocation};
+pub use requester::{RequesterAuthority, RequesterCommand, RequesterInvocation};
 
 #[path = "background.rs"]
 mod background;
@@ -110,7 +110,7 @@ pub struct CommandDescriptor {
     pub audience: InvocationAudience,
 }
 
-pub(super) const COMMANDS: &[CommandDescriptor] = &[
+pub const COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         name: "status",
         arguments: &[],
@@ -296,7 +296,7 @@ impl Ingress {
         })
     }
 
-    pub(super) fn authorize_scoped_command(
+    pub fn authorize_scoped_command(
         &self,
         policy: &AccessPolicy,
         room: &Room,
@@ -464,7 +464,7 @@ impl Ingress {
         Ok(changed)
     }
 
-    pub(super) fn spoken_reply_mode(&self, room: &Room) -> Result<SpokenReplyMode, GatewayError> {
+    pub fn spoken_reply_mode(&self, room: &Room) -> Result<SpokenReplyMode, GatewayError> {
         self.checked(true, |state| {
             let Some(default) = state.policy.spoken_reply_default(room) else {
                 return Ok(SpokenReplyMode::Off);

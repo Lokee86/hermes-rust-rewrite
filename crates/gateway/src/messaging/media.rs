@@ -18,15 +18,15 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub(super) const MAX_FILE: usize = 4 * 1024 * 1024;
+pub const MAX_FILE: usize = 4 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
-pub(super) const DISCORD_FILE_CEILING: usize = 100 * 1024 * 1024;
-pub(super) const DISCORD_INPUT_BUDGET: usize = 128 * 1024 * 1024;
+pub const MAX_ADAPTER_FILE: usize = 100 * 1024 * 1024;
+pub const MAX_ADAPTER_INPUT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PROFILE_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_PENDING_GRANTS: i64 = 64;
 const MAX_FETCH_GRANTS_PER_EFFECT: i64 = 32;
 const MAX_READ_LIFETIME: Duration = Duration::from_secs(120);
-pub(super) const MAX_FEEDBACK_TEXT: usize = 256;
+pub const MAX_FEEDBACK_TEXT: usize = 256;
 const MAX_FEEDBACK_WAV: usize = 2 * 1024 * 1024;
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_FETCH_LIFETIME: Duration = Duration::from_secs(900);
@@ -122,7 +122,10 @@ pub struct MediaRead {
     allow_artifact: bool,
 }
 
-pub(super) enum PreparedAudio {
+/// Called in the gateway's transaction after the audio grant is rechecked.
+pub type AudioSourceRecorder = fn(&rusqlite::Transaction<'_>, &str, &MediaSource) -> anyhow::Result<()>;
+
+pub enum PreparedAudio {
     Transcript(String),
     Attachment(AttachmentRef),
 }
@@ -230,8 +233,8 @@ impl Ingress {
         self.authorize_media_with_limit(source, manifest, purpose, lifetime, MAX_FILE, false).await
     }
 
-    /// Used by the bundled Discord transport after checking its current media policy.
-    pub(super) async fn authorize_discord_media(
+    /// Authorize a bounded known-size artifact for a stock adapter.
+    pub async fn authorize_adapter_media(
         &self,
         source: MediaSource,
         manifest: AttachmentManifest,
@@ -239,7 +242,7 @@ impl Ingress {
         lifetime: Duration,
         max_file: usize,
     ) -> Result<MediaRead, GatewayError> {
-        if max_file == 0 || max_file > DISCORD_FILE_CEILING || manifest.size.is_none() {
+        if max_file == 0 || max_file > MAX_ADAPTER_FILE || manifest.size.is_none() {
             return Err(GatewayError::Invalid);
         }
         self.authorize_media_with_limit(
@@ -520,10 +523,10 @@ impl Ingress {
 
     /// Decode an authorized platform audio format before invoking profile STT.
     /// The source manifest is checked against the original bytes.
-    pub(super) async fn prepare_discord_audio<R, Open, Opened>(
+    pub async fn prepare_adapter_audio<R, Open, Opened>(
         &self,
         grant: MediaRead,
-        voice_note: bool,
+        record_source: Option<AudioSourceRecorder>,
         open: Open,
         decode: fn(&[u8]) -> Result<Vec<u8>, GatewayError>,
     ) -> Result<PreparedAudio, GatewayError>
@@ -547,11 +550,11 @@ impl Ingress {
         };
         match transcript {
             Ok(text) => {
-                if voice_note {
+                if let Some(record_source) = record_source {
                     self.checked(true, |state| {
                         self.recheck_media(state, &grant)?;
                         db(self.store.write(|tx| {
-                            super::discord::voice_note::record_source(tx, &self.connection, &grant.source)
+                            record_source(tx, &self.connection, &grant.source)
                         }))
                     })?;
                 }
@@ -633,7 +636,7 @@ impl Ingress {
         })
     }
 
-    pub(super) fn spoken_addressed(
+    pub fn spoken_addressed(
         &self,
         state: &State,
         source: &MediaSource,
@@ -706,7 +709,7 @@ impl Ingress {
 
     /// Synthesize a configured live cue for an authorized tool-enabled actor.
     /// Cues use available local speech capacity and have no artifact or receipt.
-    pub(super) async fn synthesize_voice_feedback(
+    pub async fn synthesize_voice_feedback(
         &self,
         room: &Room,
         actor: &Sender,
@@ -1162,7 +1165,7 @@ fn put_inbound(
             params![connection, source.event_id, source.sender.id, room, id, name],
             |row| row.get(0),
         )?;
-        if staged + bytes.len() as i64 > DISCORD_INPUT_BUDGET as i64 {
+        if staged + bytes.len() as i64 > MAX_ADAPTER_INPUT_BYTES as i64 {
             return Ok(None);
         }
     }
@@ -1230,11 +1233,11 @@ pub(super) fn input_media(
         }
         refs.push(InputMedia { file: file.clone(), size, preview });
     }
-    let limit = if extended { DISCORD_INPUT_BUDGET } else { MAX_INPUT_BYTES };
+    let limit = if extended { MAX_ADAPTER_INPUT_BYTES } else { MAX_INPUT_BYTES };
     Ok((total <= limit).then_some(refs))
 }
 
-pub(super) fn read_input_artifact(
+pub fn read_input_artifact(
     db: &Connection,
     connection: &str,
     event: &InboundEvent,
@@ -1275,7 +1278,7 @@ fn valid_source(source: &MediaSource) -> bool {
         && source.sender.roles.iter().all(|id| valid_id(id))
 }
 
-pub(super) fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     valid_id(name) && name != "." && name != ".." && !name.contains(['/', '\\', ':'])
 }
 

@@ -70,7 +70,7 @@ pub struct TurnPolicy {
 }
 
 impl TurnPolicy {
-    pub(super) fn overlay(&mut self, next: &Self) {
+    pub fn overlay(&mut self, next: &Self) {
         if next.model.is_some() {
             self.model.clone_from(&next.model);
         }
@@ -175,7 +175,7 @@ impl AccessPolicy {
         Some(current)
     }
 
-    pub(super) fn grants_sender(&self, room: &Room, sender: &Sender, paired: bool) -> bool {
+    pub fn grants_sender(&self, room: &Room, sender: &Sender, paired: bool) -> bool {
         let grant = self.rules(room).filter_map(|rule| rule.grant.as_ref()).last();
         let allowed = grant.map_or_else(
             || paired || self.allows(sender),
@@ -207,7 +207,7 @@ impl AccessPolicy {
             && self.rules(room).all(|rule| !rule.denied_users.contains(actor))
     }
 
-    pub(super) fn allows_scoped_command(&self, room: &Room, actor: &Sender) -> bool {
+    pub fn allows_scoped_command(&self, room: &Room, actor: &Sender) -> bool {
         !self.scope.scoped_commands_disabled
             && self.requester_commands_for(room).is_none_or(|grant| {
                 grant.users.contains(&actor.id) || !grant.roles.is_disjoint(&actor.roles)
@@ -218,7 +218,7 @@ impl AccessPolicy {
         self.rules(room).filter_map(|rule| rule.requester_commands.as_ref()).last()
     }
 
-    pub(super) fn requester_command_grant(
+    pub fn requester_command_grant(
         &self, room: &Room, actor: &Sender,
     ) -> Option<&RequesterCommandGrant> {
         let grant = self.requester_commands_for(room)?;

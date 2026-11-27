@@ -141,9 +141,6 @@ pub const METHODS: &[&str] = &[
     "messaging.wake_target",
     "messaging.send",
     "messaging.profile.settings",
-    "messaging.profile.discord.list",
-    "messaging.profile.discord.create",
-    "messaging.profile.discord.update",
     "messaging.profile.enrollment_begin",
     "messaging.profile.enrollment_complete",
     "messaging.profile.enable",
@@ -160,6 +157,7 @@ pub struct GatewayConfig {
     pub token: String,
     pub provider: Config,
     pub adapters: Vec<messaging::AdapterConfig>,
+    pub stock_adapters: Vec<messaging::StockAdapter>,
     pub messaging_audio: Option<Arc<dyn messaging::AudioService>>,
     #[cfg(test)]
     telegram_transport: Option<Arc<dyn hermes_telegram::Transport>>,
@@ -173,6 +171,7 @@ impl GatewayConfig {
             token: String::new(),
             provider,
             adapters: Vec::new(),
+            stock_adapters: Vec::new(),
             messaging_audio: None,
             #[cfg(test)]
             telegram_transport: None,
@@ -309,7 +308,7 @@ impl Gateway {
             ensure!(names.insert(adapter.name.clone()), "Duplicate messaging connection name");
         }
         let library = Library::open(&config.library_root)?;
-        let messaging = messaging::Host::open(library.root(), config.messaging_audio)?;
+        let messaging = messaging::Host::open(library.root(), config.messaging_audio, config.stock_adapters)?;
         let scheduler_store = hermes_engine::cron::Store::open_gateway(library.root())?;
         let listener = TcpListener::bind(config.bind)
             .await
@@ -368,7 +367,7 @@ impl Gateway {
         for config in config.adapters {
             shared.messaging.restore(&shared, config).await?;
         }
-        shared.messaging.restore_discord(&shared).await?;
+        shared.messaging.restore_stock(&shared).await?;
         let scheduler_task = scheduler::start(shared.clone(), scheduler_store);
         if stock_plugins::has_memory_plugin() {
             let owner = shared.clone();
@@ -950,7 +949,7 @@ impl Shared {
                 json!({"instance_id":self.instance_id,"profile_id":self.profile_id,"authority_epoch":self.authority_epoch,"capabilities":RUNTIME_CAPABILITIES,"session_create":{"sources":["cli","tui","gui","acp","tool","oneshot"],"parameters":["request_id","source","cwd","model","provider","title","cols"]},"skin":{}}),
             ),
             "rpc.discover" => Ok(
-                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).collect::<Vec<_>>(),"limitations":["one running turn per session","event replay is bounded to the current process"]}),
+                json!({"implementation":"hermes-rust","version":env!("CARGO_PKG_VERSION"),"protocols":["legacy",PROTOCOL],"methods":METHODS.iter().chain(methods::METHODS).map(|method| (*method).to_owned()).chain(self.messaging.stock_methods()).collect::<Vec<_>>(),"limitations":["one running turn per session","event replay is bounded to the current process"]}),
             ),
             "gateway.capabilities" => Ok(json!({"per_session_exclusive_submit":true})),
             "client.capabilities" => Ok(
@@ -1107,25 +1106,6 @@ impl Shared {
                 Err(RpcError::new(4403, "permission_denied", "Messaging operations require the private profile client"))
             }
             "messaging.profile.settings" => Ok(json!({"connections":self.messaging.settings().await.map_err(RpcError::internal)?})),
-            "messaging.profile.discord.list" => Ok(json!({
-                "connections": self.messaging.discord_connections().await.map_err(RpcError::internal)?
-            })),
-            "messaging.profile.discord.create" | "messaging.profile.discord.update" => {
-                let name = required_string(params, "name")?;
-                let settings = serde_json::from_value(params["settings"].clone())
-                    .map_err(|_| RpcError::invalid("Invalid Discord settings"))?;
-                let result = if method.ends_with(".create") {
-                    let enabled = match params.get("enabled") {
-                        Some(value) => value.as_bool().ok_or_else(|| RpcError::invalid("Invalid enabled state"))?,
-                        None => false,
-                    };
-                    self.messaging.create_discord(self, name, enabled, settings).await
-                } else {
-                    let revision = params["revision"].as_u64().ok_or_else(|| RpcError::invalid("revision is required"))?;
-                    self.messaging.update_discord(self, name, revision, settings).await
-                };
-                Ok(json!(result.map_err(RpcError::internal)?))
-            }
             "messaging.profile.enrollment_begin" => {
                 let name = required_string(params, "name")?;
                 let ttl = params["ttl_ms"].as_i64().unwrap_or(300_000);
@@ -1268,7 +1248,32 @@ impl Shared {
                 }
                 Ok(json!({"closed":true}))
             }
-            _ => self.profile_method(method, params, peer).await,
+            _ => {
+                let Some((adapter, operation)) = self.messaging.stock_method(method) else {
+                    return self.profile_method(method, params, peer).await;
+                };
+                if operation == "list" {
+                    let connections = self.messaging.stock_connections(adapter).await.map_err(RpcError::internal)?;
+                    return Ok(json!({"connections":connections}));
+                }
+                let name = required_string(params, "name")?;
+                let configuration = (adapter.configure)(self.library.root(), params["settings"].clone())
+                    .map_err(|_| RpcError::invalid("Invalid messaging adapter settings"))?;
+                let (revision, enabled) = if operation == "create" {
+                    let enabled = match params.get("enabled") {
+                        Some(value) => value.as_bool().ok_or_else(|| RpcError::invalid("Invalid enabled state"))?,
+                        None => false,
+                    };
+                    (None, enabled)
+                } else {
+                    let revision = params["revision"].as_u64().ok_or_else(|| RpcError::invalid("revision is required"))?;
+                    (Some(revision), false)
+                };
+                let connection = self.messaging
+                    .save_stock(self, adapter, name, revision, enabled, configuration)
+                    .await.map_err(RpcError::internal)?;
+                Ok(json!(connection))
+            }
         }
     }
 

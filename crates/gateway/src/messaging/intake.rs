@@ -62,7 +62,7 @@ pub enum PreparationPurpose {
 }
 
 impl PreparationPurpose {
-    pub(super) fn context_reference(&self) -> Option<&QuoteReference> {
+    pub fn context_reference(&self) -> Option<&QuoteReference> {
         match self {
             Self::Quote(source) => Some(source),
             Self::Scrollback(request) => Some(&request.before),
@@ -347,13 +347,19 @@ impl Ingress {
     }
 }
 
-pub(super) struct Staged {
+pub struct Staged {
     pub(super) token: String,
     pub(super) purpose: PreparationPurpose,
     pub(super) expires_ms: i64,
     finished: Option<String>,
     pub(super) receipt: IntakeReceipt,
     pub(super) event: Option<InboundEvent>,
+}
+
+impl Staged {
+    pub fn into_event(self) -> Option<InboundEvent> {
+        self.event
+    }
 }
 
 impl Store {
@@ -536,7 +542,7 @@ impl Store {
         })
     }
 
-    pub(super) fn preparation(&self, connection: &str, event: &str) -> Result<Option<Staged>> {
+    pub fn preparation(&self, connection: &str, event: &str) -> Result<Option<Staged>> {
         self.read(|db| Ok(db.query_row(
             "SELECT p.token,p.expires,p.finished,i.route,i.disposition,i.input,p.purpose FROM messaging_preparation p
              JOIN messaging_ingress i USING(connection,event) WHERE p.connection = ?1 AND p.event = ?2",

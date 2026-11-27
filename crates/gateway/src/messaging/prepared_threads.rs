@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS messaging_prepared_threads (
 );
 ";
 
-pub(super) enum ThreadPreparation {
+pub enum ThreadPreparation {
     Waiting,
     Reconcile(UncertainDelivery),
     Ready(InboundEvent),
@@ -28,7 +28,7 @@ pub(super) enum ThreadPreparation {
 impl Ingress {
     /// Schedule a typed provision effect for the immutable thread reserved by
     /// the handoff. Only its exact destination receipt can move the input.
-    pub(super) async fn prepare_thread(
+    pub async fn prepare_thread(
         &self,
         event_id: String,
         token: String,
@@ -293,7 +293,7 @@ impl Ingress {
         })
     }
 
-    pub(super) fn thread_media_source_allowed(
+    pub fn thread_media_source_allowed(
         &self,
         source: &MediaSource,
         channel: &str,

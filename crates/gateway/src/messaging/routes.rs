@@ -109,7 +109,7 @@ impl Store {
     }
 }
 
-pub(super) fn insert_route(tx: &Transaction<'_>, route: &Route) -> Result<()> {
+pub fn insert_route(tx: &Transaction<'_>, route: &Route) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO messaging_routes(id,connection,room) VALUES (?1,?2,?3)",
         params![

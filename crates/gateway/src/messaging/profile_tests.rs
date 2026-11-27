@@ -602,21 +602,25 @@ async fn verified_aliases_route_together_and_membership_changes_fence_access() {
 }
 
 #[tokio::test]
-async fn discord_requester_command_rechecks_exact_guild_roles_and_revocation() {
+async fn requester_command_rechecks_exact_room_roles_and_revocation() {
     use super::commands::{RequesterCommand, RequesterInvocation};
-    use super::discord::DiscordSettings;
 
     let temp = TempDir::new().unwrap();
     let (factory, receiver) = fixture("requester-commands", "tenant");
-    let settings: DiscordSettings = serde_json::from_value(serde_json::json!({
-        "grants":{"users":["7"]},
-        "guilds":{
-            "11":{"operator_roles":["31"],"channels":{"21":{"threads":{"22":{}}}}},
-            "12":{"channels":{"23":{}}}
-        },
-        "commands":{"guild_roles":{"11":["31"]}}
+    let mut policy: AccessPolicy = serde_json::from_value(serde_json::json!({
+        "operator_roles":["discord-role:11:31"],
+        "scope":{
+            "require_actor_evidence":true,
+            "rooms":{
+                "21":{
+                    "enabled":true,"grant":{"users":["7"]},
+                    "requester_commands":{"roles":["discord-role:11:31"],"operator_roles":["discord-role:11:31"]}
+                },
+                "23":{"enabled":true,"grant":{"users":["7"]}}
+            }
+        }
     })).unwrap();
-    let gateway = open(temp.path(), &[factory], &settings.host_policy()).await;
+    let gateway = open(temp.path(), &[factory], &policy).await;
     let ingress = ready(&receiver).await;
     let exact = Room { kind: RoomKind::Group, chat: "21".into(), thread: None };
     let foreign = Room { kind: RoomKind::Group, chat: "23".into(), thread: None };
@@ -651,7 +655,7 @@ async fn discord_requester_command_rechecks_exact_guild_roles_and_revocation() {
         ingress.submit(vec![message("chat", sender.clone(), exact.clone())], None).await.unwrap().receipts[0].disposition,
         Disposition::Forbidden,
     );
-    assert!(!ingress.authorize_operator(&settings.host_policy(), &exact, &sender).unwrap());
+    assert!(!ingress.authorize_operator(&policy, &exact, &sender).unwrap());
     assert_eq!(ingress.checkpoint("interactions".into()).await.unwrap().as_deref(), Some("2"));
 
     // Membership or even just command policy revocation fences an accepted
@@ -665,9 +669,8 @@ async fn discord_requester_command_rechecks_exact_guild_roles_and_revocation() {
     evidence.revision += 1;
     ingress.record_actor(evidence).await.unwrap();
     assert!(ingress.requester_command_response(&reader).is_ok());
-    let mut revoked = settings;
-    revoked.commands.guild_roles.clear();
-    gateway.set_adapter_policy("requester-commands", revoked.host_policy()).await.unwrap();
+    policy.scope.rooms.get_mut("21").unwrap().requester_commands = None;
+    gateway.set_adapter_policy("requester-commands", policy).await.unwrap();
     assert!(matches!(ingress.requester_command_response(&reader), Err(GatewayError::Forbidden)));
 
     let status = gateway.messaging_status().await.unwrap();

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc};
 
 const MAX_QUOTE_BYTES: usize = 8 * 1024;
-pub(super) const MAX_SCROLLBACK_BYTES: usize = 12 * 1024;
-pub(super) const MAX_SCROLLBACK_MESSAGE_BYTES: usize = 3 * 1024;
+pub const MAX_SCROLLBACK_BYTES: usize = 12 * 1024;
+pub const MAX_SCROLLBACK_MESSAGE_BYTES: usize = 3 * 1024;
 const MAX_SCROLLBACK_MESSAGES: u8 = 20;
 
 pub(super) const TABLES: &str = "
@@ -337,7 +337,7 @@ impl Ingress {
         ))
     }
 
-    pub(super) fn allows_quote(
+    pub fn allows_quote(
         &self,
         state: &State,
         event: &InboundEvent,

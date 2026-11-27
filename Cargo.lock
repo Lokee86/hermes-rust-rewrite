@@ -3173,6 +3173,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes-discord-plugin"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "hermes-engine",
+ "hermes-gateway-core",
+ "hermes-library",
+ "ogg",
+ "opus2",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "songbird",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "unicode-segmentation",
+ "uuid",
+]
+
+[[package]]
 name = "hermes-engine"
 version = "0.2.0"
 dependencies = [
@@ -3211,8 +3241,30 @@ name = "hermes-gateway"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "hermes-discord-plugin",
+ "hermes-engine",
+ "hermes-gateway-core",
+ "hermes-library",
+ "hermes-reliquary-plugin",
+ "reqwest",
+ "ring",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "uuid",
+]
+
+[[package]]
+name = "hermes-gateway-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
  "async-channel",
- "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -3222,8 +3274,6 @@ dependencies = [
  "hermes-reliquary-plugin",
  "hermes-telegram",
  "libc",
- "ogg",
- "opus2",
  "reqwest",
  "ring",
  "rusqlite",
@@ -3231,13 +3281,11 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "songbird",
  "subtle",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
- "unicode-segmentation",
  "uuid",
  "windows-sys 0.61.2",
 ]

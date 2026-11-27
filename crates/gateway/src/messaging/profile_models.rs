@@ -142,7 +142,7 @@ impl Ingress {
 
     /// Bind the provider-confirmed private message before its component can
     /// select a model. A failed or uncertain edit leaves a picker unusable.
-    pub(in crate::messaging) async fn bind_model_picker_message(
+    pub async fn bind_model_picker_message(
         &self,
         event: String,
         room: Room,

@@ -842,7 +842,7 @@ impl Ingress {
 
     /// Public children inherit the proved parent audience. The caller must
     /// hold the active slot and have a confirmed provider destination receipt.
-    pub(super) fn inherit_public_thread_membership(
+    pub fn inherit_public_thread_membership(
         &self,
         parent: &Room,
         child: &Room,
@@ -906,7 +906,7 @@ impl Ingress {
         })
     }
 
-    pub(super) fn effective_sender(
+    pub fn effective_sender(
         &self,
         policy: &AccessPolicy,
         room: &Room,
@@ -963,7 +963,7 @@ impl Ingress {
         Ok(())
     }
 
-    pub(super) fn authorized_identity(
+    pub fn authorized_identity(
         &self,
         policy: &AccessPolicy,
         room: &Room,
@@ -980,7 +980,7 @@ impl Ingress {
             .then_some((verified, kind)))
     }
 
-    pub(super) fn authorize_sender(
+    pub fn authorize_sender(
         &self,
         policy: &AccessPolicy,
         room: &Room,
@@ -989,7 +989,7 @@ impl Ingress {
         Ok(self.authorized_identity(policy, room, sender)?.is_some())
     }
 
-    pub(super) fn authorize_operator(
+    pub fn authorize_operator(
         &self,
         policy: &AccessPolicy,
         room: &Room,

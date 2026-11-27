@@ -30,9 +30,9 @@ WITH work(actor,room,parent) AS (
 )
 ";
 
-pub(in crate::messaging) type ActorRefreshCursor = (String, String);
+pub type ActorRefreshCursor = (String, String);
 
-pub(in crate::messaging) struct ActorRefresh {
+pub struct ActorRefresh {
     pub actor: ActorEvidence,
     pub room: Room,
     cursor: ActorRefreshCursor,
@@ -58,7 +58,7 @@ impl ActorEvidence {
 impl Ingress {
     /// Serialize a live observation with any concurrent provider refresh or
     /// withdrawal, so the latest dispatch never loses its update to a lookup.
-    pub(in crate::messaging) async fn observe_membership(
+    pub async fn observe_membership(
         &self,
         actor: String,
         kind: ActorKind,
@@ -102,7 +102,7 @@ impl Ingress {
         Ok(())
     }
 
-    pub(in crate::messaging) async fn withdraw_observed_memberships(
+    pub async fn withdraw_observed_memberships(
         &self,
         actor: String,
         retain: impl Fn(&MemberEvidence) -> bool + Send + 'static,
@@ -133,7 +133,7 @@ impl Ingress {
 
     /// Invalidate cached observations for a Discord channel and its children,
     /// one thread, or the rooms and optional DMs that use one guild's roles.
-    pub(in crate::messaging) async fn withdraw_observed_destinations(
+    pub async fn withdraw_observed_destinations(
         &self,
         channels: Vec<String>,
         thread: Option<String>,
@@ -159,7 +159,7 @@ impl Ingress {
 
     /// The cursor walks the bounded worker through exact actor and room pairs.
     /// A denied pair advances the cursor without permitting any provider read.
-    pub(in crate::messaging) async fn next_actor_refresh(
+    pub async fn next_actor_refresh(
         &self,
         after: Option<ActorRefreshCursor>,
     ) -> Result<Option<(ActorRefreshCursor, Option<ActorRefresh>)>, GatewayError> {
@@ -196,7 +196,7 @@ impl Ingress {
 
     /// A late REST response is usable only against the exact observation,
     /// owner policy, active installation, and still-pending work it began with.
-    pub(in crate::messaging) async fn commit_actor_refresh(
+    pub async fn commit_actor_refresh(
         &self,
         refresh: ActorRefresh,
         roles: std::collections::BTreeSet<String>,

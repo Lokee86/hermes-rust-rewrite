@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, time::Duration};
 
 // Leave room for the complete 256 KiB reply and repeated code fences.
-pub(super) const MAX_ATTACHMENT_PLAN_PARTS: usize = 160;
+pub const MAX_ATTACHMENT_PLAN_PARTS: usize = 160;
 
 /// Additional operations an adapter explicitly supports.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

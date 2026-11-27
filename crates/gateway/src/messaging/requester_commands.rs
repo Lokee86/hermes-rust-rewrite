@@ -10,7 +10,7 @@ use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(in crate::messaging) enum RequesterCommand {
+pub enum RequesterCommand {
     Status,
     Help,
     Identity,
@@ -19,14 +19,14 @@ pub(in crate::messaging) enum RequesterCommand {
 /// A command from an authenticated private-response transport. The receipt
 /// has no conversation route and can never enter the session or outbox queues.
 #[derive(Clone)]
-pub(in crate::messaging) struct RequesterInvocation {
+pub struct RequesterInvocation {
     pub id: String,
     pub room: Room,
     pub sender: Sender,
     pub command: RequesterCommand,
 }
 
-pub(in crate::messaging) struct RequesterAuthority {
+pub struct RequesterAuthority {
     pub actor: String,
     pub operator: bool,
 }
@@ -86,7 +86,7 @@ impl Ingress {
     /// Commit a private native command and the provider checkpoint together.
     /// Commands on this path can report status or identity and cannot operate
     /// on an existing conversation.
-    pub(in crate::messaging) async fn commit_requester_command(
+    pub async fn commit_requester_command(
         &self,
         request: RequesterInvocation,
         advance: Advance,
@@ -147,7 +147,7 @@ impl Ingress {
 
     /// Read only the authority of this exact, durably accepted invocation.
     /// Use immediately before sending the requester's private response.
-    pub(in crate::messaging) fn requester_command_response(
+    pub fn requester_command_response(
         &self,
         request: &RequesterInvocation,
     ) -> Result<RequesterAuthority, GatewayError> {
