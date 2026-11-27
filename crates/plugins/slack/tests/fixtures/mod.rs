@@ -13,7 +13,7 @@ use hermes_gateway_core::{
     RunningGateway,
     messaging::{EnrollmentCredential, test_support::dispatch},
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
@@ -311,19 +311,21 @@ async fn api(
         Some(value) if value == authorization("xoxb", '2') => SECOND,
         _ => return response(json!({"ok":false,"error":"invalid_auth"})),
     };
-    let body = if raw.is_empty() {
-        json!({})
-    } else if headers
+    let content_type = headers
         .get(header::CONTENT_TYPE)
-        .is_some_and(|value| value == "application/x-www-form-urlencoded")
-    {
-        Value::Object(
+        .and_then(|value| value.to_str().ok());
+    let body = match content_type {
+        _ if raw.is_empty() => json!({}),
+        Some("application/x-www-form-urlencoded") => Value::Object(
             url::form_urlencoded::parse(&raw)
                 .map(|(key, value)| (key.into_owned(), json!(value)))
                 .collect(),
-        )
-    } else {
-        serde_json::from_slice(&raw).unwrap()
+        ),
+        Some("application/json") => match Json::<Map<String, Value>>::from_bytes(&raw) {
+            Ok(Json(fields)) => Value::Object(fields),
+            Err(error) => return error.into_response(),
+        },
+        _ => return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(),
     };
     let pause = {
         let mut state = context.service.lock().unwrap();
@@ -433,6 +435,31 @@ async fn api(
         _ => return StatusCode::NOT_IMPLEMENTED.into_response(),
     };
     response(result)
+}
+
+#[tokio::test]
+async fn fixture_rejects_invalid_api_bodies() {
+    let fixture = Fixture::start().await;
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}api/chat.postMessage", fixture.origin);
+
+    for (content_type, body, expected_status) in [
+        ("application/json", "{", StatusCode::BAD_REQUEST),
+        ("application/json", "[]", StatusCode::UNPROCESSABLE_ENTITY),
+        ("text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    ] {
+        let response = client
+            .post(&endpoint)
+            .header(header::AUTHORIZATION, authorization("xoxb", '1'))
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+    }
+
+    assert!(fixture.calls("chat.postMessage").is_empty());
 }
 
 async fn transfer(
