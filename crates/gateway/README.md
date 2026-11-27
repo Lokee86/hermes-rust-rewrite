@@ -173,7 +173,7 @@ The model can call `memory_query` to search eligible Memories and current Observ
 
 Private PHY Perception writes are opt-in. Enable **Private PHY Perception** in Persistent memory or set `memory_phy_perception_enabled` for a gateway-only profile with a configured Perception decision endpoint. Recall includes the active PHY on read-only mounts too.
 
-The native mixed-recall test uses disposable Core fixture files `mixed.rel`, `current.phy` and `pending.phy`. Set `MERCURY_PHY_PERCEPTION_FIXTURE` to their folder to exercise ordinary recall, exact references and disclosure across a PHY switch using a loopback decision endpoint.
+The native mixed-recall test uses disposable Core fixture files `mixed.rel`, `current.phy` and `pending.phy`. Set `MERCURY_PHY_PERCEPTION_FIXTURE` to their folder and run `cargo test -p hermes-reliquary-plugin --features native native_query_returns_one_owner_qualified_ranking_and_fences_a_phy_switch -- --ignored` to exercise ordinary recall, exact references and disclosure across a PHY switch using a loopback decision endpoint.
 
 `archive_search` accepts a natural-language time reference such as “last Tuesday.” It uses the profile's configured calendar timezone, with UTC as the fallback, and defaults to the date of the original message. Pass `basis: "mentioned"` to filter on dates discussed in the messages. A query without a resolvable time reference returns `temporal_query_required` and suggests `memory_query`. `archive_read` and `echo_read` accept only an exact reference returned to the model during the current turn. Successful retrieval content goes to the requesting model round. The stored tool entry records its result count.
 

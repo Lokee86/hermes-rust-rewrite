@@ -3,7 +3,7 @@ use crate::{memory::save_state, storage::legacy};
 use axum::{Json, Router, routing::post};
 use hermes_engine::{credentials::EndpointStore, settings::ProfileSettings};
 use hermes_library::{Library, memory_plugin::MemoryStore};
-use reliquary_memory::{Phylactery, Rel};
+use reliquary_memory::{ObservationSource, ObservationStanding, OwnerKind, Phylactery, Rel};
 use std::{fs, path::PathBuf};
 
 struct NativeChat {
@@ -26,11 +26,12 @@ impl MemorySources for NativeChat {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable Core mixed-recall fixture files"]
 async fn native_query_returns_one_owner_qualified_ranking_and_fences_a_phy_switch() {
-    let Some(fixture) = std::env::var_os("MERCURY_PHY_PERCEPTION_FIXTURE").map(PathBuf::from)
-    else {
-        return;
-    };
+    let fixture = PathBuf::from(
+        std::env::var_os("MERCURY_PHY_PERCEPTION_FIXTURE")
+            .expect("set MERCURY_PHY_PERCEPTION_FIXTURE to the disposable fixture folder"),
+    );
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -111,6 +112,25 @@ async fn native_query_returns_one_owner_qualified_ranking_and_fences_a_phy_switc
             let binding = memory
                 .binding_for_new_session(&chat)?
                 .context("fixture chat unbound")?;
+            let (_, instance) = memory.route(&binding)?;
+            let inspected =
+                instance.list_observations(private.owner_id(), OwnerKind::Phylactery, None, 2)?;
+            let [head] = inspected.items.as_slice() else {
+                anyhow::bail!("expected the authorized private Observation head");
+            };
+            assert_eq!(head.claim.proposition, "Zephyr delivery was approved.");
+            assert_eq!(head.standing == ObservationStanding::Current, current_claim);
+            let ObservationSource::Observation(id) = head.claim.citation.source else {
+                anyhow::bail!("missing exact private Observation citation");
+            };
+            let history = instance.observation_history(
+                private.owner_id(),
+                OwnerKind::Phylactery,
+                id,
+                None,
+                2,
+            )?;
+            assert_eq!(history.items[0].claim.citation, head.claim.citation);
             let invoke = |admission: &str| {
                 let sources = Arc::new(NativeChat {
                     id: chat.id.clone(),
