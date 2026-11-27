@@ -149,9 +149,16 @@ impl Library {
         ensure!(!self.profiles_dir().join(name).exists(), "A profile named {name} already exists");
         ensure!(!self.bots()?.iter().any(|bot| bot.name == *name), "A bot with that name already exists");
         self.ensure_profiles_dir()?;
-        let status = Command::new("tar").arg("-xzf").arg(archive).arg("-C").arg(self.profiles_dir()).status()?;
+        // Unpacked beside the profiles first: a link in the archive would let the profile read,
+        // chmod or overwrite a file outside it, so nothing appears until the whole tree passes.
+        // The staging name is not a valid profile name, so the profile list never shows it.
+        let staging = tempfile::Builder::new().prefix(".import-").tempdir_in(self.profiles_dir())?;
+        let status = Command::new("tar").arg("-xzf").arg(archive).arg("-C").arg(staging.path()).status()?;
         ensure!(status.success(), "Could not unpack the profile archive");
+        let unpacked = staging.path().join(name);
+        ensure!(only_folders_and_files(&unpacked)?, "The archive holds links, which a profile archive never does");
         let profile = self.profiles_dir().join(name);
+        fs::rename(&unpacked, &profile).context("Could not add the imported profile")?;
         let copy = profile.join(EXPORTED_DATABASE);
         if copy.is_file() {
             let database = profile.join(hermes_engine::db::FILE);
@@ -165,6 +172,28 @@ impl Library {
         }
         Ok(name.to_string())
     }
+}
+
+/// Whether the tree holds only folders and files with no other names: a symbolic link, or a file
+/// hard-linked to one elsewhere, would reach outside the profile.
+fn only_folders_and_files(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            if !only_folders_and_files(&entry?.path())? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() > 1 {
+            return Ok(false);
+        }
+    }
+    Ok(metadata.is_file())
 }
 
 #[cfg(test)]
@@ -224,5 +253,41 @@ mod tests {
         library.import_profile(&old).unwrap();
         assert_eq!(mode(&library.profile_path("old").unwrap().join(hermes_engine::db::FILE)), 0o600);
         assert!(hermes_engine::db::open_existing(&library.profile_path("old").unwrap()).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_with_links_is_refused_and_leaves_outside_files_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(&dir.path().join("home")).unwrap();
+        let outside = dir.path().join("private.txt");
+        fs::write(&outside, "secret").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        let pack = |name: &str, link: &dyn Fn(&Path)| {
+            let staging = tempfile::tempdir().unwrap();
+            let profile = staging.path().join(name);
+            fs::create_dir(&profile).unwrap();
+            link(&profile);
+            let archive = dir.path().join(format!("{name}.tar.gz"));
+            assert!(Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(staging.path()).arg(name).status().unwrap().success());
+            archive
+        };
+        let symlinked = pack("symlinked", &|profile| {
+            std::os::unix::fs::symlink(&outside, profile.join(EXPORTED_DATABASE)).unwrap();
+            std::os::unix::fs::symlink(&outside, profile.join("SOUL.md")).unwrap();
+        });
+        let hard_linked = pack("hard-linked", &|profile| {
+            fs::write(profile.join("notes.md"), "x").unwrap();
+            fs::hard_link(profile.join("notes.md"), profile.join("SOUL.md")).unwrap();
+        });
+        for (archive, name) in [(symlinked, "symlinked"), (hard_linked, "hard-linked")] {
+            assert!(library.import_profile(&archive).is_err(), "{name}");
+            assert!(!library.profile_path(name).unwrap().exists(), "{name}");
+        }
+        assert_eq!(fs::metadata(&outside).unwrap().permissions().mode() & 0o777, 0o644);
+        let names: Vec<_> = library.profiles().unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["default"]);
+        assert_eq!(fs::read_dir(library.root().join("profiles")).unwrap().count(), 0, "no staging left behind");
     }
 }

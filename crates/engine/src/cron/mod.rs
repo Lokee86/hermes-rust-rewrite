@@ -100,7 +100,8 @@ impl Job {
             deliver: self.deliver.clone(),
             catch_up: self.catch_up,
             grace_minutes: self.grace_minutes,
-            paused: !self.enabled,
+            // A job that has finished is off but not paused: editing it may give it a new time.
+            paused: !self.enabled && self.state != "completed",
             script: script::field(self, "script").unwrap_or_default().into(),
             no_agent: script::no_agent(self),
             monitor: script::field(self, "monitor_script").or(script::field(self, "monitor_url")).unwrap_or_default().into(),

@@ -592,7 +592,10 @@ fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result
     let changed = previous.is_none_or(|job| {
         !same_timing(&job.schedule, &schedule) || job.timezone() != draft.timezone
     });
-    let completed = previous.map_or(0, |job| job.repeat.completed);
+    // A one-shot given a new time is a new occurrence, so its single run is owed again.
+    let completed = previous
+        .filter(|job| !(schedule.is_once() && !same_timing(&job.schedule, &schedule)))
+        .map_or(0, |job| job.repeat.completed);
     let next = if draft.paused {
         None
     } else if !changed {
@@ -862,5 +865,42 @@ mod gateway_recovery_tests {
         assert!(restarted.bind_gateway_session(&claim.run.id, "other").is_err());
         restarted.finish(&claims[0], Outcome::Completed { output: "done".into() }, now).unwrap();
         assert!(restarted.gateway_claims().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_finished_one_shot_given_a_new_time_runs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let now = Utc::now();
+        let at = now + Duration::minutes(5);
+        let job = store.create(Draft { prompt: "remind me".into(), schedule: stamp(at), ..Default::default() }, now).unwrap();
+        let claims = store.claim_due(at).unwrap();
+        store.begin(&claims[0], at).unwrap();
+        store.finish(&claims[0], Outcome::Completed { output: "done".into() }, at).unwrap();
+        let done = store.jobs().unwrap().remove(0);
+        assert_eq!((done.enabled, done.state.as_str()), (false, "completed"));
+
+        // Renaming it leaves it finished.
+        let mut renamed = done.draft();
+        renamed.name = "Reminder".into();
+        let kept = store.update(&job.id, renamed, at).unwrap();
+        assert_eq!((kept.enabled, kept.next_run_at.as_deref()), (false, None));
+
+        let later = at + Duration::days(1);
+        let mut moved = kept.draft();
+        moved.schedule = stamp(later);
+        let rescheduled = store.update(&job.id, moved, at).unwrap();
+        assert_eq!((rescheduled.enabled, rescheduled.state.as_str()), (true, "scheduled"));
+        assert_eq!(rescheduled.next_run_at, Some(stamp(later)));
+        assert_eq!(store.claim_due(later).unwrap().len(), 1);
+
+        // A paused job stays paused through an edit.
+        let paused = store.create(Draft { prompt: "later".into(), schedule: "every 1h".into(), ..Default::default() }, now).unwrap();
+        store.pause(&paused.id, now).unwrap();
+        let paused = store.jobs().unwrap().into_iter().find(|j| j.id == paused.id).unwrap();
+        let mut edited = paused.draft();
+        edited.schedule = "every 2h".into();
+        let edited = store.update(&paused.id, edited, now).unwrap();
+        assert_eq!((edited.enabled, edited.next_run_at.as_deref()), (false, None));
     }
 }
