@@ -587,7 +587,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             json!({"version":1,"approved":approved})
         }
         "dream_pair_classification" => json!({"relation":"none","direction":"none","evidence":[]}),
-        "memory_web_audit_v2" => {
+        "memory_web_audit_v3" => {
             let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let candidates = input["sources"].as_array().into_iter().flatten()
                 .find(|row| row["kind"] == "memory" && row["text"] == PROJECT_FACT)
