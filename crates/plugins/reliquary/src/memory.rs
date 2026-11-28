@@ -208,7 +208,8 @@ impl EmbeddedMemory {
         Ok((owner, instance))
     }
 
-    pub(super) fn check_recall_scope(&self) -> Result<()> {
+    /// Fence outstanding private access when the profile changes its active PHY.
+    pub(super) fn check_active_phy_scope(&self) -> Result<()> {
         if self
             .recall_online
             .load(std::sync::atomic::Ordering::Acquire)

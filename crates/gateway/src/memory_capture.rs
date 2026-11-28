@@ -671,11 +671,12 @@ impl Shared {
 
 pub(super) struct CaptureSources(pub Library);
 
-fn eligible_source(summary: &SessionSummary, binding: &CaptureBinding) -> bool {
-    !source_ended(&summary.directory)
+fn eligible_source(summary: &SessionSummary, binding: Option<&CaptureBinding>) -> bool {
+    !summary.archived
+        && !source_ended(&summary.directory)
         && summary.bot.is_none()
         && matches!(summary.source, SessionSource::Native)
-        && summary.project_id == binding.project_id
+        && binding.is_none_or(|binding| summary.project_id == binding.project_id)
 }
 
 impl MemorySources for CaptureSources {
@@ -689,8 +690,7 @@ impl MemorySources for CaptureSources {
         );
         let summary = self.0.session(session_id)?;
         ensure!(
-            !summary.archived
-                && eligible_source(&summary, binding)
+            eligible_source(&summary, Some(binding))
                 && Settings::read(&summary.directory)?.memory_binding.as_ref() == Some(binding),
             "Native session binding is unavailable"
         );
@@ -700,9 +700,7 @@ impl MemorySources for CaptureSources {
     fn check_ego_session(&self, session_id: &str, binding: Option<&CaptureBinding>) -> Result<()> {
         let summary = self.0.session(session_id)?;
         ensure!(
-            !summary.archived && summary.bot.is_none()
-                && matches!(summary.source, SessionSource::Native)
-                && binding.is_none_or(|binding| eligible_source(&summary, binding))
+            eligible_source(&summary, binding)
                 && Settings::read(&summary.directory)?.memory_binding.as_ref() == binding,
             "Native Ego session binding is unavailable"
         );

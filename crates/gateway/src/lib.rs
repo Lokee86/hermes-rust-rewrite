@@ -532,6 +532,10 @@ struct Settings {
 }
 
 impl Settings {
+    fn accepts_profile_memory(&self) -> bool {
+        !matches!(self.source.as_str(), "subagent" | "recovered" | "import")
+    }
+
     fn is_telegram_session(&self) -> bool {
         self.source == TELEGRAM_SOURCE && self.creation_fingerprint.is_none()
             && self.creation_key.as_deref().is_some_and(|key| key.starts_with(TELEGRAM_ROUTE_PREFIX))
@@ -1481,7 +1485,7 @@ impl Shared {
                     ensure!(existing.creation_key == prepared.creation_key && existing.creation_fingerprint == prepared.creation_fingerprint,
                         "Creation identity was previously used with different options");
                 } else {
-                    if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
+                    if prepared.accepts_profile_memory() {
                         prepared.memory_binding = selected_memory.binding(summary)?;
                     }
                     if let Some(backend) = local_backend {

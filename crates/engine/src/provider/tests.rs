@@ -813,6 +813,33 @@ fn requests_mark_the_stable_prefix_for_caching() {
 }
 
 #[tokio::test]
+async fn structured_responses_reads_text_from_the_completion_event() {
+    let router = Router::new().route(
+        "/responses",
+        post(|| async {
+            sse(concat!(
+                r#"data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]}}"#,
+                "\n\n",
+            ))
+        }),
+    );
+    let (base, server) = serve(router).await;
+    let mut provider = Provider::new(config(&base)).unwrap();
+    provider.protocol = Protocol::Responses;
+    provider.endpoint = format!("{base}/responses").parse().unwrap();
+    let schema = json!({
+        "type":"object","properties":{"ok":{"type":"boolean"}},
+        "required":["ok"],"additionalProperties":false,
+    });
+    let result = provider
+        .complete_json("system", "input", "terminal", &schema)
+        .await
+        .unwrap();
+    assert_eq!(result, json!({"ok":true}));
+    server.abort();
+}
+
+#[tokio::test]
 async fn structured_responses_tool_retains_reasoning_and_correlates_local_result() {
     let router = Router::new().route(
         "/responses",

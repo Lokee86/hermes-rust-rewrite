@@ -58,6 +58,7 @@ impl Access {
             "Native Ego is no longer active for this profile"
         );
         self.sources.check_ego_session(&self.session_id, self.binding.as_ref())?;
+        self.memory.check_active_phy_scope()?;
         self.memory
             .ego_authority
             .as_ref()
@@ -132,6 +133,7 @@ impl EgoAccess for Access {
                     .into_iter()
                     .map(pin_value)
                     .collect::<Vec<_>>();
+                self.authority()?;
                 json!({"owner": owner, "pins": pins})
             }
             PinRequest::PinAnchor { text, priority, .. } => {
@@ -158,6 +160,7 @@ impl EgoAccess for Access {
                 let priority = priority
                     .map(|value| fixed_priority(value, Some(pin.priority)))
                     .transpose()?;
+                self.authority()?;
                 let updated = if text.is_none() && priority == Some(pin.priority) {
                     pin
                 } else {
@@ -174,6 +177,7 @@ impl EgoAccess for Access {
 
     fn identity(&self) -> Result<Option<String>> {
         let (_, identity) = active(self.authority()?, self.memory.phy)?;
+        self.authority()?;
         Ok(identity.map(|identity| identity.text))
     }
 
@@ -210,7 +214,7 @@ impl EgoAccess for Access {
                         current_selection == selection,
                         "Active Identity changed after review"
                     );
-                    instance.approve_ego_identity(owner, prepared)?;
+                    access.authority()?.approve_ego_identity(owner, prepared)?;
                     Ok(())
                 }),
             })
@@ -227,6 +231,7 @@ impl EgoAccess for Access {
                         current == selection && active.is_none(),
                         "Active Identity changed after review"
                     );
+                    let instance = access.authority()?;
                     let identity = instance.create_ego_identity(owner, name, text)?;
                     instance.select_ego_identity(
                         owner,

@@ -2233,35 +2233,40 @@ async fn native_gateway_captures_the_verified_ego_package_and_reviews_identity()
     use hermes_library::Library;
     use std::{fs, path::{Path, PathBuf}, sync::Mutex};
 
-    let Some(fixture) = std::env::var_os("MERCURY_EGO_CAPTURE_FIXTURE").map(PathBuf::from) else {
-        return;
-    };
+    let fixture = std::env::var_os("MERCURY_EGO_CAPTURE_FIXTURE").map(PathBuf::from);
     let sandbox = TempDir::new().unwrap();
     let profiles = Library::open(sandbox.path().join("data")).unwrap();
     let home = profiles.create_profile("work").unwrap().path;
-    let directory = home.join("reliquary");
-    fs::create_dir(&directory).unwrap();
-    let mut copies = std::collections::BTreeMap::new();
-    for entry in fs::read_dir(fixture).unwrap() {
-        let path = entry.unwrap().path();
-        let Some(extension @ ("rel" | "phy")) = path.extension().and_then(|extension| extension.to_str()) else {
-            continue;
-        };
-        let copy = directory.join(format!("fixture.{extension}"));
-        assert!(copies.insert(extension.to_owned(), copy.clone()).is_none(), "ambiguous fixture");
-        fs::copy(path, copy).unwrap();
-    }
-    let rel = "a2".repeat(16);
-    let phy = "a3".repeat(16);
-    let topology = json!({
-        "version":2,"profile_id":"work","principal_id":"fixture-principal",
-        "main_rel":rel,"active_phy":phy,"projects":{},"owners":{
-            rel.clone():{"kind":"rel","path":copies["rel"]},
-            phy.clone():{"kind":"phylactery","path":copies["phy"]}
+    let older_chat = Library::open(&home)
+        .unwrap()
+        .create_session(None, Some("Chat before enrollment"))
+        .unwrap();
+    let fixture_phy = fixture.map(|fixture| {
+        let directory = home.join("reliquary");
+        fs::create_dir(&directory).unwrap();
+        let mut copies = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(fixture).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(extension @ ("rel" | "phy")) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            let copy = directory.join(format!("fixture.{extension}"));
+            assert!(copies.insert(extension.to_owned(), copy.clone()).is_none(), "ambiguous fixture");
+            fs::copy(path, copy).unwrap();
         }
+        let rel = "a2".repeat(16);
+        let phy = "a3".repeat(16);
+        let topology = json!({
+            "version":2,"profile_id":"work","principal_id":"fixture-principal",
+            "main_rel":rel,"active_phy":phy,"projects":{},"owners":{
+                rel.clone():{"kind":"rel","path":copies["rel"]},
+                phy.clone():{"kind":"phylactery","path":copies["phy"]}
+            }
+        });
+        fs::write(directory.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
+        fs::write(directory.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
+        phy
     });
-    fs::write(directory.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
-    fs::write(directory.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
     let options = json!({
         "memory_provider":"reliquary","memory_ego_enabled":true,"timezone":"UTC",
         "mcp_tools":false,"clock_tools":false,"terminal_tools":false,"file_tools":false,"skill_tools":false,
@@ -2301,22 +2306,27 @@ async fn native_gateway_captures_the_verified_ego_package_and_reviews_identity()
     }
     let request = requests.lock().unwrap().last().unwrap().clone();
     let prompt = request["messages"][0]["content"].as_str().unwrap();
-    for text in [
-        "Respond with practical precision.",
-        "Always use metric units.",
-        "Meetings use video.",
-        "Every Atlas purchase request is reviewed before payment is released.",
-    ] {
-        assert_eq!(prompt.matches(text).count(), 1, "expected one {text:?} in {prompt:?}");
+    if fixture_phy.is_some() {
+        for text in [
+            "Respond with practical precision.",
+            "Always use metric units.",
+            "Meetings use video.",
+            "Every Atlas purchase request is reviewed before payment is released.",
+        ] {
+            assert_eq!(prompt.matches(text).count(), 1, "expected one {text:?} in {prompt:?}");
+        }
+        assert!(!prompt.contains("Host fallback sentinel."));
+        assert!(prompt.find("Respond with practical precision.").unwrap() < prompt.find("User timezone: UTC.").unwrap());
+    } else {
+        assert_eq!(prompt.matches("Host fallback sentinel.").count(), 1);
     }
     for absent in [
-        "Host fallback sentinel.", "Built-in MEMORY sentinel.", "Built-in USER sentinel.",
+        "Built-in MEMORY sentinel.", "Built-in USER sentinel.",
         "Atlas reviews purchase requests before releasing payment.",
     ] {
         assert!(!prompt.contains(absent));
     }
     assert!(prompt.starts_with("You are Hermes, a helpful desktop agent."));
-    assert!(prompt.find("Respond with practical precision.").unwrap() < prompt.find("User timezone: UTC.").unwrap());
     assert_eq!(request["messages"][1]["content"], "Earlier conversation sentinel.");
     assert_eq!(request["messages"][2]["content"], "Fixture reply");
     assert_eq!(request["messages"][3]["content"], "What is the guidance for Atlas payment?");
@@ -2329,6 +2339,8 @@ async fn native_gateway_captures_the_verified_ego_package_and_reviews_identity()
     let mut events = client.subscribe();
     control.connect(&client).await.unwrap();
     client.request("session.resume", json!({"session_id":sid})).await.unwrap();
+    let before = client.request("slash.exec", json!({"session_id":sid,"command":"/identity"}))
+        .await.unwrap();
     let draft = "Review this exact Mercury Identity.\nKeep the second line.";
     client.request("slash.exec", json!({"session_id":sid,"command":format!("/identity {draft}")}))
         .await.unwrap();
@@ -2339,15 +2351,32 @@ async fn native_gateway_captures_the_verified_ego_package_and_reviews_identity()
         }
     }).await.unwrap();
     assert_eq!(approval["payload"]["command"], draft);
-    assert_eq!(approval["payload"]["identity_draft"]["phy"], phy);
+    if let Some(phy) = fixture_phy {
+        assert_eq!(approval["payload"]["identity_draft"]["phy"], phy);
+        assert_eq!(before["output"], "Respond with practical precision.");
+    }
     assert_eq!(client.request("slash.exec", json!({"session_id":sid,"command":"/identity"}))
-        .await.unwrap()["output"], "Respond with practical precision.");
+        .await.unwrap()["output"], before["output"]);
     let decision = json!({"session_id":sid,"prompt_id":approval["payload"]["prompt_id"],
         "execution_generation":approval["execution_generation"],"choice":"once"});
     assert!(chat.call("approval.respond", decision.clone()).await.get("error").is_some());
     client.request("approval.respond", decision).await.unwrap();
     assert_eq!(client.request("slash.exec", json!({"session_id":sid,"command":"/identity"}))
         .await.unwrap()["output"], draft);
+
+    chat.ok("session.resume", json!({"session_id":older_chat.id})).await;
+    chat.ok("prompt.submit", json!({
+        "session_id":older_chat.id,"submission_id":"ego-older-chat","text":"Hello again.",
+    })).await;
+    let complete = chat.event_with_timeout("message.complete", 65).await;
+    assert_eq!(complete["payload"]["status"], "complete", "{complete}");
+    let request = requests.lock().unwrap().last().unwrap().clone();
+    let prompt = request["messages"][0]["content"].as_str().unwrap();
+    assert_eq!(prompt.matches(draft).count(), 1);
+    assert!(!prompt.contains("Host fallback sentinel."));
+    assert!(!request["tools"].as_array().unwrap().iter()
+        .any(|tool| tool["function"]["name"] == "memory_query"));
+
     client.close();
     drop(chat);
     gateway.shutdown().await;

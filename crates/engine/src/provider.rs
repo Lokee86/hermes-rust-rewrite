@@ -1158,9 +1158,13 @@ impl ResponsesStream {
                     name: item["name"].as_str().unwrap_or_default().to_owned(), arguments: item["arguments"].as_str().unwrap_or("{}").to_owned() });
             }
             "response.completed" | "response.done" => {
-                // Structured Responses can carry the final answer only in the retained items.
-                if self.keep_items && self.content_bytes == 0 {
-                    let text = self.items.iter()
+                // A completed response can carry the answer without streaming text deltas.
+                if self.content_bytes == 0 {
+                    let items = event
+                        .pointer("/response/output")
+                        .and_then(Value::as_array)
+                        .unwrap_or(&self.items);
+                    let text = items.iter()
                         .filter(|item| item["type"] == "message")
                         .filter_map(|item| item["content"].as_array())
                         .flatten()

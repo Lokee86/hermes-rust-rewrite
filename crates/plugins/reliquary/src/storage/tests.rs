@@ -540,7 +540,7 @@ async fn native_request_renders_approved_profile_identity_and_pins_once() {
     );
     (pending.apply)().unwrap();
     assert_eq!(ego.identity().unwrap().as_deref(), Some(draft));
-    session.set_native_ego(Some(ego));
+    session.set_native_ego(Some(ego.clone()));
     session
         .turn(
             config,
@@ -585,4 +585,18 @@ async fn native_request_renders_approved_profile_identity_and_pins_once() {
             1
         );
     }
+
+    let pending = ego.prepare_identity("Identity awaiting review.".into()).unwrap();
+    let directory = home.join("reliquary");
+    let replacement = Phylactery::create(directory.join("replacement.phy")).unwrap();
+    let mut topology = legacy_topology(&home);
+    topology["active_phy"] = json!(replacement.owner_id());
+    topology["owners"][replacement.owner_id().to_string()] =
+        json!({"kind":"phylactery","path":replacement.path()});
+    save_state(&directory.join(TOPOLOGY), &topology, true).unwrap();
+
+    assert!((pending.apply)().is_err());
+    assert!(ego.context("current preferences", 4096).is_err());
+    assert!(ego.identity().is_err());
+    assert!(ego.pin(PinRequest::ListPins { scope: PinScope::Phy }).is_err());
 }

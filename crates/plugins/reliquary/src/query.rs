@@ -54,7 +54,7 @@ impl GatewayMemoryQuery {
     }
 
     fn check_session(&self) -> Result<()> {
-        self.memory.check_recall_scope()?;
+        self.memory.check_active_phy_scope()?;
         self.sources
             .check_session(&self.turn.session_id, &self.binding)
     }
