@@ -17,13 +17,20 @@ pub(super) struct Tunnel {
     _guard: Arc<Guard>,
 }
 /// Owns the forward and the remote serve; closes both when the last Tunnel copy goes away.
-struct Guard { remote_pid: String, files: String, ssh: Ssh, forward: Mutex<Option<Child>> }
+struct Guard { remote_pid: Mutex<Option<String>>, files: String, ssh: Ssh, forward: Mutex<Option<Child>> }
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Ok(mut forward) = self.forward.lock() && let Some(mut child) = forward.take() { let _ = child.kill(); let _ = child.wait(); }
         // The token is worth nothing once its server is gone, and neither is the log.
-        let _ = run(&self.ssh, &format!("kill {} 2>/dev/null; rm -f \"{files}.token\" \"{files}.log\"; true", self.remote_pid, files = self.files), None);
+        let pid = self.remote_pid.lock().ok().and_then(|pid| pid.clone());
+        let kill = pid.map(|pid| format!("kill {pid} 2>/dev/null; ")).unwrap_or_default();
+        let _ = run(&self.ssh, &format!("{kill}rm -f \"{files}.token\" \"{files}.log\"; true", files = self.files), None);
     }
+}
+
+/// `value` as one POSIX shell word: an apostrophe in a path is kept, not dropped.
+fn quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn hex(bytes: usize) -> String {
@@ -89,7 +96,10 @@ pub(super) fn connect(root: &Path, ssh: Ssh) -> Result<Tunnel, String> {
     let token = hex(32);
     let dir = format!("$HOME/.hermes/desktop-ssh/{oid}");
     let hermes = if ssh.hermes_path.trim().is_empty() { "\"$(command -v hermes || echo $HOME/.local/bin/hermes)\"".to_owned() }
-        else { format!("'{}'", ssh.hermes_path.trim().replace('\'', "")) };
+        else { quoted(ssh.hermes_path.trim()) };
+    // From the first remote write on, giving up removes what was left there, even if the launch
+    // or its PID reply fails.
+    let guard = Guard { remote_pid: Mutex::new(None), files: format!("{dir}/{nonce}"), ssh: ssh.clone(), forward: Mutex::new(None) };
     // 1. The token file: owner-only, written from stdin so the secret is never in argv.
     run(&ssh, &format!("umask 077 && mkdir -p \"{dir}\" && cat > \"{dir}/{nonce}.token\""), Some(&token))?;
     // 2. The serve, detached, logging its ready line.
@@ -100,7 +110,7 @@ pub(super) fn connect(root: &Path, ssh: Ssh) -> Result<Tunnel, String> {
     let remote_pid = run(&ssh, &spawn, None)?.trim().to_owned();
     if remote_pid.is_empty() || !remote_pid.bytes().all(|b| b.is_ascii_digit()) { return Err("The remote Hermes did not start.".into()); }
     // From here on, giving up also stops what was started.
-    let guard = Guard { remote_pid: remote_pid.clone(), files: format!("{dir}/{nonce}"), ssh: ssh.clone(), forward: Mutex::new(None) };
+    if let Ok(mut pid) = guard.remote_pid.lock() { *pid = Some(remote_pid.clone()); }
     // 3. Wait for the port announcement.
     let deadline = Instant::now() + Duration::from_secs(120);
     let remote_port = loop {
@@ -141,6 +151,15 @@ impl Tunnel {
 mod tests {
     use super::*;
     use std::sync::OnceLock;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_an_apostrophe_stays_one_unchanged_shell_word() {
+        let path = "/opt/O'Brien tools/hermes";
+        let word = quoted(path);
+        let echoed = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {word}")).output().unwrap();
+        assert_eq!(String::from_utf8(echoed.stdout).unwrap(), path);
+    }
 
     /// Keeps the test's host key out of the user's own known_hosts.
     pub(super) static KNOWN_HOSTS: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -201,7 +220,7 @@ mod tests {
         assert_eq!(fs::read_to_string(token.path()).unwrap(), tunnel.token);
         let args = fs::read_to_string(at("home").join("args")).unwrap();
         assert!(args.contains("serve --isolated") && !args.contains(&tunnel.token), "the secret stays out of argv");
-        let pid = tunnel._guard.remote_pid.clone();
+        let pid = tunnel._guard.remote_pid.lock().unwrap().clone().unwrap();
         tunnel.close();
         assert!(files().is_empty(), "the token and log are removed");
         let gone = (0..40).any(|_| { std::thread::sleep(Duration::from_millis(50)); !Command::new("kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success() });
