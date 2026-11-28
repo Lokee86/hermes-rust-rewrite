@@ -302,9 +302,11 @@ impl Session {
             biased;
             _ = cancel.cancelled() => Status::Interrupted,
             result = async {
+                let original = config.clone();
                 let config = Provider::resolve_config(config).await?;
                 self.history.turns[index].model = config.model.clone();
-                self.run_model(index, &Provider::new_with_options(config,options)?, python_memory, &events, &cancel, &controls).await
+                let provider = Provider::new_with_options(config,options)?.renewing(&original);
+                self.run_model(index, &provider, python_memory, &events, &cancel, &controls).await
             } => match result {
                 Ok(()) => Status::Complete,
                 Err(err) => Status::Failed(format!("{err:#}")),

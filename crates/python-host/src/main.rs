@@ -26,6 +26,11 @@ const VERSION: &str = env!("HERMES_PYTHON_VERSION");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // In the package this executable is `sys.executable`, so a plugin's multiprocessing workers
+    // start it the way they would start Python: interpreter flags, then `-c <code>`.
+    if let Some((code, rest)) = python_command(&args) {
+        std::process::exit(run_code(code, rest));
+    }
     let code = match args.first().map(String::as_str) {
         Some("--version") => version(),
         Some("serve") if args.len() >= 2 => serve(Path::new(&args[1]), args.get(2).map(PathBuf::from)),
@@ -126,6 +131,50 @@ def run(path):
     Python::attach(|py| -> PyResult<i32> {
         let module = PyModule::from_code(py, code, c"hermes_run.py", c"hermes_run")?;
         module.getattr("run")?.call1((script.to_string_lossy(),))?.extract()
+    }).unwrap_or_else(|error| { eprintln!("{error}"); 1 })
+}
+
+/// `[flags…] -c <code> [args…]`, as multiprocessing's spawn and resource tracker run Python.
+fn python_command(args: &[String]) -> Option<(&str, &[String])> {
+    let mut index = 0;
+    while let Some(flag) = args.get(index).filter(|arg| arg.starts_with('-') && *arg != "-c") {
+        // Only interpreter flags may come first; `-X` and `-W` take a value.
+        if !flag.bytes().skip(1).all(|b| b.is_ascii_alphabetic()) { return None; }
+        index += if matches!(flag.as_str(), "-X" | "-W") { 2 } else { 1 };
+    }
+    (args.get(index)? == "-c").then(|| Some((args.get(index + 1)?.as_str(), &args[index + 2..])))?
+}
+
+fn run_code(source: &str, rest: &[String]) -> i32 {
+    start();
+    let code = c"
+import sys, traceback
+def run(source, rest):
+    sys.argv = ['-c', *rest]
+    # A worker inherits the host's stdout, which carries the protocol: its prints go to stderr.
+    sys.stdout = sys.stderr
+    namespace = {'__name__': '__main__'}
+    try:
+        exec(compile(source, '<string>', 'exec'), namespace)
+        return 0
+    except SystemExit as stop:
+        if stop.code is None or isinstance(stop.code, int):
+            return stop.code or 0
+        print(stop.code, file=sys.stderr)
+        return 1
+    except BaseException:
+        traceback.print_exc()
+        return 1
+    finally:
+        # A helper such as multiprocessing's resource tracker may have closed its streams.
+        try:
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+";
+    Python::attach(|py| -> PyResult<i32> {
+        let module = PyModule::from_code(py, code, c"hermes_run_code.py", c"hermes_run_code")?;
+        module.getattr("run")?.call1((source, rest.to_vec()))?.extract()
     }).unwrap_or_else(|error| { eprintln!("{error}"); 1 })
 }
 

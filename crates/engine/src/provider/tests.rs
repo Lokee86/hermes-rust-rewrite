@@ -832,3 +832,41 @@ fn responses_calls_meet_the_same_contract_as_other_protocols() {
     let broken = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{"}}"#;
     assert!(finish(&[broken, completed]).is_err());
 }
+
+#[test]
+fn a_responses_refusal_is_shown_as_the_answer() {
+    let mut stream = ResponsesStream::default();
+    let mut shown = String::new();
+    let mut emit = |text: &str| { shown.push_str(text); Ok(()) };
+    for event in [r#"{"type":"response.refusal.delta","delta":"I can't help with that."}"#, r#"{"type":"response.completed","response":{}}"#] {
+        stream.accept(event, &mut emit).unwrap();
+    }
+    assert!(stream.finish().is_ok(), "a refusal is a usable answer");
+    assert_eq!(shown, "I can't help with that.");
+}
+
+#[tokio::test]
+async fn a_managed_sign_in_is_renewed_before_every_model_request() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let router = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap| {
+        let recorded = recorded.clone();
+        async move {
+            recorded.lock().unwrap().push(headers["authorization"].to_str().unwrap().to_owned());
+            sse(OPENAI_TEXT)
+        }
+    }));
+    let (base, server) = serve(router).await;
+    let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = renewals.clone();
+    let renew: Renew = Arc::new(move || {
+        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move { Ok(format!("token-{n}")) })
+    });
+    let provider = Provider::new(config(format!("{base}/v1"))).unwrap().with_renewal(Some(renew));
+    for _ in 0..2 {
+        provider.stream_with_tools(user_messages(), &[], |_| Ok(())).await.unwrap();
+    }
+    assert_eq!(*seen.lock().unwrap(), ["Bearer token-1", "Bearer token-2"]);
+    server.abort();
+}

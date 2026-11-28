@@ -250,8 +250,10 @@ fn install_checkout(
         save(root, &list)?;
     }
     let target = dir(root).join(&entry.name);
-    // Package generations stay available to workers that already loaded them.
-    if let Err(error) = remove_dir(&target) {
+    // Package generations stay available to workers that already loaded them. The new copy is
+    // complete before the working one is touched: a full disk or a permissions error leaves the
+    // installed plugin as it was.
+    if let Err(error) = replace_tree(source, &target) {
         if was_enabled {
             for plugin in list.iter_mut().filter(|plugin| plugin.name == entry.name) { plugin.enabled = true; }
             save(root, &list)?;
@@ -261,7 +263,6 @@ fn install_checkout(
     if list.iter().any(|plugin| plugin.name == entry.name) {
         crate::settings::ProfileSettings::invalidate_plugin_memory(root, &entry.name)?;
     }
-    copy_tree(source, &target)?;
     let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
     crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
     let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
@@ -398,6 +399,41 @@ pub fn remove_dir(path: &Path) -> Result<()> {
             Err(error) => return Err(error).with_context(|| format!("Could not remove {}. Close anything that uses it and try again", path.display())),
         }
     }
+}
+
+/// Put a copy of `source` at `target`, keeping whatever was there until the copy is whole. The
+/// staging names start with a dot, which no plugin name does.
+fn replace_tree(source: &Path, target: &Path) -> Result<()> {
+    let name = target.file_name().context("Invalid plugin folder")?.to_string_lossy().into_owned();
+    let parent = target.parent().context("Invalid plugin folder")?;
+    let (incoming, retired) = (parent.join(format!(".{name}.incoming")), parent.join(format!(".{name}.retired")));
+    remove_dir(&incoming)?;
+    remove_dir(&retired)?;
+    if let Err(error) = copy_tree(source, &incoming) {
+        let _ = remove_dir(&incoming);
+        return Err(error.context("Could not copy the plugin update; the installed version is unchanged"));
+    }
+    let had_previous = target.exists();
+    // Windows refuses while the stopping plugin still holds its files, as `remove_dir` allows for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if cfg!(windows) { 20 } else { 0 });
+    let moved = loop {
+        match fs::rename(target, &retired) {
+            Err(_) if had_previous && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            result => break result,
+        }
+    };
+    if had_previous && let Err(error) = moved {
+        let _ = remove_dir(&incoming);
+        return Err(anyhow::Error::new(error).context(format!("Could not replace {}. Close anything that uses it and try again", target.display())));
+    }
+    if let Err(error) = fs::rename(&incoming, target) {
+        if had_previous { let _ = fs::rename(&retired, target); }
+        let _ = remove_dir(&incoming);
+        return Err(anyhow::Error::new(error).context("Could not publish the plugin update; the installed version is unchanged"));
+    }
+    // The old copy is gone from its name already; removing its files can wait for Windows to let go.
+    let _ = remove_dir(&retired);
+    Ok(())
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -544,6 +580,21 @@ fn read_package(root: &Path) -> Result<Package> {
     Ok(Package { name, version: manifest["version"].as_str().unwrap_or_default().to_owned(), description: manifest["description"].as_str().unwrap_or_default().to_owned(), skills, servers, python_dependencies: vec![] })
 }
 
+/// The server's usual prefix, unless an earlier server already has it: two plugins may both name a
+/// server `github`, and the name is cut to 20 characters. A taken prefix gets a suffix from the
+/// plugin and server names, so every tool name reaches the server that offered it.
+fn unique_prefix(taken: &mut std::collections::BTreeSet<String>, plugin: &str, server: &str) -> String {
+    let usual = prefix(server);
+    if taken.insert(usual.clone()) {
+        return usual;
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, format!("{plugin}/{server}").as_bytes());
+    let suffix: String = digest.as_ref().iter().take(3).map(|byte| format!("{byte:02x}")).collect();
+    let unique = format!("{usual}_{suffix}");
+    taken.insert(unique.clone());
+    unique
+}
+
 fn prefix(server: &str) -> String {
     let clean: String = server.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).take(20).collect();
     format!("mcp_{clean}")
@@ -557,6 +608,7 @@ async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
 /// Connect Agent Plugins v1 servers. Embedded Python has its own profile-owned activation.
 async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
     let (mut live, mut errors) = (vec![], vec![]);
+    let mut prefixes = std::collections::BTreeSet::new();
     for plugin in installed(root).unwrap_or_default().into_iter().filter(|p| p.enabled && !p.servers.is_empty() && !p.servers.iter().any(|kind| kind == "python") && valid_name(&p.name)) {
         let plugin_root = dir(root).join(&plugin.name);
         let data = root.join("plugin-data").join(&plugin.name);
@@ -571,11 +623,12 @@ async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
         };
         let config_env: Vec<(String, String)> = defaults.iter().map(|f| (format!("PLUGIN_CONFIG_{}", f.key.to_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_")), setting(&f.key))).collect();
         for (name, server) in package.servers {
+            let prefix = unique_prefix(&mut prefixes, &plugin.name, &name);
             let connected = match server {
                 Server::Http { url, headers } => {
                     let (url, headers) = (expand(&url), headers.into_iter().map(|(k, v)| (k, expand(&v))).collect());
                     let token = crate::mcp_oauth::token(&data, &name).await.ok().flatten();
-                    let result = Mcp::connect_http(&url, token, headers, &prefix(&name)).await;
+                    let result = Mcp::connect_http(&url, token, headers, &prefix).await;
                     if let Err(e) = &result && format!("{e:#}").contains("401") { errors.push(format!("{} › {name}: needs sign-in (Capabilities › Plugins › Sign in)", plugin.title)); continue }
                     result
                 }
@@ -589,7 +642,7 @@ async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
                     env.extend(config_env.iter().cloned());
                     env.push(("PLUGIN_ROOT".into(), plugin_root.to_string_lossy().into_owned()));
                     env.push(("PLUGIN_DATA".into(), data.to_string_lossy().into_owned()));
-                    Mcp::connect_stdio(Stdio { command, args: args.iter().map(|a| expand(a)).collect(), env, cwd }, &prefix(&name)).await
+                    Mcp::connect_stdio(Stdio { command, args: args.iter().map(|a| expand(a)).collect(), env, cwd }, &prefix).await
                 }
             };
             match connected { Ok(mcp) => live.push(mcp), Err(e) => errors.push(format!("{} › {name}: {e:#}", plugin.title)) }
@@ -633,6 +686,40 @@ mod tests {
         let get = |key: &str| env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!((get("HERMES_HOME"), get("HERMES_PROFILE_NAME")), (Some("/p"), Some("work")));
         assert_eq!(get("PLUGIN_SETTING"), Some("1"));
+    }
+
+    #[test]
+    fn servers_from_two_plugins_never_share_a_tool_prefix() {
+        let mut taken = std::collections::BTreeSet::new();
+        let first = unique_prefix(&mut taken, "issues", "github");
+        let second = unique_prefix(&mut taken, "reviews", "github");
+        let long = unique_prefix(&mut taken, "a", "a-very-long-server-name-one");
+        let truncated = unique_prefix(&mut taken, "b", "a-very-long-server-name-two");
+        assert_eq!(first, "mcp_github", "the first keeps the usual name");
+        assert_ne!(first, second);
+        assert_ne!(long, truncated, "names cut to the same 20 characters still differ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_update_copy_leaves_the_installed_plugin_working() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (installed, update) = (dir.path().join("plugins/notes"), dir.path().join("update"));
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("plugin.json"), "working").unwrap();
+        fs::create_dir(&update).unwrap();
+        fs::write(update.join("plugin.json"), "new").unwrap();
+        fs::write(update.join("unreadable.py"), "x").unwrap();
+        fs::set_permissions(update.join("unreadable.py"), fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(replace_tree(&update, &installed).is_err());
+        assert_eq!(fs::read_to_string(installed.join("plugin.json")).unwrap(), "working");
+        assert_eq!(fs::read_dir(dir.path().join("plugins")).unwrap().count(), 1, "no staging copy is left");
+
+        fs::set_permissions(update.join("unreadable.py"), fs::Permissions::from_mode(0o644)).unwrap();
+        replace_tree(&update, &installed).unwrap();
+        assert_eq!(fs::read_to_string(installed.join("plugin.json")).unwrap(), "new");
+        assert_eq!(fs::read_dir(dir.path().join("plugins")).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
