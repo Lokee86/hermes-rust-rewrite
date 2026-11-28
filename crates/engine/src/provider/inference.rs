@@ -245,16 +245,6 @@ impl Provider {
                         .filter(|item| item["type"] == "function_call");
                     let Some(call) = calls.next() else {
                         ensure!(output.calls.is_empty(), "Missing structured tool call item");
-                        if text.is_empty() {
-                            text = output
-                                .response_items
-                                .iter()
-                                .filter_map(|item| item["content"].as_array())
-                                .flatten()
-                                .filter(|item| item["type"] == "output_text")
-                                .filter_map(|item| item["text"].as_str())
-                                .collect();
-                        }
                         return serde_json::from_str(&text)
                             .context("Invalid terminal tool-job JSON");
                     };

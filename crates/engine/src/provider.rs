@@ -1157,7 +1157,22 @@ impl ResponsesStream {
                 self.calls.push(ToolCall { id: item["call_id"].as_str().unwrap_or_default().to_owned(),
                     name: item["name"].as_str().unwrap_or_default().to_owned(), arguments: item["arguments"].as_str().unwrap_or("{}").to_owned() });
             }
-            "response.completed" | "response.done" => { self.done = true; return Ok(true); }
+            "response.completed" | "response.done" => {
+                // Structured Responses can carry the final answer only in the retained items.
+                if self.keep_items && self.content_bytes == 0 {
+                    let text = self.items.iter()
+                        .filter(|item| item["type"] == "message")
+                        .filter_map(|item| item["content"].as_array())
+                        .flatten()
+                        .filter(|part| part["type"] == "output_text")
+                        .filter_map(|part| part["text"].as_str());
+                    for part in text {
+                        emit_text(&mut self.content_bytes, part, emit)?;
+                    }
+                }
+                self.done = true;
+                return Ok(true);
+            }
             "response.failed" | "error" | "response.error" => {
                 let error = event.pointer("/response/error").or(event.get("error")).unwrap_or(&event);
                 bail!("{}", provider_error(error));
