@@ -126,6 +126,11 @@ fn decode(response: &Value, previous: Option<&Tokens>) -> Result<Tokens> {
     Ok(token)
 }
 
+/// A current Portal access token, refreshed when near expiry.
+pub(crate) async fn access_token() -> Result<String> {
+    Ok(credentials().await?.access_token)
+}
+
 async fn credentials() -> Result<Tokens> {
     let path = store_path()?;
     let _guard = lock(&path).await?;

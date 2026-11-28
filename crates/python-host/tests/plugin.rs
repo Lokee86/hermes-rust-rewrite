@@ -208,9 +208,12 @@ def register(host):
     host.register_memory_provider(FixtureMemory())
     host.register_memory_observer(None)
     if hasattr(host, "llm"):
-        profile_activations += 1
         host.register_command("session-source", lambda raw, source: source.session_id)
-        host.on_unload(lambda: Path(host.get_config("trace")).write_text(str(profile_activations)))
+        def unloaded():
+            global profile_activations
+            profile_activations += 1
+            Path(host.get_config("trace")).write_text(str(profile_activations))
+        host.on_unload(unloaded)
 "#;
 
 fn launch_plugin(src: &str, allow_services: bool) -> (tempfile::TempDir, Host) {
@@ -299,4 +302,66 @@ async def register(host):
     assert_eq!(reply["id"], 1);
     assert_eq!(reply["result"], "answer");
     host.expect_exit();
+}
+
+#[test]
+fn a_memory_provider_built_with_the_model_services_opens_for_each_session() {
+    let (_dir, mut host) = launch_plugin(r#"
+class Memory:
+    name = "Uses services"
+    def __init__(self, llm):
+        self.llm = llm
+    def initialize(self, session_id, **kwargs):
+        self.session_id = session_id
+    def prefetch(self, query):
+        return {"results": []}
+
+def register(host):
+    host.register_memory_provider(Memory(host.llm))
+"#, true);
+    for session_id in ["a", "b"] {
+        let opened = host.request("hermes/memory.open", json!({"session_id": session_id}));
+        assert_eq!(opened["result"]["available"], true, "{opened}");
+    }
+}
+
+#[test]
+fn async_callbacks_share_one_event_loop() {
+    let (_dir, mut host) = launch_plugin(r#"
+import asyncio
+first = None
+async def same_loop(args, **_):
+    global first
+    loop = asyncio.get_running_loop()
+    if first is None:
+        first = loop
+    return {"same": first is loop}
+def register(ctx):
+    ctx.register_tool("same_loop", "loop", {"name": "same_loop", "description": "", "parameters": {"type": "object"}}, same_loop, is_async=True)
+"#, false);
+    host.request("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let text = |reply: &Value| reply["result"]["content"][0]["text"].as_str().unwrap().to_owned();
+    for _ in 0..2 {
+        let reply = host.request("tools/call", json!({"name": "same_loop", "arguments": {}}));
+        assert_eq!(text(&reply), r#"{"same": true}"#, "{reply}");
+    }
+}
+
+// Windows is not covered yet: its spawned worker does not answer in CI, and the cause is unknown.
+#[cfg(unix)]
+#[test]
+fn a_plugin_can_start_a_spawned_worker_process() {
+    let (_dir, mut host) = launch_plugin(r#"
+import multiprocessing, os
+def start_worker(args, **_):
+    worker = multiprocessing.get_context("spawn").Process(target=os.getpid)
+    worker.start()
+    worker.join(60)
+    return {"exitcode": worker.exitcode}
+def register(ctx):
+    ctx.register_tool("start_worker", "workers", {"name": "start_worker", "description": "", "parameters": {"type": "object"}}, start_worker)
+"#, false);
+    host.request("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let reply = host.request("tools/call", json!({"name": "start_worker", "arguments": {}}));
+    assert_eq!(reply["result"]["content"][0]["text"].as_str(), Some(r#"{"exitcode": 0}"#), "{reply}");
 }

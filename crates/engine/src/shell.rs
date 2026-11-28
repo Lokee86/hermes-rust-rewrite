@@ -374,11 +374,30 @@ impl Command {
     }
 }
 
-// Retain complete streams until redaction. A fixed raw tail can expose a
-// credential that starts outside the retained region, including URL credentials.
+/// Far more than the few thousand characters returned, so redaction still sees whole lines.
+const RETAINED: usize = 1024 * 1024;
+
+// Retain a generous tail until redaction, not the whole stream: a large log must not exhaust
+// memory. A credential cut by the start of the tail would escape redaction, so once anything was
+// dropped the partial first line goes too.
 async fn read(mut reader: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
-    reader.read_to_end(&mut output).await?;
+    let mut chunk = vec![0; 64 * 1024];
+    let mut dropped = false;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 { break; }
+        output.extend_from_slice(&chunk[..read]);
+        if output.len() > 2 * RETAINED {
+            output.drain(..output.len() - RETAINED);
+            dropped = true;
+        }
+    }
+    if dropped {
+        if output.len() > RETAINED { output.drain(..output.len() - RETAINED); }
+        let line = output.iter().position(|byte| *byte == b'\n').map_or(output.len(), |end| end + 1);
+        output.drain(..line);
+    }
     Ok(output)
 }
 
@@ -398,6 +417,20 @@ fn output_tail(bytes: &[u8], protected: &[&str], limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_large_stream_keeps_a_bounded_tail_of_whole_lines() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"token=start-of-a-secret-that-spans");
+        while stream.len() < 5 * RETAINED { stream.extend_from_slice(b"log line\n"); }
+        stream.extend_from_slice(b"last line\n");
+        let kept = read(stream.as_slice()).await.unwrap();
+        assert!(kept.len() <= RETAINED, "{}", kept.len());
+        assert!(kept.starts_with(b"log line\n"), "the cut first line is dropped");
+        assert!(kept.ends_with(b"last line\n"));
+        let small = read(&b"short output"[..]).await.unwrap();
+        assert_eq!(small, b"short output", "a stream that fits is kept whole");
+    }
 
     #[test]
     fn rejects_empty_and_nul_input() {

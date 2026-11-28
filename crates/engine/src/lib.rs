@@ -295,16 +295,31 @@ impl Session {
         if let Some(memory) = &mut self.memory { memory.reset_turn(); }
         let model = config.model.clone();
         let index = self.history.turns.len();
-        let context = if self.input != SessionInput::Native { String::new() } else { references::expand(&prompt, self.tools.workspace_root()).await };
-        self.history.turns.push(Turn { context, prompt, model, attachments, entries:vec![], status:Status::Running });
+        // Expanding references can fetch several slow links: Stop must not wait for them.
+        let context = if self.input != SessionInput::Native { Some(String::new()) } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                context = references::expand(&prompt, self.tools.workspace_root()) => Some(context),
+            }
+        };
+        let stopped = context.is_none();
+        self.history.turns.push(Turn { context: context.unwrap_or_default(), prompt, model, attachments, entries:vec![], status:Status::Running });
         self.publish(&events)?;
+        if stopped {
+            self.history.turns[index].status = Status::Interrupted;
+            if save_terminal { self.publish(&events)?; }
+            return Ok(());
+        }
         let status = tokio::select! {
             biased;
             _ = cancel.cancelled() => Status::Interrupted,
             result = async {
+                let original = config.clone();
                 let config = Provider::resolve_config(config).await?;
                 self.history.turns[index].model = config.model.clone();
-                self.run_model(index, &Provider::new_with_options(config,options)?, python_memory, &events, &cancel, &controls).await
+                let provider = Provider::new_with_options(config,options)?.renewing(&original);
+                self.run_model(index, &provider, python_memory, &events, &cancel, &controls).await
             } => match result {
                 Ok(()) => Status::Complete,
                 Err(err) => Status::Failed(format!("{err:#}")),

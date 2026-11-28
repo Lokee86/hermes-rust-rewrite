@@ -352,6 +352,10 @@ impl Store {
             .is_none_or(|run| run.cancel_requested))
     }
     pub fn claim_due(&self, now: DateTime<Utc>) -> Result<Vec<Claim>> {
+        self.claim_due_matching(now, |_| true)
+    }
+    /// Claim only the due jobs `eligible` accepts: without a usable model, script-only jobs still run.
+    pub fn claim_due_matching(&self, now: DateTime<Utc>, eligible: impl Fn(&Job) -> bool) -> Result<Vec<Claim>> {
         if !self.owns_scheduler() {
             return Ok(Vec::new());
         }
@@ -369,11 +373,18 @@ impl Store {
         self.transaction(|document| {
             let mut claims = Vec::new();
             let already_running = document.runs.iter().filter(|run| run.status.live()).count();
-            for index in 0..document.jobs.len() {
+            // Longest-waiting first: in creation order, two jobs that overrun their intervals would
+            // take both slots every time and starve a later job.
+            let mut order: Vec<usize> = (0..document.jobs.len()).collect();
+            order.sort_by_key(|&index| document.jobs[index].next_run_at.as_deref().and_then(|value| instant(value).ok()));
+            for index in order {
                 if claims.len() + already_running >= 2 {
                     break;
                 }
                 let job = &document.jobs[index];
+                if !eligible(job) {
+                    continue;
+                }
                 if !job.enabled
                     || job.paused_at.is_some()
                     || exhausted(job)
@@ -588,8 +599,9 @@ fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result
         .repeat
         .filter(|times| *times > 0)
         .or_else(|| schedule.is_once().then_some(1));
+    // A one-shot names an absolute instant, so its timezone alone does not move it.
     let changed = previous.is_none_or(|job| {
-        !same_timing(&job.schedule, &schedule) || job.timezone() != draft.timezone
+        !same_timing(&job.schedule, &schedule) || (!schedule.is_once() && job.timezone() != draft.timezone)
     });
     // A one-shot given a new time is a new occurrence, so its single run is owed again.
     let completed = previous
@@ -642,7 +654,9 @@ fn build(mut draft: Draft, now: DateTime<Utc>, previous: Option<&Job>) -> Result
         definition_revision: previous.map_or(1, |job| job.definition_revision + 1),
         extra,
     };
-    if exhausted(&job) {
+    // An enabled job with nowhere to run next has finished: a one-shot skipped outside its
+    // catch-up window keeps no count, and renaming it must not leave it "scheduled" forever.
+    if exhausted(&job) || (job.enabled && job.next_run_at.is_none()) {
         job.enabled = false;
         job.state = "completed".into();
         job.next_run_at = None;
@@ -737,6 +751,11 @@ fn settle(job: &mut Job, run: &mut Run, now: DateTime<Utc>) {
         .into(),
     );
     job.last_error = run.error.clone();
+    // A run of a definition the user has since edited (a one-shot moved to a new time) must not
+    // finish the new occurrence or count against it.
+    if job.schedule.is_once() && run.definition_revision != job.definition_revision {
+        return;
+    }
     if !run.manual && !run.repeat_counted {
         job.repeat.completed = job.repeat.completed.saturating_add(1);
         run.repeat_counted = true;
@@ -746,7 +765,7 @@ fn settle(job: &mut Job, run: &mut Run, now: DateTime<Utc>) {
         job.next_run_at = None;
         job.state = "completed".into();
     } else if !job.enabled {
-        job.state = "paused".into();
+        // Paused or finished already says why it is off; a manual extra run changes neither.
     } else {
         job.state = if run.status == RunStatus::Failed {
             "error"
@@ -864,6 +883,96 @@ mod gateway_recovery_tests {
         assert!(restarted.bind_gateway_session(&claim.run.id, "other").is_err());
         restarted.finish(&claims[0], Outcome::Completed { output: "done".into() }, now).unwrap();
         assert!(restarted.gateway_claims().unwrap().is_empty());
+    }
+
+    fn one_shot(store: &Store, at: DateTime<Utc>, now: DateTime<Utc>) -> Job {
+        store.create(Draft { prompt: "remind me".into(), schedule: stamp(at), ..Default::default() }, now).unwrap()
+    }
+    fn job(store: &Store, id: &str) -> Job { store.jobs().unwrap().into_iter().find(|job| job.id == id).unwrap() }
+
+    #[test]
+    fn one_shot_edits_keep_pauses_and_new_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let now = Utc::now();
+        let at = now + Duration::minutes(5);
+        let later = at + Duration::days(1);
+
+        // 41: moved to a new time while its old occurrence runs.
+        let moved = one_shot(&store, at, now);
+        let claim = store.claim_due(at).unwrap().remove(0);
+        store.begin(&claim, at).unwrap();
+        let mut draft = job(&store, &moved.id).draft();
+        draft.schedule = stamp(later);
+        store.update(&moved.id, draft, at).unwrap();
+        store.finish(&claim, Outcome::Completed { output: "done".into() }, at).unwrap();
+        let after = job(&store, &moved.id);
+        assert_eq!((after.enabled, after.next_run_at.clone()), (true, Some(stamp(later))), "the new occurrence survives");
+
+        // 43: paused while it ran, then given a new time.
+        let paused = one_shot(&store, at, now);
+        let claim = store.claim_due(at).unwrap().into_iter().find(|c| c.job.id == paused.id).unwrap();
+        store.begin(&claim, at).unwrap();
+        store.pause(&paused.id, at).unwrap();
+        store.finish(&claim, Outcome::Completed { output: "done".into() }, at).unwrap();
+        let mut draft = job(&store, &paused.id).draft();
+        draft.schedule = stamp(later);
+        let edited = store.update(&paused.id, draft, at).unwrap();
+        assert!(!edited.enabled && edited.next_run_at.is_none(), "the pause holds");
+
+        // 44: an extra manual run of a finished one-shot, then a new time.
+        let finished = one_shot(&store, at, now);
+        let claim = store.claim_due(at).unwrap().into_iter().find(|c| c.job.id == finished.id).unwrap();
+        store.begin(&claim, at).unwrap();
+        store.finish(&claim, Outcome::Completed { output: "done".into() }, at).unwrap();
+        let extra = store.claim_now(&finished.id, at).unwrap();
+        store.begin(&extra, at).unwrap();
+        store.finish(&extra, Outcome::Completed { output: "again".into() }, at).unwrap();
+        assert_eq!(job(&store, &finished.id).state, "completed", "a manual run does not pause it");
+        let mut draft = job(&store, &finished.id).draft();
+        draft.schedule = stamp(later);
+        assert!(store.update(&finished.id, draft, at).unwrap().enabled, "it can be rescheduled");
+
+        // 57: a finished one-shot whose timezone alone changes, well after it ran.
+        let done = one_shot(&store, at, now);
+        let claim = store.claim_due(at).unwrap().into_iter().find(|c| c.job.id == done.id).unwrap();
+        store.begin(&claim, at).unwrap();
+        store.finish(&claim, Outcome::Completed { output: "done".into() }, at).unwrap();
+        let mut draft = job(&store, &done.id).draft();
+        draft.timezone = "America/New_York".into();
+        let kept = store.update(&done.id, draft, later).unwrap();
+        assert_eq!(kept.state, "completed");
+    }
+
+    #[test]
+    fn a_skipped_one_shot_stays_finished_when_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let now = Utc::now();
+        let at = now + Duration::minutes(5);
+        let missed = one_shot(&store, at, now);
+        assert!(store.claim_due(at + Duration::hours(3)).unwrap().is_empty(), "outside the catch-up window");
+        let mut draft = job(&store, &missed.id).draft();
+        draft.name = "Renamed".into();
+        let renamed = store.update(&missed.id, draft, at + Duration::hours(3)).unwrap();
+        assert_eq!((renamed.enabled, renamed.state.as_str(), renamed.next_run_at), (false, "completed", None));
+    }
+
+    #[test]
+    fn the_longest_waiting_due_job_is_claimed_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let now = Utc::now();
+        let jobs: Vec<_> = (0..3).map(|n| store.create(Draft { prompt: format!("job {n}"), schedule: "every 1m".into(), catch_up: Some(true), ..Default::default() }, now).unwrap()).collect();
+        // The third job has waited longest.
+        for (job, minutes) in jobs.iter().zip([1, 1, 30]) {
+            store.transaction(|document| {
+                find(document, &job.id)?.next_run_at = Some(stamp(now - Duration::minutes(minutes)));
+                Ok(())
+            }).unwrap();
+        }
+        let claimed: Vec<_> = store.claim_due(now).unwrap().into_iter().map(|claim| claim.job.id).collect();
+        assert!(claimed.contains(&jobs[2].id), "{claimed:?}");
     }
 
     #[test]

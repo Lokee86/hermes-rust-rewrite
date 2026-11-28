@@ -125,16 +125,21 @@ impl Library {
         ensure!(profile.is_dir(), "No such profile");
         // The database and its companions may change while tar reads them, so a copy goes instead.
         let copy = profile.join(EXPORTED_DATABASE);
-        let _ = fs::remove_file(&copy);
-        hermes_engine::db::snapshot(&profile, &copy)?;
-        // The archive holds the profile's chats and settings: tar fills a private file, which then
-        // takes the chosen name.
-        let parent = dest.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        let archive = tempfile::NamedTempFile::new_in(parent).context("Could not write the profile archive")?.into_temp_path();
-        let status = Command::new("tar").arg("--exclude=mercury.db*").arg("-czf").arg(&archive).arg("-C").arg(self.profiles_dir()).arg(name).status();
-        let _ = fs::remove_file(&copy);
-        let status = status.context("tar is not available")?;
-        ensure!(status.success(), "Could not write the profile archive");
+        // The profile's catalog stays locked from the snapshot until tar has read every chat
+        // folder: a chat deleted in between would leave a catalog entry with no folder, which the
+        // restored profile refuses to open.
+        let archive = Library::open(&profile)?.holding_catalog(|| {
+            let _ = fs::remove_file(&copy);
+            hermes_engine::db::snapshot(&profile, &copy)?;
+            // The archive holds the profile's chats and settings: tar fills a private file, which
+            // then takes the chosen name.
+            let parent = dest.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let archive = tempfile::NamedTempFile::new_in(parent).context("Could not write the profile archive")?.into_temp_path();
+            let status = Command::new("tar").arg("--exclude=mercury.db*").arg("-czf").arg(&archive).arg("-C").arg(self.profiles_dir()).arg(name).status();
+            let _ = fs::remove_file(&copy);
+            ensure!(status.context("tar is not available")?.success(), "Could not write the profile archive");
+            Ok(archive)
+        })?;
         archive.persist(dest).context("Could not write the profile archive")?;
         Ok(())
     }
@@ -149,6 +154,12 @@ impl Library {
         let [name] = tops.as_slice() else { bail!("A profile archive holds exactly one profile folder") };
         ensure!(valid_name(name), "The archive's profile name is not valid");
         ensure!(!entries.lines().any(|l| l.starts_with('/') || l.split('/').any(|p| p == "..")), "The archive has unsafe paths");
+        // Hard links are refused from the listing, which every platform's tar can report: Windows
+        // offers no stable link count to check after unpacking.
+        let verbose = Command::new("tar").arg("-tvzf").arg(archive).output().context("tar is not available")?;
+        ensure!(verbose.status.success(), "That file is not a profile archive");
+        ensure!(!String::from_utf8_lossy(&verbose.stdout).lines().any(|l| l.contains(" link to ")),
+            "The archive holds hard links, which a profile archive never does");
         ensure!(!self.profiles_dir().join(name).exists(), "A profile named {name} already exists");
         ensure!(!self.bots()?.iter().any(|bot| bot.name == *name), "A bot with that name already exists");
         self.ensure_profiles_dir()?;
@@ -159,12 +170,16 @@ impl Library {
         let status = Command::new("tar").arg("-xzf").arg(archive).arg("-C").arg(staging.path()).status()?;
         ensure!(status.success(), "Could not unpack the profile archive");
         let unpacked = staging.path().join(name);
+        ensure!(fs::symlink_metadata(&unpacked)?.is_dir(), "A profile archive holds one profile folder, not a file");
+        // An export keeps workspace links such as npm's executable links. Followed, one could reach
+        // outside the profile, so they are left out; npm recreates them.
+        drop_links(&unpacked)?;
         ensure!(only_folders_and_files(&unpacked)?, "The archive holds links, which a profile archive never does");
-        let profile = self.profiles_dir().join(name);
-        fs::rename(&unpacked, &profile).context("Could not add the imported profile")?;
-        let copy = profile.join(EXPORTED_DATABASE);
+        // The profile is finished in staging, so a failure leaves no half-imported profile blocking
+        // a retry under the same name.
+        let copy = unpacked.join(EXPORTED_DATABASE);
         if copy.is_file() {
-            let database = profile.join(hermes_engine::db::FILE);
+            let database = unpacked.join(hermes_engine::db::FILE);
             fs::rename(copy, &database)?;
             // An archive from an earlier version stored the copy readable by everyone.
             #[cfg(unix)]
@@ -173,8 +188,24 @@ impl Library {
                 fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
             }
         }
+        let profile = self.profiles_dir().join(name);
+        fs::rename(&unpacked, &profile).context("Could not add the imported profile")?;
         Ok(name.to_string())
     }
+}
+
+/// Remove every symbolic link in the tree without following any.
+fn drop_links(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            fs::remove_file(entry.path()).or_else(|_| fs::remove_dir(entry.path()))?;
+        } else if kind.is_dir() {
+            drop_links(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether the tree holds only folders and files with no other names: a symbolic link, or a file
@@ -280,6 +311,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_exported_profile_with_workspace_links_imports_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let profile = library.create_profile("work").unwrap();
+        let bin = profile.path.join("workspace/node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("../tool.js"), "run").unwrap();
+        std::os::unix::fs::symlink("../tool.js", bin.join("tool")).unwrap();
+        let archive = dir.path().join("work.tar.gz");
+        library.export_profile("work", &archive).unwrap();
+        library.delete_profile("work").unwrap();
+        assert_eq!(library.import_profile(&archive).unwrap(), "work");
+        let restored = library.profile_path("work").unwrap();
+        assert_eq!(fs::read_to_string(restored.join("workspace/node_modules/tool.js")).unwrap(), "run");
+        assert!(fs::symlink_metadata(restored.join("workspace/node_modules/.bin/tool")).is_err());
+    }
+
+    #[test]
+    fn a_single_file_archive_reserves_no_profile_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        fs::write(staging.path().join("lonely"), "not a profile").unwrap();
+        let archive = dir.path().join("lonely.tar.gz");
+        assert!(Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(staging.path()).arg("lonely").status().unwrap().success());
+        assert!(library.import_profile(&archive).is_err());
+        assert!(fs::symlink_metadata(library.profile_path("lonely").unwrap()).is_err());
+        library.create_profile("lonely").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn an_archive_with_links_is_refused_and_leaves_outside_files_alone() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -304,13 +367,18 @@ mod tests {
             fs::write(profile.join("notes.md"), "x").unwrap();
             fs::hard_link(profile.join("notes.md"), profile.join("SOUL.md")).unwrap();
         });
-        for (archive, name) in [(symlinked, "symlinked"), (hard_linked, "hard-linked")] {
-            assert!(library.import_profile(&archive).is_err(), "{name}");
-            assert!(!library.profile_path(name).unwrap().exists(), "{name}");
+        // Symbolic links are left out of the imported profile; hard links refuse the archive.
+        assert_eq!(library.import_profile(&symlinked).unwrap(), "symlinked");
+        let imported = library.profile_path("symlinked").unwrap();
+        for name in ["SOUL.md", EXPORTED_DATABASE, hermes_engine::db::FILE] {
+            assert!(fs::symlink_metadata(imported.join(name)).is_err(), "{name} is not imported as a link");
         }
+        assert!(library.import_profile(&hard_linked).is_err());
+        assert!(!library.profile_path("hard-linked").unwrap().exists());
         assert_eq!(fs::metadata(&outside).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
         let names: Vec<_> = library.profiles().unwrap().into_iter().map(|p| p.name).collect();
-        assert_eq!(names, ["default"]);
-        assert_eq!(fs::read_dir(library.root().join("profiles")).unwrap().count(), 0, "no staging left behind");
+        assert_eq!(names, ["default", "symlinked"]);
+        assert_eq!(fs::read_dir(library.root().join("profiles")).unwrap().count(), 1, "no staging left behind");
     }
 }

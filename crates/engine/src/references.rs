@@ -76,14 +76,37 @@ fn expand_file(r: &Reference, workspace: &Path) -> Result<String, String> {
     let path = resolve(workspace, &target)?;
     if !path.is_file() { return Err("path is not a file".into()); }
     let size = path.metadata().map_err(|e| e.to_string())?.len();
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    if bytes.iter().take(8192).any(|b| *b == 0) { return Ok(format!("📄 {} (binary file, {size} bytes — not inlined; use the file tools)", r.raw)); }
+    // Look before reading: a large log or binary must not be loaded whole just to be refused.
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut head = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&file, 8192), &mut head).map_err(|e| e.to_string())?;
+    if head.contains(&0) { return Ok(format!("📄 {} (binary file, {size} bytes — not inlined; use the file tools)", r.raw)); }
     if size > MAX_FILE_BYTES && start.is_none() { return Ok(format!("📄 {} (~{} tokens — too large to inline; read it with the file tools)", r.raw, size / 4)); }
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.trim_start_matches('\u{feff}');
     let body = match start {
-        Some(a) => text.lines().enumerate().skip(a.saturating_sub(1)).take(end.unwrap_or(a).saturating_sub(a) + 1).map(|(i, l)| format!("{:>5} {l}", i + 1)).collect::<Vec<_>>().join("\n"),
-        None => text.to_owned(),
+        // A range reads only up to its last line, and inlines at most the size limit.
+        Some(a) => {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(std::fs::File::open(&path).map_err(|e| e.to_string())?);
+            let (first, last) = (a.max(1), end.unwrap_or(a).max(a.max(1)));
+            let (mut lines, mut kept, mut line, mut number) = (Vec::new(), 0u64, Vec::new(), 0);
+            while number < last && kept <= MAX_FILE_BYTES {
+                line.clear();
+                if reader.read_until(b'\n', &mut line).map_err(|e| e.to_string())? == 0 { break; }
+                number += 1;
+                if number >= first {
+                    let text = String::from_utf8_lossy(&line);
+                    let text = text.trim_end_matches(['\n', '\r']);
+                    let text = if number == 1 { text.trim_start_matches('\u{feff}') } else { text };
+                    kept += text.len() as u64;
+                    lines.push(format!("{:>5} {text}", number));
+                }
+            }
+            lines.join("\n")
+        }
+        None => {
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').to_owned()
+        }
     };
     Ok(format!("📄 {} ({} tokens)\n```{}\n{body}\n```", r.raw, tokens(&body), fence(&path)))
 }
@@ -240,6 +263,19 @@ pub async fn expand(prompt: &str, workspace: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_file_is_refused_whole_and_read_by_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = String::from("\u{feff}first line\r\nsecond line\n");
+        while big.len() < 2 * MAX_FILE_BYTES as usize { big.push_str("filler line\n"); }
+        std::fs::write(dir.path().join("app.log"), &big).unwrap();
+        let reference = |value: &str| Reference { raw: format!("@file:{value}"), kind: "file".into(), value: value.into() };
+        assert!(expand_file(&reference("app.log"), dir.path()).unwrap().contains("too large to inline"));
+        let lines = expand_file(&reference("app.log:1-2"), dir.path()).unwrap();
+        assert!(lines.contains("    1 first line\n    2 second line"), "{lines}");
+        assert!(!lines.contains("filler"));
+    }
     #[test]
     fn parses_the_hermes_reference_grammar() {
         let refs = parse("look at @file:src/main.rs:10-20, @folder:docs and @diff; also @git:3 @url:https://example.com/a. not me@file:x");
