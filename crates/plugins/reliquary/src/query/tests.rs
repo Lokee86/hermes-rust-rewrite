@@ -57,9 +57,23 @@ async fn native_query_returns_one_owner_qualified_ranking_and_fences_a_phy_switc
                 json!({"version":1,"approved":approved}).to_string()},"finish_reason":"stop"}]}),
             )
         };
+        let embeddings = |Json(request): Json<Value>| async move {
+            let data = request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    json!({"index": index, "embedding": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]})
+                })
+                .collect::<Vec<_>>();
+            Json(json!({"model": request["model"], "data": data}))
+        };
         axum::serve(
             listener,
-            Router::new().route("/v1/chat/completions", post(decision)),
+            Router::new()
+                .route("/v1/chat/completions", post(decision))
+                .route("/v1/embeddings", post(embeddings)),
         )
         .await
         .unwrap();

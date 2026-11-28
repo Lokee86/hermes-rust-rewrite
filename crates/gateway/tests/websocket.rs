@@ -1067,14 +1067,20 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let [support] = expected["evidence"].as_array().unwrap().as_slice() else {
         panic!("expected one exact supporting Memory citation: {expected}");
     };
-    let support_memory_id: String = support["source"]["Memory"].as_array().unwrap().iter()
-        .map(|byte| format!("{:02x}", byte.as_u64().unwrap())).collect();
+    let hex_id = |value: &Value| -> String {
+        value.as_array().unwrap().iter()
+            .map(|byte| format!("{:02x}", byte.as_u64().unwrap())).collect()
+    };
+    let support_memory_id = hex_id(&support["source"]["Memory"]);
+    let support_owner_id = hex_id(&support["owner_id"]);
     let control = lexical["memories"].as_array().unwrap().iter()
-        .find(|row| row["id"] == support_memory_id).unwrap();
+        .find(|row| row["reference"]["memory_id"] == support_memory_id
+            && row["reference"]["owner_id"] == support_owner_id)
+        .unwrap_or_else(|| panic!("expected the cited Memory in {lexical}"));
     assert_eq!(control["content"], PROJECT_FACT);
     assert_eq!(support["owner_id"], citation["owner_id"]);
     assert_eq!(support["history_generation"], citation["history_generation"]);
-    assert_eq!(support["revision"], control["revision"]);
+    assert_eq!(support["revision"], control["reference"]["revision"]);
     assert_eq!(support["field"], "Content");
     assert_eq!(support["start_byte"], 0);
     assert_eq!(support["end_byte"], PROJECT_FACT.len());
