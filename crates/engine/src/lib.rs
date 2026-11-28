@@ -136,6 +136,12 @@ impl Session {
         Ok(registry.controls())
     }
     pub fn process_controls(&self) -> Option<ProcessControls> { self.processes.as_ref().map(|registry| registry.controls()) }
+    fn delegates(&self) -> bool { !self.child && self.input == SessionInput::Native }
+    /// A delegated child of a parent that runs commands gets its own registry: builds and tests are
+    /// most of what delegated coding work needs. Its jobs end with the child.
+    pub(crate) fn enable_child_processes(&mut self) {
+        self.processes = Some(processes::Registry::new(self.tools.workspace_root(), &self.directory));
+    }
     /// Release jobs launched by an abandoned turn, without touching earlier jobs.
     pub async fn release_abandoned_turn(&self, turn: usize) -> Result<usize> {
         match &self.processes { Some(registry) => registry.controls().release_turn(turn).await, None => Ok(0) }
@@ -352,7 +358,9 @@ impl Session {
         let mut specs = Vec::new();
         if allow_tools {
             specs = tools::tool_specs();
-            if !self.child { specs.push(subagents::spec()); }
+            // A child turn runs as a native session, so it cannot carry a channel's approval,
+            // skill and memory limits: only native turns delegate.
+            if self.delegates() { specs.push(subagents::spec()); }
             if let Some(spec) = self.memory.as_ref().and_then(|memory| memory.tool_spec()) { specs.push(spec); }
             for server in &mcp {
                 specs.extend(server.specs().into_iter().filter(|spec| {
@@ -586,9 +594,9 @@ impl Session {
                         python_results.push((self.history.turns[index].entries.len(), content));
                     }
                     (approved, summary)
-                } else if call.name == "delegate_task" && !self.child {
+                } else if call.name == "delegate_task" && self.delegates() {
                     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                    let value = subagents::delegate(&args, provider.config().clone(), provider.options().clone(), &self.profile_root, self.tools.workspace_root(), self.native_enrolled, runtime.as_ref().expect("tool execution has a plugin runtime").clone(), events, cancel.clone()).await;
+                    let value = subagents::delegate(&args, provider.config().clone(), provider.options().clone(), &self.profile_root, self.tools.workspace_root(), self.native_enrolled, self.processes.is_some(), runtime.as_ref().expect("tool execution has a plugin runtime").clone(), events, cancel.clone()).await;
                     (true, value.to_string())
                 } else { handle_tool(&call, index, events, &self.tools, self.processes.as_mut(), self.memory.as_mut(), &mut mcp, &self.settings,&self.profile_root).await? };
                 let result = if approved { plugin_hooks::after_tool_call(&mut mcp, &call, result).await } else { result };

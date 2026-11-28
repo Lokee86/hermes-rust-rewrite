@@ -248,7 +248,11 @@ impl Library {
                         private_directory(&queue)?;
                         write_blob(&queue, blob, &blob.path)?;
                     } else if blob.path == "conversation.json" {
-                        hermes_engine::restore_conversation(&directory, serde_json::from_slice(&decode(blob)?)?)?;
+                        // Admission receipts belong to the gateway that accepted the work. Kept,
+                        // a queued one would make this gateway run the prompt at its next start.
+                        let mut saved: serde_json::Value = serde_json::from_slice(&decode(blob)?)?;
+                        if let Some(record) = saved.as_object_mut() { record.remove("authority"); }
+                        hermes_engine::restore_conversation(&directory, saved)?;
                     } else {
                         write_blob(&directory, blob, &blob.path)?;
                     }
@@ -612,6 +616,31 @@ mod tests {
             let session = hermes_engine::Session::open(&chat.directory).unwrap();
             assert!(session.history().turns[0].prompt.starts_with("Saved conversation"));
         }
+    }
+
+    #[test]
+    fn a_restored_chat_carries_no_queued_work_for_this_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Library::open(dir.path().join("source")).unwrap();
+        let chat = source.create_session(None, Some("Queued")).unwrap();
+        let mut history = History::default();
+        history.turns.push(hermes_engine::Turn {
+            prompt: "Earlier turn".into(), context: String::new(), attachments: vec![],
+            model: "fixture".into(), entries: vec![], status: hermes_engine::Status::Complete,
+        });
+        let mut saved = serde_json::to_value(&history).unwrap();
+        saved["authority"] = serde_json::json!({"receipts":[{"input_id":"queued-1","status":"queued","prompt":"delete everything"}]});
+        hermes_engine::restore_conversation(&chat.directory, saved).unwrap();
+        assert!(hermes_engine::read_conversation(&chat.directory).unwrap().1.is_some());
+        let archive = dir.path().join("backup.hermes-native.json");
+        source.export_native_backup(&archive).unwrap();
+        let target = Library::open(dir.path().join("target")).unwrap();
+        target.import_native_backup(&inspect_native_backup(&archive).unwrap()).unwrap();
+        let restored = target.list_sessions(&SessionQuery::default()).unwrap();
+        assert_eq!(restored.len(), 1);
+        let (history, authority) = hermes_engine::read_conversation(&restored[0].directory).unwrap();
+        assert_eq!(history.turns[0].prompt, "Earlier turn", "the conversation itself is restored");
+        assert!(authority.is_none(), "no admission receipt survives the restore");
     }
 
     #[cfg(unix)]

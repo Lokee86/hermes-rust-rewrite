@@ -769,11 +769,12 @@ impl Shared {
             RpcError::internal(error)
         })?;
         let mut settings = Settings::read(&dir).map_err(RpcError::internal)?;
-        let workspace = self
-            .library
-            .workspace_for_session(id)
-            .map_err(RpcError::internal)?
-            .or_else(|| settings.cwd.clone());
+        // A scheduled job names its own working directory; a project the chat belongs to must not
+        // move its tools somewhere else.
+        let workspace = match settings.cwd.clone().filter(|_| settings.source == "scheduled") {
+            Some(cwd) => Some(cwd),
+            None => self.library.workspace_for_session(id).map_err(RpcError::internal)?.or_else(|| settings.cwd.clone()),
+        };
         let actual_workspace = workspace.clone().unwrap_or_else(|| dir.join("workspace"));
         let profile = match summary.bot.as_deref() {
             Some(name) if !name.starts_with("group:") => self.library.bot_profile(name).map_err(RpcError::internal)?,

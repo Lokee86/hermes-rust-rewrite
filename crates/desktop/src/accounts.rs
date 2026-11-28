@@ -55,7 +55,7 @@ pub(super) fn update(app: &mut Hermes, action: Action) -> Task<Message> {
             app.config = Config { base_url: provider.base_url.into(), model: provider.default_model.into(), api_key: String::new() };
             app.models.selected_endpoint = None; app.models.endpoint_name = provider.name.into();
             app.models.invalidate(); app.models.load_options(&app.config);
-            if let Err(e) = super::Preferences::save(&app.config) { app.accounts.error = Some(e); return Task::none(); }
+            if let Err(e) = super::Preferences::save(&app.config, None) { app.accounts.error = Some(e); return Task::none(); }
             app.accounts.notice = Some(format!("Chats now use {} · {}.", provider.name, provider.default_model));
         }
         Action::Use(_) => {}

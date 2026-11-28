@@ -45,10 +45,11 @@ pub(super) fn start(shared: Arc<Shared>, store: Store) -> JoinHandle<()> {
 async fn session_for(shared: &Arc<Shared>, store: &Store, claim: &Claim, workspace: &Path, model: &str) -> Result<Arc<LiveSession>> {
     let _guard = shared.creates.lock().await;
     let id = if let Some(id) = &claim.run.gateway_session { id.clone() } else {
-        let summary = shared.library.create_session(None, None)?;
-        shared.library.rename_session(&summary.id, &format!("Run · {}", claim.job.title()))?;
+        // A background chat: it never takes over the user's open "New chat" or the profile's
+        // default project, and a retry after a crash finds the same chat by its run.
         let settings = Settings { source: "scheduled".into(), cwd: Some(workspace.to_owned()), model: Some(model.to_owned()), ..Default::default() };
-        settings.save(&summary.directory)?;
+        let summary = shared.library.create_background_session(&format!("Run · {}", claim.job.title()), &format!("scheduled-run:{}", claim.run.id),
+            |summary| settings.save(&summary.directory))?;
         store.bind_gateway_session(&claim.run.id, &summary.id)?;
         summary.id
     };
@@ -316,6 +317,29 @@ mod tests {
         store.begin(&claim, chrono::Utc::now()).unwrap();
         let claim = store.gateway_claims().unwrap().into_iter().find(|saved| saved.run.id == claim.run.id).unwrap();
         (claim, session)
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_keeps_its_own_folder_and_leaves_the_users_new_chat_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, job_folder) = (dir.path().join("project-a"), dir.path().join("job-b"));
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&job_folder).unwrap();
+        fs::write(dir.path().join("agent-settings.json"), serde_json::json!({"default_directory": project}).to_string()).unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let blank = library.create_session(None, None).unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let (claim, session) = bound_claim_for(&gateway, cron::Draft {
+            prompt: "scheduled".into(), workdir: Some(job_folder.clone()), paused: true, ..Default::default()
+        }).await;
+        let run_chat = claim.run.gateway_session.clone().unwrap();
+        assert_ne!(run_chat, blank.id, "the run has a chat of its own");
+        assert_eq!(library.active_session().unwrap().map(|s| s.id), Some(blank.id.clone()), "the user's selection is unchanged");
+        assert_eq!(library.session(&blank.id).unwrap().title, "New chat");
+        assert_eq!(library.session(&run_chat).unwrap().project_id, None, "not filed under the default project");
+        assert_eq!(gateway.shared.library.workspace_for_session(&run_chat).unwrap(), None);
+        assert_eq!(session.settings.lock().unwrap().cwd.as_deref(), Some(job_folder.canonicalize().unwrap().as_path()));
+        server.abort();
     }
 
     async fn wait_for_receipt(shared: &Shared, session: &LiveSession, input: &str, status: &str) {

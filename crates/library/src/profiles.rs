@@ -118,6 +118,9 @@ impl Library {
     /// A `.tar.gz` of one named profile (its sessions, memory, settings, keys).
     pub fn export_profile(&self, name: &str, dest: &Path) -> Result<()> {
         ensure!(name != "default", "Back up the default profile from Settings › Backup");
+        // Exports share one database copy inside the profile: another export could remove it while
+        // this one archives it, leaving an archive with no chats that still reports success.
+        let _lock = self.lock_profiles()?;
         let profile = self.profile_path(name)?;
         ensure!(profile.is_dir(), "No such profile");
         // The database and its companions may change while tar reads them, so a copy goes instead.
@@ -253,6 +256,26 @@ mod tests {
         library.import_profile(&old).unwrap();
         assert_eq!(mode(&library.profile_path("old").unwrap().join(hermes_engine::db::FILE)), 0o600);
         assert!(hermes_engine::db::open_existing(&library.profile_path("old").unwrap()).unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_exports_each_hold_the_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        library.create_profile("work").unwrap();
+        Library::open(library.profile_path("work").unwrap()).unwrap().create_session(None, Some("Kept chat")).unwrap();
+        let archives: Vec<_> = (0..6).map(|i| dir.path().join(format!("work-{i}.tar.gz"))).collect();
+        std::thread::scope(|scope| {
+            for archive in &archives {
+                let root = dir.path();
+                scope.spawn(move || Library::open(root).unwrap().export_profile("work", archive).unwrap());
+            }
+        });
+        for archive in &archives {
+            let listing = Command::new("tar").arg("-tzf").arg(archive).output().unwrap();
+            let entries = String::from_utf8_lossy(&listing.stdout);
+            assert!(entries.lines().any(|l| l.trim_start_matches("./") == format!("work/{EXPORTED_DATABASE}")), "{}: {entries}", archive.display());
+        }
     }
 
     #[cfg(unix)]

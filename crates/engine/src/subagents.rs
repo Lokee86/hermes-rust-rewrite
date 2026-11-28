@@ -35,11 +35,11 @@ fn now() -> i64 { chrono::Utc::now().timestamp() }
 /// Run the delegation and return the JSON result for the parent model.
 /// Boxed with an explicit `Send` bound: a child turn can reach this tool again
 /// (it does not, children never get it), and the erased type breaks that cycle.
-pub(crate) fn delegate<'a>(args: &'a Value, config: Config, options: crate::models::GenerationOptions, profile_root: &'a Path, workspace: &'a Path, native_enrolled: bool,
+pub(crate) fn delegate<'a>(args: &'a Value, config: Config, options: crate::models::GenerationOptions, profile_root: &'a Path, workspace: &'a Path, native_enrolled: bool, processes: bool,
     runtime: Arc<crate::plugins::PluginRuntime>, events: &'a Sender<Event>, cancel: CancellationToken) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
-    Box::pin(delegate_inner(args, config, options, profile_root, workspace, native_enrolled, runtime, events, cancel))
+    Box::pin(delegate_inner(args, config, options, profile_root, workspace, native_enrolled, processes, runtime, events, cancel))
 }
-async fn delegate_inner(args: &Value, config: Config, options: crate::models::GenerationOptions, profile_root: &Path, workspace: &Path, native_enrolled: bool,
+async fn delegate_inner(args: &Value, config: Config, options: crate::models::GenerationOptions, profile_root: &Path, workspace: &Path, native_enrolled: bool, processes: bool,
     runtime: Arc<crate::plugins::PluginRuntime>, events: &Sender<Event>, cancel: CancellationToken) -> Value {
     let tasks: Vec<(String, String)> = args["tasks"].as_array().into_iter().flatten()
         .filter_map(|t| Some((t["goal"].as_str()?.trim().to_owned(), t["context"].as_str().unwrap_or_default().trim().to_owned())))
@@ -59,7 +59,7 @@ async fn delegate_inner(args: &Value, config: Config, options: crate::models::Ge
         let runtime = runtime.clone();
         async move {
             let _permit = semaphore.acquire().await;
-            run_child(goal, context, progress, config, options, profile_root, workspace, native_enrolled, runtime, events, cancel).await;
+            run_child(goal, context, progress, config, options, profile_root, workspace, native_enrolled, processes, runtime, events, cancel).await;
         }
     });
     futures_util::future::join_all(runs).await;
@@ -88,13 +88,14 @@ fn uuid_like() -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_child(goal: String, context: String, progress: &mut Progress, config: Config, options: crate::models::GenerationOptions, profile_root: &Path, workspace: &Path, native_enrolled: bool,
+async fn run_child(goal: String, context: String, progress: &mut Progress, config: Config, options: crate::models::GenerationOptions, profile_root: &Path, workspace: &Path, native_enrolled: bool, processes: bool,
     runtime: Arc<crate::plugins::PluginRuntime>, events: &Sender<Event>, cancel: CancellationToken) {
     let fail = |p: &mut Progress, why: String| { p.status = "failed".into(); p.summary = Some(why); p.updated_at = now(); };
     if let Err(e) = std::fs::create_dir_all(&progress.session_dir) { fail(progress, e.to_string()); let _ = events.send(Event::Subagent(progress.clone())).await; return; }
     let mut child = match Session::open_for_profile_with_enrollment(&progress.session_dir, Some(workspace), profile_root, native_enrolled) { Ok(s) => s, Err(e) => { fail(progress, format!("{e:#}")); let _ = events.send(Event::Subagent(progress.clone())).await; return; } };
     child.set_plugin_runtime(runtime);
     child.child = true;
+    if processes { child.enable_child_processes(); }
     progress.status = "running".into(); progress.updated_at = now();
     let _ = events.send(Event::Subagent(progress.clone())).await;
     let prompt = child_prompt(&goal, &context);
