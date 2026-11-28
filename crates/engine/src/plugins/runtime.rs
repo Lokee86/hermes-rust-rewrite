@@ -290,7 +290,10 @@ impl PluginRuntime {
 
     pub(crate) async fn tool_connections(&self) -> (Vec<Mcp>, Vec<String>) {
         let candidates = self.reconcile().await;
-        let (mut live, mut errors) = connect_mcp(&self.root).await;
+        // Python plugin tools keep their prefix (a running worker cannot be renamed), so servers
+        // avoid it: no two tools may share a name.
+        let reserved = candidates.iter().filter(|candidate| candidate.activation.is_some()).map(|candidate| prefix(&candidate.installed.name)).collect();
+        let (mut live, mut errors) = connect_mcp(&self.root, reserved).await;
         for candidate in candidates {
             let Some(slot) = candidate.activation else { continue };
             match slot.open(self).await {
@@ -469,6 +472,7 @@ impl Activation {
             &data,
             &packages,
             &self.key.env,
+            (&runtime.root, &runtime.name),
             &prefix(&self.id),
         )
         .await?;

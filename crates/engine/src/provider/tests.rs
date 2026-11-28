@@ -859,3 +859,73 @@ async fn structured_responses_tool_retains_reasoning_and_correlates_local_result
     assert_eq!(result, json!({"ok":true}));
     server.abort();
 }
+
+#[test]
+fn responses_calls_meet_the_same_contract_as_other_protocols() {
+    let call = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{}"}}"#;
+    let completed = r#"{"type":"response.completed","response":{}}"#;
+    let finish = |events: &[&str]| {
+        let mut stream = ResponsesStream::default();
+        let mut emit = |_: &str| Ok(());
+        for event in events {
+            stream.accept(event, &mut emit).unwrap();
+        }
+        stream.finish()
+    };
+    assert!(finish(&[call, completed]).is_ok());
+    assert!(finish(&[call, call, completed]).is_err(), "duplicate call IDs");
+    assert!(finish(&[completed]).is_err(), "no text and no calls");
+    let unnamed = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"","arguments":"{}"}}"#;
+    assert!(finish(&[unnamed, completed]).is_err());
+    let broken = r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read_file","arguments":"{"}}"#;
+    assert!(finish(&[broken, completed]).is_err());
+}
+
+#[test]
+fn a_responses_refusal_is_shown_as_the_answer() {
+    let mut stream = ResponsesStream::default();
+    let mut shown = String::new();
+    let mut emit = |text: &str| { shown.push_str(text); Ok(()) };
+    for event in [r#"{"type":"response.refusal.delta","delta":"I can't help with that."}"#, r#"{"type":"response.completed","response":{}}"#] {
+        stream.accept(event, &mut emit).unwrap();
+    }
+    assert!(stream.finish().is_ok(), "a refusal is a usable answer");
+    assert_eq!(shown, "I can't help with that.");
+}
+
+#[tokio::test]
+async fn a_managed_sign_in_is_renewed_before_every_model_request() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let router = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap| {
+        let recorded = recorded.clone();
+        async move {
+            recorded.lock().unwrap().push(headers["authorization"].to_str().unwrap().to_owned());
+            sse(OPENAI_TEXT)
+        }
+    }));
+    let (base, server) = serve(router).await;
+    let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = renewals.clone();
+    let renew: Renew = Arc::new(move || {
+        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move { Ok(format!("token-{n}")) })
+    });
+    let provider = Provider::new(config(format!("{base}/v1"))).unwrap().with_renewal(Some(renew));
+    for _ in 0..2 {
+        provider.stream_with_tools(user_messages(), &[], |_| Ok(())).await.unwrap();
+    }
+    assert_eq!(*seen.lock().unwrap(), ["Bearer token-1", "Bearer token-2"]);
+    server.abort();
+}
+
+#[test]
+fn work_started_from_a_managed_turn_resolves_its_sign_in_again() {
+    let account = crate::accounts::CATALOG.iter().find(|a| crate::accounts::for_base_url(a.base_url).is_some()).unwrap();
+    let original = Config { base_url: account.base_url.into(), model: "m".into(), api_key: String::new() };
+    let resolved = Config { api_key: "resolved-fixture-token".into(), ..original.clone() };
+    let provider = Provider::new(resolved.clone()).unwrap().renewing(&original);
+    assert!(provider.turn_config().api_key.is_empty(), "a delegated child renews the sign-in, not the parent's token");
+    let explicit = Provider::new(resolved.clone()).unwrap().renewing(&resolved);
+    assert_eq!(explicit.turn_config().api_key, "resolved-fixture-token", "an explicit key is passed on");
+}

@@ -24,8 +24,35 @@ def load(plugin_dir, name):
         qualified, os.path.join(plugin_dir, "__init__.py"), submodule_search_locations=[plugin_dir])
     module = importlib.util.module_from_spec(spec)
     sys.modules[qualified] = module
+    # Worker processes the plugin starts import its functions by this name.
+    os.environ["HERMES_PLUGIN_FOLDER"], os.environ["HERMES_PLUGIN_MODULE"] = plugin_dir, name
     spec.loader.exec_module(module)
     return module
+
+
+class _PluginFinder:
+    """In a worker process: finds the plugin's module when a task names one of its functions.
+    Found on demand, after multiprocessing has given the worker the plugin's import path."""
+
+    def __init__(self, folder, name):
+        self._folder, self._qualified = folder, f"hermes_plugins.{name}"
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != self._qualified:
+            return None
+        return importlib.util.spec_from_file_location(
+            fullname, os.path.join(self._folder, "__init__.py"), submodule_search_locations=[self._folder])
+
+
+def expose_plugin_to_worker():
+    folder, name = os.environ.get("HERMES_PLUGIN_FOLDER"), os.environ.get("HERMES_PLUGIN_MODULE")
+    if not folder or not name:
+        return
+    if "hermes_plugins" not in sys.modules:
+        namespace = types.ModuleType("hermes_plugins")
+        namespace.__path__ = []
+        sys.modules["hermes_plugins"] = namespace
+    sys.meta_path.append(_PluginFinder(folder, name))
 
 
 def _accepted(fn, args, kwargs):
@@ -40,10 +67,26 @@ def _accepted(fn, args, kwargs):
     return {k: v for k, v in kwargs.items() if k not in bound and (any_keyword or k in names)}
 
 
+_loop = None
+_loop_lock = threading.Lock()
+
+
+def _plugin_loop():
+    """One event loop for the plugin's life: a client made in one callback stays usable in the next.
+    A fresh asyncio.run() per callback would close the loop such a client is bound to."""
+    global _loop
+    with _loop_lock:
+        if _loop is None:
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, name="plugin-event-loop", daemon=True).start()
+            _loop = loop
+        return _loop
+
+
 def call(fn, args, kwargs, running=None):
     result = fn(*args, **_accepted(fn, args, kwargs))
     if inspect.isawaitable(result):
-        result = asyncio.run(_wait(result, running))
+        result = asyncio.run_coroutine_threadsafe(_wait(result, running), _plugin_loop()).result()
     return result
 
 
@@ -129,6 +172,9 @@ class _ProviderCollector:
         self.plugin_id = host.plugin_id
         self.get_config = host.get_config
         self.provider = None
+        # A provider built during registration may keep the model services it was given.
+        if hasattr(host, "llm"):
+            self.llm = host.llm
 
     def register_memory_provider(self, provider):
         self.provider = provider

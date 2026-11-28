@@ -51,6 +51,13 @@ impl<'de> Deserialize<'de> for Token {
     }
 }
 
+/// Telegram measures message length in UTF-16 code units, so an emoji counts twice.
+pub const MAX_TEXT_UNITS: usize = 4096;
+
+pub fn text_units(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     Invalid,
@@ -370,7 +377,7 @@ impl Client {
         if user_id <= 0 {
             return Err(Error::invalid("Invalid Telegram direct chat ID"));
         }
-        if text.trim().is_empty() || text.chars().count() > 4096 {
+        if text.trim().is_empty() || text_units(text) > MAX_TEXT_UNITS {
             return Err(Error::invalid("Enter a reply of 1–4096 characters"));
         }
         let result = self

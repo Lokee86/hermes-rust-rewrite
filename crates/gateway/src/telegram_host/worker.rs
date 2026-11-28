@@ -3,7 +3,8 @@ mod tests;
 
 use super::super::{LiveSession, Settings, Shared, TELEGRAM_ROUTE_PREFIX, TELEGRAM_SOURCE, lock};
 use hermes_telegram::{
-    Client, DeliveryOutcome, ErrorKind, Identity, Store, Token, TurnOutcome, Work, WorkStage,
+    Client, DeliveryOutcome, ErrorKind, Identity, MAX_TEXT_UNITS, Store, Token, TurnOutcome, Work,
+    WorkStage, text_units,
 };
 use std::{
     sync::{Arc, Weak},
@@ -194,8 +195,12 @@ impl Connector {
                     .await;
             }
         };
-        let input = submission_key(self.bot.id, work.update_id);
-        let receipt = match owner.submission_receipt(&session, &input) {
+        let input = submission_key(self.bot.id, work.update_id, &work.message);
+        // A turn submitted before message identities were part of the key keeps its old key.
+        let receipt = owner.submission_receipt(&session, &input).or_else(|| {
+            (work.stage == WorkStage::TurnUnknown).then(|| owner.submission_receipt(&session, &legacy_submission_key(self.bot.id, work.update_id))).flatten()
+        });
+        let receipt = match receipt {
             Some(receipt) => receipt,
             None if work.stage == WorkStage::TurnUnknown => {
                 return self
@@ -209,7 +214,10 @@ impl Connector {
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(error) if error.data["reason"] == "shutdown" => return Ok(()),
+                    // Nothing was admitted: a fault the owner can fix (storage, a restart, a settings
+                    // change) leaves the message to be submitted again, not discarded.
+                    Err(error) if matches!(error.data["reason"].as_str(),
+                        Some("shutdown" | "internal_error" | "owner_changed" | "revision_conflict")) => return Ok(()),
                     Err(error) if error.data["reason"] == "admission_conflict" => {
                         return self
                             .record_turn(work.update_id, TurnOutcome::Blocked("admission_conflict"))
@@ -381,7 +389,10 @@ enum Route {
     Blocked,
 }
 
-pub(crate) fn submission_key(bot: i64, update: i64) -> String {
+pub(crate) fn submission_key(bot: i64, update: i64, message: &str) -> String {
+    format!("telegram:{bot}:{update}:{message}")
+}
+pub(crate) fn legacy_submission_key(bot: i64, update: i64) -> String {
     format!("telegram:{bot}:{update}")
 }
 
@@ -390,14 +401,18 @@ fn reply_text(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    const MAX_REPLY_CHARS: usize = 4096;
-    const SUFFIX: &str = "\n… [truncated]";
-    if text.chars().count() <= MAX_REPLY_CHARS {
+    if text_units(text) <= MAX_TEXT_UNITS {
         return Some(text.to_owned());
     }
+    const SUFFIX: &str = "\n… [truncated]";
+    let budget = MAX_TEXT_UNITS - text_units(SUFFIX);
+    let mut used = 0;
     let mut reply: String = text
         .chars()
-        .take(MAX_REPLY_CHARS - SUFFIX.chars().count())
+        .take_while(|c| {
+            used += c.len_utf16();
+            used <= budget
+        })
         .collect();
     reply.push_str(SUFFIX);
     Some(reply)

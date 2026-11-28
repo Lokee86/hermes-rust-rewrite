@@ -193,17 +193,29 @@ impl Log {
         }
     }
 
-    fn snapshot(&self, from: u64) -> (Value, u64) {
+    /// While the process runs, a character split across reads stays for the
+    /// next poll so incremental output never shows a replacement character.
+    fn snapshot(&self, from: u64, running: bool) -> (Value, u64) {
         let start = self.end - self.bytes as u64;
+        let held = match self.chunks.back() {
+            Some((_, last)) if running => incomplete_tail(last),
+            _ => 0,
+        };
+        let end = self.end - held as u64;
         let mut skip = from.saturating_sub(start) as usize;
+        let mut remaining = end.saturating_sub(from.max(start)) as usize;
         let (mut combined, mut stdout, mut stderr) = (Vec::new(), Vec::new(), Vec::new());
         for (is_error, bytes) in &self.chunks {
+            if remaining == 0 {
+                break;
+            }
             if skip >= bytes.len() {
                 skip -= bytes.len();
                 continue;
             }
-            let data = &bytes[skip..];
+            let data = &bytes[skip..bytes.len().min(skip + remaining)];
             skip = 0;
+            remaining -= data.len();
             combined.extend_from_slice(data);
             if *is_error {
                 stderr.extend_from_slice(data);
@@ -214,9 +226,27 @@ impl Log {
         (
             json!({"output":String::from_utf8_lossy(&combined),"stdout":String::from_utf8_lossy(&stdout),
             "stderr":String::from_utf8_lossy(&stderr),"truncated":from < start}),
-            self.end,
+            end.max(from),
         )
     }
+}
+
+/// Bytes at the end that begin a UTF-8 sequence the read has not finished.
+fn incomplete_tail(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let needed = match byte {
+            0xF0.. => 4,
+            0xE0.. => 3,
+            0xC0.. => 2,
+            _ => 1,
+        };
+        return if needed > back { back } else { 0 };
+    }
+    0
 }
 
 async fn drain(
@@ -311,7 +341,7 @@ impl Job {
                 },
             };
             if background {
-                let (mut saved, _) = reader_log.lock().expect("process log").snapshot(0);
+                let (mut saved, _) = reader_log.lock().expect("process log").snapshot(0, false);
                 saved["session_id"] = json!(receipt.id);
                 saved["status"] = json!("exited");
                 saved["exit_code"] = json!(exit.code);
@@ -356,7 +386,8 @@ impl Job {
 
     fn result(&mut self, incremental: bool) -> Value {
         let start = if incremental { self.cursor } else { 0 };
-        let (mut data, end) = self.log.lock().expect("process log").snapshot(start);
+        let running = self.done.borrow().is_none();
+        let (mut data, end) = self.log.lock().expect("process log").snapshot(start, running);
         if incremental {
             self.cursor = end;
         }
@@ -376,6 +407,8 @@ impl Job {
 }
 
 /// Owned by the gateway's engine session, scoped before a model can select a job.
+pub(crate) type Terminals = Option<(crate::herdr::Core, String)>;
+
 pub(crate) struct Registry {
     jobs: VecDeque<Job>,
     controls: ProcessControls,
@@ -428,6 +461,15 @@ impl Registry {
             cwd: workspace.into(),
             env,
         }
+    }
+
+    /// The terminal service binding a delegated child shares, so its PTYs belong to the parent's
+    /// conversation like the parent's own.
+    pub(crate) fn terminals(&self) -> Terminals { self.pty_owner.clone() }
+    pub(crate) fn with_terminals(mut self, terminals: Terminals) -> Self {
+        self.pty_owner = terminals;
+        self.controls.owner.clone_from(&self.pty_owner);
+        self
     }
 
     pub fn bind_terminals(&mut self, profile: &Path, conversation: &str) -> Result<()> {
@@ -802,6 +844,37 @@ fn load_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delegated_child_shares_its_parents_terminal_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = Registry::new(dir.path(), dir.path());
+        parent.bind_terminals(dir.path(), "conversation-1").unwrap();
+        let child = Registry::new(dir.path(), &dir.path().join("child")).with_terminals(parent.terminals());
+        assert_eq!(child.terminals().map(|(_, conversation)| conversation).as_deref(), Some("conversation-1"));
+        assert!(child.controls().owner.is_some(), "PTY launches have an owner");
+    }
+
+    #[test]
+    fn incremental_output_never_splits_a_character_between_polls() {
+        let mut log = Log::default();
+        let text = "héllo 😀".as_bytes();
+        let split = text.len() - 2;
+        log.push(false, &text[..split]);
+        let (first, cursor) = log.snapshot(0, true);
+        log.push(false, &text[split..]);
+        let (second, _) = log.snapshot(cursor, true);
+        let joined = format!(
+            "{}{}",
+            first["output"].as_str().unwrap(),
+            second["output"].as_str().unwrap()
+        );
+        assert_eq!(joined, "héllo 😀");
+        // A finished process reports every byte it wrote.
+        let mut ended = Log::default();
+        ended.push(false, &text[..split]);
+        assert_eq!(ended.snapshot(0, false).1, split as u64);
+    }
 
     async fn call(r: &mut Registry, name: &str, args: Value) -> Result<Value> {
         static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

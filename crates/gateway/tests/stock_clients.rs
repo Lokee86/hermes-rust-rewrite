@@ -547,6 +547,30 @@ async fn native_password_pkce_has_one_time_codes_and_distinct_refresh_credential
         rotate(refresh).send().await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
+    // A refresh retires the access token it replaces.
+    assert_eq!(
+        profile(bearer).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // A long-lived client that renews many times never fills the sign-in table.
+    let mut current = renewed["refresh_token"].as_str().unwrap().to_owned();
+    for _ in 0..600 {
+        let response = rotate(&current).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        current = value(response).await["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    }
+    let last = value(rotate(&current).send().await.unwrap()).await;
+    assert_eq!(
+        profile(last["access_token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     gateway.shutdown().await.unwrap();
 }
 

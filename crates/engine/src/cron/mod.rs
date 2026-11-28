@@ -72,13 +72,14 @@ fn local() -> String {
     "local".into()
 }
 impl Job {
+    /// At most 180 bytes: chat titles built from it ("Run · …") must fit their 200-character limit,
+    /// or every attempt to open the run's chat fails while the run stays live.
     pub fn title(&self) -> &str {
-        if self.name.trim().is_empty() {
-            &self.prompt
-        } else {
-            &self.name
-        }
+        let title = if self.name.trim().is_empty() { &self.prompt } else { &self.name };
+        &title[..title.floor_char_boundary(180)]
     }
+    /// A script-only job: it runs no model.
+    pub fn no_agent(&self) -> bool { script::no_agent(self) }
     pub fn timezone(&self) -> &str {
         self.timezone.as_deref().unwrap_or("UTC")
     }
@@ -100,7 +101,9 @@ impl Job {
             deliver: self.deliver.clone(),
             catch_up: self.catch_up,
             grace_minutes: self.grace_minutes,
-            paused: !self.enabled,
+            // A job that has finished is off but not paused: editing it may give it a new time.
+            // A pause made while a one-shot ran still holds once the run completes it.
+            paused: self.paused_at.is_some() || (!self.enabled && self.state != "completed"),
             script: script::field(self, "script").unwrap_or_default().into(),
             no_agent: script::no_agent(self),
             monitor: script::field(self, "monitor_script").or(script::field(self, "monitor_url")).unwrap_or_default().into(),

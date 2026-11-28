@@ -529,6 +529,13 @@ impl Library {
         }
     }
 
+    /// Run `f` while no one can change this library's catalog.
+    pub(crate) fn holding_catalog<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(self.root.join("library.lock"))?;
+        lock.lock_exclusive().context("Could not lock the native conversation catalog")?;
+        f()
+    }
+
     fn with_catalog<T>(&self, save: bool, f: impl FnOnce(&mut Catalog) -> Result<T>) -> Result<T> {
         let lock = OpenOptions::new()
             .create(true)

@@ -68,18 +68,21 @@ fn command(path: &Path) -> Result<Vec<OsString>> {
     })
 }
 
-async fn read(stream: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
-    let mut kept = Vec::new();
-    let Some(mut stream) = stream else { return kept };
+/// How long output may keep arriving after the script itself exited.
+const DRAIN: Duration = Duration::from_secs(5);
+
+async fn read(stream: Option<impl AsyncRead + Unpin>, kept: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    let Some(mut stream) = stream else { return };
     let mut chunk = [0; 8192];
     // Keep reading past the limit so the script is not blocked on a full pipe.
     while let Ok(count) = stream.read(&mut chunk).await {
         if count == 0 {
             break;
         }
-        kept.extend_from_slice(&chunk[..count.min(MAX_OUTPUT.saturating_sub(kept.len()))]);
+        let mut kept = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = MAX_OUTPUT.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..count.min(room)]);
     }
-    kept
 }
 
 /// Run a script to completion. `cancelled` is asked while it runs.
@@ -95,8 +98,9 @@ pub(super) async fn run(profile: &Path, script: &str, workdir: Option<&Path>, ti
     });
     processes::wrap_process_group(&mut command);
     let mut child = command.spawn().context("Could not start the script")?;
-    let output = tokio::spawn(read(child.stdout().take()));
-    let errors = tokio::spawn(read(child.stderr().take()));
+    let (output_kept, errors_kept) = (std::sync::Arc::default(), std::sync::Arc::default());
+    let mut output = tokio::spawn(read(child.stdout().take(), std::sync::Arc::clone(&output_kept)));
+    let mut errors = tokio::spawn(read(child.stderr().take(), std::sync::Arc::clone(&errors_kept)));
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -116,14 +120,18 @@ pub(super) async fn run(profile: &Path, script: &str, workdir: Option<&Path>, ti
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    // A program the script left running can hold its output open.
+    // A program the script left running can hold its output open, even past the group kill if
+    // it left the group: the run takes what arrived and ends.
     let _ = child.start_kill();
-    let text = |bytes: Vec<u8>| {
+    let drained = tokio::time::timeout(DRAIN, async { let _ = (&mut output).await; let _ = (&mut errors).await; }).await;
+    if drained.is_err() { output.abort(); errors.abort(); }
+    let text = |kept: &std::sync::Mutex<Vec<u8>>| {
+        let bytes = std::mem::take(&mut *kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         let mut text = String::from_utf8_lossy(&bytes).trim().to_owned();
         privacy::redact(&mut text);
         text
     };
-    let (output, errors) = (text(output.await?), text(errors.await?));
+    let (output, errors) = (text(&output_kept), text(&errors_kept));
     if !status.success() {
         let mut message = format!("The script exited with code {}", status.code().map_or("unknown".into(), |code| code.to_string()));
         for (name, part) in [("stderr", errors), ("stdout", output)] {
@@ -274,6 +282,17 @@ mod tests {
             std::os::unix::fs::symlink(dir.path().join("outside.sh"), dir.path().join("scripts/link.sh")).unwrap();
             assert!(resolve(dir.path(), "link.sh").is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_left_behind_program_does_not_hold_a_finished_script_open() {
+        // The leftover leaves the script's process group and keeps its stdout.
+        let dir = profile("leave.sh", "perl -e 'use POSIX; POSIX::setsid(); sleep 60' &\necho finished\n");
+        let started = Instant::now();
+        let output = run(dir.path(), "leave.sh", None, Duration::from_secs(120), || false).await.unwrap();
+        assert_eq!(output, "finished");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
     }
 
     #[cfg(unix)]

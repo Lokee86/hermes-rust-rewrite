@@ -76,6 +76,7 @@ impl Job {
         let (mut output, input) = stream.split();
         let input = Arc::new(AsyncMutex::new(input));
         job.stdin = Some(Input::Pty(input.clone()));
+        let (owner, terminal) = (core.clone(), t.clone());
         tokio::spawn(async move {
             let read = async {
                 loop {
@@ -96,7 +97,36 @@ impl Job {
             };
             tokio::select! {
                 _ = stop.cancelled()=>{},
-                result = read => { sender.send_replace(Some(result.unwrap_or_else(|e|Exit{code:None,error:Some(format!("PTY stream lost: {e:#}"))}))); }
+                result = read => {
+                    let exit = match result {
+                        Ok(exit) => exit,
+                        // A lost stream is not an exit. Reported as one, Stop and cleanup would
+                        // skip a command that still runs, so the terminal is ended first.
+                        Err(error) => {
+                            let finished = |status: &Value| status["state"] == "finished";
+                            let running = owner.status(&terminal).await.map_or(true, |status| !finished(&status));
+                            if running { let _ = owner.kill(&terminal).await; }
+                            // Reported only once the terminal has really ended: a kill that did not
+                            // take leaves the job running, so Stop and cleanup still reach it.
+                            let status = loop {
+                                match owner.status(&terminal).await {
+                                    Ok(status) if finished(&status) => break Some(status),
+                                    Ok(_) => {}
+                                    Err(_) if !running => break None,
+                                    Err(_) => {}
+                                }
+                                tokio::select! {
+                                    _ = stop.cancelled() => return,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                }
+                            };
+                            let code = status.as_ref().and_then(|status| exit(status).code);
+                            let stopped = if running { "; the command was stopped" } else { "" };
+                            Exit { code, error: Some(format!("PTY stream lost: {error:#}{stopped}")) }
+                        }
+                    };
+                    sender.send_replace(Some(exit));
+                }
             }
         });
         Ok(job)

@@ -2547,6 +2547,7 @@ dependencies = [
  "libc",
  "reqwest",
  "ring",
+ "rusqlite",
  "scrypt",
  "serde",
  "serde_json",

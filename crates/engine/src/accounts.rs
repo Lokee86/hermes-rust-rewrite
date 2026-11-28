@@ -81,45 +81,86 @@ fn minimax_client() -> Result<Client> {
 fn now() -> i64 { chrono::Utc::now().timestamp() }
 
 // ---------------------------------------------------------------- store
-fn store_path() -> Result<PathBuf> { Ok(Session::default_dir()?.join("accounts-oauth.json")) }
-fn read_store() -> BTreeMap<String, Value> { try_read_store().unwrap_or_default() }
-fn try_read_store() -> Result<BTreeMap<String, Value>> {
-    match std::fs::read_to_string(store_path()?) {
-        Ok(text) => Ok(serde_json::from_str(&crate::secret::unseal(text.trim())?).unwrap_or_default()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(error) => Err(error.into()),
+/// The desktop's account store and the Hermes CLI home it may borrow a sign-in from.
+struct Store { path: PathBuf, cli_home: Option<PathBuf> }
+impl Store {
+    fn live() -> Result<Self> { Ok(Self { path: Session::default_dir()?.join("accounts-oauth.json"), cli_home: hermes_home() }) }
+    /// An unreadable store is an error, never an empty one: treating it as empty would let a chat
+    /// fall back to another sign-in, and the next save would replace every other account.
+    fn read(&self) -> Result<BTreeMap<String, Value>> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => serde_json::from_str(&crate::secret::unseal(text.trim())?).context("Your saved accounts could not be read"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error).context("Your saved accounts could not be read"),
+        }
+    }
+    fn write(&self, store: &BTreeMap<String, Value>) -> Result<()> {
+        let dir = self.path.parent().context("No store directory")?;
+        std::fs::create_dir_all(dir)?;
+        let temp = tempfile::NamedTempFile::new_in(dir)?;
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600))?; }
+        std::io::Write::write_all(&mut temp.as_file(), crate::secret::seal(dir, &serde_json::to_string(store)?)?.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path)?;
+        Ok(())
+    }
+    fn lock_file(&self, name: &str) -> Result<std::fs::File> {
+        let dir = self.path.parent().context("No store directory")?;
+        std::fs::create_dir_all(dir)?;
+        Ok(std::fs::File::options().read(true).write(true).create(true).truncate(false).open(dir.join(name))?)
+    }
+    /// Held only while the store is read and rewritten, so a sign-out never waits on the network.
+    fn edit<T>(&self, change: impl FnOnce(&mut BTreeMap<String, Value>) -> Result<T>) -> Result<T> {
+        use fs2::FileExt;
+        let lock = self.lock_file("accounts-oauth.lock")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(e) if e.kind() == fs2::lock_contended_error().kind() && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(e).context("Could not open your saved accounts"),
+            }
+        }
+        let mut store = self.read()?;
+        let result = change(&mut store)?;
+        self.write(&store)?;
+        Ok(result)
+    }
+    /// One refresh at a time across windows and the gateway: a rotating refresh token is spent once.
+    async fn refreshing(&self) -> Result<std::fs::File> {
+        use fs2::FileExt;
+        let lock = self.lock_file("accounts-refresh.lock")?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => return Ok(lock),
+                // Windows reports a held lock as its own error, not WouldBlock.
+                Err(e) if e.kind() == fs2::lock_contended_error().kind() && Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+                Err(e) => return Err(e).context("Could not renew the account session"),
+            }
+        }
+    }
+    fn save(&self, id: &str, state: Value) -> Result<()> { self.edit(|store| { store.insert(id.into(), state); Ok(()) }) }
+    /// A provider the Hermes CLI signed in to (~/.hermes/auth.json), read-only.
+    fn cli_state(&self, id: &str) -> Option<Value> {
+        let store: Value = serde_json::from_slice(&std::fs::read(self.cli_home.as_ref()?.join("auth.json")).ok()?).ok()?;
+        let state = store.pointer(&format!("/providers/{id}"))?.clone();
+        (state.get("access_token").and_then(Value::as_str).is_some_and(|t| !t.is_empty())
+            || state.pointer("/tokens/access_token").and_then(Value::as_str).is_some_and(|t| !t.is_empty())).then_some(state)
     }
 }
-fn write_store(store: &BTreeMap<String, Value>) -> Result<()> {
-    let path = store_path()?;
-    let dir = path.parent().context("No store directory")?;
-    std::fs::create_dir_all(dir)?;
-    let temp = tempfile::NamedTempFile::new_in(dir)?;
-    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600))?; }
-    std::io::Write::write_all(&mut temp.as_file(), crate::secret::seal(dir, &serde_json::to_string(store)?)?.as_bytes())?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)?;
-    Ok(())
-}
-// A store that cannot be opened right now must not be replaced by one with a single account.
-fn save(id: &str, state: Value) -> Result<()> { let mut s = try_read_store().context("Could not open your saved accounts")?; s.insert(id.into(), state); write_store(&s) }
+fn save(id: &str, state: Value) -> Result<()> { Store::live()?.save(id, state) }
 
 fn hermes_home() -> Option<PathBuf> {
     std::env::var_os("HERMES_HOME").map(PathBuf::from).or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".hermes")))
-}
-/// A provider the Hermes CLI signed in to (~/.hermes/auth.json), read-only.
-fn cli_state(id: &str) -> Option<Value> {
-    let store: Value = serde_json::from_slice(&std::fs::read(hermes_home()?.join("auth.json")).ok()?).ok()?;
-    let state = store.pointer(&format!("/providers/{id}"))?.clone();
-    (state.get("access_token").and_then(Value::as_str).is_some_and(|t| !t.is_empty())
-        || state.pointer("/tokens/access_token").and_then(Value::as_str).is_some_and(|t| !t.is_empty())).then_some(state)
 }
 fn qwen_creds_path() -> Option<PathBuf> { directories::BaseDirs::new().map(|d| d.home_dir().join(".qwen/oauth_creds.json")) }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status { pub logged_in: bool, pub source: String }
 pub fn status(id: &str) -> Status {
-    if read_store().get(id).and_then(|s| s["access_token"].as_str()).is_some_and(|t| !t.is_empty()) {
+    let Ok(store) = Store::live() else { return Status::default() };
+    if store.read().ok().and_then(|s| s.get(id)?["access_token"].as_str().map(str::to_owned)).is_some_and(|t| !t.is_empty()) {
         return Status { logged_in: true, source: "Signed in here".into() };
     }
     match id {
@@ -127,15 +168,10 @@ pub fn status(id: &str) -> Status {
         "claude-code" => if directories::BaseDirs::new().is_some_and(|d| d.home_dir().join(".claude/.credentials.json").is_file()) { return Status { logged_in: true, source: "Claude Code".into() } },
         _ => {}
     }
-    if cli_state(id).is_some() { return Status { logged_in: true, source: "Hermes CLI".into() }; }
+    if store.cli_state(id).is_some() { return Status { logged_in: true, source: "Hermes CLI".into() }; }
     Status::default()
 }
-pub fn disconnect(id: &str) -> Result<bool> {
-    let mut s = try_read_store().context("Could not open your saved accounts")?;
-    let removed = s.remove(id).is_some();
-    write_store(&s)?;
-    Ok(removed)
-}
+pub fn disconnect(id: &str) -> Result<bool> { Store::live()?.edit(|store| Ok(store.remove(id).is_some())) }
 
 // ---------------------------------------------------------------- device login
 #[derive(Clone)]
@@ -280,13 +316,48 @@ fn jwt_exp(token: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------- runtime
+fn name(id: &str) -> &str { provider(id).map_or(id, |p| p.name) }
+/// The access token while it has more than two minutes left.
+fn current(state: &Value) -> Option<String> {
+    let expires = state["expires_at"].as_i64().or_else(|| state["access_token"].as_str().and_then(jwt_exp)).unwrap_or(i64::MAX);
+    (expires > now() + 120).then(|| state["access_token"].as_str().map(str::to_owned)).flatten()
+}
+
 /// A fresh access token for `id`, refreshing (and saving) it when near expiry.
 pub async fn access_token(id: &str) -> Result<String> {
     if id == "qwen-oauth" { return qwen_token().await; }
-    let mut state = read_store().get(id).cloned().or_else(|| cli_state(id).map(|s| if s.get("tokens").is_some() { s["tokens"].clone() } else { s }))
-        .with_context(|| format!("Sign in to {} in Settings › Accounts", provider(id).map_or(id, |p| p.name)))?;
-    let expires = state["expires_at"].as_i64().or_else(|| state["access_token"].as_str().and_then(jwt_exp)).unwrap_or(i64::MAX);
-    if expires > now() + 120 { return state["access_token"].as_str().map(str::to_owned).context("Missing access token"); }
+    token_from(&Store::live()?, id, |id, state| async move { refresh(&id, state).await }).await
+}
+
+async fn token_from<F, Fut>(store: &Store, id: &str, refresh: F) -> Result<String>
+where
+    F: FnOnce(String, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    let Some(state) = store.read()?.get(id).cloned() else {
+        // The Hermes CLI owns a grant it signed in with: refreshing it here would spend the CLI's
+        // rotating refresh token and leave the CLI signed out, so only a current token is borrowed.
+        let cli = store.cli_state(id).with_context(|| format!("Sign in to {} in Settings › Accounts", name(id)))?;
+        let cli = if cli.get("tokens").is_some() { cli["tokens"].clone() } else { cli };
+        return current(&cli).with_context(|| format!("The Hermes CLI sign-in for {} has expired. Run the Hermes CLI once to renew it, or sign in here in Settings › Accounts", name(id)));
+    };
+    if let Some(token) = current(&state) { return Ok(token); }
+    let _refreshing = store.refreshing().await?;
+    // Another request may have renewed the session, or it was signed out, while this one waited.
+    let state = store.read()?.get(id).cloned().with_context(|| format!("Sign in to {} in Settings › Accounts", name(id)))?;
+    if let Some(token) = current(&state) { return Ok(token); }
+    let renewed = refresh(id.to_owned(), state.clone()).await?;
+    let token = renewed["access_token"].as_str().filter(|t| !t.is_empty()).map(str::to_owned).context("Missing access token")?;
+    store.edit(|saved| {
+        ensure!(saved.get(id).is_some_and(|now| now["refresh_token"] == state["refresh_token"]),
+            "{} was signed out while its session was being renewed", name(id));
+        saved.insert(id.into(), renewed);
+        Ok(())
+    })?;
+    Ok(token)
+}
+
+async fn refresh(id: &str, state: Value) -> Result<Value> {
     let refresh = state["refresh_token"].as_str().filter(|t| !t.is_empty()).context("The session expired. Sign in again in Settings › Accounts")?.to_owned();
     let client = client()?;
     let (url, form): (String, Vec<(&str, String)>) = match id {
@@ -300,11 +371,9 @@ pub async fn access_token(id: &str) -> Result<String> {
     let response = client.post(url).header("Accept", "application/json").form(&form).send().await?;
     ensure!(response.status().is_success(), "Token refresh returned HTTP {}. Sign in again in Settings › Accounts", response.status());
     let body: Value = response.json().await?;
-    state = if id == "minimax-oauth" {
-        json!({"access_token":body["access_token"],"refresh_token":body["refresh_token"].as_str().or(state["refresh_token"].as_str()),"expires_at":expiry_unix(body["expired_in"].as_i64().unwrap_or(3600))})
-    } else { token_state(&body, Some(&state), json!({}))? };
-    save(id, state.clone())?;
-    state["access_token"].as_str().map(str::to_owned).context("Missing access token")
+    if id == "minimax-oauth" {
+        Ok(json!({"access_token":body["access_token"],"refresh_token":body["refresh_token"].as_str().or(state["refresh_token"].as_str()),"expires_at":expiry_unix(body["expired_in"].as_i64().unwrap_or(3600))}))
+    } else { token_state(&body, Some(&state), json!({})) }
 }
 
 async fn qwen_token() -> Result<String> {
@@ -390,6 +459,77 @@ mod tests {
         let state = token_state(&json!({"access_token":"a","expires_in":60}), Some(&json!({"refresh_token":"r","token_endpoint":"e"})), json!({})).unwrap();
         assert_eq!((state["refresh_token"].as_str(), state["token_endpoint"].as_str()), (Some("r"), Some("e")));
     }
+    fn temp_store(dir: &std::path::Path) -> Store {
+        Store { path: dir.join("accounts-oauth.json"), cli_home: Some(dir.join("cli")) }
+    }
+    fn renewed() -> Value { json!({"access_token":"new","refresh_token":"r-2","expires_at":now() + 3600}) }
+    fn cli_sign_in(dir: &std::path::Path, expires_at: i64) {
+        std::fs::create_dir_all(dir.join("cli")).unwrap();
+        std::fs::write(dir.join("cli/auth.json"), json!({"providers":{"openai-codex":{
+            "access_token":"cli-token","refresh_token":"cli-refresh","expires_at":expires_at}}}).to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_is_never_treated_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        cli_sign_in(dir.path(), now() + 3600);
+        std::fs::write(&store.path, crate::secret::seal(dir.path(), "{not json").unwrap()).unwrap();
+        let before = std::fs::read(&store.path).unwrap();
+        assert!(store.save("xai-oauth", json!({"access_token":"x"})).is_err());
+        assert_eq!(std::fs::read(&store.path).unwrap(), before, "the other saved accounts are not replaced");
+        let error = token_from(&store, "openai-codex", |_, _| async { Ok(renewed()) }).await.unwrap_err();
+        assert!(format!("{error:#}").contains("could not be read"), "no fall back to the CLI's account: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_spend_a_rotating_refresh_token_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        store.save("openai-codex", json!({"access_token":"old","refresh_token":"r-1","expires_at":0})).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh = |calls: std::sync::Arc<std::sync::atomic::AtomicUsize>| move |_: String, state: Value| async move {
+            assert_eq!(state["refresh_token"], "r-1");
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sleep(Duration::from_millis(300)).await;
+            Ok(renewed())
+        };
+        let (a, b) = tokio::join!(
+            token_from(&store, "openai-codex", refresh(calls.clone())),
+            token_from(&store, "openai-codex", refresh(calls.clone())),
+        );
+        assert_eq!((a.unwrap().as_str(), b.unwrap().as_str()), ("new", "new"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(store.read().unwrap()["openai-codex"]["refresh_token"], "r-2");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_finishing_after_sign_out_does_not_restore_the_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        store.save("openai-codex", json!({"access_token":"old","refresh_token":"r-1","expires_at":0})).unwrap();
+        let signed_out = &store;
+        let result = token_from(&store, "openai-codex", |_, _| async move {
+            signed_out.edit(|saved| Ok(saved.remove("openai-codex"))).unwrap();
+            Ok(renewed())
+        }).await;
+        assert!(result.is_err());
+        assert!(store.read().unwrap().get("openai-codex").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_borrowed_cli_sign_in_is_used_but_never_refreshed_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        cli_sign_in(dir.path(), now() + 3600);
+        let never = |_: String, _: Value| async { Err::<Value, _>(anyhow::anyhow!("refreshed a CLI grant")) };
+        assert_eq!(token_from(&store, "openai-codex", never).await.unwrap(), "cli-token");
+        cli_sign_in(dir.path(), now() - 10);
+        let error = token_from(&store, "openai-codex", never).await.unwrap_err();
+        assert!(error.to_string().contains("Run the Hermes CLI"), "{error:#}");
+        assert!(!store.path.exists(), "the CLI's grant is not copied into this store");
+    }
+
     /// Network: each device-code provider issues a user code. `cargo test -- --ignored live_begin`
     #[tokio::test] #[ignore]
     async fn live_begin_each_device_login() {

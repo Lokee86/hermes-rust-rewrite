@@ -185,6 +185,10 @@ pub(crate) fn messages(history: &History, directory: &std::path::Path) -> Result
         messages.push(json!({"role":"user","content":crate::Attachment::user_content(directory,&prompt,&turn.attachments)?}));
         for entry in &turn.entries {
             match entry {
+                Entry::User { text } => {
+                    answer_unfinished(&mut messages, &mut unanswered);
+                    messages.push(json!({"role":"user","content":text}));
+                }
                 Entry::Assistant { text, calls } => {
                     if stopped.is_some() {
                         answer_unfinished(&mut messages, &mut unanswered);
@@ -742,12 +746,22 @@ fn safe_label(value: &str) -> String {
         .collect()
 }
 
+/// Fetches a current token for a managed sign-in, refreshing it when near expiry.
+pub(crate) type Renew = std::sync::Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> + Send + Sync>;
+
 pub(crate) struct Provider {
     client: Client,
     config: Config,
     protocol: Protocol,
     endpoint: Url,
     options: crate::models::GenerationOptions,
+    /// A managed sign-in is renewed before every model request: a turn can outlast its token
+    /// while tools run or an approval waits.
+    renew: Option<Renew>,
+    key: std::sync::Mutex<Option<String>>,
+    /// The chat's settings before a managed sign-in filled in its token, for work started from
+    /// this turn (a delegated child) to renew the sign-in itself.
+    unresolved: Option<Config>,
 }
 
 impl Provider {
@@ -779,19 +793,56 @@ impl Provider {
             protocol,
             endpoint,
             options,
+            renew: None,
+            key: std::sync::Mutex::new(None),
+            unresolved: None,
         })
+    }
+
+    /// Renew the token for `original`'s managed sign-in (an account or Nous Portal chosen with no
+    /// key of its own) before each model request.
+    pub(crate) fn renewing(self, original: &Config) -> Self {
+        if !original.api_key.trim().is_empty() {
+            return self;
+        }
+        let renew: Option<Renew> = if crate::portal::is_portal(&original.base_url) {
+            Some(std::sync::Arc::new(|| Box::pin(crate::portal::access_token())))
+        } else {
+            crate::accounts::for_base_url(&original.base_url)
+                .map(|account| -> Renew { std::sync::Arc::new(move || Box::pin(crate::accounts::access_token(account.id))) })
+        };
+        let managed = renew.is_some();
+        let mut provider = self.with_renewal(renew);
+        if managed { provider.unresolved = Some(original.clone()); }
+        provider
+    }
+
+    /// Settings for a new turn started from this one: a managed sign-in is resolved again there,
+    /// so it is renewed like this turn's, never frozen at this turn's token.
+    pub(crate) fn turn_config(&self) -> Config {
+        self.unresolved.clone().unwrap_or_else(|| self.config.clone())
+    }
+
+    pub(crate) fn with_renewal(mut self, renew: Option<Renew>) -> Self {
+        self.renew = renew;
+        self
+    }
+
+    fn key(&self) -> String {
+        self.key.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_else(|| self.config.api_key.clone())
     }
 
     pub(crate) fn config(&self) -> &Config { &self.config }
     pub(crate) fn options(&self) -> &crate::models::GenerationOptions { &self.options }
 
     fn error_message(&self, raw: &str) -> String {
-        let key = self.config.api_key.trim();
-        let text = if key.is_empty() {
-            raw.to_owned()
-        } else {
-            raw.replace(key, "[redacted]")
-        };
+        let mut text = raw.to_owned();
+        for key in [self.config.api_key.clone(), self.key()] {
+            let key = key.trim();
+            if !key.is_empty() {
+                text = text.replace(key, "[redacted]");
+            }
+        }
         text.chars()
             .filter(|character| !character.is_control() || *character == '\n')
             .take(480)
@@ -858,6 +909,10 @@ impl Provider {
         } else {
             self.options.apply(&mut body, self.protocol == Protocol::Anthropic)?;
         }
+        if let Some(renew) = &self.renew {
+            let key = renew().await?;
+            *self.key.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
+        }
         let request = self.post(&self.endpoint, &body, "text/event-stream");
         let response = Self::send_request(request).await?;
         self.read_stream(response, emit).await
@@ -902,7 +957,8 @@ impl Provider {
     }
 
     fn authenticate(&self, mut request: RequestBuilder, endpoint: &Url) -> RequestBuilder {
-        let key = self.config.api_key.trim();
+        let key = self.key();
+        let key = key.trim();
         match self.protocol {
             Protocol::Anthropic => {
                 request = request.header("anthropic-version", "2023-06-01");
@@ -1089,7 +1145,8 @@ impl ResponsesStream {
             }
         }
         match event["type"].as_str().unwrap_or_default() {
-            "response.output_text.delta" => if let Some(delta) = event["delta"].as_str() { emit_text(&mut self.content_bytes, delta, emit)?; },
+            // A refusal is the provider's answer: shown, not reported as an empty response.
+            "response.output_text.delta" | "response.refusal.delta" => if let Some(delta) = event["delta"].as_str() { emit_text(&mut self.content_bytes, delta, emit)?; },
             "response.reasoning_summary_text.delta" => if let Some(delta) = event["delta"].as_str() {
                 let available = (8 * 1024usize).saturating_sub(self.reasoning_summary.len());
                 self.reasoning_summary.push_str(&delta[..delta.floor_char_boundary(available.min(delta.len()))]);
@@ -1112,7 +1169,12 @@ impl ResponsesStream {
     }
     fn finish(self) -> Result<Vec<ToolCall>> {
         ensure!(self.done, "Provider stream ended before the response completed");
-        Ok(self.calls)
+        // The same contract as the other protocols: a usable answer, and well-formed calls.
+        ensure!(
+            !self.calls.is_empty() || self.content_bytes > 0,
+            "Provider completed without returning a usable answer"
+        );
+        valid_calls(self.calls)
     }
 }
 

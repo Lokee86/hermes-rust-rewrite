@@ -1,0 +1,33 @@
+# Twilio SMS stock plugin implementation spec
+
+Register Twilio SMS as a bundled Rust adapter with platform key `sms`. Start after Email and the shared gate. A headless profile receives signed inbound SMS on a verified Twilio number, admits authorized plain-text interactions, and sends replies and scheduled results under the same provider account and recipient policy. [Shared gateway contract](ADAPTER_CONTRACT.md#shared-requirements-for-stock-plugins) · [Email spec](EMAIL_ADAPTER_SPEC.md) · [Hermes SMS guide](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/sms.md) · [Next adapter, ntfy](NTFY_ADAPTER_SPEC.md)
+
+## Registration and signed callbacks
+
+Put the factory and REST client in `hermes-gateway::messaging::sms`. Bind the Twilio account or subaccount SID, webhook verification secret, approved E.164 owner number and the verified send credential to the profile. Verify number ownership and mode, TLS receiver endpoints and authorized outbound eligibility. Use a scoped REST credential where supported. Keep webhook authentication material private and separate from any application-level actor grants. Use one verified lease per account and number with independent inbound, outbound and status health. [Mercury adapter types](src/messaging/types.rs) · [Twilio Message API](https://www.twilio.com/docs/messaging/api/message-resource)
+
+Use a dedicated HTTPS inbound receiver and a separate signed status slot. Validate `X-Twilio-Signature` with Twilio's current request validation rules against the exact configured externally visible URL and original parameter multimap. Reject missing signatures, ambiguous routing or conflicting named fields before authority dispatch. Do not trust an arbitrary forwarded host. Verify payload account and destination against the receiver binding. Respond with empty successful TwiML for a durable inbound disposition, including safe duplicates. A transient write failure returns a request failure to allow provider redelivery where configured. Dedup logical inbound by verified account, number and `MessageSid`. Preserve actor and contents as immutable evidence. Reject an unsigned production callback. [Twilio request validation](https://www.twilio.com/docs/usage/security#validating-requests) · [Twilio inbound webhook fields](https://www.twilio.com/docs/messaging/guides/webhook-request)
+
+## SMS conversations and policy
+
+Use verified sender number and receiving number for DMs. Follow the current provider normalization rules and scope phone aliases to that account and carrier route. Ignore empty texts and own echoes. Treat unsupported MMS payloads as typed outcomes and avoid media fetches. Enforce recipient permission and current opt-in state, including provider-handled STOP, START, HELP or supported `OptOutType` events. An opt-out is a transport policy change with no native turn, and Twilio's own auto-response stays under Twilio. Keep an opt-in event distinct from an operator's native allowlist. Maintain an explicit sender policy with deliberate enablement for SMS pairing. Native commands and permitted text controls use the verified request and execution generation. A general SMS sender grant does not convey high-assurance approval authority. [Twilio Advanced Opt-Out](https://www.twilio.com/docs/messaging/tutorials/advanced-opt-out) · [Hermes SMS sender controls](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/website/docs/user-guide/messaging/sms.md#user-allowlists)
+
+## Ordered text and status
+
+Render plain text and split at approved character and provider encoding limits. Respect GSM-7 and Unicode segment sizes and the documented API limit rather than counting bytes as characters. Reserve each part and send from the verified number to its exact recipient. Recheck opt-out, registration and applicable rate/quota before each part and after restart. Record the provider Message SID and initial state. A verified status callback can settle the expected attempt by account, message SID and signed per-effect callback association when applicable. Dedup repeated callbacks, allow provider terminal status to refine acceptance and avoid replacing newer terminal evidence with a stale state. Distinguish queued/sent from delivered and terminal failure. No guarantee of handset visibility. [Twilio outbound status](https://www.twilio.com/docs/messaging/guides/track-outbound-message-status) · [Twilio Message resource](https://www.twilio.com/docs/messaging/api/message-resource)
+
+A lost create response remains uncertain until an exact signed callback/lookup ties its SID to that effect, or the owner resolves it. Keep subsequent parts held. Retry after evidence of non-acceptance, never after a timeout alone. Admit inbound retries only once and report known provider retry or retention gaps. A verified, eligible SMS home number can receive the same native outbox's manual and scheduled results with the same sender and consent constraints. No automatic use of another number or Messaging Service as a fallback. [Shared delivery contract](ADAPTER_CONTRACT.md#delivery-and-recovery)
+
+## Implementation and acceptance
+
+| Step | Prerequisite | Evidence |
+| --- | --- | --- |
+| Number binding and intake | Email live acceptance and shared gate | Scoped sender, HTTPS and signed callback validation, durable SID dedup after restart. |
+| Policy and SMS outbox | Durable intake | Agent replies and named home delivery, consent changes, multipart bounds and exact status. |
+| Live acceptance | Transport and shared conformance | Real opted-in SMS sender and recipient demonstrate authorized texts, status and recovery. |
+
+Use scripted Twilio REST and signed inbound/status payloads through the production adapter and owner. Cover URL mismatches, account and number crossover, conflicting request fields, repeated inbound SID after a lost ack, own echo, opt-out between parts, forged and out-of-order status, API acceptance with lost response and chronological resend protection. Run shared conformance and `cargo test --locked --workspace`. Qualify one current messaging deployment whose number can send and receive. Prove an authorized reply, denied number, opt-out behavior, long Unicode text, delivery status and an approved home result after restart. Record sender registration, provider mode, and acceptance and delivery evidence. [Hermes SMS fixtures](https://github.com/NousResearch/hermes-agent/blob/v0.23.4/tests/gateway/test_sms.py)
+
+## Scope
+
+SMS is plain text in the Hermes stock plugin. Exclude MMS, RCS, unsigned live webhook configuration, standalone senders and Desktop UI. [Backend parity scope](../../BACKEND_PARITY_PLAN.md#scope)

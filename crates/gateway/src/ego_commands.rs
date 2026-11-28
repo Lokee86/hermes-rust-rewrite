@@ -82,6 +82,8 @@ impl Shared {
                 id.clone(),
                 Approval {
                     payload: payload.clone(),
+                    tool: None,
+                    expires_ms: chrono::Utc::now().timestamp_millis() + 300_000,
                     timeout: timeout.clone(),
                     action: ApprovalAction::Identity {
                         peer: peer.id.clone(),

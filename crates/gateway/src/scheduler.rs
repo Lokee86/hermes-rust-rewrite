@@ -19,8 +19,11 @@ pub(super) fn start(shared: Arc<Shared>, store: Store) -> JoinHandle<()> {
                 _ = interval.tick() => {
                     let mut claims = match store.gateway_claims() { Ok(claims) => claims, Err(error) => { eprintln!("scheduler recovery: {error:#}"); vec![] } };
                     let _admissions = lock(&shared.admissions);
-                    if !shared.shutdown.is_cancelled() && shared.provider.validate().is_ok() {
-                        match store.claim_due(chrono::Utc::now()) { Ok(due) => claims.extend(due), Err(error) => eprintln!("scheduler claim: {error:#}") }
+                    if !shared.shutdown.is_cancelled() {
+                        // Script-only jobs never call a model, so a broken model setting must not stop them.
+                        let model_ready = shared.provider.validate().is_ok();
+                        let due = store.claim_due_matching(chrono::Utc::now(), |job| model_ready || job.no_agent());
+                        match due { Ok(due) => claims.extend(due), Err(error) => eprintln!("scheduler claim: {error:#}") }
                     }
                     claims
                 }
@@ -45,10 +48,11 @@ pub(super) fn start(shared: Arc<Shared>, store: Store) -> JoinHandle<()> {
 async fn session_for(shared: &Arc<Shared>, store: &Store, claim: &Claim, workspace: &Path, model: &str) -> Result<Arc<LiveSession>> {
     let _guard = shared.creates.lock().await;
     let id = if let Some(id) = &claim.run.gateway_session { id.clone() } else {
-        let summary = shared.library.create_session(None, None)?;
-        shared.library.rename_session(&summary.id, &format!("Run · {}", claim.job.title()))?;
+        // A background chat: it never takes over the user's open "New chat" or the profile's
+        // default project, and a retry after a crash finds the same chat by its run.
         let settings = Settings { source: "scheduled".into(), cwd: Some(workspace.to_owned()), model: Some(model.to_owned()), ..Default::default() };
-        settings.save(&summary.directory)?;
+        let summary = shared.library.create_background_session(&format!("Run · {}", claim.job.title()), &format!("scheduled-run:{}", claim.run.id),
+            |summary| settings.save(&summary.directory))?;
         store.bind_gateway_session(&claim.run.id, &summary.id)?;
         summary.id
     };
@@ -142,8 +146,8 @@ pub(super) async fn routine_for(shared: &Arc<Shared>, job_id: &str, title: &str)
     let summary = match index.get(job_id).and_then(|id| shared.library.session(id).ok()).filter(|s| !s.archived) {
         Some(summary) => summary,
         None => {
-            let summary = shared.library.create_session(None, None)?;
-            let summary = shared.library.rename_session(&summary.id, &format!("Routine · {title}"))?;
+            // A background chat never takes over the user's open "New chat" or the selection.
+            let summary = shared.library.create_background_session(&format!("Routine · {title}"), &format!("routine-chat:{job_id}"), |_| Ok(()))?;
             index.insert(job_id.to_owned(), summary.id.clone());
             let mut temp = NamedTempFile::new_in(shared.library.root())?;
             serde_json::to_writer_pretty(&mut temp, &index)?;
@@ -175,6 +179,12 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
             }
             let outside_agent = cron::has_preflight(&claim.job);
             if outside_agent && claim.run.status != RunStatus::Claimed {
+                if let Some(route) = claim.job.deliver.strip_prefix("channel:")
+                    && let Some(output) = shared.messaging.notification_text(route, &("cron", &claim.run.id))?
+                {
+                    store.finish(&claim, Outcome::Completed { output }, chrono::Utc::now())?;
+                    return Ok(());
+                }
                 // A started script can have effects without an agent receipt.
                 // Preserve its run identity and never execute it again after recovery.
                 fail_unadmitted(&store, &claim, "Hermes restarted while this job's script was running")?;
@@ -189,6 +199,9 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
                 match cron::preflight_with_cancel(&store, &claim, &shared.shutdown).await {
                     Ok(cron::Preflight::Agent(text)) => prompt = text,
                     Ok(cron::Preflight::Done(output)) => {
+                        if let Some(route) = claim.job.deliver.strip_prefix("channel:") {
+                            shared.messaging.notify_route(route, &("cron", &claim.run.id), output.clone())?;
+                        }
                         store.finish(&claim, Outcome::Completed { output }, chrono::Utc::now())?;
                         return Ok(());
                     }
@@ -252,6 +265,11 @@ async fn run(shared: Arc<Shared>, store: Store, claim: Claim) -> Result<()> {
         None if finished.receipt.outcome.as_deref() == Some("cancelled") => Outcome::Cancelled { reason: "Stopped by the user".into() },
         None => Outcome::Failed { error: "Run ended without a conversation turn".into() },
     };
+    if let Outcome::Completed { output } = &outcome
+        && let Some(route) = claim.job.deliver.strip_prefix("channel:")
+    {
+        shared.messaging.notify_route(route, &("cron", &claim.run.id), output.clone())?;
+    }
     store.finish(&claim, outcome, chrono::Utc::now())?;
     Ok(())
 }
@@ -302,6 +320,51 @@ mod tests {
         store.begin(&claim, chrono::Utc::now()).unwrap();
         let claim = store.gateway_claims().unwrap().into_iter().find(|saved| saved.run.id == claim.run.id).unwrap();
         (claim, session)
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_keeps_its_own_folder_and_leaves_the_users_new_chat_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, job_folder) = (dir.path().join("project-a"), dir.path().join("job-b"));
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&job_folder).unwrap();
+        fs::write(dir.path().join("agent-settings.json"), serde_json::json!({"default_directory": project}).to_string()).unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let blank = library.create_session(None, None).unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let (claim, session) = bound_claim_for(&gateway, cron::Draft {
+            prompt: "scheduled".into(), workdir: Some(job_folder.clone()), paused: true, ..Default::default()
+        }).await;
+        let run_chat = claim.run.gateway_session.clone().unwrap();
+        assert_ne!(run_chat, blank.id, "the run has a chat of its own");
+        assert_eq!(library.active_session().unwrap().map(|s| s.id), Some(blank.id.clone()), "the user's selection is unchanged");
+        assert_eq!(library.session(&blank.id).unwrap().title, "New chat");
+        assert_eq!(library.session(&run_chat).unwrap().project_id, None, "not filed under the default project");
+        assert_eq!(gateway.shared.library.workspace_for_session(&run_chat).unwrap(), None);
+        assert_eq!(session.settings.lock().unwrap().cwd.as_deref(), Some(job_folder.canonicalize().unwrap().as_path()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn scheduled_runs_appear_as_cron_chats_for_stock_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let run = library.create_session(None, Some("Run · nightly")).unwrap();
+        Settings { source: "scheduled".into(), ..Default::default() }.save(&run.directory).unwrap();
+        let mut history = hermes_engine::History::default();
+        history.turns.push(hermes_engine::Turn {
+            prompt: "scheduled".into(), context: String::new(), attachments: vec![], model: "fixture".into(),
+            entries: vec![hermes_engine::Entry::Assistant { text: "done".into(), calls: vec![] }], status: hermes_engine::Status::Complete,
+        });
+        hermes_engine::restore_conversation(&run.directory, serde_json::to_value(&history).unwrap()).unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let sidebar: Value = reqwest::Client::new()
+            .get(format!("{}/api/profiles/sessions/sidebar?recents_profile=default&recents_exclude=cron", gateway.http_url()))
+            .bearer_auth(gateway.token()).send().await.unwrap().json().await.unwrap();
+        let ids = |list: &Value| list["sessions"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        assert_eq!(ids(&sidebar["cron"]), [run.id.clone()], "{sidebar}");
+        assert!(!ids(&sidebar["recents"]).contains(&run.id), "{sidebar}");
+        server.abort();
     }
 
     async fn wait_for_receipt(shared: &Shared, session: &LiveSession, input: &str, status: &str) {

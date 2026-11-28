@@ -12,6 +12,8 @@ use std::{
 };
 
 const MAX_INBOX_MESSAGES: i64 = 10_000;
+// Settled delivery records kept for duplicate detection and the status view.
+const MAX_SETTLED_UPDATES: i64 = 10_000;
 // Telegram retains updates for at most 24 hours, and can restart update IDs
 // at a lower value after a week of inactivity.
 const CURSOR_IDLE_SECONDS: i64 = 24 * 60 * 60;
@@ -78,6 +80,9 @@ pub struct Work {
     pub chat_id: i64,
     pub stage: WorkStage,
     pub text: String,
+    /// Which message this is. Telegram reuses update IDs after an idle reset, so an update ID alone
+    /// can name an earlier message and match its answer.
+    pub message: String,
 }
 
 pub enum TurnOutcome {
@@ -267,6 +272,16 @@ impl Store {
                 let hash = fingerprint(message.chat_id, message.message_id, &message.text);
                 let stage = if settings.agent_replies { "received" } else { "manual" };
                 let text = settings.agent_replies.then_some(message.text.as_str());
+                if offset == 0 {
+                    // Offset 0 follows an idle reset, after which Telegram may reuse an
+                    // update ID. A settled row with a different message is a past epoch.
+                    tx.execute(
+                        "DELETE FROM telegram_updates
+                         WHERE bot_id = ?1 AND update_id = ?2 AND fingerprint <> ?3
+                             AND stage NOT IN ('received','turn_unknown','blocked','pending','sending','unknown')",
+                        params![bot.id, message.update_id, hash.as_ref()],
+                    )?;
+                }
                 let inserted = if message.update_id >= offset {
                     tx.execute(
                         "INSERT OR IGNORE INTO telegram_updates (bot_id,update_id,chat_id,fingerprint,stage,text)
@@ -299,7 +314,7 @@ impl Store {
                  WHERE bot_id = ?1 AND ?2 > ?4 AND (?4 = 0 OR cursor <= ?4)",
                 params![bot.id, next_offset, now, offset],
             )?;
-            Ok(())
+            prune(tx, bot.id)
         })
     }
 
@@ -351,7 +366,7 @@ impl Store {
                  WHERE bot_id = ?1 AND stage IN ('received','turn_unknown','blocked','pending','sending','unknown')
                  GROUP BY chat_id
              )
-             SELECT update_id,chat_id,stage,text FROM telegram_updates JOIN heads ON ingress_order = heads.id
+             SELECT update_id,chat_id,stage,text,fingerprint FROM telegram_updates JOIN heads ON ingress_order = heads.id
              WHERE stage IN ('received','turn_unknown','pending') AND (retry_at IS NULL OR retry_at <= ?2)
              ORDER BY ingress_order",
         ).and_then(|mut query| {
@@ -362,7 +377,7 @@ impl Store {
                     "pending" => WorkStage::Pending,
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 };
-                Ok(Work { update_id: row.get(0)?, chat_id: row.get(1)?, stage, text: row.get(3)? })
+                Ok(Work { update_id: row.get(0)?, chat_id: row.get(1)?, stage, text: row.get(3)?, message: message_identity(&row.get::<_, Vec<u8>>(4)?) })
             })?.collect()
         }).map_err(storage)
     }
@@ -486,7 +501,7 @@ impl Store {
             )
             .map_err(storage)?;
         let issues = read.prepare(
-            "SELECT u.update_id,u.chat_id,u.stage,u.conflict,u.attempt,u.retry_at,u.reason,r.session_id
+            "SELECT u.update_id,u.chat_id,u.stage,u.conflict,u.attempt,u.retry_at,u.reason,r.session_id,u.fingerprint
              FROM telegram_updates u LEFT JOIN telegram_routes r ON u.bot_id = r.bot_id AND u.chat_id = r.chat_id
              WHERE u.bot_id = ?1 AND (u.conflict = 1 OR u.reason IS NOT NULL)
              ORDER BY (u.stage IN ('unknown','turn_unknown','blocked')) DESC,u.ingress_order DESC LIMIT 50",
@@ -506,6 +521,7 @@ fn status_row(row: &Row<'_>) -> rusqlite::Result<Value> {
         "retry_at": row.get::<_, Option<i64>>(5)?,
         "reason": row.get::<_, Option<String>>(6)?,
         "session_id": row.get::<_, Option<String>>(7)?,
+        "message": message_identity(&row.get::<_, Vec<u8>>(8)?),
     }))
 }
 
@@ -533,7 +549,28 @@ fn record_echo(
             "UPDATE telegram_inboxes SET revision = revision + 1 WHERE bot_id = ?1",
             [bot_id],
         )?;
+        prune(tx, bot_id)?;
     }
+    Ok(())
+}
+
+/// Bounds both tables. Only acknowledged, settled updates are dropped, so a
+/// redelivery that could still arrive keeps its duplicate check.
+fn prune(tx: &Transaction<'_>, bot_id: i64) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM telegram_messages WHERE bot_id = ?1 AND id <= (
+             SELECT id FROM telegram_messages WHERE bot_id = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+        params![bot_id, MAX_INBOX_MESSAGES],
+    )?;
+    tx.execute(
+        "DELETE FROM telegram_updates WHERE bot_id = ?1
+             AND stage NOT IN ('received','turn_unknown','blocked','pending','sending','unknown')
+             AND update_id < (SELECT cursor FROM telegram_inboxes WHERE bot_id = ?1)
+             AND ingress_order <= (
+                 SELECT ingress_order FROM telegram_updates WHERE bot_id = ?1
+                 ORDER BY ingress_order DESC LIMIT 1 OFFSET ?2)",
+        params![bot_id, MAX_SETTLED_UPDATES],
+    )?;
     Ok(())
 }
 
@@ -548,6 +585,16 @@ fn append_message(
         params![bot_id, message.update_id, message.message_id, message.user_id, message.sender,
             message.text, message.timestamp, message.outgoing],
     ).map(|changed| changed != 0)
+}
+
+/// The short identity of a received message, from its stored fingerprint.
+fn message_identity(fingerprint: &[u8]) -> String {
+    fingerprint.iter().take(8).map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The identity `Work::message` gives a message received with these fields.
+pub fn incoming_identity(chat_id: i64, message_id: i64, text: &str) -> String {
+    message_identity(fingerprint(chat_id, message_id, text).as_ref())
 }
 
 fn fingerprint(chat_id: i64, message_id: i64, text: &str) -> digest::Digest {
@@ -699,5 +746,70 @@ mod tests {
         store.save_settings(&settings).unwrap();
         assert_eq!(store.begin_send(&bot, &token, &head, 100).unwrap(), None);
         assert_eq!(store.work_status(&bot).unwrap()["counts"]["pending"], 1);
+    }
+    #[test]
+    fn a_reused_update_id_after_an_idle_reset_is_a_new_message() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, bot, token) = setup(root.path());
+        store
+            .commit_poll(&bot, &token, &[dm(&bot, 5, "first epoch")], 0, 6, 100)
+            .unwrap();
+        store
+            .record_turn(&bot, 5, TurnOutcome::Failed("fixture"))
+            .unwrap();
+        let later = 100 + CURSOR_IDLE_SECONDS + 1;
+        assert_eq!(store.poll_offset(&bot, later).unwrap(), 0);
+        let mut fresh = dm(&bot, 5, "new epoch message");
+        fresh.message_id = 500;
+        store
+            .commit_poll(&bot, &token, &[fresh.clone()], 0, 6, later)
+            .unwrap();
+        let inbox = store.load_inbox(&bot).unwrap();
+        assert_eq!(inbox.messages.last().unwrap().text, "new epoch message");
+        let ready = store.ready(&bot, later).unwrap();
+        assert_eq!(
+            (ready.len(), ready[0].text.as_str()),
+            (1, "new epoch message")
+        );
+        assert_eq!(store.work_status(&bot).unwrap()["conflicts"], 0);
+        // A redelivery of the same message is still a duplicate.
+        store
+            .commit_poll(&bot, &token, &[fresh], 0, 6, later)
+            .unwrap();
+        assert_eq!(store.load_inbox(&bot).unwrap().messages.len(), 2);
+    }
+
+    #[test]
+    fn the_inbox_keeps_a_bounded_history() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, bot, token) = setup(root.path());
+        // Manual mode settles each update as it arrives.
+        let mut settings = store.load_settings().unwrap().unwrap();
+        settings.agent_replies = false;
+        store.save_settings(&settings).unwrap();
+        let total = MAX_INBOX_MESSAGES + 25;
+        let batch: Vec<_> = (1..=total).map(|id| dm(&bot, id, "note")).collect();
+        store
+            .commit_poll(&bot, &token, &batch, 0, total + 1, 100)
+            .unwrap();
+        let sql = store.open_inbox(&bot).unwrap();
+        let count = |table: &str| -> i64 {
+            sql.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count("telegram_messages"), MAX_INBOX_MESSAGES);
+        assert_eq!(count("telegram_updates"), MAX_SETTLED_UPDATES);
+        assert_eq!(
+            store
+                .load_inbox(&bot)
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .update_id,
+            Some(total)
+        );
     }
 }
