@@ -363,13 +363,11 @@ impl Store {
         if record.as_ref() == Some(&next) {
             return Ok(());
         }
-        let change = db::writing(db)?;
-        write_changes(&change, &self.id, record.as_ref(), &next)?;
-        change.commit().context("Could not save the conversation")?;
         let rewound = record.as_ref().is_some_and(|record| next.history.turns.len() < record.history.turns.len());
-        *record = Some(next);
         if rewound {
-            // The file the chat moved from still holds the turns just removed.
+            // The file the chat moved from still holds the turns being removed. It goes first: the
+            // database has its contents, and if removing it fails nothing is committed, so a
+            // retry of the same rewind tries both again instead of finding nothing to do.
             for kept in [LEGACY, LEGACY_CHECKPOINT] {
                 match fs::remove_file(self.dir.join(format!("{kept}.{}", db::MIGRATED))) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -379,6 +377,10 @@ impl Store {
                 }
             }
         }
+        let change = db::writing(db)?;
+        write_changes(&change, &self.id, record.as_ref(), &next)?;
+        change.commit().context("Could not save the conversation")?;
+        *record = Some(next);
         Ok(())
     }
 }
@@ -513,6 +515,27 @@ mod storage_tests {
         assert_eq!(read_history(&dir).unwrap(), opened);
         opened.rewind(0);
         store.save(&opened).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_whose_cleanup_failed_finishes_on_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions/chat");
+        let mut history = History::default();
+        history.turns = vec![Turn { status: Status::Complete, ..running("first") }, Turn { status: Status::Complete, ..running("secret second") }];
+        legacy(&dir, &history, None, 1);
+        let kept = dir.join(format!("{LEGACY}.{}", db::MIGRATED));
+        let (store, mut opened) = Store::open(&dir).unwrap();
+        opened.rewind(1);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = store.save(&opened);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err());
+        store.save(&opened).unwrap();
+        assert!(!kept.exists(), "the retry removes the earlier file");
+        assert_eq!(read_history(&dir).unwrap(), opened);
     }
 
     /// A process that dies while saving leaves the last whole save.

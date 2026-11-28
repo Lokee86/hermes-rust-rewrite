@@ -534,6 +534,13 @@ struct Groups { #[serde(default)] groups: Vec<Group> }
 
 impl Library {
     fn groups_path(&self) -> PathBuf { self.root.join("groups.json") }
+    /// Held across a read and rewrite of the group registry, so two windows editing groups at once
+    /// cannot drop or revive each other's change.
+    fn lock_groups(&self) -> Result<File> {
+        let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(self.root.join(".groups.lock"))?;
+        fs2::FileExt::lock_exclusive(&lock).context("Could not lock the group chats")?;
+        Ok(lock)
+    }
     pub fn groups(&self) -> Result<Vec<Group>> {
         match fs::read(self.groups_path()) {
             Ok(bytes) => Ok(serde_json::from_slice::<Groups>(&bytes).context("Could not read group chats")?.groups),
@@ -547,6 +554,7 @@ impl Library {
         let bots = self.bots()?;
         ensure!(members.len() >= 2, "A group chat needs at least two bots");
         ensure!(members.iter().all(|m| bots.iter().any(|b| &b.name == m)), "A selected bot no longer exists");
+        let _lock = self.lock_groups()?;
         let mut all = self.groups()?;
         let group = Group { id: new_id("group"), name: name.into(), members: members.to_vec() };
         all.push(group.clone());
@@ -554,9 +562,11 @@ impl Library {
         Ok(group)
     }
     pub fn delete_group(&self, id: &str) -> Result<()> {
+        let lock = self.lock_groups()?;
         let mut all = self.groups()?;
         all.retain(|g| g.id != id);
         atomic_json(&self.groups_path(), &Groups { groups: all })?;
+        drop(lock);
         let owner = format!("group:{id}");
         self.with_catalog(true, |catalog| { for r in catalog.sessions.iter_mut().filter(|r| r.bot.as_deref() == Some(owner.as_str())) { r.archived = true; r.bot = None; } Ok(()) })
     }
@@ -583,6 +593,19 @@ impl Library {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+    #[test]
+    fn concurrent_group_edits_keep_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let names: Vec<_> = ["Ada", "Bo"].iter().map(|n| library.create_bot(n, "", "", "").unwrap().name).collect();
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let (root, names) = (dir.path(), &names);
+                scope.spawn(move || Library::open(root).unwrap().create_group(&format!("Team {n}"), names).unwrap());
+            }
+        });
+        assert_eq!(library.groups().unwrap().len(), 8, "no group was lost");
+    }
     #[test]
     fn group_needs_two_bots_and_owns_one_hidden_chat() {
         let dir = tempfile::tempdir().unwrap();

@@ -243,7 +243,16 @@ impl Store {
                 index += 1;
             }
         }
+        self.retain(document);
         Ok(released)
+    }
+    /// Keep at most `max` finished checkpoints, oldest first out. Pending writes are not counted.
+    fn retain(&self, document: &mut Document) {
+        let finished = |record: &Record| record.ready || record.restored_at.is_some();
+        while document.records.iter().filter(|record| finished(record)).count() > self.max {
+            let Some(index) = document.records.iter().position(finished) else { break };
+            document.records.remove(index);
+        }
     }
     fn finish_pending(&self, id: &str, applied: bool) -> Result<()> {
         self.transaction(|document| {
@@ -257,6 +266,7 @@ impl Store {
                     }
                 }
             }
+            self.retain(document);
             Ok(())
         })
     }
@@ -335,15 +345,11 @@ impl Store {
         lease.lock_exclusive()?;
         let captured = self.transaction(|document| {
             let released = self.reconcile_pending(document)?;
+            // Nothing is evicted for a write that may still fail: the snapshots it would replace
+            // stay restorable until it is ready.
+            let pending = document.records.iter().filter(|record| !record.ready && record.restored_at.is_none()).count();
+            ensure!(pending < self.max, "Checkpoint retention is full of pending writes");
             document.records.push(record);
-            while document.records.len() > self.max {
-                let index = document
-                    .records
-                    .iter()
-                    .position(|record| record.ready || record.restored_at.is_some())
-                    .context("Checkpoint retention is full of pending writes")?;
-                document.records.remove(index);
-            }
             Ok(released)
         });
         match captured {
@@ -370,6 +376,7 @@ impl Store {
             let directory = open_workspace(record)?;
             verify_after(record, &directory)?;
             record.ready = true;
+            self.retain(document);
             Ok(())
         })
     }
@@ -705,6 +712,23 @@ mod tests {
         store.commit(&token).unwrap();
         drop(token);
         assert!(store.list().unwrap()[0].ready);
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_only_restorable_checkpoint() {
+        let (_directory, workspace, store) = fixture();
+        let first = store.capture(&workspace, Path::new("note.txt"), Some("before"), Some("after")).unwrap();
+        fs::write(workspace.join("note.txt"), "after").unwrap();
+        first.mark_applied();
+        store.commit(&first).unwrap();
+        let kept = first.id.clone();
+        drop(first);
+        // The next write fails before it changes the file.
+        let failed = store.capture(&workspace, Path::new("note.txt"), Some("after"), Some("later")).unwrap();
+        drop(failed);
+        let list = store.list().unwrap();
+        assert_eq!(list.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), [kept], "the earlier checkpoint is still there");
+        assert!(list[0].ready);
     }
 
     #[test]
