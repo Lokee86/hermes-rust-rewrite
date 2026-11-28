@@ -160,8 +160,9 @@ fn run_code(source: &str, rest: &[String]) -> i32 {
     start();
     let code = c"
 import sys, traceback
-def run(source, rest):
+def run(source, rest, expose):
     sys.argv = ['-c', *rest]
+    expose()
     # A worker inherits the host's stdout, which carries the protocol: its prints go to stderr.
     sys.stdout = sys.stderr
     namespace = {'__name__': '__main__'}
@@ -185,7 +186,8 @@ def run(source, rest):
 ";
     Python::attach(|py| -> PyResult<i32> {
         let module = PyModule::from_code(py, code, c"hermes_run_code.py", c"hermes_run_code")?;
-        module.getattr("run")?.call1((source, rest.to_vec()))?.extract()
+        let expose = helper(py)?.getattr("expose_plugin_to_worker")?;
+        module.getattr("run")?.call1((source, rest.to_vec(), expose))?.extract()
     }).unwrap_or_else(|error| { eprintln!("{error}"); 1 })
 }
 

@@ -870,3 +870,14 @@ async fn a_managed_sign_in_is_renewed_before_every_model_request() {
     assert_eq!(*seen.lock().unwrap(), ["Bearer token-1", "Bearer token-2"]);
     server.abort();
 }
+
+#[test]
+fn work_started_from_a_managed_turn_resolves_its_sign_in_again() {
+    let account = crate::accounts::CATALOG.iter().find(|a| crate::accounts::for_base_url(a.base_url).is_some()).unwrap();
+    let original = Config { base_url: account.base_url.into(), model: "m".into(), api_key: String::new() };
+    let resolved = Config { api_key: "resolved-fixture-token".into(), ..original.clone() };
+    let provider = Provider::new(resolved.clone()).unwrap().renewing(&original);
+    assert!(provider.turn_config().api_key.is_empty(), "a delegated child renews the sign-in, not the parent's token");
+    let explicit = Provider::new(resolved.clone()).unwrap().renewing(&resolved);
+    assert_eq!(explicit.turn_config().api_key, "resolved-fixture-token", "an explicit key is passed on");
+}

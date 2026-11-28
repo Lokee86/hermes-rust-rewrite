@@ -85,13 +85,11 @@ fn expand_file(r: &Reference, workspace: &Path) -> Result<String, String> {
     let body = match start {
         // A range reads only up to its last line, and inlines at most the size limit.
         Some(a) => {
-            use std::io::BufRead;
             let mut reader = std::io::BufReader::new(std::fs::File::open(&path).map_err(|e| e.to_string())?);
             let (first, last) = (a.max(1), end.unwrap_or(a).max(a.max(1)));
             let (mut lines, mut kept, mut line, mut number) = (Vec::new(), 0u64, Vec::new(), 0);
             while number < last && kept <= MAX_FILE_BYTES {
-                line.clear();
-                if reader.read_until(b'\n', &mut line).map_err(|e| e.to_string())? == 0 { break; }
+                if !read_line_capped(&mut reader, &mut line, MAX_FILE_BYTES as usize).map_err(|e| e.to_string())? { break; }
                 number += 1;
                 if number >= first {
                     let text = String::from_utf8_lossy(&line);
@@ -109,6 +107,27 @@ fn expand_file(r: &Reference, workspace: &Path) -> Result<String, String> {
         }
     };
     Ok(format!("📄 {} ({} tokens)\n```{}\n{body}\n```", r.raw, tokens(&body), fence(&path)))
+}
+
+/// The next line, keeping at most `cap` bytes of it: one enormous line (a minified bundle, a log
+/// without newlines) is skipped through rather than held whole. False at end of file.
+fn read_line_capped(reader: &mut impl std::io::BufRead, line: &mut Vec<u8>, cap: usize) -> std::io::Result<bool> {
+    line.clear();
+    let mut read_any = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() { return Ok(read_any); }
+        read_any = true;
+        let (chunk, ends) = match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (&buffer[..=end], true),
+            None => (buffer, false),
+        };
+        let room = cap.saturating_sub(line.len());
+        line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let used = chunk.len();
+        reader.consume(used);
+        if ends { return Ok(true); }
+    }
 }
 
 fn expand_folder(r: &Reference, workspace: &Path) -> Result<String, String> {
@@ -275,6 +294,14 @@ mod tests {
         let lines = expand_file(&reference("app.log:1-2"), dir.path()).unwrap();
         assert!(lines.contains("    1 first line\n    2 second line"), "{lines}");
         assert!(!lines.contains("filler"));
+        let mut huge = vec![b'x'; 3 * MAX_FILE_BYTES as usize];
+        huge.extend_from_slice(b"\nafter\n");
+        let mut reader = std::io::BufReader::new(huge.as_slice());
+        let mut line = Vec::new();
+        assert!(read_line_capped(&mut reader, &mut line, MAX_FILE_BYTES as usize).unwrap());
+        assert_eq!(line.len(), MAX_FILE_BYTES as usize, "a huge line is held only up to the cap");
+        assert!(read_line_capped(&mut reader, &mut line, MAX_FILE_BYTES as usize).unwrap());
+        assert_eq!(line, b"after\n", "and reading goes on after it");
     }
     #[test]
     fn parses_the_hermes_reference_grammar() {

@@ -759,6 +759,9 @@ pub(crate) struct Provider {
     /// while tools run or an approval waits.
     renew: Option<Renew>,
     key: std::sync::Mutex<Option<String>>,
+    /// The chat's settings before a managed sign-in filled in its token, for work started from
+    /// this turn (a delegated child) to renew the sign-in itself.
+    unresolved: Option<Config>,
 }
 
 impl Provider {
@@ -792,6 +795,7 @@ impl Provider {
             options,
             renew: None,
             key: std::sync::Mutex::new(None),
+            unresolved: None,
         })
     }
 
@@ -807,7 +811,16 @@ impl Provider {
             crate::accounts::for_base_url(&original.base_url)
                 .map(|account| -> Renew { std::sync::Arc::new(move || Box::pin(crate::accounts::access_token(account.id))) })
         };
-        self.with_renewal(renew)
+        let managed = renew.is_some();
+        let mut provider = self.with_renewal(renew);
+        if managed { provider.unresolved = Some(original.clone()); }
+        provider
+    }
+
+    /// Settings for a new turn started from this one: a managed sign-in is resolved again there,
+    /// so it is renewed like this turn's, never frozen at this turn's token.
+    pub(crate) fn turn_config(&self) -> Config {
+        self.unresolved.clone().unwrap_or_else(|| self.config.clone())
     }
 
     pub(crate) fn with_renewal(mut self, renew: Option<Renew>) -> Self {

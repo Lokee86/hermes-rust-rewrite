@@ -253,25 +253,47 @@ fn install_checkout(
     // Package generations stay available to workers that already loaded them. The new copy is
     // complete before the working one is touched: a full disk or a permissions error leaves the
     // installed plugin as it was.
-    if let Err(error) = replace_tree(source, &target) {
+    let reenable = |list: &mut Vec<Installed>| -> Result<()> {
         if was_enabled {
             for plugin in list.iter_mut().filter(|plugin| plugin.name == entry.name) { plugin.enabled = true; }
-            save(root, &list)?;
+            save(root, list)?;
         }
-        return Err(error);
-    }
-    if list.iter().any(|plugin| plugin.name == entry.name) {
-        crate::settings::ProfileSettings::invalidate_plugin_memory(root, &entry.name)?;
-    }
-    let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
-    crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
-    let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
-        version: package.version, description: package.description, sha: entry.sha.clone(), enabled: true,
-        servers: package.servers.keys().cloned().collect(), skills: package.skills.into_iter().map(|(s, _)| s).collect(),
-        revision: revision.saturating_add(1), python_package_generation };
-    list.retain(|p| p.name != entry.name);
-    list.push(record.clone());
-    save(root, &list)?;
+        Ok(())
+    };
+    let replaced = match replace_tree(source, &target) {
+        Ok(replaced) => replaced,
+        Err(error) => { reenable(&mut list)?; return Err(error); }
+    };
+    let previous = list.clone();
+    let published = (|| -> Result<Installed> {
+        if list.iter().any(|plugin| plugin.name == entry.name) {
+            crate::settings::ProfileSettings::invalidate_plugin_memory(root, &entry.name)?;
+        }
+        let docs = package.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
+        crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs)?;
+        let record = Installed { name: entry.name.clone(), title: if entry.title.is_empty() { package.name.clone() } else { entry.title.clone() },
+            version: package.version.clone(), description: package.description.clone(), sha: entry.sha.clone(), enabled: true,
+            servers: package.servers.keys().cloned().collect(), skills: package.skills.iter().map(|(s, _)| s.clone()).collect(),
+            revision: revision.saturating_add(1), python_package_generation: python_package_generation.clone() };
+        list.retain(|p| p.name != entry.name);
+        list.push(record.clone());
+        save(root, &list)?;
+        Ok(record)
+    })();
+    let record = match published {
+        Ok(record) => { replaced.keep(); record }
+        Err(error) => {
+            // The files go back with the record: an update recorded only halfway is undone whole.
+            drop(replaced);
+            if let Ok(restored) = read_package(&target) {
+                let docs = restored.skills.iter().map(|(skill, doc)| (format!("plugin/{}/{skill}", entry.name), doc.clone())).collect();
+                let _ = crate::skill_catalog::put_documents(root, &format!("plugin/{}/", entry.name), docs);
+            }
+            let mut previous = previous;
+            reenable(&mut previous)?;
+            return Err(error);
+        }
+    };
     if let Some(staged) = staged {
         // Published generations may be mapped in another process. Only
         // unpublished generations are automatically removed by TempDir.
@@ -403,7 +425,25 @@ pub fn remove_dir(path: &Path) -> Result<()> {
 
 /// Put a copy of `source` at `target`, keeping whatever was there until the copy is whole. The
 /// staging names start with a dot, which no plugin name does.
-fn replace_tree(source: &Path, target: &Path) -> Result<()> {
+/// A plugin folder replaced by `replace_tree`: the old copy waits beside it until `keep`, and is
+/// put back if the update is dropped instead.
+struct Replaced { target: PathBuf, retired: PathBuf, had_previous: bool, kept: bool }
+impl Replaced {
+    fn keep(mut self) {
+        self.kept = true;
+        // The old copy is gone from its name already; removing its files can wait for Windows to let go.
+        let _ = remove_dir(&self.retired);
+    }
+}
+impl Drop for Replaced {
+    fn drop(&mut self) {
+        if self.kept { return; }
+        let _ = remove_dir(&self.target);
+        if self.had_previous { let _ = fs::rename(&self.retired, &self.target); }
+    }
+}
+
+fn replace_tree(source: &Path, target: &Path) -> Result<Replaced> {
     let name = target.file_name().context("Invalid plugin folder")?.to_string_lossy().into_owned();
     let parent = target.parent().context("Invalid plugin folder")?;
     let (incoming, retired) = (parent.join(format!(".{name}.incoming")), parent.join(format!(".{name}.retired")));
@@ -431,9 +471,7 @@ fn replace_tree(source: &Path, target: &Path) -> Result<()> {
         let _ = remove_dir(&incoming);
         return Err(anyhow::Error::new(error).context("Could not publish the plugin update; the installed version is unchanged"));
     }
-    // The old copy is gone from its name already; removing its files can wait for Windows to let go.
-    let _ = remove_dir(&retired);
-    Ok(())
+    Ok(Replaced { target: target.to_path_buf(), retired, had_previous, kept: false })
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
@@ -606,9 +644,10 @@ async fn connect_all(root: &Path) -> (Vec<Mcp>, Vec<String>) {
 }
 
 /// Connect Agent Plugins v1 servers. Embedded Python has its own profile-owned activation.
-async fn connect_mcp(root: &Path) -> (Vec<Mcp>, Vec<String>) {
+/// `reserved`: prefixes already used by Python plugin tools, which a server must not share.
+async fn connect_mcp(root: &Path, reserved: std::collections::BTreeSet<String>) -> (Vec<Mcp>, Vec<String>) {
     let (mut live, mut errors) = (vec![], vec![]);
-    let mut prefixes = std::collections::BTreeSet::new();
+    let mut prefixes = reserved;
     for plugin in installed(root).unwrap_or_default().into_iter().filter(|p| p.enabled && !p.servers.is_empty() && !p.servers.iter().any(|kind| kind == "python") && valid_name(&p.name)) {
         let plugin_root = dir(root).join(&plugin.name);
         let data = root.join("plugin-data").join(&plugin.name);
@@ -698,6 +737,9 @@ mod tests {
         assert_eq!(first, "mcp_github", "the first keeps the usual name");
         assert_ne!(first, second);
         assert_ne!(long, truncated, "names cut to the same 20 characters still differ");
+        // A Python plugin named like a server keeps its prefix; the server takes another.
+        let mut taken = std::collections::BTreeSet::from([prefix("github")]);
+        assert_ne!(unique_prefix(&mut taken, "issues", "github"), prefix("github"));
     }
 
     #[cfg(unix)]
@@ -717,7 +759,11 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path().join("plugins")).unwrap().count(), 1, "no staging copy is left");
 
         fs::set_permissions(update.join("unreadable.py"), fs::Permissions::from_mode(0o644)).unwrap();
-        replace_tree(&update, &installed).unwrap();
+        // Publishing fails after the swap (here the update is dropped): the working copy comes back.
+        drop(replace_tree(&update, &installed).unwrap());
+        assert_eq!(fs::read_to_string(installed.join("plugin.json")).unwrap(), "working");
+        assert_eq!(fs::read_dir(dir.path().join("plugins")).unwrap().count(), 1);
+        replace_tree(&update, &installed).unwrap().keep();
         assert_eq!(fs::read_to_string(installed.join("plugin.json")).unwrap(), "new");
         assert_eq!(fs::read_dir(dir.path().join("plugins")).unwrap().count(), 1);
     }

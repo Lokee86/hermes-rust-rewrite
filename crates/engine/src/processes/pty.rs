@@ -103,9 +103,24 @@ impl Job {
                         // A lost stream is not an exit. Reported as one, Stop and cleanup would
                         // skip a command that still runs, so the terminal is ended first.
                         Err(error) => {
-                            let running = owner.status(&terminal).await.map_or(true, |status| status["state"] != "finished");
+                            let finished = |status: &Value| status["state"] == "finished";
+                            let running = owner.status(&terminal).await.map_or(true, |status| !finished(&status));
                             if running { let _ = owner.kill(&terminal).await; }
-                            let code = owner.status(&terminal).await.ok().and_then(|status| exit(&status).code);
+                            // Reported only once the terminal has really ended: a kill that did not
+                            // take leaves the job running, so Stop and cleanup still reach it.
+                            let status = loop {
+                                match owner.status(&terminal).await {
+                                    Ok(status) if finished(&status) => break Some(status),
+                                    Ok(_) => {}
+                                    Err(_) if !running => break None,
+                                    Err(_) => {}
+                                }
+                                tokio::select! {
+                                    _ = stop.cancelled() => return,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                                }
+                            };
+                            let code = status.as_ref().and_then(|status| exit(status).code);
                             let stopped = if running { "; the command was stopped" } else { "" };
                             Exit { code, error: Some(format!("PTY stream lost: {error:#}{stopped}")) }
                         }
