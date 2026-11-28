@@ -395,3 +395,208 @@ fn profile_deletion_requires_the_registered_identity_and_respects_a_mount() {
     purge_profile_data(original.root(), "original").unwrap();
     assert!(!directory.exists());
 }
+
+fn mock_ego_chat(count: usize) -> (hermes_engine::Config, std::thread::JoinHandle<Vec<Value>>) {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+    };
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}/v1", socket.local_addr().unwrap());
+    let requests = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..count {
+            let (mut tcp, _) = socket.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut reader = BufReader::new(tcp.try_clone().unwrap());
+            let mut size = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    size = value.trim().parse::<usize>().ok();
+                }
+            }
+            let mut body = vec![0; size.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            requests.push(serde_json::from_slice::<Value>(&body).unwrap());
+            let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Fixture reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            write!(tcp, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len()).unwrap();
+        }
+        requests
+    });
+
+    let config = hermes_engine::Config {
+        base_url: origin,
+        model: "fixture".into(),
+        api_key: String::new(),
+    };
+    (config, requests)
+}
+
+#[tokio::test]
+async fn native_request_renders_approved_profile_identity_and_pins_once() {
+    use hermes_engine::{
+        CancellationToken, Session, Status,
+        native_ego::{PinPriority, PinRequest, PinScope},
+        settings::ProfileSettings,
+    };
+    use hermes_library::memory_plugin::{MemorySources, MemoryStore};
+    use std::sync::Arc;
+
+    struct Sources(CaptureBinding);
+    impl MemorySources for Sources {
+        fn check_session(&self, _: &str, binding: &CaptureBinding) -> Result<()> {
+            ensure!(*binding == self.0, "wrong fixture session");
+            Ok(())
+        }
+        fn copied_source_change_pending(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let (_, home, general, _, phy) = legacy_profile(temp.path());
+    let library = Library::open(home.clone()).unwrap();
+    let options = json!({
+        "memory_provider":"reliquary","memory_ego_enabled":true,"timezone":"UTC",
+        "mcp_tools":false,"clock_tools":false,"terminal_tools":false,"file_tools":false,"skill_tools":false,
+    });
+    ProfileSettings::update(&home, options.as_object().unwrap()).unwrap();
+    fs::write(home.join("SOUL.md"), "Mercury fallback persona.").unwrap();
+    let notes = home.join("memories");
+    fs::create_dir_all(&notes).unwrap();
+    fs::write(notes.join("MEMORY.md"), "Legacy Mercury memory sentinel.").unwrap();
+    fs::write(notes.join("USER.md"), "Legacy Mercury user sentinel.").unwrap();
+
+    let memory = Arc::new(open(&library, "work", false).unwrap().unwrap());
+    let binding = CaptureBinding {
+        profile_id: "work".into(),
+        principal_id: "legacy-principal".into(),
+        project_id: None,
+        rel_id: general.to_string(),
+        phy_id: phy.to_string(),
+    };
+    let ego = memory
+        .ego(
+            Arc::new(Sources(binding.clone())),
+            "fixture".into(),
+            Some(binding),
+        )
+        .unwrap()
+        .unwrap();
+    ego.pin(PinRequest::PinAnchor {
+        scope: PinScope::Phy,
+        text: "Profile pin alpha sentinel.".into(),
+        priority: None,
+    })
+    .unwrap();
+    let pin = ego
+        .pin(PinRequest::PinAnchor {
+            scope: PinScope::Rel,
+            text: "Project pin beta sentinel.".into(),
+            priority: Some(PinPriority::Low),
+        })
+        .unwrap();
+    let pin = &pin["pin"];
+    let raised = ego
+        .pin(PinRequest::ModifyAnchor {
+            scope: PinScope::Rel,
+            id: pin["id"].as_str().unwrap().into(),
+            revision: pin["revision"].as_u64().unwrap(),
+            text: None,
+            priority: Some(PinPriority::Raise),
+        })
+        .unwrap();
+    assert_eq!(raised["pin"]["text"], "Project pin beta sentinel.");
+    assert_eq!(raised["pin"]["priority"], "normal");
+
+    let draft = "Exact approved Mercury persona.\nIts second line remains verbatim.";
+    let pending = ego.prepare_identity(draft.into()).unwrap();
+    assert_eq!(pending.review["text"], draft);
+    assert!(ego.identity().unwrap().is_none());
+
+    let (config, requests) = mock_ego_chat(2);
+    let mut session =
+        Session::open_for_profile_with_enrollment(&temp.path().join("chat"), None, &home, true)
+            .unwrap();
+    let (events, _received) = async_channel::unbounded();
+    session.set_native_ego(Some(ego.clone()));
+    session
+        .turn(
+            config.clone(),
+            "Before approval.".into(),
+            events.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session.history().turns.last().unwrap().status,
+        Status::Complete
+    );
+    (pending.apply)().unwrap();
+    assert_eq!(ego.identity().unwrap().as_deref(), Some(draft));
+    session.set_native_ego(Some(ego.clone()));
+    session
+        .turn(
+            config,
+            "After approval.".into(),
+            events,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session.history().turns.last().unwrap().status,
+        Status::Complete
+    );
+
+    let requests = requests.join().unwrap();
+    let prompt = |index: usize| requests[index]["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt(0).contains("Mercury fallback persona."));
+    assert!(!prompt(0).contains(draft));
+    assert!(!prompt(1).contains("Mercury fallback persona."));
+    assert_eq!(prompt(1).matches(draft).count(), 1);
+    assert!(prompt(1).find(draft).unwrap() < prompt(1).find("User timezone: UTC.").unwrap());
+    assert!(prompt(1).contains("You are Hermes, a helpful desktop agent."));
+    for marker in ["Profile pin alpha sentinel.", "Project pin beta sentinel."] {
+        assert_eq!(prompt(1).matches(marker).count(), 1);
+    }
+    for index in [0, 1] {
+        assert!(!prompt(index).contains("Legacy Mercury memory sentinel."));
+        assert!(!prompt(index).contains("Legacy Mercury user sentinel."));
+    }
+    let current = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(current[1]["content"], "Before approval.");
+    assert_eq!(current[2]["content"], "Fixture reply");
+    assert_eq!(current[3]["content"], "After approval.");
+    for name in ["list_pins", "pin_anchor", "modify_anchor", "delete_anchor"] {
+        assert_eq!(
+            requests[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| tool["function"]["name"] == name)
+                .count(),
+            1
+        );
+    }
+
+    let pending = ego.prepare_identity("Identity awaiting review.".into()).unwrap();
+    let directory = home.join("reliquary");
+    let replacement = Phylactery::create(directory.join("replacement.phy")).unwrap();
+    let mut topology = legacy_topology(&home);
+    topology["active_phy"] = json!(replacement.owner_id());
+    topology["owners"][replacement.owner_id().to_string()] =
+        json!({"kind":"phylactery","path":replacement.path()});
+    save_state(&directory.join(TOPOLOGY), &topology, true).unwrap();
+
+    assert!((pending.apply)().is_err());
+    assert!(ego.context("current preferences", 4096).is_err());
+    assert!(ego.identity().is_err());
+    assert!(ego.pin(PinRequest::ListPins { scope: PinScope::Phy }).is_err());
+}

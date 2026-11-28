@@ -5,13 +5,13 @@ use anyhow::{Context, Result};
 use hermes_engine::{
     Config,
     credentials::EndpointStore,
-    inference::{CompletionInference, EmbeddingInference, InferenceTarget},
+    inference::{CompletionInference, EmbeddingInference, InferenceTarget, StructuredTool},
     settings::ProfileSettings,
 };
 use reliquary_memory::{
     ConfiguredDecisionEndpoint, ConfiguredRuntime, ConfiguredRuntimeError, DecisionEndpoint,
     DecisionEndpointError, EmbeddingEndpoint, EmbeddingEndpointError, EmbeddingNormalization,
-    GeneralEndpoint, GeneralEndpointError, ModelSlot, SwitchboardEmbeddingMode,
+    GeneralEndpoint, GeneralEndpointError, GeneralTool, ModelSlot, SwitchboardEmbeddingMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,6 +54,34 @@ impl GeneralEndpoint for Completion {
             .block_on(self.inference.complete_json(system, user, name, schema))
             .map_err(|_| {
                 GeneralEndpointError::Failure("Hermes structured completion failed".into())
+            })
+    }
+    fn complete_json_with_tool(
+        &self,
+        system: &str,
+        user: &str,
+        name: &str,
+        schema: &Value,
+        tool: GeneralTool<'_>,
+        run: &mut dyn FnMut(Value) -> Result<Value, GeneralEndpointError>,
+    ) -> Result<Value, GeneralEndpointError> {
+        let tool = StructuredTool {
+            name: tool.name,
+            schema: tool.schema,
+            max_results: tool.max_results,
+            max_input_bytes: tool.max_input_bytes,
+        };
+        self.executor
+            .block_on(self.inference.complete_json_with_tool(
+                system,
+                user,
+                name,
+                schema,
+                tool,
+                &mut |arguments| Ok(run(arguments)?),
+            ))
+            .map_err(|_| {
+                GeneralEndpointError::Failure("Hermes structured tool completion failed".into())
             })
     }
 }

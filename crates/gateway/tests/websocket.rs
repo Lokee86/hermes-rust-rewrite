@@ -587,7 +587,7 @@ fn structured_memory_fixture(request: &Value, schema: &Value) -> Value {
             json!({"version":1,"approved":approved})
         }
         "dream_pair_classification" => json!({"relation":"none","direction":"none","evidence":[]}),
-        "memory_web_audit_v2" => {
+        "memory_web_audit_v3" => {
             let input: Value = serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
             let candidates = input["sources"].as_array().into_iter().flatten()
                 .find(|row| row["kind"] == "memory" && row["text"] == PROJECT_FACT)
@@ -1067,14 +1067,20 @@ async fn stock_reliquary_enrolls_renames_and_recalls_only_on_request() {
     let [support] = expected["evidence"].as_array().unwrap().as_slice() else {
         panic!("expected one exact supporting Memory citation: {expected}");
     };
-    let support_memory_id: String = support["source"]["Memory"].as_array().unwrap().iter()
-        .map(|byte| format!("{:02x}", byte.as_u64().unwrap())).collect();
+    let hex_id = |value: &Value| -> String {
+        value.as_array().unwrap().iter()
+            .map(|byte| format!("{:02x}", byte.as_u64().unwrap())).collect()
+    };
+    let support_memory_id = hex_id(&support["source"]["Memory"]);
+    let support_owner_id = hex_id(&support["owner_id"]);
     let control = lexical["memories"].as_array().unwrap().iter()
-        .find(|row| row["id"] == support_memory_id).unwrap();
+        .find(|row| row["reference"]["memory_id"] == support_memory_id
+            && row["reference"]["owner_id"] == support_owner_id)
+        .unwrap_or_else(|| panic!("expected the cited Memory in {lexical}"));
     assert_eq!(control["content"], PROJECT_FACT);
     assert_eq!(support["owner_id"], citation["owner_id"]);
     assert_eq!(support["history_generation"], citation["history_generation"]);
-    assert_eq!(support["revision"], control["revision"]);
+    assert_eq!(support["revision"], control["reference"]["revision"]);
     assert_eq!(support["field"], "Content");
     assert_eq!(support["start_byte"], 0);
     assert_eq!(support["end_byte"], PROJECT_FACT.len());
@@ -2214,4 +2220,165 @@ async fn group_round_runs_each_profile_without_desktop_and_deduplicates_retry() 
     client.ok("prompt.cancel", json!({"session_id":chat.id,"admission_id":active["admission_id"]})).await;
     client.socket.close(None).await.unwrap();
     gateway.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "reliquary")]
+#[tokio::test]
+async fn native_gateway_captures_the_verified_ego_package_and_reviews_identity() {
+    use hermes_engine::settings::ProfileSettings;
+    use hermes_gateway::{
+        client::{ClientMessage, ClientOptions, GatewayClient},
+        owner,
+    };
+    use hermes_library::Library;
+    use std::{fs, path::{Path, PathBuf}, sync::Mutex};
+
+    let fixture = std::env::var_os("MERCURY_EGO_CAPTURE_FIXTURE").map(PathBuf::from);
+    let sandbox = TempDir::new().unwrap();
+    let profiles = Library::open(sandbox.path().join("data")).unwrap();
+    let home = profiles.create_profile("work").unwrap().path;
+    let older_chat = Library::open(&home)
+        .unwrap()
+        .create_session(None, Some("Chat before enrollment"))
+        .unwrap();
+    let fixture_phy = fixture.map(|fixture| {
+        let directory = home.join("reliquary");
+        fs::create_dir(&directory).unwrap();
+        let mut copies = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(fixture).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(extension @ ("rel" | "phy")) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            let copy = directory.join(format!("fixture.{extension}"));
+            assert!(copies.insert(extension.to_owned(), copy.clone()).is_none(), "ambiguous fixture");
+            fs::copy(path, copy).unwrap();
+        }
+        let rel = "a2".repeat(16);
+        let phy = "a3".repeat(16);
+        let topology = json!({
+            "version":2,"profile_id":"work","principal_id":"fixture-principal",
+            "main_rel":rel,"active_phy":phy,"projects":{},"owners":{
+                rel.clone():{"kind":"rel","path":copies["rel"]},
+                phy.clone():{"kind":"phylactery","path":copies["phy"]}
+            }
+        });
+        fs::write(directory.join("topology-v1.json"), serde_json::to_vec(&topology).unwrap()).unwrap();
+        fs::write(directory.join("capture-enrollment-v1.json"), br#"{"version":1,"cutoff":1}"#).unwrap();
+        phy
+    });
+    let options = json!({
+        "memory_provider":"reliquary","memory_ego_enabled":true,"timezone":"UTC",
+        "mcp_tools":false,"clock_tools":false,"terminal_tools":false,"file_tools":false,"skill_tools":false,
+    });
+    ProfileSettings::update(&home, options.as_object().unwrap()).unwrap();
+    fs::write(home.join("SOUL.md"), "Host fallback sentinel.").unwrap();
+    fs::create_dir_all(home.join("memories")).unwrap();
+    fs::write(home.join("memories/MEMORY.md"), "Built-in MEMORY sentinel.").unwrap();
+    fs::write(home.join("memories/USER.md"), "Built-in USER sentinel.").unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    async fn model(State(requests): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>) -> Response {
+        requests.lock().unwrap().push(body);
+        Response::builder().header(header::CONTENT_TYPE, "text/event-stream").body(Body::from(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Fixture reply\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+        )).unwrap()
+    }
+    let router = Router::new().route("/v1/chat/completions", post(model)).with_state(requests.clone());
+    let address = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", address.local_addr().unwrap());
+    let provider = tokio::spawn(async move { axum::serve(address, router).await.unwrap(); });
+    let config = Config { base_url, model: "fixture".into(), api_key: String::new() };
+
+    let binary = Path::new(env!("CARGO_BIN_EXE_hermes-gateway"));
+    let gateway = PortableGateway::start(binary, &home, &config).await;
+    assert_eq!(gateway.reconcile_memory().await["enrolled"], true);
+    let mut chat = gateway.client().await;
+    let session = chat.ok("session.create", json!({"title":"Disposable Ego fixture"})).await;
+    let sid = session["session_id"].as_str().unwrap();
+    for (submission, query) in [
+        ("ego-previous","Earlier conversation sentinel."),
+        ("ego-atlas","What is the guidance for Atlas payment?"),
+    ] {
+        chat.ok("prompt.submit", json!({"session_id":sid,"submission_id":submission,"text":query})).await;
+        let complete = chat.event_with_timeout("message.complete", 65).await;
+        assert_eq!(complete["payload"]["status"], "complete", "{complete}");
+    }
+    let request = requests.lock().unwrap().last().unwrap().clone();
+    let prompt = request["messages"][0]["content"].as_str().unwrap();
+    if fixture_phy.is_some() {
+        for text in [
+            "Respond with practical precision.",
+            "Always use metric units.",
+            "Meetings use video.",
+            "Every Atlas purchase request is reviewed before payment is released.",
+        ] {
+            assert_eq!(prompt.matches(text).count(), 1, "expected one {text:?} in {prompt:?}");
+        }
+        assert!(!prompt.contains("Host fallback sentinel."));
+        assert!(prompt.find("Respond with practical precision.").unwrap() < prompt.find("User timezone: UTC.").unwrap());
+    } else {
+        assert_eq!(prompt.matches("Host fallback sentinel.").count(), 1);
+    }
+    for absent in [
+        "Built-in MEMORY sentinel.", "Built-in USER sentinel.",
+        "Atlas reviews purchase requests before releasing payment.",
+    ] {
+        assert!(!prompt.contains(absent));
+    }
+    assert!(prompt.starts_with("You are Hermes, a helpful desktop agent."));
+    assert_eq!(request["messages"][1]["content"], "Earlier conversation sentinel.");
+    assert_eq!(request["messages"][2]["content"], "Fixture reply");
+    assert_eq!(request["messages"][3]["content"], "What is the guidance for Atlas payment?");
+    if let Some(path) = std::env::var_os("MERCURY_EGO_CAPTURE_REQUEST") {
+        fs::write(path, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+    }
+
+    let control = owner::discover(&home).await.unwrap().unwrap();
+    let client = GatewayClient::new(ClientOptions::default());
+    let mut events = client.subscribe();
+    control.connect(&client).await.unwrap();
+    client.request("session.resume", json!({"session_id":sid})).await.unwrap();
+    let before = client.request("slash.exec", json!({"session_id":sid,"command":"/identity"}))
+        .await.unwrap();
+    let draft = "Review this exact Mercury Identity.\nKeep the second line.";
+    client.request("slash.exec", json!({"session_id":sid,"command":format!("/identity {draft}")}))
+        .await.unwrap();
+    let approval = timeout(Duration::from_secs(5), async {
+        loop {
+            if let ClientMessage::Event(event) = events.recv().await.unwrap()
+                && event["type"] == "approval.request" { break event; }
+        }
+    }).await.unwrap();
+    assert_eq!(approval["payload"]["command"], draft);
+    if let Some(phy) = fixture_phy {
+        assert_eq!(approval["payload"]["identity_draft"]["phy"], phy);
+        assert_eq!(before["output"], "Respond with practical precision.");
+    }
+    assert_eq!(client.request("slash.exec", json!({"session_id":sid,"command":"/identity"}))
+        .await.unwrap()["output"], before["output"]);
+    let decision = json!({"session_id":sid,"prompt_id":approval["payload"]["prompt_id"],
+        "execution_generation":approval["execution_generation"],"choice":"once"});
+    assert!(chat.call("approval.respond", decision.clone()).await.get("error").is_some());
+    client.request("approval.respond", decision).await.unwrap();
+    assert_eq!(client.request("slash.exec", json!({"session_id":sid,"command":"/identity"}))
+        .await.unwrap()["output"], draft);
+
+    chat.ok("session.resume", json!({"session_id":older_chat.id})).await;
+    chat.ok("prompt.submit", json!({
+        "session_id":older_chat.id,"submission_id":"ego-older-chat","text":"Hello again.",
+    })).await;
+    let complete = chat.event_with_timeout("message.complete", 65).await;
+    assert_eq!(complete["payload"]["status"], "complete", "{complete}");
+    let request = requests.lock().unwrap().last().unwrap().clone();
+    let prompt = request["messages"][0]["content"].as_str().unwrap();
+    assert_eq!(prompt.matches(draft).count(), 1);
+    assert!(!prompt.contains("Host fallback sentinel."));
+    assert!(!request["tools"].as_array().unwrap().iter()
+        .any(|tool| tool["function"]["name"] == "memory_query"));
+
+    client.close();
+    drop(chat);
+    gateway.shutdown().await;
+    provider.abort();
 }

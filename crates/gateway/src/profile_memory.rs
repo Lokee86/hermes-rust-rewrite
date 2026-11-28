@@ -37,6 +37,16 @@ impl NativeSlot {
             return Ok(());
         };
         let configured = ProfileSettings::load(self.library.root())?.memory_provider;
+        if matches!(configured, MemoryProvider::Auto | MemoryProvider::Reliquary)
+            && let Some(store) = mounted.as_ref()
+            && store.needs_profile_remount()?
+        {
+            if Arc::strong_count(store) > 1 {
+                store.pause_for_remount();
+                return Ok(());
+            }
+            self.unmount(mounted);
+        }
         let opening = mounted.is_none();
         if !matches!(configured, MemoryProvider::Auto | MemoryProvider::Reliquary) {
             self.unmount(mounted);
@@ -256,6 +266,30 @@ impl Selected {
         }
     }
 
+    pub(super) fn ego(
+        &self,
+        library: &Library,
+        session: &LiveSession,
+    ) -> Result<Option<Arc<dyn hermes_engine::native_ego::EgoAccess>>> {
+        let Some(memory) = &self.native else {
+            return Ok(None);
+        };
+        let summary = lock(&session.summary).clone();
+        if summary.archived
+            || summary.bot.is_some()
+            || !matches!(summary.source, hermes_library::SessionSource::Native)
+            || memory_capture::source_ended(&session.dir)
+        {
+            return Ok(None);
+        }
+        let binding = lock(&session.settings).memory_binding.clone();
+        memory.clone().ego(
+            Arc::new(memory_capture::CaptureSources(library.clone())),
+            summary.id,
+            binding,
+        )
+    }
+
     pub(super) fn configure_turn(
         &self,
         target: &mut Session,
@@ -266,6 +300,7 @@ impl Selected {
         let summary = lock(&session.summary).clone();
         if summary.bot.is_some() {
             target.set_native_memory(false, None);
+            target.set_native_ego(None);
             return;
         }
         // Require consent both when the client submits and when its turn runs.
@@ -298,5 +333,10 @@ impl Selected {
             )
         });
         target.set_native_memory(self.native(), query);
+        let ego = admission
+            .ordinary_chat
+            .then(|| self.ego(library, session))
+            .and_then(|access| access.ok().flatten());
+        target.set_native_ego(ego);
     }
 }

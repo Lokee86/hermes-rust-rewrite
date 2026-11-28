@@ -209,7 +209,7 @@ impl Shared {
                     }
                     view.clarifications.get(request).is_some_and(|ask| !ask.answer.is_closed() && ask.expires_ms > now)
                 }
-                _ => view.approvals.get(request).is_some_and(|ask| !ask.answer.is_closed() && ask.expires_ms > now),
+                _ => view.approvals.get(request).is_some_and(Approval::tool_is_live),
             };
             if !live {
                 return Err(RpcError::new(4001, "prompt_stale", "This prompt is no longer waiting"));
@@ -245,10 +245,14 @@ impl Shared {
     }
 
     pub(super) fn answer_approval(view: &mut View, request: &str, approve: bool) -> bool {
-        view.approvals.remove(request).is_some_and(|pending| {
-            pending.timeout.cancel();
-            pending.answer.try_send(approve).is_ok()
-        })
+        if view.approvals.get(request).is_some_and(Approval::tool_is_live)
+            && let Some(Approval { action: ApprovalAction::Tool(answer), timeout, .. }) =
+                view.approvals.remove(request)
+        {
+            timeout.cancel();
+            return answer.try_send(approve).is_ok();
+        }
+        false
     }
 
     fn check_generation(view: &View, generation: u64) -> Result<(), RpcError> {

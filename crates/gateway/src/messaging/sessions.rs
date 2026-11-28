@@ -418,7 +418,7 @@ fn publish_prompts(
         let approvals = view
             .approvals
             .iter()
-            .filter(|(_, pending)| !pending.answer.is_closed())
+            .filter(|(_, pending)| pending.tool_is_live())
             .map(|(id, pending)| {
                 let text = pending.payload["command"]
                     .as_str()

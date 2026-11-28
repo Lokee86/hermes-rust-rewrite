@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use hermes_engine::{
     Config, Turn,
     memory_capture::{CaptureBinding, CaptureReceipt, CapturedEchoKind, PendingMemoryCapture},
+    native_ego::{EgoAccess, count_context},
     native_memory::MemoryQuery,
     settings::ProfileSettings,
 };
@@ -12,10 +13,11 @@ use hermes_library::{
     memory_plugin::{MemorySources, MemoryStore, MemoryTurn, UserArchiveHit},
 };
 use reliquary_memory::{
-    Gateway, HermesCopiedEcho, HermesCopiedEchoKind, HermesCopiedMessage, HermesCopiedRole,
-    HermesCopiedSnapshot, HermesCopiedToolOutcome, HermesCopyScope, HostCredentialBinding,
-    Instance, NativeImportPlan, NativeImportState, OwnerGrant, OwnerId, OwnerKind,
-    OwnerProcessingJob, Phylactery, ProcessOptions, Rel, TrustedHostAdmission,
+    ActivePhyRecall, EgoWorkerHandle, Gateway, HermesCopiedEcho, HermesCopiedEchoKind,
+    HermesCopiedMessage, HermesCopiedRole, HermesCopiedSnapshot, HermesCopiedToolOutcome,
+    HermesCopyScope, HostCredentialBinding, Instance, NativeImportPlan, NativeImportState,
+    OwnerGrant, OwnerId, OwnerKind, OwnerProcessingJob, PhyPerceptionWorker, Phylactery,
+    ProcessOptions, ProductErrorKind, Rel, TrustedHostAdmission,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -28,16 +30,23 @@ use std::{
 use uuid::Uuid;
 
 pub(super) struct EmbeddedMemory {
+    phy_perception_worker: Mutex<Option<PhyPerceptionWorker>>,
+    ego_worker: Mutex<Option<EgoWorkerHandle>>,
+    pub(super) ego_authority: Option<Instance>,
+    pub(super) ego_online: std::sync::atomic::AtomicBool,
+    phy_perception_authority: Option<Instance>,
+    pub(super) recall: ActivePhyRecall,
+    recall_online: std::sync::atomic::AtomicBool,
     profile_id: String,
     principal_id: String,
     cutoff: f64,
     general: OwnerId,
-    phy: OwnerId,
+    pub(super) phy: OwnerId,
     projects: BTreeMap<String, OwnerId>,
-    instances: BTreeMap<OwnerId, Instance>,
+    pub(super) instances: BTreeMap<OwnerId, Instance>,
     gateway: Gateway,
     _managers: Vec<Instance>,
-    home: PathBuf,
+    pub(super) home: PathBuf,
     directory: PathBuf,
     managed_projects: Option<Vec<Project>>,
     /// The import each owner is processing.
@@ -85,6 +94,10 @@ impl EmbeddedMemory {
         enrollment.validate()?;
         HermesCopyScope::new(topology.profile_id.clone(), "profile-check".into())?;
         let gateway = Gateway::new();
+        let settings = ProfileSettings::load(&home)?;
+        let ego = settings.memory_ego_enabled;
+        let phy_perception =
+            settings.memory_phy_perception_enabled && settings.memory_perception_endpoint.is_some();
         let owner_path = |id: OwnerId, kind: OwnerKind| -> Result<PathBuf> {
             let owner = topology
                 .owners
@@ -95,7 +108,7 @@ impl EmbeddedMemory {
         };
         let phy = gateway.mount_phylactery(
             &Phylactery::open(owner_path(topology.active_phy, OwnerKind::Phylactery)?)?,
-            false,
+            ego || phy_perception,
         )?;
         ensure!(phy == topology.active_phy, "private owner identity changed");
         let projects: BTreeMap<_, _> = topology
@@ -128,13 +141,39 @@ impl EmbeddedMemory {
             ]);
             tokens.insert(id, (token, manager));
         }
+        let phy_token = (ego || phy_perception).then(|| Uuid::new_v4().simple().to_string());
+        if let Some(token) = &phy_token {
+            let grants = std::iter::once(OwnerGrant::OperatePhylactery(phy)).chain(
+                tokens
+                    .keys()
+                    .copied()
+                    .filter(|_| ego)
+                    .map(OwnerGrant::ViewRel),
+            );
+            credentials.push(HostCredentialBinding::new(
+                &topology.principal_id,
+                token,
+                grants,
+            ));
+        }
         let (adapter, _) = TrustedHostAdmission::new(credentials).install(&gateway)?;
+        let phy_authority = phy_token
+            .as_deref()
+            .map(|token| adapter.authenticate(token))
+            .transpose()?;
         let mut managers = Vec::with_capacity(tokens.len());
         for (id, (token, manager)) in tokens {
             instances.insert(id, adapter.authenticate(&token)?);
             managers.push(adapter.authenticate(&manager)?);
         }
         Ok(Self {
+            phy_perception_worker: Mutex::new(None),
+            ego_worker: Mutex::new(None),
+            ego_authority: phy_authority.clone().filter(|_| ego),
+            ego_online: ego.into(),
+            phy_perception_authority: phy_authority.filter(|_| phy_perception),
+            recall: ActivePhyRecall::new(phy),
+            recall_online: true.into(),
             profile_id: topology.profile_id,
             principal_id: topology.principal_id,
             cutoff: enrollment.cutoff,
@@ -167,6 +206,32 @@ impl EmbeddedMemory {
             .get(&owner)
             .context("original memory owner unavailable")?;
         Ok((owner, instance))
+    }
+
+    /// Fence outstanding private access when the profile changes its active PHY.
+    pub(super) fn check_active_phy_scope(&self) -> Result<()> {
+        if self
+            .recall_online
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.active_phy_unchanged()?
+        {
+            return Ok(());
+        }
+        self.invalidate_recall();
+        anyhow::bail!("active private Memory owner changed")
+    }
+
+    fn invalidate_recall(&self) {
+        self.recall_online
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.recall.invalidate();
+    }
+
+    fn active_phy_unchanged(&self) -> Result<bool> {
+        let active = Topology::read(&self.directory)?;
+        Ok(active.profile_id == self.profile_id
+            && active.principal_id == self.principal_id
+            && active.active_phy == self.phy)
     }
 
     pub(super) fn runtime(
@@ -420,20 +485,99 @@ impl EmbeddedMemory {
 
 impl MemoryStore for EmbeddedMemory {
     fn configure_profile_runtime(&self, config: &Config) -> Result<()> {
+        let mut phy = self
+            .phy_perception_worker
+            .lock()
+            .expect("PHY Perception worker lock");
+        if let Some(mut worker) = phy.take() {
+            worker.stop()?;
+        }
+        let mut ego = self.ego_worker.lock().expect("Ego worker lock");
+        ego.take();
         self.gateway.set_perception_runtime(None)?;
-        let Some(endpoint_id) = ProfileSettings::load(&self.home)?.memory_perception_endpoint
-        else {
+        let settings = ProfileSettings::load(&self.home)?;
+        let phy_perception = settings.memory_phy_perception_enabled;
+        let perception = settings.memory_perception_endpoint;
+        let ego_authority = self
+            .ego_authority
+            .as_ref()
+            .filter(|_| settings.memory_ego_enabled);
+        if perception.is_none() && ego_authority.is_none() {
+            return Ok(());
+        }
+        let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
+            ensure!(
+                perception.is_none(),
+                "Configure the Reliquary embedding route before enabling Perception"
+            );
             return Ok(());
         };
-        let Some((runtime, identity)) = super::hosted::from_profile(&self.home, config)? else {
-            anyhow::bail!("Configure the Reliquary embedding route before enabling Perception");
+        let runtime = if let Some(endpoint) = &perception {
+            super::hosted::with_native_perception(&self.home, endpoint, runtime)?
+        } else {
+            runtime
         };
-        let runtime = super::hosted::with_native_perception(&self.home, &endpoint_id, runtime)?;
         for (&owner, instance) in &self.instances {
             self.check_embedding_identity(owner, instance, &identity)?;
         }
-        self.gateway.set_perception_runtime(Some(&runtime))?;
+        if perception.is_some() {
+            self.gateway.set_perception_runtime(Some(&runtime))?;
+        }
+        if let Some(authority) = ego_authority {
+            let owners = self.instances.keys().copied().collect::<Vec<_>>();
+            match authority.start_ego_worker(self.phy, &owners, &self.directory, &runtime, |text| {
+                count_context(text) as u64
+            }) {
+                Ok(worker) => *ego = Some(worker),
+                Err(error) if error.kind() == ProductErrorKind::Unavailable => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if phy_perception
+            && perception.is_some()
+            && let Some(authority) = &self.phy_perception_authority
+        {
+            *phy = Some(authority.start_phy_perception(self.phy)?);
+        }
         Ok(())
+    }
+
+    fn needs_profile_remount(&self) -> Result<bool> {
+        let settings = ProfileSettings::load(&self.home)?;
+        let ego = settings.memory_ego_enabled;
+        let phy_perception =
+            settings.memory_phy_perception_enabled && settings.memory_perception_endpoint.is_some();
+        Ok(!self.active_phy_unchanged()?
+            || !self
+                .recall_online
+                .load(std::sync::atomic::Ordering::Acquire)
+            || ego != self.ego_authority.is_some()
+            || ego && !self.ego_online.load(std::sync::atomic::Ordering::Acquire)
+            || phy_perception != self.phy_perception_authority.is_some())
+    }
+
+    fn pause_for_remount(&self) {
+        self.invalidate_recall();
+        self.phy_perception_worker
+            .lock()
+            .expect("PHY Perception worker lock")
+            .take();
+        self.pause_ego();
+    }
+
+    fn pause_ego(&self) {
+        self.ego_online
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.ego_worker.lock().expect("Ego worker lock").take();
+    }
+
+    fn ego(
+        self: Arc<Self>,
+        sources: Arc<dyn MemorySources>,
+        session_id: String,
+        binding: Option<CaptureBinding>,
+    ) -> Result<Option<Arc<dyn EgoAccess>>> {
+        super::ego::access(self, sources, session_id, binding)
     }
 
     fn projects_changed(&self, projects: &[Project]) -> bool {
@@ -618,6 +762,7 @@ impl MemoryStore for EmbeddedMemory {
     }
 
     fn stop_processing(&self) {
+        self.pause_for_remount();
         let _ = self.gateway.set_perception_runtime(None);
         let mut jobs = self.jobs.lock().expect("memory jobs lock");
         for (_, job) in jobs.values() {
@@ -1049,7 +1194,10 @@ mod tests {
         )
         .unwrap();
         assert!(legacy(tmp.path(), "other").is_err());
+        let legacy_routes = json!({"memory_perception_endpoint":"existing-rel-route"});
+        ProfileSettings::update(tmp.path(), legacy_routes.as_object().unwrap()).unwrap();
         let mem = legacy(tmp.path(), "default").unwrap().unwrap();
+        assert!(mem.phy_perception_authority.is_none());
         let library = hermes_library::Library::open(tmp.path().join("library")).unwrap();
         let mut summary = library.create_session(None, Some("native")).unwrap();
         assert_eq!(

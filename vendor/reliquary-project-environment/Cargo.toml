@@ -8,5 +8,5 @@ license = "MPL-2.0"
 publish = false
 
 [dependencies]
-reliquary-archive = { git = "https://github.com/Lokee86/Reliquary.git", rev = "9961f1bc1677b64f3ed97d608387aa3927093497" }
+reliquary-archive = { git = "https://github.com/Lokee86/Reliquary.git", rev = "bb887b70aba2b414ec5c371fa144fcd076b282cc" }
 sha2 = "0.10"

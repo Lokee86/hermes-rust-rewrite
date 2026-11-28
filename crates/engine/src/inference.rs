@@ -133,6 +133,14 @@ fn model_identity(config: &Config) -> Result<ModelIdentity> {
     })
 }
 
+/// A single local function and the limits of its structured continuation.
+pub struct StructuredTool<'a> {
+    pub name: &'a str,
+    pub schema: &'a Value,
+    pub max_results: usize,
+    pub max_input_bytes: usize,
+}
+
 pub struct CompletionInference(TaskProvider);
 
 impl CompletionInference {
@@ -182,6 +190,22 @@ impl CompletionInference {
             .as_ref()
             .unwrap_or(&self.0.provider)
             .complete_json(system, input, name, schema)
+            .await
+    }
+    pub async fn complete_json_with_tool(
+        &self,
+        system: &str,
+        input: &str,
+        name: &str,
+        schema: &Value,
+        tool: StructuredTool<'_>,
+        run: &mut dyn FnMut(Value) -> Result<Value>,
+    ) -> Result<Value> {
+        let refreshed = self.0.refreshed().await?;
+        refreshed
+            .as_ref()
+            .unwrap_or(&self.0.provider)
+            .complete_json_with_tool(system, input, name, schema, tool, run)
             .await
     }
 }

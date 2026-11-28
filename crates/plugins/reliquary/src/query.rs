@@ -1,4 +1,7 @@
 //! Explicit read-only model queries against one admitted native conversation.
+#[cfg(test)]
+mod tests;
+
 use super::memory::{EmbeddedMemory, hex};
 use anyhow::{Context, Result, ensure};
 use hermes_engine::{
@@ -11,7 +14,8 @@ use hermes_engine::{
 use hermes_library::memory_plugin::{MemorySources, MemoryTurn};
 use reliquary_memory::{
     ChatRetrieval, HermesCopiedSourceTurn, InspectionItem, InspectionQuery, Instance, MemoryId,
-    OwnerId, ProductErrorKind, RetrievalPreview, SourceAvailability, TemporalBasis,
+    OwnerId, ProductErrorKind, RetrievalPreview, RetrievalRankedHit, SourceAvailability,
+    TemporalBasis,
 };
 use serde_json::{Value, json};
 use std::{
@@ -22,6 +26,7 @@ use tokio::sync::Semaphore;
 
 // A timed-out provider can still run within its transport deadline.
 static QUERY_SLOTS: Semaphore = Semaphore::const_new(4);
+const MEMORY_RESULT_LIMIT: usize = 10;
 
 #[derive(Clone)]
 pub(super) struct GatewayMemoryQuery {
@@ -49,6 +54,7 @@ impl GatewayMemoryQuery {
     }
 
     fn check_session(&self) -> Result<()> {
+        self.memory.check_active_phy_scope()?;
         self.sources
             .check_session(&self.turn.session_id, &self.binding)
     }
@@ -102,7 +108,11 @@ impl MemoryQuery for GatewayMemoryQuery {
             .map_err(|_| anyhow::anyhow!("Memory turn lock unavailable"))?;
         if state.is_none() {
             let id = format!("hermes-{}-{}", self.turn.session_id, self.turn.admission_id);
-            *state = Some(instance.begin_chat_retrieval(owner, &id)?);
+            *state = Some(instance.begin_scoped_chat_retrieval(
+                Some(owner),
+                self.memory.recall.clone(),
+                &id,
+            )?);
         }
         let retrieval = state.as_mut().context("Memory turn unavailable")?;
         let echo = matches!(&request, MemoryRequest::EchoRead { .. });
@@ -214,7 +224,9 @@ impl MemoryQuery for GatewayMemoryQuery {
             .runtime(owner, instance, config)?
             .context("Missing memory model route")?;
         let result = match request {
-            MemoryRequest::Query { query } => retrieval.query_memory(&query, &runtime)?,
+            MemoryRequest::Query { query } => {
+                retrieval.query_memory_limited(&query, &runtime, MEMORY_RESULT_LIMIT)?
+            }
             MemoryRequest::Refine {
                 query,
                 search_id,
@@ -232,19 +244,26 @@ impl MemoryQuery for GatewayMemoryQuery {
             .preview
             .iter()
             .flat_map(|preview| &preview.memories)
-            .map(|row| json!({"id":row.memory_id,"revision":row.revision,"content":row.content}))
+            .map(|row| {
+                json!({
+                    "id": format!("{}:{}", row.owner_id, row.memory_id),
+                    "reference": row.reference(),
+                    "content": row.content,
+                })
+            })
             .collect();
-        let ids: Vec<_> = result
+        let memories: Vec<_> = result
             .preview
             .iter()
             .flat_map(|preview| &preview.memories)
-            .map(|row| row.memory_id.clone())
+            .map(|row| row.reference())
             .collect();
         let observations = result
             .preview
             .iter()
             .flat_map(|preview| &preview.observations);
         let citations: Vec<_> = observations.clone().map(|row| row.claim.citation).collect();
+        retrieval.validate_scoped_memory_result(&result.result_id, &memories, &citations)?;
         let mut content =
             json!({"memories":hits,"search_id":result.search_id,"result_id":result.result_id});
         if !citations.is_empty() {
@@ -262,10 +281,30 @@ impl MemoryQuery for GatewayMemoryQuery {
                     .collect(),
             );
         }
+        if let Some(preview) = &result.preview {
+            // Positions refer to the typed payload arrays and preserve one Core ranking.
+            content["ranked"] = Value::Array(
+                preview
+                    .ranked
+                    .iter()
+                    .map(|hit| match hit {
+                        RetrievalRankedHit::Memory { reference } => memories
+                            .iter()
+                            .position(|row| row == reference)
+                            .map(|index| json!({"kind":"memory", "index":index})),
+                        RetrievalRankedHit::Observation { citation } => citations
+                            .iter()
+                            .position(|row| row == citation)
+                            .map(|index| json!({"kind":"observation", "index":index})),
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .context("invalid ranked Memory result")?,
+            );
+        }
         check_payload(&content, config)?;
         let backend = self.clone();
         Ok(MemorySelection::Result {
-            count: ids.len() + citations.len(),
+            count: memories.len() + citations.len(),
             content,
             check_disclosure: Box::new(move || {
                 backend.check_disclosure(result.preview.as_ref())?;
@@ -276,7 +315,7 @@ impl MemoryQuery for GatewayMemoryQuery {
                 state
                     .as_mut()
                     .context("Memory turn unavailable")?
-                    .accept_typed_memory_result(&result.result_id, &ids, &citations)?;
+                    .accept_scoped_memory_result(&result.result_id, &memories, &citations)?;
                 Ok(())
             }),
         })
@@ -343,7 +382,9 @@ fn check_provenance(
     profile_id: &str,
 ) -> Result<()> {
     ensure!(
-        !preview.truncated && preview.memories.len() <= 10,
+        !preview.truncated
+            && preview.memories.len() + preview.observations.len() <= MEMORY_RESULT_LIMIT
+            && preview.ranked.len() == preview.memories.len() + preview.observations.len(),
         "invalid or incomplete retrieval selection"
     );
     let management = instance.workspace_management(owner)?;
@@ -407,16 +448,20 @@ fn check_provenance(
         }
         Ok(())
     };
+    let rel_id = owner.to_string();
+    let phy_id = memory.phy.to_string();
     for entry in &preview.memories {
         ensure!(
             !entry.truncated
+                && (entry.owner_id == rel_id || entry.owner_id == phy_id)
                 && !contains_inline_data(&entry.content)
                 && redact_text(&entry.content) == entry.content,
             "retrieval contains incomplete or excluded content"
         );
-        if entry.source.episode_id.is_some()
-            || entry.source.content_conversation_id.is_some()
-            || entry.source.grounding_conversation_id.is_some()
+        if entry.owner_id == rel_id
+            && (entry.source.episode_id.is_some()
+                || entry.source.content_conversation_id.is_some()
+                || entry.source.grounding_conversation_id.is_some())
         {
             check_memory(
                 memory_id(&entry.memory_id)?,
@@ -429,12 +474,16 @@ fn check_provenance(
     let mut lineage = BTreeSet::new();
     for row in &preview.observations {
         let claim = &row.claim;
+        let claim_owner = OwnerId::from_bytes(claim.citation.owner_id).to_string();
         ensure!(
-            !contains_inline_data(&claim.proposition)
+            (claim_owner == rel_id || claim_owner == phy_id)
+                && !contains_inline_data(&claim.proposition)
                 && redact_text(&claim.proposition) == claim.proposition,
             "Observation is unavailable for this disclosure"
         );
-        lineage.extend(claim.lineage.iter().copied());
+        if claim_owner == rel_id {
+            lineage.extend(claim.lineage.iter().copied());
+        }
     }
     for evidence in lineage {
         check_memory(

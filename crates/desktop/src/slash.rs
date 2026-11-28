@@ -220,7 +220,8 @@ pub(super) fn run(app: &mut Hermes, line: &str) -> Option<Task<Message>> {
     let word = word.to_lowercase();
     let canonical = COMMANDS.iter().find(|(name, aliases, _, _)| *name == word || aliases.contains(&word.as_str())).map(|c| c.0);
     let clear = |app: &mut Hermes| { app.composer = text_editor::Content::new(); let _ = app.save_draft(); app.slash.reset_picker(); };
-    if canonical.is_none() && app.slash.catalog.iter().any(|item| item.name == word) {
+    if canonical.is_none() && (app.slash.catalog.iter().any(|item| item.name == word)
+        || word == "/identity" && app.profile_settings.saved.memory_ego_enabled) {
         clear(app);
         return Some(app.run_plugin_command(word[1..].to_owned(),arg.to_owned()));
     }

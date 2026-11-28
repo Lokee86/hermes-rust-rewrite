@@ -509,10 +509,12 @@ impl Shared {
         }
         let sid = summary.id.clone();
         let config = lock(&session.config).clone();
-        let options = lock(&session.settings).generation_options.clone();
-        let bound = lock(&session.settings).memory_binding.is_some();
+        let (options, accepts_profile_memory) = {
+            let settings = lock(&session.settings);
+            (settings.generation_options.clone(), settings.accepts_profile_memory())
+        };
         let ordinary_chat = matches!(origin, AdmissionOrigin::Chat) && summary.bot.is_none()
-            && bound && self.selected_memory().await.native();
+            && accepts_profile_memory && self.selected_memory().await.native();
         let python_selection = if matches!(origin, AdmissionOrigin::Chat)
             && attachments.is_empty()
             && hermes_engine::references::parse(&text).is_empty()
@@ -545,7 +547,7 @@ impl Shared {
             python_delivery: None,
             unattended: telegram || matches!(origin, AdmissionOrigin::Background { unattended: true }),
             channel: None,
-            // Freeze consent at submission, including queued turns that run after a switch.
+            // Freeze native memory admission at submission. REL access also checks the binding.
             ordinary_chat,
             capture: None,
             group: None,

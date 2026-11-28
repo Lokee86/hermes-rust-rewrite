@@ -13,6 +13,7 @@ mod profile_memory;
 mod python_history;
 mod python_memory;
 mod slash_commands;
+mod ego_commands;
 mod methods;
 
 mod auth;
@@ -531,6 +532,10 @@ struct Settings {
 }
 
 impl Settings {
+    fn accepts_profile_memory(&self) -> bool {
+        !matches!(self.source.as_str(), "subagent" | "recovered" | "import")
+    }
+
     fn is_telegram_session(&self) -> bool {
         self.source == TELEGRAM_SOURCE && self.creation_fingerprint.is_none()
             && self.creation_key.as_deref().is_some_and(|key| key.starts_with(TELEGRAM_ROUTE_PREFIX))
@@ -595,10 +600,28 @@ struct Clarification {
 }
 struct Approval {
     payload: Value,
+    action: ApprovalAction,
     tool: Option<String>,
     expires_ms: i64,
-    answer: async_channel::Sender<bool>,
     timeout: CancellationToken,
+}
+
+enum ApprovalAction {
+    Tool(async_channel::Sender<bool>),
+    Identity { peer: String, apply: Box<dyn FnOnce() -> Result<()> + Send> },
+}
+
+impl Approval {
+    fn tool_is_live(&self) -> bool {
+        matches!(&self.action, ApprovalAction::Tool(answer) if !answer.is_closed())
+            && self.expires_ms > chrono::Utc::now().timestamp_millis()
+    }
+
+    fn decline(&self) {
+        if let ApprovalAction::Tool(answer) = &self.action {
+            let _ = answer.try_send(false);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1462,7 +1485,7 @@ impl Shared {
                     ensure!(existing.creation_key == prepared.creation_key && existing.creation_fingerprint == prepared.creation_fingerprint,
                         "Creation identity was previously used with different options");
                 } else {
-                    if !matches!(prepared.source.as_str(), "subagent" | "recovered" | "import") {
+                    if prepared.accepts_profile_memory() {
                         prepared.memory_binding = selected_memory.binding(summary)?;
                     }
                     if let Some(backend) = local_backend {
@@ -1739,31 +1762,65 @@ impl Shared {
         if peer.canonical && requested.is_none() {
             return Err(RpcError::invalid("prompt_id is required"));
         }
-        let mut view = lock(&session.view);
-        if peer.canonical {
-            let generation = params["execution_generation"]
-                .as_u64()
-                .ok_or_else(|| RpcError::invalid("execution_generation is required"))?;
-            if generation != view.generation {
-                return Err(RpcError::fenced(
-                    "stale_generation",
-                    "This approval belongs to an older turn",
-                    &view,
-                ));
+        let mut resolved = Vec::new();
+        let mut identity = Vec::new();
+        {
+            let mut view = lock(&session.view);
+            if peer.canonical {
+                let generation = params["execution_generation"]
+                    .as_u64()
+                    .ok_or_else(|| RpcError::invalid("execution_generation is required"))?;
+                if generation != view.generation {
+                    return Err(RpcError::fenced(
+                        "stale_generation",
+                        "This approval belongs to an older turn",
+                        &view,
+                    ));
+                }
+            }
+            let ids: Vec<_> = if params["all"].as_bool() == Some(true) {
+                view.approvals.keys().cloned().collect()
+            } else if let Some(id) = requested {
+                vec![id.to_owned()]
+            } else {
+                view.approvals.keys().next().cloned().into_iter().collect()
+            };
+            for id in ids {
+                if Self::answer_approval(&mut view, &id, choice == "once") {
+                    resolved.push(id);
+                    continue;
+                }
+                let can_review = view.approvals.get(&id).is_some_and(|approval| {
+                    matches!(&approval.action, ApprovalAction::Identity { peer: actor, .. }
+                        if actor == &peer.id && requested == Some(id.as_str()) && peer.local_native
+                            && approval.payload["execution_generation"] == view.generation
+                            && approval.expires_ms > chrono::Utc::now().timestamp_millis())
+                });
+                if can_review
+                    && let Some(Approval { action: ApprovalAction::Identity { apply, .. }, timeout, .. }) =
+                        view.approvals.remove(&id)
+                {
+                    timeout.cancel();
+                    if choice == "once" {
+                        identity.push((id, apply));
+                    } else {
+                        resolved.push(id);
+                    }
+                }
             }
         }
-        let ids: Vec<_> = if params["all"].as_bool() == Some(true) {
-            view.approvals.keys().cloned().collect()
-        } else if let Some(id) = requested {
-            vec![id.to_owned()]
-        } else {
-            view.approvals.keys().next().cloned().into_iter().collect()
-        };
-        let mut resolved = Vec::new();
-        for id in ids {
-            if Self::answer_approval(&mut view, &id, choice == "once") {
+        let mut identity_failed = false;
+        for (id, apply) in identity {
+            if tokio::task::spawn_blocking(apply).await.is_ok_and(|result| result.is_ok()) {
                 resolved.push(id);
+            } else {
+                identity_failed = true;
+                self.emit(&session, "approval.settled",
+                    json!({"prompt_id":id,"request_id":id,"status":"failed"}));
             }
+        }
+        if identity_failed {
+            return Err(RpcError::new(4001, "ego_identity_stale", "The Identity draft could not be saved. Review it again."));
         }
         if peer.canonical && resolved.is_empty() {
             return Err(RpcError::new(
@@ -1772,7 +1829,6 @@ impl Shared {
                 "Approval is no longer waiting; resume to refresh",
             ));
         }
-        drop(view);
         for id in &resolved {
             self.emit(
                 &session,
@@ -2094,7 +2150,7 @@ impl Shared {
             let approvals = std::mem::take(&mut view.approvals);
             for approval in approvals.values() {
                 approval.timeout.cancel();
-                let _ = approval.answer.try_send(false);
+                approval.decline();
             }
             let cancelled: Vec<_> = approvals.into_keys().collect();
             if !cancelled.is_empty() {
@@ -2206,9 +2262,9 @@ impl Shared {
                     id.clone(),
                     Approval {
                         payload: payload.clone(),
+                        action: ApprovalAction::Tool(answer),
                         tool,
                         expires_ms,
-                        answer,
                         timeout: timeout.clone(),
                     },
                 );
@@ -2224,7 +2280,7 @@ impl Shared {
                     }
                     let approval = lock(&session.view).approvals.remove(&id);
                     if let Some(approval) = approval {
-                        let _ = approval.answer.try_send(false);
+                        approval.decline();
                         shared.emit(
                             &session,
                             "approval.settled",
