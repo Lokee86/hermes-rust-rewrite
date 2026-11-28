@@ -24,8 +24,35 @@ def load(plugin_dir, name):
         qualified, os.path.join(plugin_dir, "__init__.py"), submodule_search_locations=[plugin_dir])
     module = importlib.util.module_from_spec(spec)
     sys.modules[qualified] = module
+    # Worker processes the plugin starts import its functions by this name.
+    os.environ["HERMES_PLUGIN_FOLDER"], os.environ["HERMES_PLUGIN_MODULE"] = plugin_dir, name
     spec.loader.exec_module(module)
     return module
+
+
+class _PluginFinder:
+    """In a worker process: finds the plugin's module when a task names one of its functions.
+    Found on demand, after multiprocessing has given the worker the plugin's import path."""
+
+    def __init__(self, folder, name):
+        self._folder, self._qualified = folder, f"hermes_plugins.{name}"
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != self._qualified:
+            return None
+        return importlib.util.spec_from_file_location(
+            fullname, os.path.join(self._folder, "__init__.py"), submodule_search_locations=[self._folder])
+
+
+def expose_plugin_to_worker():
+    folder, name = os.environ.get("HERMES_PLUGIN_FOLDER"), os.environ.get("HERMES_PLUGIN_MODULE")
+    if not folder or not name:
+        return
+    if "hermes_plugins" not in sys.modules:
+        namespace = types.ModuleType("hermes_plugins")
+        namespace.__path__ = []
+        sys.modules["hermes_plugins"] = namespace
+    sys.meta_path.append(_PluginFinder(folder, name))
 
 
 def _accepted(fn, args, kwargs):

@@ -352,9 +352,12 @@ def register(ctx):
 #[test]
 fn a_plugin_can_start_a_spawned_worker_process() {
     let (_dir, mut host) = launch_plugin(r#"
-import multiprocessing, os
+import multiprocessing, os, sys
+def exit_three():
+    sys.exit(3)
 def start_worker(args, **_):
-    worker = multiprocessing.get_context("spawn").Process(target=os.getpid)
+    # The target is the plugin's own function, which the worker must import.
+    worker = multiprocessing.get_context("spawn").Process(target=exit_three)
     worker.start()
     worker.join(60)
     return {"exitcode": worker.exitcode}
@@ -363,5 +366,5 @@ def register(ctx):
 "#, false);
     host.request("initialize", json!({"protocolVersion": "2025-06-18"}));
     let reply = host.request("tools/call", json!({"name": "start_worker", "arguments": {}}));
-    assert_eq!(reply["result"]["content"][0]["text"].as_str(), Some(r#"{"exitcode": 0}"#), "{reply}");
+    assert_eq!(reply["result"]["content"][0]["text"].as_str(), Some(r#"{"exitcode": 3}"#), "{reply}");
 }

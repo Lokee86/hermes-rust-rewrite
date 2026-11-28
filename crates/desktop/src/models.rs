@@ -131,8 +131,18 @@ impl Default for State {
 /// The saved endpoint a starting session uses for `config`'s URL, filling in its key. The one the
 /// last session chose wins over the first URL match, because two saved keys (two accounts) can share
 /// one URL.
+/// How preferences name a chosen account sign-in, beside saved endpoint IDs.
+pub(super) fn account_choice(id: &str) -> String { format!("account:{id}") }
+
 fn restore_endpoint(vault: &EndpointStore, endpoints: &[EndpointProfile], config: &mut Config, endpoint: Option<&str>)
     -> anyhow::Result<Option<EndpointProfile>> {
+    // A chosen account sign-in for this URL keeps authenticating with the account, not with a
+    // saved key that happens to share its URL.
+    if let Some(id) = endpoint.and_then(|choice| choice.strip_prefix("account:"))
+        && hermes_engine::accounts::for_base_url(&config.base_url).is_some_and(|account| account.id == id)
+    {
+        return Ok(None);
+    }
     let same_url = |entry: &&EndpointProfile| scope(&entry.base_url).ok() == scope(&config.base_url).ok();
     let chosen = endpoint.and_then(|id| endpoints.iter().find(|entry| entry.id == id)).filter(same_url);
     let profile = chosen.or_else(|| endpoints.iter().find(same_url)).cloned();
@@ -980,6 +990,13 @@ mod tests {
             let restored = restore_endpoint(&vault, &endpoints, &mut config, remembered).unwrap().unwrap();
             assert_eq!((restored.name.as_str(), config.api_key.as_str()), ("Personal", "personal-fixture-key"));
         }
+        // A chosen account sign-in is not swapped for a saved key with the same URL.
+        let account = hermes_engine::accounts::CATALOG.iter().find(|a| hermes_engine::accounts::for_base_url(a.base_url).is_some()).unwrap();
+        vault.save(None, "Shared", &Config { base_url: account.base_url.into(), model: "m".into(), api_key: "shared-fixture-key".into() }).unwrap();
+        let endpoints = vault.list().unwrap();
+        let mut config = Config { base_url: account.base_url.into(), model: "m".into(), api_key: String::new() };
+        assert!(restore_endpoint(&vault, &endpoints, &mut config, Some(&account_choice(account.id))).unwrap().is_none());
+        assert!(config.api_key.is_empty(), "the account authenticates, not the saved key");
         // An explicit key is never replaced.
         let mut config = key("explicit-fixture-key");
         restore_endpoint(&vault, &endpoints, &mut config, Some(&work.id)).unwrap();

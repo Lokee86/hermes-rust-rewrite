@@ -22,9 +22,12 @@ impl Drop for Guard {
     fn drop(&mut self) {
         if let Ok(mut forward) = self.forward.lock() && let Some(mut child) = forward.take() { let _ = child.kill(); let _ = child.wait(); }
         // The token is worth nothing once its server is gone, and neither is the log.
+        // The PID file is written on the remote side before the reply: a reply lost on the way back
+        // still lets the server be stopped.
         let pid = self.remote_pid.lock().ok().and_then(|pid| pid.clone());
         let kill = pid.map(|pid| format!("kill {pid} 2>/dev/null; ")).unwrap_or_default();
-        let _ = run(&self.ssh, &format!("{kill}rm -f \"{files}.token\" \"{files}.log\"; true", files = self.files), None);
+        let _ = run(&self.ssh, &format!("{kill}[ -f \"{files}.pid\" ] && kill \"$(cat \"{files}.pid\")\" 2>/dev/null; \
+            rm -f \"{files}.token\" \"{files}.log\" \"{files}.pid\"; true", files = self.files), None);
     }
 }
 
@@ -106,7 +109,7 @@ pub(super) fn connect(root: &Path, ssh: Ssh) -> Result<Tunnel, String> {
     // `cd` stands alone: in `cd && nohup … &` a subshell would hold the session open until the serve
     // exits, and `$!` would be that subshell.
     let spawn = format!("cd \"$HOME\" || exit 1; nohup env HERMES_DESKTOP=1 {hermes} serve --isolated --host 127.0.0.1 --port 0 \
-        --ssh-session-token-file \"{dir}/{nonce}.token\" --ssh-owner-nonce {nonce} </dev/null >> \"{dir}/{nonce}.log\" 2>&1 & echo $!");
+        --ssh-session-token-file \"{dir}/{nonce}.token\" --ssh-owner-nonce {nonce} </dev/null >> \"{dir}/{nonce}.log\" 2>&1 & echo $! > \"{dir}/{nonce}.pid\"; cat \"{dir}/{nonce}.pid\"");
     let remote_pid = run(&ssh, &spawn, None)?.trim().to_owned();
     if remote_pid.is_empty() || !remote_pid.bytes().all(|b| b.is_ascii_digit()) { return Err("The remote Hermes did not start.".into()); }
     // From here on, giving up also stops what was started.

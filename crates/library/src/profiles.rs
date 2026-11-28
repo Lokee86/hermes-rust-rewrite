@@ -154,12 +154,15 @@ impl Library {
         let [name] = tops.as_slice() else { bail!("A profile archive holds exactly one profile folder") };
         ensure!(valid_name(name), "The archive's profile name is not valid");
         ensure!(!entries.lines().any(|l| l.starts_with('/') || l.split('/').any(|p| p == "..")), "The archive has unsafe paths");
-        // Hard links are refused from the listing, which every platform's tar can report: Windows
+        // Hard links are checked from the listing, which every platform's tar can report: Windows
         // offers no stable link count to check after unpacking.
         let verbose = Command::new("tar").arg("-tvzf").arg(archive).output().context("tar is not available")?;
         ensure!(verbose.status.success(), "That file is not a profile archive");
-        ensure!(!String::from_utf8_lossy(&verbose.stdout).lines().any(|l| l.contains(" link to ")),
-            "The archive holds hard links, which a profile archive never does");
+        // A hard link inside the profile (a package cache, say) is safe once unpacked as a copy of
+        // its own; one naming anything outside the profile folder is refused.
+        let inside = |target: &str| target.trim_start_matches("./").strip_prefix(&format!("{name}/")).is_some_and(|rest| !rest.split('/').any(|part| part == ".."));
+        ensure!(String::from_utf8_lossy(&verbose.stdout).lines().filter_map(|l| l.split_once(" link to ")).all(|(_, target)| inside(target.trim())),
+            "The archive holds a hard link to a file outside its profile");
         ensure!(!self.profiles_dir().join(name).exists(), "A profile named {name} already exists");
         ensure!(!self.bots()?.iter().any(|bot| bot.name == *name), "A bot with that name already exists");
         self.ensure_profiles_dir()?;
@@ -174,6 +177,7 @@ impl Library {
         // An export keeps workspace links such as npm's executable links. Followed, one could reach
         // outside the profile, so they are left out; npm recreates them.
         drop_links(&unpacked)?;
+        separate_hard_links(&unpacked)?;
         ensure!(only_folders_and_files(&unpacked)?, "The archive holds links, which a profile archive never does");
         // The profile is finished in staging, so a failure leaves no half-imported profile blocking
         // a retry under the same name.
@@ -192,6 +196,30 @@ impl Library {
         fs::rename(&unpacked, &profile).context("Could not add the imported profile")?;
         Ok(name.to_string())
     }
+}
+
+/// Give every hard-linked file in the tree a copy of its own, so writing one name never changes
+/// another. Windows offers no stable link count; there the archive check above is the guard.
+fn separate_hard_links(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            separate_hard_links(&entry.path())?;
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if kind.is_file() && entry.metadata()?.nlink() > 1 {
+                let copy = tempfile::NamedTempFile::new_in(path)?;
+                fs::copy(entry.path(), copy.path())?;
+                fs::set_permissions(copy.path(), entry.metadata()?.permissions())?;
+                copy.persist(entry.path())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove every symbolic link in the tree without following any.
@@ -343,7 +371,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_archive_with_links_is_refused_and_leaves_outside_files_alone() {
+    fn linked_archives_import_without_reaching_outside_the_profile() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let library = Library::open(&dir.path().join("home")).unwrap();
@@ -373,12 +401,15 @@ mod tests {
         for name in ["SOUL.md", EXPORTED_DATABASE, hermes_engine::db::FILE] {
             assert!(fs::symlink_metadata(imported.join(name)).is_err(), "{name} is not imported as a link");
         }
-        assert!(library.import_profile(&hard_linked).is_err());
-        assert!(!library.profile_path("hard-linked").unwrap().exists());
+        // A hard link within the profile imports as two separate files.
+        assert_eq!(library.import_profile(&hard_linked).unwrap(), "hard-linked");
+        let linked = library.profile_path("hard-linked").unwrap();
+        fs::write(linked.join("SOUL.md"), "changed").unwrap();
+        assert_eq!(fs::read_to_string(linked.join("notes.md")).unwrap(), "x", "writing one name leaves the other alone");
         assert_eq!(fs::metadata(&outside).unwrap().permissions().mode() & 0o777, 0o644);
         assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
         let names: Vec<_> = library.profiles().unwrap().into_iter().map(|p| p.name).collect();
-        assert_eq!(names, ["default", "symlinked"]);
-        assert_eq!(fs::read_dir(library.root().join("profiles")).unwrap().count(), 1, "no staging left behind");
+        assert_eq!(names, ["default", "hard-linked", "symlinked"]);
+        assert_eq!(fs::read_dir(library.root().join("profiles")).unwrap().count(), 2, "no staging left behind");
     }
 }

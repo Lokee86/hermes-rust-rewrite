@@ -407,6 +407,8 @@ impl Job {
 }
 
 /// Owned by the gateway's engine session, scoped before a model can select a job.
+pub(crate) type Terminals = Option<(crate::herdr::Core, String)>;
+
 pub(crate) struct Registry {
     jobs: VecDeque<Job>,
     controls: ProcessControls,
@@ -459,6 +461,15 @@ impl Registry {
             cwd: workspace.into(),
             env,
         }
+    }
+
+    /// The terminal service binding a delegated child shares, so its PTYs belong to the parent's
+    /// conversation like the parent's own.
+    pub(crate) fn terminals(&self) -> Terminals { self.pty_owner.clone() }
+    pub(crate) fn with_terminals(mut self, terminals: Terminals) -> Self {
+        self.pty_owner = terminals;
+        self.controls.owner.clone_from(&self.pty_owner);
+        self
     }
 
     pub fn bind_terminals(&mut self, profile: &Path, conversation: &str) -> Result<()> {
@@ -833,6 +844,16 @@ fn load_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delegated_child_shares_its_parents_terminal_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = Registry::new(dir.path(), dir.path());
+        parent.bind_terminals(dir.path(), "conversation-1").unwrap();
+        let child = Registry::new(dir.path(), &dir.path().join("child")).with_terminals(parent.terminals());
+        assert_eq!(child.terminals().map(|(_, conversation)| conversation).as_deref(), Some("conversation-1"));
+        assert!(child.controls().owner.is_some(), "PTY launches have an owner");
+    }
 
     #[test]
     fn incremental_output_never_splits_a_character_between_polls() {
