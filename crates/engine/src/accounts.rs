@@ -117,7 +117,7 @@ impl Store {
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) if e.kind() == fs2::lock_contended_error().kind() && std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
                 Err(e) => return Err(e).context("Could not open your saved accounts"),
             }
         }
@@ -134,7 +134,8 @@ impl Store {
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => return Ok(lock),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+                // Windows reports a held lock as its own error, not WouldBlock.
+                Err(e) if e.kind() == fs2::lock_contended_error().kind() && Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
                 Err(e) => return Err(e).context("Could not renew the account session"),
             }
         }
