@@ -74,6 +74,17 @@ fn start() {
         std::env::remove_var("PYTHONPATH");
     }
     Python::initialize();
+    // Child interpreters (multiprocessing's workers and resource tracker) start `sys.executable`.
+    // An embedded runtime may report another Python there, which cannot start with this host's
+    // PYTHONHOME; this executable runs their `-c` commands itself.
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Python::attach(|py| -> PyResult<()> {
+            let sys = py.import("sys")?;
+            let exe = exe.to_string_lossy();
+            sys.setattr("executable", exe.as_ref())?;
+            sys.setattr("_base_executable", exe.as_ref())
+        });
+    }
 }
 
 fn helper(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
