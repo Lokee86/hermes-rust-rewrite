@@ -136,6 +136,20 @@ pub async fn oneshot(config: Config, instructions: &str, input: &str) -> Result<
     Ok(text)
 }
 
+/// `text` in pieces of at most `room` bytes, cut on character boundaries.
+fn parts(text: &str, room: usize) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let cut = if rest.len() <= room { rest.len() } else { rest.floor_char_boundary(room).max(rest.ceil_char_boundary(1)) };
+        let (part, after) = rest.split_at(cut);
+        rest = after;
+        Some(part)
+    })
+}
+
 /// One turn as plain text for the summarizer.
 fn describe(turn: &Turn) -> String {
     let clip = |text: &str, max: usize| match text.len() > max {
@@ -143,6 +157,11 @@ fn describe(turn: &Turn) -> String {
         false => text.to_owned(),
     };
     let mut out = format!("User: {}\n", clip(&turn.prompt, 8_000));
+    // What the prompt's @file, diff and URL references expanded to: the requirements they hold
+    // must outlive the filename.
+    if !turn.context.trim().is_empty() {
+        out.push_str(&format!("Referenced content:\n{}\n", clip(&turn.context, 8_000)));
+    }
     for entry in &turn.entries {
         match entry {
             Entry::User { text } => out.push_str(&format!("User: {}\n", clip(text, 8_000))),
@@ -212,14 +231,17 @@ pub(crate) async fn compress(history: &mut History, running: usize, provider: &P
     let mut piece = String::new();
     for turn in &history.turns[already..through] {
         let next = describe(turn);
-        if !piece.is_empty() && piece.len() + next.len() > room {
-            text = summarize(provider, &text, &piece, redact).await;
-            piece.clear();
+        // A turn larger than one request is summarized in parts: cut to fit, its later
+        // corrections and results would be lost while the turn counts as covered.
+        for part in parts(&next, room) {
+            if !piece.is_empty() && piece.len() + part.len() > room {
+                text = summarize(provider, &text, &piece, redact).await;
+                piece.clear();
+            }
+            piece.push_str(part);
         }
-        piece.push_str(&next);
         piece.push('\n');
     }
-    piece.truncate(piece.floor_char_boundary(piece.len().min(room)));
     text = summarize(provider, &text, &piece, redact).await;
     history.summary = Some(Summary { through, text });
     Ok(true)
@@ -342,6 +364,24 @@ mod tests {
         // It does not come back when the chat grows past the turns it covered.
         for n in 0..7 { history.turns.push(turn(&format!("later {n}"), "ok")); }
         assert!(history.active_summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_long_turn_and_its_referenced_content_reach_the_summarizer() {
+        let (provider, seen) = provider("summary").await;
+        let mut history = History::default();
+        let mut long = turn("plan the release", "start");
+        long.context = "Referenced NOTES.md: the release must support IPv6".into();
+        for n in 0..12 {
+            long.entries.push(Entry::Assistant { text: format!("step {n} {}", "x".repeat(900)), calls: vec![] });
+        }
+        long.entries.push(Entry::Assistant { text: "FINAL: ship on port 9000".into(), calls: vec![] });
+        history.turns.push(long);
+        history.turns.push(Turn { status: Status::Running, entries: vec![], ..turn("now", "") });
+        assert!(compress(&mut history, 1, &provider, 2_000, false).await.unwrap());
+        let asked: String = seen.lock().unwrap().iter().map(|body| body["messages"][1]["content"].as_str().unwrap().to_owned()).collect();
+        assert!(asked.contains("FINAL: ship on port 9000"), "the end of the turn was summarized");
+        assert!(asked.contains("must support IPv6"), "referenced content was summarized");
     }
 
     #[tokio::test]

@@ -76,6 +76,7 @@ impl Job {
         let (mut output, input) = stream.split();
         let input = Arc::new(AsyncMutex::new(input));
         job.stdin = Some(Input::Pty(input.clone()));
+        let (owner, terminal) = (core.clone(), t.clone());
         tokio::spawn(async move {
             let read = async {
                 loop {
@@ -96,7 +97,21 @@ impl Job {
             };
             tokio::select! {
                 _ = stop.cancelled()=>{},
-                result = read => { sender.send_replace(Some(result.unwrap_or_else(|e|Exit{code:None,error:Some(format!("PTY stream lost: {e:#}"))}))); }
+                result = read => {
+                    let exit = match result {
+                        Ok(exit) => exit,
+                        // A lost stream is not an exit. Reported as one, Stop and cleanup would
+                        // skip a command that still runs, so the terminal is ended first.
+                        Err(error) => {
+                            let running = owner.status(&terminal).await.map_or(true, |status| status["state"] != "finished");
+                            if running { let _ = owner.kill(&terminal).await; }
+                            let code = owner.status(&terminal).await.ok().and_then(|status| exit(&status).code);
+                            let stopped = if running { "; the command was stopped" } else { "" };
+                            Exit { code, error: Some(format!("PTY stream lost: {error:#}{stopped}")) }
+                        }
+                    };
+                    sender.send_replace(Some(exit));
+                }
             }
         });
         Ok(job)
