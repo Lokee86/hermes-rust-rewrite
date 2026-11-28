@@ -19,8 +19,11 @@ pub(super) fn start(shared: Arc<Shared>, store: Store) -> JoinHandle<()> {
                 _ = interval.tick() => {
                     let mut claims = match store.gateway_claims() { Ok(claims) => claims, Err(error) => { eprintln!("scheduler recovery: {error:#}"); vec![] } };
                     let _admissions = lock(&shared.admissions);
-                    if !shared.shutdown.is_cancelled() && shared.provider.validate().is_ok() {
-                        match store.claim_due(chrono::Utc::now()) { Ok(due) => claims.extend(due), Err(error) => eprintln!("scheduler claim: {error:#}") }
+                    if !shared.shutdown.is_cancelled() {
+                        // Script-only jobs never call a model, so a broken model setting must not stop them.
+                        let model_ready = shared.provider.validate().is_ok();
+                        let due = store.claim_due_matching(chrono::Utc::now(), |job| model_ready || job.no_agent());
+                        match due { Ok(due) => claims.extend(due), Err(error) => eprintln!("scheduler claim: {error:#}") }
                     }
                     claims
                 }
@@ -143,8 +146,8 @@ pub(super) async fn routine_for(shared: &Arc<Shared>, job_id: &str, title: &str)
     let summary = match index.get(job_id).and_then(|id| shared.library.session(id).ok()).filter(|s| !s.archived) {
         Some(summary) => summary,
         None => {
-            let summary = shared.library.create_session(None, None)?;
-            let summary = shared.library.rename_session(&summary.id, &format!("Routine · {title}"))?;
+            // A background chat never takes over the user's open "New chat" or the selection.
+            let summary = shared.library.create_background_session(&format!("Routine · {title}"), &format!("routine-chat:{job_id}"), |_| Ok(()))?;
             index.insert(job_id.to_owned(), summary.id.clone());
             let mut temp = NamedTempFile::new_in(shared.library.root())?;
             serde_json::to_writer_pretty(&mut temp, &index)?;
