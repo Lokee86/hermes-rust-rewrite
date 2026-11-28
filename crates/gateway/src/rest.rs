@@ -50,7 +50,11 @@ fn csv(value: Option<&str>) -> impl Iterator<Item = &str> {
 }
 
 fn source_for(summary: &SessionSummary, settings: &Settings) -> String {
-    if settings.source.is_empty() {
+    // Stock clients name scheduled-job chats `cron`: the cron sidebar selects them by that name,
+    // and recents leave them out by it.
+    if settings.source == "scheduled" {
+        "cron".into()
+    } else if settings.source.is_empty() {
         match &summary.source {
             SessionSource::Hermes { .. } => "hermes",
             SessionSource::Native | SessionSource::LegacyRust => "rust",

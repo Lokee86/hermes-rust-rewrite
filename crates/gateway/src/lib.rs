@@ -858,6 +858,14 @@ impl Shared {
     }
 
     fn emit_locked(&self, session: &LiveSession, id: &str, view: &mut View, kind: &str, payload: Value) {
+        // Every way a native request ends is announced here; a remote prompt for it must end too.
+        let ended: Vec<String> = match kind {
+            "approval.settled" | "clarify.settled" => payload["request_id"].as_str().map(str::to_owned).into_iter().collect(),
+            "approval.cancelled" => payload["request_ids"].as_array().into_iter().flatten()
+                .filter_map(|id| id.as_str().map(str::to_owned)).collect(),
+            _ => Vec::new(),
+        };
+        self.messaging.close_requests(id, &ended);
         view.sequence += 1;
         let mut params = json!({"type":kind,"session_id":id,"payload":payload,
             "seq":view.sequence,"replay_epoch":self.epoch,"authority_epoch":self.authority_epoch,"execution_generation":view.generation});
@@ -1207,9 +1215,10 @@ impl Shared {
                     && let Some(issues) = status["work"]["issues"].as_array_mut()
                 {
                     for issue in issues.iter_mut().filter(|issue| issue["stage"] == "turn_unknown") {
-                        if let (Some(session), Some(update)) = (issue["session_id"].as_str(), issue["update_id"].as_i64())
+                        if let (Some(session), Some(update), Some(message)) = (issue["session_id"].as_str(), issue["update_id"].as_i64(), issue["message"].as_str())
                             && let Ok(session) = self.session(session).await
-                            && let Some(receipt) = self.submission_receipt(&session, &telegram_host::submission_key(bot, update))
+                            && let Some(receipt) = self.submission_receipt(&session, &telegram_host::submission_key(bot, update, message))
+                                .or_else(|| self.submission_receipt(&session, &telegram_host::legacy_submission_key(bot, update)))
                         {
                             issue["admission_id"] = receipt["admission_id"].clone();
                             issue["execution_generation"] = receipt["execution_generation"].clone();
@@ -2079,7 +2088,8 @@ impl Shared {
             }
             view.history = history;
             view.authority = authority;
-            view.clarifications.clear();
+            let questions: Vec<_> = std::mem::take(&mut view.clarifications).into_keys().collect();
+            self.messaging.close_requests(&id, &questions);
             view.corrections = None;
             let approvals = std::mem::take(&mut view.approvals);
             for approval in approvals.values() {

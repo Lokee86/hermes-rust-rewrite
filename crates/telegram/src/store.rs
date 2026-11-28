@@ -1,7 +1,7 @@
 //! Native Telegram settings, connection ownership, and per-bot inbox storage.
 mod inbox;
 
-pub use inbox::{DeliveryOutcome, DeliveryResolution, TurnOutcome, Work, WorkStage};
+pub use inbox::{DeliveryOutcome, DeliveryResolution, TurnOutcome, Work, WorkStage, incoming_identity};
 use super::telegram::{Identity, Token};
 use fs2::FileExt;
 use hermes_engine::secret;

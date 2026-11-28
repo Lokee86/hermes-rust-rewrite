@@ -367,7 +367,7 @@ async fn telegram_restart_resumes_received_queued_and_complete_but_fences_starte
         else {
             panic!("invalid fixture route");
         };
-        let submission = submission_key(BOT_ID, input.update_id);
+        let submission = submission_key(BOT_ID, input.update_id, &hermes_telegram::incoming_identity(input.chat_id, input.message_id, &input.text));
         gateway
             .shared
             .submit_telegram(session.clone(), input.text.clone(), submission.clone())
@@ -614,6 +614,30 @@ async fn telegram_retries_explicit_rate_limit_after_restart_without_regenerating
         assert_eq!(sent[0].1, sent[1].1);
     }
     assert_eq!(model.requests.lock().unwrap().len(), 1);
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_reused_update_id_gets_an_answer_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = setup(dir.path(), &[42]);
+    let telegram = Arc::new(Telegram::default());
+    telegram.updates.lock().unwrap().push_back(json!([message(10, 42, "first")]));
+    let model = Model::start().await;
+    let gateway = model.gateway(dir.path(), telegram.clone()).await;
+    expect_work(&gateway, |work| work["counts"]["sent"] == 1).await;
+    gateway.shutdown().await.unwrap();
+
+    // After an idle reset, Telegram numbers a new message with an update ID it used before.
+    let mut reused = incoming(10, 42, "second");
+    reused.message_id = 99;
+    store.commit_poll(&identity(), &token(), &[reused], 0, 11, now()).unwrap();
+    let restarted = model.gateway(dir.path(), telegram.clone()).await;
+    time::timeout(Duration::from_secs(10), async {
+        while telegram.sends.lock().unwrap().len() < 2 { time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("the new message is answered");
+    let reply = telegram.sends.lock().unwrap()[1].1["text"].as_str().unwrap().to_owned();
+    assert!(reply.contains("Reply to second"), "not the earlier message's answer: {reply}");
     restarted.shutdown().await.unwrap();
 }
 

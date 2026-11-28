@@ -545,6 +545,26 @@ impl Store {
             .optional()?)
     }
 
+    /// A native request decided here, by timeout or by the turn ending: its remote prompts can no
+    /// longer answer anything. Marked decided, a click is refused as already decided, and a prompt
+    /// still being sent is retired once it lands. The stored value only marks the action closed;
+    /// no approval is recorded for it.
+    pub fn close_actions(&self, session: &str, requests: &[String]) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let closed = serde_json::to_string(&Response::Deny)?;
+        self.write(|tx| {
+            for request in requests {
+                tx.execute(
+                    "UPDATE messaging_actions SET resolved = ?3 WHERE session = ?1 AND request = ?2 AND resolved IS NULL",
+                    params![session, request, closed],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn settle_action(
         &self,
         route: &Route,
@@ -1061,4 +1081,31 @@ fn finish_delivery(db: &Connection, id: &str) -> Result<()> {
         [id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod closed_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_settled_natively_closes_only_its_remote_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        {
+            let db = crate::lock(&store.0);
+            db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for (id, request) in [("action-1", "request-1"), ("action-2", "request-2")] {
+                db.execute(
+                    "INSERT INTO messaging_actions (id,connection,route,session,recipient,generation,request,type)
+                     VALUES (?1,'connection','route','session','person',1,?2,'approval')",
+                    params![id, request],
+                ).unwrap();
+            }
+        }
+        store.close_actions("session", &["request-1".to_owned()]).unwrap();
+        let decided = |id: &str| crate::lock(&store.0)
+            .query_row("SELECT resolved IS NOT NULL FROM messaging_actions WHERE id = ?1", [id], |row| row.get::<_, bool>(0)).unwrap();
+        assert!(decided("action-1"), "a click on the expired prompt is refused as already decided");
+        assert!(!decided("action-2"), "another request's prompt still answers");
+    }
 }

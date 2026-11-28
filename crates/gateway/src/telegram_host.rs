@@ -11,7 +11,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use worker::Connector;
-pub(super) use worker::submission_key;
+pub(super) use worker::{legacy_submission_key, submission_key};
 
 struct Active {
     bot: Identity,

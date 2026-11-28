@@ -80,6 +80,9 @@ pub struct Work {
     pub chat_id: i64,
     pub stage: WorkStage,
     pub text: String,
+    /// Which message this is. Telegram reuses update IDs after an idle reset, so an update ID alone
+    /// can name an earlier message and match its answer.
+    pub message: String,
 }
 
 pub enum TurnOutcome {
@@ -363,7 +366,7 @@ impl Store {
                  WHERE bot_id = ?1 AND stage IN ('received','turn_unknown','blocked','pending','sending','unknown')
                  GROUP BY chat_id
              )
-             SELECT update_id,chat_id,stage,text FROM telegram_updates JOIN heads ON ingress_order = heads.id
+             SELECT update_id,chat_id,stage,text,fingerprint FROM telegram_updates JOIN heads ON ingress_order = heads.id
              WHERE stage IN ('received','turn_unknown','pending') AND (retry_at IS NULL OR retry_at <= ?2)
              ORDER BY ingress_order",
         ).and_then(|mut query| {
@@ -374,7 +377,7 @@ impl Store {
                     "pending" => WorkStage::Pending,
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 };
-                Ok(Work { update_id: row.get(0)?, chat_id: row.get(1)?, stage, text: row.get(3)? })
+                Ok(Work { update_id: row.get(0)?, chat_id: row.get(1)?, stage, text: row.get(3)?, message: message_identity(&row.get::<_, Vec<u8>>(4)?) })
             })?.collect()
         }).map_err(storage)
     }
@@ -498,7 +501,7 @@ impl Store {
             )
             .map_err(storage)?;
         let issues = read.prepare(
-            "SELECT u.update_id,u.chat_id,u.stage,u.conflict,u.attempt,u.retry_at,u.reason,r.session_id
+            "SELECT u.update_id,u.chat_id,u.stage,u.conflict,u.attempt,u.retry_at,u.reason,r.session_id,u.fingerprint
              FROM telegram_updates u LEFT JOIN telegram_routes r ON u.bot_id = r.bot_id AND u.chat_id = r.chat_id
              WHERE u.bot_id = ?1 AND (u.conflict = 1 OR u.reason IS NOT NULL)
              ORDER BY (u.stage IN ('unknown','turn_unknown','blocked')) DESC,u.ingress_order DESC LIMIT 50",
@@ -518,6 +521,7 @@ fn status_row(row: &Row<'_>) -> rusqlite::Result<Value> {
         "retry_at": row.get::<_, Option<i64>>(5)?,
         "reason": row.get::<_, Option<String>>(6)?,
         "session_id": row.get::<_, Option<String>>(7)?,
+        "message": message_identity(&row.get::<_, Vec<u8>>(8)?),
     }))
 }
 
@@ -581,6 +585,16 @@ fn append_message(
         params![bot_id, message.update_id, message.message_id, message.user_id, message.sender,
             message.text, message.timestamp, message.outgoing],
     ).map(|changed| changed != 0)
+}
+
+/// The short identity of a received message, from its stored fingerprint.
+fn message_identity(fingerprint: &[u8]) -> String {
+    fingerprint.iter().take(8).map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The identity `Work::message` gives a message received with these fields.
+pub fn incoming_identity(chat_id: i64, message_id: i64, text: &str) -> String {
+    message_identity(fingerprint(chat_id, message_id, text).as_ref())
 }
 
 fn fingerprint(chat_id: i64, message_id: i64, text: &str) -> digest::Digest {

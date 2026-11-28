@@ -345,6 +345,28 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn scheduled_runs_appear_as_cron_chats_for_stock_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::open(dir.path()).unwrap();
+        let run = library.create_session(None, Some("Run · nightly")).unwrap();
+        Settings { source: "scheduled".into(), ..Default::default() }.save(&run.directory).unwrap();
+        let mut history = hermes_engine::History::default();
+        history.turns.push(hermes_engine::Turn {
+            prompt: "scheduled".into(), context: String::new(), attachments: vec![], model: "fixture".into(),
+            entries: vec![hermes_engine::Entry::Assistant { text: "done".into(), calls: vec![] }], status: hermes_engine::Status::Complete,
+        });
+        hermes_engine::restore_conversation(&run.directory, serde_json::to_value(&history).unwrap()).unwrap();
+        let (gateway, server) = isolated_gateway(dir.path()).await;
+        let sidebar: Value = reqwest::Client::new()
+            .get(format!("{}/api/profiles/sessions/sidebar?recents_profile=default&recents_exclude=cron", gateway.http_url()))
+            .bearer_auth(gateway.token()).send().await.unwrap().json().await.unwrap();
+        let ids = |list: &Value| list["sessions"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        assert_eq!(ids(&sidebar["cron"]), [run.id.clone()], "{sidebar}");
+        assert!(!ids(&sidebar["recents"]).contains(&run.id), "{sidebar}");
+        server.abort();
+    }
+
     async fn wait_for_receipt(shared: &Shared, session: &LiveSession, input: &str, status: &str) {
         timeout(Duration::from_secs(5), async {
             while shared.submission_receipt(session, input).is_none_or(|receipt| receipt["status"] != status) {

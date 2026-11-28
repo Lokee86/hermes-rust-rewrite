@@ -124,10 +124,20 @@ fn prompt(hook: &hermes_library::webhooks::Webhook, event: &str, payload: &serde
 pub(super) async fn recover(shared: &Arc<Shared>) -> anyhow::Result<()> {
     for hook in shared.library.webhooks()? {
         let Some(id) = hook.session_id.as_deref() else { continue };
-        let pending: Vec<_> = hook.deliveries.iter().filter_map(|delivery| {
+        let mut pending: std::collections::BTreeSet<_> = hook.deliveries.iter().filter_map(|delivery| {
             let id = delivery.id.clone()?;
             (!delivery.status.starts_with("ran (")).then_some(id)
         }).collect();
+        // The display log keeps only the newest deliveries; the chat's own admissions name every
+        // one still outstanding, so an older queued turn still gets its reply delivered.
+        if let Ok(directory) = shared.library.session_dir(id)
+            && let (_, Some(authority)) = hermes_engine::read_conversation(&directory)?
+        {
+            let authority: super::Authority = serde_json::from_value(authority)?;
+            let prefix = format!("webhook:{}:", hook.name);
+            pending.extend(authority.receipts.iter().filter(|receipt| receipt.status != "terminal")
+                .filter_map(|receipt| receipt.input_id.as_deref()?.strip_prefix(&prefix).map(str::to_owned)));
+        }
         if pending.is_empty() { continue; }
         let Ok(session) = shared.session(id).await else { continue; };
         for id in pending {

@@ -13,7 +13,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -71,7 +71,9 @@ pub enum ClientMessage {
 pub struct ServerResponse {
     inner: Weak<Inner>,
     id: String,
-    settled: Arc<AtomicBool>,
+    /// Set once an answer is queued. Held while sending, so a retry after a failed send goes out
+    /// and a concurrent second answer waits to see whether the first one was queued.
+    settled: Arc<Mutex<bool>>,
 }
 impl fmt::Debug for ServerResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,7 +88,8 @@ impl ServerResponse {
         self.send(json!({"error":{"code":code,"message":message}}))
     }
     fn send(&self, mut frame: Value) -> Result<(), ClientError> {
-        if self.settled.swap(true, Ordering::AcqRel) {
+        let mut settled = lock(&self.settled);
+        if *settled {
             return Ok(());
         }
         let inner = self.inner.upgrade().ok_or(ClientError::NotConnected)?;
@@ -97,7 +100,9 @@ impl ServerResponse {
         frame["jsonrpc"] = json!("2.0");
         frame["id"] = json!(self.id);
         tx.try_send(frame)
-            .map_err(|_| ClientError::Transport("server response could not be queued"))
+            .map_err(|_| ClientError::Transport("server response could not be queued"))?;
+        *settled = true;
+        Ok(())
     }
 }
 
@@ -629,7 +634,7 @@ impl Inner {
         let response = ServerResponse {
             inner: Arc::downgrade(self),
             id: id.into(),
-            settled: Arc::new(AtomicBool::new(false)),
+            settled: Arc::new(Mutex::new(false)),
         };
         if !self.options.server_requests || self.events.receiver_count() == 0 {
             let _ = response.fail(-32601, "no handler for server request");
@@ -769,7 +774,7 @@ mod tests {
         let response = ServerResponse {
             inner: Arc::downgrade(&client.inner),
             id: "synthetic-request".into(),
-            settled: Arc::new(AtomicBool::new(false)),
+            settled: Arc::new(Mutex::new(false)),
         };
         let duplicate = response.clone();
         response.respond(json!({"choice":"once"})).unwrap();
@@ -781,6 +786,23 @@ mod tests {
         assert!(outgoing.try_recv().is_err());
         assert_eq!(format!("{response:?}"), "ServerResponse");
     }
+    #[tokio::test]
+    async fn an_answer_that_could_not_be_queued_is_sent_on_retry() {
+        let (client, mut outgoing) = synthetic_connection();
+        let response = ServerResponse {
+            inner: Arc::downgrade(&client.inner),
+            id: "synthetic-request".into(),
+            settled: Arc::new(Mutex::new(false)),
+        };
+        let connection = lock(&client.inner.connection).take();
+        assert!(matches!(response.respond(json!({"choice":"once"})), Err(ClientError::NotConnected)));
+        assert!(matches!(response.clone().respond(json!({"choice":"once"})), Err(ClientError::NotConnected)),
+            "a failed answer is not reported as sent");
+        *lock(&client.inner.connection) = connection;
+        response.respond(json!({"choice":"once"})).unwrap();
+        assert_eq!(outgoing.recv().await.unwrap()["result"]["choice"], "once");
+    }
+
     #[tokio::test]
     async fn deadline_cancel_and_dropped_future_retire_pending_requests() {
         let (client, mut outgoing) = synthetic_connection();
