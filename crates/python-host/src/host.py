@@ -40,10 +40,26 @@ def _accepted(fn, args, kwargs):
     return {k: v for k, v in kwargs.items() if k not in bound and (any_keyword or k in names)}
 
 
+_loop = None
+_loop_lock = threading.Lock()
+
+
+def _plugin_loop():
+    """One event loop for the plugin's life: a client made in one callback stays usable in the next.
+    A fresh asyncio.run() per callback would close the loop such a client is bound to."""
+    global _loop
+    with _loop_lock:
+        if _loop is None:
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, name="plugin-event-loop", daemon=True).start()
+            _loop = loop
+        return _loop
+
+
 def call(fn, args, kwargs, running=None):
     result = fn(*args, **_accepted(fn, args, kwargs))
     if inspect.isawaitable(result):
-        result = asyncio.run(_wait(result, running))
+        result = asyncio.run_coroutine_threadsafe(_wait(result, running), _plugin_loop()).result()
     return result
 
 
@@ -129,6 +145,9 @@ class _ProviderCollector:
         self.plugin_id = host.plugin_id
         self.get_config = host.get_config
         self.provider = None
+        # A provider built during registration may keep the model services it was given.
+        if hasattr(host, "llm"):
+            self.llm = host.llm
 
     def register_memory_provider(self, provider):
         self.provider = provider

@@ -746,12 +746,19 @@ fn safe_label(value: &str) -> String {
         .collect()
 }
 
+/// Fetches a current token for a managed sign-in, refreshing it when near expiry.
+pub(crate) type Renew = std::sync::Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>> + Send + Sync>;
+
 pub(crate) struct Provider {
     client: Client,
     config: Config,
     protocol: Protocol,
     endpoint: Url,
     options: crate::models::GenerationOptions,
+    /// A managed sign-in is renewed before every model request: a turn can outlast its token
+    /// while tools run or an approval waits.
+    renew: Option<Renew>,
+    key: std::sync::Mutex<Option<String>>,
 }
 
 impl Provider {
@@ -783,19 +790,46 @@ impl Provider {
             protocol,
             endpoint,
             options,
+            renew: None,
+            key: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Renew the token for `original`'s managed sign-in (an account or Nous Portal chosen with no
+    /// key of its own) before each model request.
+    pub(crate) fn renewing(self, original: &Config) -> Self {
+        if !original.api_key.trim().is_empty() {
+            return self;
+        }
+        let renew: Option<Renew> = if crate::portal::is_portal(&original.base_url) {
+            Some(std::sync::Arc::new(|| Box::pin(crate::portal::access_token())))
+        } else {
+            crate::accounts::for_base_url(&original.base_url)
+                .map(|account| -> Renew { std::sync::Arc::new(move || Box::pin(crate::accounts::access_token(account.id))) })
+        };
+        self.with_renewal(renew)
+    }
+
+    pub(crate) fn with_renewal(mut self, renew: Option<Renew>) -> Self {
+        self.renew = renew;
+        self
+    }
+
+    fn key(&self) -> String {
+        self.key.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_else(|| self.config.api_key.clone())
     }
 
     pub(crate) fn config(&self) -> &Config { &self.config }
     pub(crate) fn options(&self) -> &crate::models::GenerationOptions { &self.options }
 
     fn error_message(&self, raw: &str) -> String {
-        let key = self.config.api_key.trim();
-        let text = if key.is_empty() {
-            raw.to_owned()
-        } else {
-            raw.replace(key, "[redacted]")
-        };
+        let mut text = raw.to_owned();
+        for key in [self.config.api_key.clone(), self.key()] {
+            let key = key.trim();
+            if !key.is_empty() {
+                text = text.replace(key, "[redacted]");
+            }
+        }
         text.chars()
             .filter(|character| !character.is_control() || *character == '\n')
             .take(480)
@@ -862,6 +896,10 @@ impl Provider {
         } else {
             self.options.apply(&mut body, self.protocol == Protocol::Anthropic)?;
         }
+        if let Some(renew) = &self.renew {
+            let key = renew().await?;
+            *self.key.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(key);
+        }
         let request = self.post(&self.endpoint, &body, "text/event-stream");
         let response = Self::send_request(request).await?;
         self.read_stream(response, emit).await
@@ -906,7 +944,8 @@ impl Provider {
     }
 
     fn authenticate(&self, mut request: RequestBuilder, endpoint: &Url) -> RequestBuilder {
-        let key = self.config.api_key.trim();
+        let key = self.key();
+        let key = key.trim();
         match self.protocol {
             Protocol::Anthropic => {
                 request = request.header("anthropic-version", "2023-06-01");
@@ -1069,7 +1108,8 @@ impl ResponsesStream {
     fn accept(&mut self, data: &str, emit: &mut impl FnMut(&str) -> Result<()>) -> Result<bool> {
         let event: Value = serde_json::from_str(data).map_err(|_| anyhow!("Invalid provider stream event"))?;
         match event["type"].as_str().unwrap_or_default() {
-            "response.output_text.delta" => if let Some(delta) = event["delta"].as_str() { emit_text(&mut self.content_bytes, delta, emit)?; },
+            // A refusal is the provider's answer: shown, not reported as an empty response.
+            "response.output_text.delta" | "response.refusal.delta" => if let Some(delta) = event["delta"].as_str() { emit_text(&mut self.content_bytes, delta, emit)?; },
             "response.reasoning_summary_text.delta" => if let Some(delta) = event["delta"].as_str() {
                 let available = (8 * 1024usize).saturating_sub(self.reasoning_summary.len());
                 self.reasoning_summary.push_str(&delta[..delta.floor_char_boundary(available.min(delta.len()))]);

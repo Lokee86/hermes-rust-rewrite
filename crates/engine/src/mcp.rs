@@ -126,7 +126,14 @@ impl Mcp {
         Some(req)
     }
 
+    /// Bounded like a request: a server that accepts the connection and then stalls must not hold
+    /// the turn before inference.
     async fn notify(&mut self, body: Value) -> Result<()> {
+        tokio::time::timeout(REQUEST_TIMEOUT, self.notify_unbounded(body)).await
+            .map_err(|_| anyhow::anyhow!("MCP server did not accept its initialization notification in time"))?
+    }
+
+    async fn notify_unbounded(&mut self, body: Value) -> Result<()> {
         if matches!(self.transport, Transport::Plugin(_)) {
             return Ok(()); // The embedded worker is initialized by its request/reply handshake.
         }
