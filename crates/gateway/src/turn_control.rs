@@ -245,12 +245,14 @@ impl Shared {
     }
 
     pub(super) fn answer_approval(view: &mut View, request: &str, approve: bool) -> bool {
-        if !view.approvals.get(request).is_some_and(Approval::tool_is_live) {
-            return false;
+        if view.approvals.get(request).is_some_and(Approval::tool_is_live)
+            && let Some(Approval { action: ApprovalAction::Tool(answer), timeout, .. }) =
+                view.approvals.remove(request)
+        {
+            timeout.cancel();
+            return answer.try_send(approve).is_ok();
         }
-        let pending = view.approvals.remove(request).expect("live approval");
-        pending.timeout.cancel();
-        matches!(pending.action, ApprovalAction::Tool(answer) if answer.try_send(approve).is_ok())
+        false
     }
 
     fn check_generation(view: &View, generation: u64) -> Result<(), RpcError> {

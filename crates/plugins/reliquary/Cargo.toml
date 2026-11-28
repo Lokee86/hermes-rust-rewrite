@@ -13,7 +13,7 @@ blake3 = "1"
 tokio.workspace = true
 hermes-engine = { path = "../../engine" }
 hermes-library = { path = "../../library" }
-reliquary-memory = { git = "https://github.com/Lokee86/Reliquary.git", rev = "da03bac76282152e778f52403b51cd103217d68c", optional = true }
+reliquary-memory = { git = "https://github.com/Lokee86/Reliquary.git", rev = "bb887b70aba2b414ec5c371fa144fcd076b282cc", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

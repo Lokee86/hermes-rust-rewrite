@@ -5237,7 +5237,7 @@ checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 [[package]]
 name = "reliquary-application"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -5264,7 +5264,7 @@ dependencies = [
 [[package]]
 name = "reliquary-archive"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "aho-corasick",
  "regex",
@@ -5277,7 +5277,7 @@ dependencies = [
 [[package]]
 name = "reliquary-chronos"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "regex",
  "time",
@@ -5286,7 +5286,7 @@ dependencies = [
 [[package]]
 name = "reliquary-container"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "blake3",
  "serde",
@@ -5297,7 +5297,7 @@ dependencies = [
 [[package]]
 name = "reliquary-context-engine"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-archive",
 ]
@@ -5305,7 +5305,7 @@ dependencies = [
 [[package]]
 name = "reliquary-dream"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-chronos",
  "reliquary-graph",
@@ -5318,7 +5318,7 @@ dependencies = [
 [[package]]
 name = "reliquary-ego"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-memory-audit",
  "serde",
@@ -5328,7 +5328,7 @@ dependencies = [
 [[package]]
 name = "reliquary-ego-store"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-container",
  "rmp-serde",
@@ -5338,7 +5338,7 @@ dependencies = [
 [[package]]
 name = "reliquary-entity-resolution"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-memory-core",
  "reliquary-perception-store",
@@ -5350,7 +5350,7 @@ dependencies = [
 [[package]]
 name = "reliquary-freshness"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-freshness-store",
  "reliquary-graph",
@@ -5361,7 +5361,7 @@ dependencies = [
 [[package]]
 name = "reliquary-freshness-store"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-container",
  "serde",
@@ -5371,7 +5371,7 @@ dependencies = [
 [[package]]
 name = "reliquary-graph"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "leiden-rs",
  "reliquary-container",
@@ -5382,7 +5382,7 @@ dependencies = [
 [[package]]
 name = "reliquary-insomnia"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-archive",
  "reliquary-memory-core",
@@ -5394,7 +5394,7 @@ dependencies = [
 [[package]]
 name = "reliquary-insomnia-store"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-container",
  "serde",
@@ -5404,7 +5404,7 @@ dependencies = [
 [[package]]
 name = "reliquary-memory"
 version = "0.2.2"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "blake3",
  "reliquary-application",
@@ -5436,7 +5436,7 @@ dependencies = [
 [[package]]
 name = "reliquary-memory-audit"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-switchboard",
  "serde",
@@ -5446,7 +5446,7 @@ dependencies = [
 [[package]]
 name = "reliquary-memory-core"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-container",
  "serde",
@@ -5456,7 +5456,7 @@ dependencies = [
 [[package]]
 name = "reliquary-owner-session"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "blake3",
  "directories",
@@ -5481,7 +5481,7 @@ dependencies = [
 [[package]]
 name = "reliquary-perception"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "blake3",
  "reliquary-memory-audit",
@@ -5493,7 +5493,7 @@ dependencies = [
 [[package]]
 name = "reliquary-perception-store"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-container",
  "serde",
@@ -5513,7 +5513,7 @@ dependencies = [
 [[package]]
 name = "reliquary-retrieval"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-archive",
  "reliquary-graph",
@@ -5527,7 +5527,7 @@ dependencies = [
 [[package]]
 name = "reliquary-runtime-gateway"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "blake3",
  "reliquary-application",
@@ -5543,7 +5543,7 @@ dependencies = [
 [[package]]
 name = "reliquary-switchboard"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -5559,7 +5559,7 @@ dependencies = [
 [[package]]
 name = "reliquary-vector-store"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "lodestone-core",
  "lodestone-packed",
@@ -5571,7 +5571,7 @@ dependencies = [
 [[package]]
 name = "reliquary-vectors"
 version = "0.1.0"
-source = "git+https://github.com/Lokee86/Reliquary.git?rev=da03bac76282152e778f52403b51cd103217d68c#da03bac76282152e778f52403b51cd103217d68c"
+source = "git+https://github.com/Lokee86/Reliquary.git?rev=bb887b70aba2b414ec5c371fa144fcd076b282cc#bb887b70aba2b414ec5c371fa144fcd076b282cc"
 dependencies = [
  "reliquary-switchboard",
  "reliquary-vector-store",

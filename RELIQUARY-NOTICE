@@ -5,13 +5,13 @@ Hermes embeds portions of Reliquary, Copyright (c) the Reliquary
 contributors, under the Mozilla Public License, version 2.0 (MPL-2.0).
 
 The exact corresponding Source Code Form used by official Hermes builds is
-Reliquary commit da03bac76282152e778f52403b51cd103217d68c. It is available at:
+Reliquary commit bb887b70aba2b414ec5c371fa144fcd076b282cc. It is available at:
 
-https://github.com/Lokee86/Reliquary/tree/da03bac76282152e778f52403b51cd103217d68c
+https://github.com/Lokee86/Reliquary/tree/bb887b70aba2b414ec5c371fa144fcd076b282cc
 
 A downloadable archive of that source is available at:
 
-https://github.com/Lokee86/Reliquary/archive/da03bac76282152e778f52403b51cd103217d68c.tar.gz
+https://github.com/Lokee86/Reliquary/archive/bb887b70aba2b414ec5c371fa144fcd076b282cc.tar.gz
 
 One of its crates, reliquary-project-environment, is modified to leave out
 Lore. The Source Code Form of the modified crate is in
@@ -21,7 +21,7 @@ https://github.com/itsflownium/mercury-hermes-rust-rewrite/tree/main/vendor/reli
 
 The MPL-2.0 license text is available at:
 
-https://github.com/Lokee86/Reliquary/blob/da03bac76282152e778f52403b51cd103217d68c/LICENSE
+https://github.com/Lokee86/Reliquary/blob/bb887b70aba2b414ec5c371fa144fcd076b282cc/LICENSE
 https://www.mozilla.org/MPL/2.0/
 
 This notice applies only to the Reliquary files. The surrounding Hermes work

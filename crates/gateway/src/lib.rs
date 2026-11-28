@@ -1782,23 +1782,25 @@ impl Shared {
                 view.approvals.keys().next().cloned().into_iter().collect()
             };
             for id in ids {
-                if view.approvals.get(&id).is_some_and(|approval| {
-                    matches!(&approval.action, ApprovalAction::Identity { peer: actor, .. }
-                        if actor != &peer.id || requested != Some(id.as_str()) || !peer.local_native
-                            || approval.payload["execution_generation"] != view.generation)
-                }) {
+                if Self::answer_approval(&mut view, &id, choice == "once") {
+                    resolved.push(id);
                     continue;
                 }
-                if let Some(approval) = view.approvals.remove(&id) {
-                    approval.timeout.cancel();
-                    match approval.action {
-                        ApprovalAction::Tool(answer) => {
-                            if answer.try_send(choice == "once").is_ok() { resolved.push(id); }
-                        }
-                        ApprovalAction::Identity { apply, .. } if choice == "once" => {
-                            identity.push((id, apply));
-                        }
-                        ApprovalAction::Identity { .. } => resolved.push(id),
+                let can_review = view.approvals.get(&id).is_some_and(|approval| {
+                    matches!(&approval.action, ApprovalAction::Identity { peer: actor, .. }
+                        if actor == &peer.id && requested == Some(id.as_str()) && peer.local_native
+                            && approval.payload["execution_generation"] == view.generation
+                            && approval.expires_ms > chrono::Utc::now().timestamp_millis())
+                });
+                if can_review
+                    && let Some(Approval { action: ApprovalAction::Identity { apply, .. }, timeout, .. }) =
+                        view.approvals.remove(&id)
+                {
+                    timeout.cancel();
+                    if choice == "once" {
+                        identity.push((id, apply));
+                    } else {
+                        resolved.push(id);
                     }
                 }
             }
